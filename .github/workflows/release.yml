@@ -1,0 +1,242 @@
+name: Release Docker Images & Deploy Dokploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "src/**"
+      - "scripts/**"
+      - "config/**"
+      - "frontend/**"
+      - "docker/**"
+      - "pyproject.toml"
+      - "uv.lock"
+      - "docker-compose.dokploy.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  deployments: write
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+      sha: ${{ steps.check.outputs.sha }}
+      namespace: ${{ steps.check.outputs.namespace }}
+      built_at: ${{ steps.check.outputs.built_at }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TARGET_SHA: ${{ github.sha }}
+      REPO_OWNER: ${{ github.repository_owner }}
+    steps:
+      - name: Verify commit is still main tip
+        id: check
+        run: |
+          set -euo pipefail
+          current_sha="$(curl -fsS --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/main" \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["sha"])')"
+          if [ "$current_sha" != "$TARGET_SHA" ]; then
+            echo "::notice title=Release superseded::main moved to $current_sha; skipping obsolete SHA $TARGET_SHA"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          ns="$(printf '%s' "$REPO_OWNER" | tr '[:upper:]' '[:lower:]')"
+          echo "ready=true" >> "$GITHUB_OUTPUT"
+          echo "sha=$TARGET_SHA" >> "$GITHUB_OUTPUT"
+          echo "namespace=$ns" >> "$GITHUB_OUTPUT"
+          echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    needs: gate
+    if: needs.gate.outputs.ready == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      REGISTRY: ghcr.io
+      NS: ${{ needs.gate.outputs.namespace }}
+      SHA: ${{ needs.gate.outputs.sha }}
+      BUILT_AT: ${{ needs.gate.outputs.built_at }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build backend image (local load for smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/backend.Dockerfile
+          target: backend
+          load: true
+          push: false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.NS }}/hl-backend:sha-${{ env.SHA }}
+            ${{ env.REGISTRY }}/${{ env.NS }}/hl-backend:latest
+          build-args: |
+            BUILD_SHA=${{ env.SHA }}
+            BUILT_AT=${{ env.BUILT_AT }}
+          cache-from: type=gha,scope=hl-backend
+          cache-to: type=gha,mode=max,scope=hl-backend
+
+      - name: Build worker image (local load for smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/backend.Dockerfile
+          target: worker
+          load: true
+          push: false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.NS }}/hl-worker:sha-${{ env.SHA }}
+            ${{ env.REGISTRY }}/${{ env.NS }}/hl-worker:latest
+          build-args: |
+            BUILD_SHA=${{ env.SHA }}
+            BUILT_AT=${{ env.BUILT_AT }}
+          cache-from: type=gha,scope=hl-worker
+          cache-to: type=gha,mode=max,scope=hl-worker
+
+      - name: Build frontend image (local load for smoke test)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/frontend.Dockerfile
+          target: frontend
+          load: true
+          push: false
+          tags: |
+            ${{ env.REGISTRY }}/${{ env.NS }}/hl-frontend:sha-${{ env.SHA }}
+            ${{ env.REGISTRY }}/${{ env.NS }}/hl-frontend:latest
+          build-args: |
+            BUILD_SHA=${{ env.SHA }}
+            BUILT_AT=${{ env.BUILT_AT }}
+          cache-from: type=gha,scope=hl-frontend
+          cache-to: type=gha,mode=max,scope=hl-frontend
+
+      - name: Pre-push container smoke tests
+        run: |
+          set -euo pipefail
+          be_img="$REGISTRY/$NS/hl-backend:sha-$SHA"
+          wk_img="$REGISTRY/$NS/hl-worker:sha-$SHA"
+          fe_img="$REGISTRY/$NS/hl-frontend:sha-$SHA"
+
+          # 1. Verify OCI revision labels
+          for img in "$be_img" "$wk_img" "$fe_img"; do
+            rev="$(docker image inspect "$img" --format '{{ index .Config.Labels "org.opencontainers.image.revision" }}')"
+            test "$rev" = "$SHA"
+          done
+
+          # 2. Verify backend /healthz and /api/v1/build-info.json
+          docker run --rm -e "EXPECTED_SHA=$SHA" "$be_img" python -c '
+          import os
+          from fastapi.testclient import TestClient
+          from hl_quant.api.app import app
+          client = TestClient(app)
+          h = client.get("/healthz")
+          assert h.status_code == 200 and h.json()["status"] == "ok"
+          b = client.get("/api/v1/build-info.json")
+          assert b.status_code == 200 and b.json()["sha"] == os.environ["EXPECTED_SHA"]
+          o = client.get("/api/v1/overview")
+          assert o.status_code == 200
+          print("backend smoke OK:", b.json())
+          '
+
+          # 3. Verify worker CLI and testnet SDK extra
+          docker run --rm "$wk_img" python -c '
+          import hyperliquid
+          from hl_quant.scheduler import build_job_specs
+          jobs = build_job_specs()
+          assert len(jobs) == 9
+          print("worker smoke OK:", len(jobs), "jobs")
+          '
+
+          # 4. Verify frontend nginx serves /nginx-health, /index.html, and exact /build-info.json
+          docker run -d --name fe-smoke -p 127.0.0.1:18080:80 "$fe_img"
+          trap 'docker rm -f fe-smoke >/dev/null 2>&1 || true' EXIT
+          sleep 2
+          test "$(curl -fsS http://127.0.0.1:18080/nginx-health)" = "ok"
+          curl -fsS http://127.0.0.1:18080/index.html | grep -q "Hyperliquid Quant DeFi"
+          curl -fsS http://127.0.0.1:18080/build-info.json | python3 -c "import json, sys; d=json.load(sys.stdin); assert d['sha']=='$SHA', d; print('frontend smoke OK:', d)"
+
+      - name: Push verified immutable SHA images to GHCR
+        run: |
+          set -euo pipefail
+          for svc in hl-backend hl-worker hl-frontend; do
+            docker push "$REGISTRY/$NS/$svc:sha-$SHA"
+            docker push "$REGISTRY/$NS/$svc:latest"
+          done
+          {
+            echo "### Published Verified GHCR Images"
+            echo "- Source SHA: \`$SHA\`"
+            echo "- \`$REGISTRY/$NS/hl-backend:sha-$SHA\`"
+            echo "- \`$REGISTRY/$NS/hl-worker:sha-$SHA\`"
+            echo "- \`$REGISTRY/$NS/hl-frontend:sha-$SHA\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  deploy-dokploy:
+    needs: [gate, build-and-push]
+    if: needs.gate.outputs.ready == 'true' && vars.DOKPLOY_DEPLOY_ENABLED == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      SHA: ${{ needs.gate.outputs.sha }}
+      DOKPLOY_API_URL: ${{ secrets.DOKPLOY_API_URL }}
+      DOKPLOY_API_KEY: ${{ secrets.DOKPLOY_API_KEY }}
+      DOKPLOY_COMPOSE_ID: ${{ secrets.DOKPLOY_COMPOSE_ID }}
+      DOKPLOY_PUBLIC_URL: ${{ vars.DOKPLOY_PUBLIC_URL }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+
+      - name: Confirm SHA is still main tip before production rollout
+        run: |
+          set -euo pipefail
+          current_sha="$(curl -fsS --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/main" \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["sha"])')"
+          test "$current_sha" = "$SHA"
+
+      - name: Deploy immutable SHA release to Dokploy and verify live probes
+        run: python3 scripts/ops/deploy_dokploy.py "$SHA"
+
+      - name: Record GitHub Deployment status
+        if: success()
+        run: |
+          set -euo pipefail
+          payload="$(python3 -c 'import json, os; print(json.dumps({"ref": "main", "sha": os.environ["SHA"], "environment": "production", "auto_merge": False, "required_contexts": [], "description": "Dokploy release " + os.environ["SHA"][:12]}))')"
+          dep_id="$(curl -fsS --retry 3 -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/deployments" \
+            -d "$payload" | python3 -c 'import json, sys; print(int(json.load(sys.stdin)["id"]))')"
+          status_payload="$(python3 -c 'import json, os; print(json.dumps({"state": "success", "environment_url": os.environ.get("DOKPLOY_PUBLIC_URL") or "", "description": "Dokploy stack verified on " + os.environ["SHA"][:12]}))')"
+          curl -fsS --retry 3 -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/deployments/$dep_id/statuses" \
+            -d "$status_payload" >/dev/null
