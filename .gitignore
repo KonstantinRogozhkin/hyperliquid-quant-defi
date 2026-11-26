@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
+.pytest_cache/
+.ruff_cache/
+.neira/
+data/
+logs/
+outputs/
+.env
+docs/reports/*/*
+!docs/reports/*/*.md
+!docs/reports/*/*.html

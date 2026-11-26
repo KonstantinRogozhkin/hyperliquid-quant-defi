@@ -1,0 +1,84 @@
+#!/bin/zsh
+set -euo pipefail
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'EOF'
+Usage: run_hyperliquid_snapshot_tick.sh
+
+Single local cron tick to collect a public Hyperliquid snapshot
+(metaAndAssetCtxs, predictedFundings, L2 books) for future funding-arb research.
+Read-only public API; does not touch DuckDB or place orders.
+
+Recommended local cron (UTC/local hourly at :50, 10m before HL funding settlement):
+  50 * * * * zsh /path/to/scripts/ops/run_hyperliquid_snapshot_tick.sh
+
+Environment:
+  HL_SNAPSHOT_COINS       Comma-separated HL perp names
+                          Default: BTC,ETH,SOL,HYPE,DOGE,XRP,SUI,ENA,WIF,kPEPE,AVAX,LINK,TAO
+  HL_SNAPSHOT_TRADES      1 to also collect recent trades, 0 to skip (default: 0)
+  HL_SNAPSHOT_OUTPUT_ROOT Optional override for --output-root (default: $BACKTESTER_RAW_ROOT/hyperliquid)
+  PYTHON_BIN              Optional python binary override
+  BACKTESTER_LOG_DIR      Optional log directory override
+EOF
+  exit 0
+fi
+
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+DEFAULT_PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
+if [[ -x "${DEFAULT_PYTHON_BIN}" ]]; then
+  PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PYTHON_BIN}}"
+else
+  PYTHON_BIN="${PYTHON_BIN:-python3}"
+fi
+
+export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
+
+HL_SNAPSHOT_COINS="${HL_SNAPSHOT_COINS:-BTC,ETH,SOL,HYPE,DOGE,XRP,SUI,ENA,WIF,kPEPE,AVAX,LINK,TAO}"
+HL_SNAPSHOT_TRADES="${HL_SNAPSHOT_TRADES:-0}"
+HL_SNAPSHOT_OUTPUT_ROOT="${HL_SNAPSHOT_OUTPUT_ROOT:-}"
+
+LOCK_DIR="${ROOT_DIR}/.neira/state/hyperliquid_snapshot.lock"
+mkdir -p "${ROOT_DIR}/.neira/state"
+if mkdir "${LOCK_DIR}" 2>/dev/null; then
+  echo "$$" > "${LOCK_DIR}/pid"
+else
+  if [[ -f "${LOCK_DIR}/pid" ]]; then
+    ACTIVE_PID="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
+    if [[ -n "${ACTIVE_PID}" ]] && kill -0 "${ACTIVE_PID}" 2>/dev/null; then
+      exit 0
+    fi
+  fi
+  rm -rf "${LOCK_DIR}"
+  mkdir "${LOCK_DIR}"
+  echo "$$" > "${LOCK_DIR}/pid"
+fi
+trap 'rm -rf "${LOCK_DIR}"' EXIT
+
+RUN_DATE="$(date -u +%F)"
+RUN_TIME="$(date -u +%H%M)"
+LOG_DIR="${BACKTESTER_LOG_DIR:-${ROOT_DIR}/.neira/logs/runs/${RUN_DATE}/${RUN_TIME}/hyperliquid_snapshot_tick}"
+LOG_FILE="${LOG_DIR}/run_hyperliquid_snapshot_tick.log"
+mkdir -p "${LOG_DIR}"
+
+CMD=(
+  "${PYTHON_BIN}"
+  "${ROOT_DIR}/scripts/analytics/collect_hyperliquid_market_data.py"
+  snapshot
+  --coins "${HL_SNAPSHOT_COINS}"
+)
+if [[ "${HL_SNAPSHOT_TRADES}" == "1" || "${HL_SNAPSHOT_TRADES:l}" == "true" ]]; then
+  CMD+=(--trades)
+else
+  CMD+=(--no-trades)
+fi
+if [[ -n "${HL_SNAPSHOT_OUTPUT_ROOT}" ]]; then
+  CMD+=(--output-root "${HL_SNAPSHOT_OUTPUT_ROOT}")
+fi
+
+{
+  echo "utc_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "coins=${HL_SNAPSHOT_COINS}"
+  echo "trades=${HL_SNAPSHOT_TRADES}"
+} >> "${LOG_FILE}"
+
+"${CMD[@]}" | tee -a "${LOG_FILE}"

@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling>=1.27.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hyperliquid-quant-defi"
+version = "0.1.0"
+description = "Hyperliquid quantitative trading, Avellaneda-Stoikov market making, 5-DEX arbitrage, HIP-3/Pendle Boros, and HyperEVM Chain 999 on-chain DeFi stack."
+readme = "README.md"
+requires-python = ">=3.11.5"
+license = { text = "MIT" }
+dependencies = [
+  "httpx>=0.28.0",
+  "numpy>=2.0.0",
+  "pandas>=2.2.0",
+  "polars>=1.20.0",
+  "pyarrow>=18.0.0",
+  "pyyaml>=6.0.0",
+  "scikit-learn>=1.5.0",
+  "typer>=0.15.0",
+  "websockets>=14.0",
+]
+
+[project.optional-dependencies]
+testnet = [
+  "eth-account>=0.13.0",
+  "hyperliquid-python-sdk>=0.15.0",
+]
+dev = [
+  "pytest>=8.4.0",
+  "ruff>=0.14.0",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hl_quant"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = [".", "src"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E9", "E402", "F401", "F811", "F821", "F841"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*.py" = ["E402"]

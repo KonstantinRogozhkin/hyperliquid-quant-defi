@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Hyperliquid Quantitative & DeFi Desk Dashboard — hyperliquid-quant-defi</title>
+<style>
+  :root {
+    --bg: #070d17; --panel: #0f172a; --panel2: #111c33; --border: #1e293b;
+    --text: #e2e8f0; --muted: #94a3b8; --green: #10b981; --red: #f43f5e;
+    --amber: #f59e0b; --cyan: #38bdf8;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", sans-serif; background: var(--bg); color: var(--text); line-height: 1.45; }
+  .wrap { max-width: 1320px; margin: 0 auto; padding: 24px 20px 48px; }
+  header { display: flex; justify-content: space-between; align-items: flex-end; flex-wrap: wrap; gap: 12px; border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 20px; }
+  h1 { margin: 0; font-size: 22px; letter-spacing: -0.02em; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  .badge-live { background: rgba(16,185,129,0.14); color: var(--green); border: 1px solid rgba(16,185,129,0.35); padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .kpis { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-bottom: 20px; }
+  .kpi { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; }
+  .kpi .lbl { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; }
+  .kpi .val { font-size: 21px; font-weight: 700; margin: 4px 0 2px; }
+  .kpi .sub { color: var(--muted); font-size: 12px; }
+  .tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 18px; }
+  .tab-btn { background: var(--panel); color: var(--muted); border: 1px solid var(--border); border-radius: 8px; padding: 8px 14px; font-size: 13px; font-weight: 600; cursor: pointer; transition: 0.15s; }
+  .tab-btn:hover { color: var(--text); border-color: #334155; }
+  .tab-btn.active { background: rgba(16,185,129,0.16); color: var(--green); border-color: rgba(16,185,129,0.5); }
+  .panel { display: none; }
+  .panel.active { display: block; }
+  .grid-2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(380px, 1fr)); gap: 16px; margin-bottom: 16px; }
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 16px; margin-bottom: 16px; overflow-x: auto; }
+  .card h3, .card h4 { margin: 0 0 10px; font-size: 15px; }
+  .guide-box { background: linear-gradient(135deg, rgba(16,185,129,0.08), rgba(56,189,248,0.08)); border: 1px solid rgba(56,189,248,0.28); border-radius: 12px; padding: 14px 16px; margin-bottom: 16px; }
+  .guide-title { font-size: 13px; font-weight: 700; color: var(--cyan); margin-bottom: 6px; }
+  .guide-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 10px; font-size: 13px; color: var(--text); }
+  .guide-item b { color: #f8fafc; }
+  .meta-line { color: var(--muted); font-size: 12px; margin-bottom: 10px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em; background: var(--panel2); }
+  td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
+  tr:hover td { background: rgba(56,189,248,0.04); }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+  .muted { color: var(--muted); font-size: 12px; }
+  .pill { display: inline-block; padding: 2px 7px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+  .pill.green { background: rgba(16,185,129,0.16); color: var(--green); }
+  .pill.red { background: rgba(244,63,94,0.16); color: var(--red); }
+  .pill.amber { background: rgba(245,158,11,0.18); color: var(--amber); }
+  .pill.gray { background: rgba(148,163,184,0.15); color: var(--muted); }
+  code { background: #1e293b; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+  .spark { width: 100%; height: 86px; display: block; }
+  .chart-svg { width: 100%; max-height: 170px; display: block; }
+  footer { margin-top: 28px; color: var(--muted); font-size: 12px; text-align: center; border-top: 1px solid var(--border); padding-top: 14px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <div>
+      <h1>Hyperliquid Quantitative &amp; On-Chain DeFi Desk</h1>
+      <div class="subtitle">hyperliquid-quant-defi · Alpha Research · Paper L2 · Testnet ALO · Avellaneda–Stoikov MM v2 · HIP-3 · Boros · 5-DEX · HyperEVM 999</div>
+    </div>
+    <span class="badge-live">● Live Snapshot · 2026-11-26 22:33 UTC</span>
+  </header>
+
+  <section class="kpis">
+    <div class="kpi">
+      <div class="lbl">1. Аудит метамодели (58 гип.)</div>
+      <div class="val" style="color: var(--amber);">1.5 → 5.0 б.п.</div>
+      <div class="sub">Измеренный ALO fill 55% · Ex-INIT −0.37% → Obs-Only</div>
+    </div>
+    <div class="kpi">
+      <div class="lbl">2. Тестнет-счёт (ALO ордера)</div>
+      <div class="val">$998.84</div>
+      <div class="sub">Исполнение ALO <b>95.7%</b> · Риск ликв.: <b>0</b></div>
+    </div>
+    <div class="kpi">
+      <div class="lbl">3. Маркет-мейкер (живой тест)</div>
+      <div class="val pos">+0.0165$</div>
+      <div class="sub">Оборот $150.1 · 100% Maker · скорость <b>5.5 мкс</b></div>
+    </div>
+    <div class="kpi">
+      <div class="lbl">4. Арбитраж HL × Lighter</div>
+      <div class="val pos">+29.1% APR</div>
+      <div class="sub">Открыто 5 пар · Баланс $49,969.23</div>
+    </div>
+    <div class="kpi">
+      <div class="lbl">5. HyperEVM (Chain 999) и HLP</div>
+      <div class="val pos">$152.4M</div>
+      <div class="sub">Доходность HLP +15.66% · Пег USDT0 +11.1 б.п.</div>
+    </div>
+    <div class="kpi">
+      <div class="lbl">6. Аудит фандинга в :00</div>
+      <div class="val">60,370</div>
+      <div class="sub">51 монет · 52.0 дн. · Фильтр в проде</div>
+    </div>
+  </section>
+
+  <nav class="tabs" role="tablist">
+    <button class="tab-btn active" onclick="openTab('exec', this)">1. Testnet &amp; Paper L2</button>
+    <button class="tab-btn" onclick="openTab('mm', this)">2. Avellaneda–Stoikov MM v2</button>
+    <button class="tab-btn" onclick="openTab('cdex', this)">3. Cross-DEX v2 (5 DEX) &amp; HL×Lighter</button>
+    <button class="tab-btn" onclick="openTab('evm', this)">4. HyperEVM Chain 999 &amp; HLP</button>
+    <button class="tab-btn" onclick="openTab('alpha', this)">5. Ликвидации китов &amp; :00 OOS</button>
+    <button class="tab-btn" onclick="openTab('frontier', this)">6. HIP-3, Boros &amp; Yield Stack</button>
+  </nav>
+
+  <section id="tab-exec" class="panel active">
+    <div class="guide-box">
+      <div class="guide-title">💡 Простыми словами: что показано на вкладке «Testnet &amp; Paper L2»</div>
+      <div class="guide-grid">
+        <div class="guide-item"><b>Что делает бот:</b> каждые 4 часа трекер наблюдает за метамоделью уже по честным измеренным издержкам <code>5.0 б.п.</code> (PR #16–#19 показали, что при реальном BBO ALO fill 55% метамодель без <code>INIT</code> в нуле, поэтому она остаётся только в paper-наблюдении).</div>
+        <div class="guide-item"><b>Как читать цифры:</b> на Testnet проверяется сам механизм исполнения: <code>ALO Fill &ge; 85%</code> на малых клипах — минимум комиссий; <code>До ликв. &gt; 25%</code> и <code>Риск ликв. = 0</code> — безопасная маржа.</div>
+        <div class="guide-item"><b>Статус сейчас:</b> 🟢 Метамодель честно переведена в observation-only; Testnet-контур исполнения в норме (0 предупреждений по ликвидации, фильтр <code>onlyIsolated</code> активен).</div>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Paper L2 Shadow Tracker (HL × Bybit/Binance/OKX)</h3>
+        <div class="meta-line">Тиков: <b>8</b> · Позиций: <b>18</b> · Equity: <b>$99,522.21</b> (-0.478%) · HL fee <code>5.0 б.п.</code> (PR #19) · Obs-Only</div>
+        <svg viewBox="0 0 340 86" class="spark" role="img" aria-label="Equity curve"><polygon points="8.0,78.0 8.0,20.8 54.3,21.7 100.6,33.3 146.9,40.4 193.1,45.3 239.4,8.0 285.7,61.5 332.0,78.0 332.0,78.0" fill="#38bdf8" fill-opacity="0.14"/><polyline points="8.0,20.8 54.3,21.7 100.6,33.3 146.9,40.4 193.1,45.3 239.4,8.0 285.7,61.5 332.0,78.0" fill="none" stroke="#38bdf8" stroke-width="2.2" stroke-linecap="round"/></svg>
+      </div>
+      <div class="card">
+        <h3>Пост-трейд атрибуция Hyperliquid Testnet</h3>
+        <div class="meta-line">Адрес: <code>0x6b9C2Ee61bEaCF9Ca805A7b5620F21C241573afD</code> · Сделок: <b>83</b> · Оборот: <b>$1,329.4</b> · Maker: <b>89.4%</b> · Fee: <b>1.82 б.п.</b></div>
+        <div class="meta-line">Риски: <b>0</b> ликв. · <b>0</b> ADL-алертов · API Quota: <code>OK (0.017 req/$)</code> · защита <code>onlyIsolated</code> + <code>cross:3x</code> + <code>:55–:59</code>.</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Разрез живых позиций и сделок Testnet</h3>
+      <table>
+        <thead><tr><th>Монета</th><th>Позиция</th><th>Режим</th><th class="num">Филлов</th><th class="num">Maker %</th><th class="num">Net PnL</th><th class="num">Markout</th><th class="num">До ликв.</th><th class="num">ADL Rank</th></tr></thead>
+        <tbody><tr><td><b>GRAM</b></td><td><span class="pill red">Шорт</span> $82.4</td><td><code>cross:3</code></td><td class='num'>2</td><td class='num'>100%</td><td class='num neg'>-0.52$</td><td class='num'>-59.0 б.п.</td><td class='num'>1069.0%</td><td class='num'>—</td></tr><tr><td><b>kPEPE</b></td><td><span class="pill green">Лонг</span> $43.3</td><td><code>cross:10</code></td><td class='num'>3</td><td class='num'>100%</td><td class='num pos'>+0.92$</td><td class='num'>+209.6 б.п.</td><td class='num'>—</td><td class='num'>0.04</td></tr><tr><td><b>LIT</b></td><td><span class="pill red">Шорт</span> $37.7</td><td><code>cross:5</code></td><td class='num'>1</td><td class='num'>100%</td><td class='num neg'>-1.01$</td><td class='num'>-277.9 б.п.</td><td class='num'>2333.9%</td><td class='num'>—</td></tr><tr><td><b>TRUMP</b></td><td><span class="pill green">Лонг</span> $37.4</td><td><code>cross:3</code></td><td class='num'>5</td><td class='num'>100%</td><td class='num neg'>-0.06$</td><td class='num'>-17.7 б.п.</td><td class='num'>—</td><td class='num'>0.04</td></tr><tr><td><b>XMR</b></td><td><span class="pill green">Лонг</span> $27.1</td><td><code>cross:5</code></td><td class='num'>1</td><td class='num'>100%</td><td class='num neg'>-0.05$</td><td class='num'>+4.3 б.п.</td><td class='num'>—</td><td class='num'>—</td></tr><tr><td><b>TAO</b></td><td><span class="pill red">Шорт</span> $25.9</td><td><code>cross:10</code></td><td class='num'>2</td><td class='num'>100%</td><td class='num neg'>-0.52$</td><td class='num'>-204.3 б.п.</td><td class='num'>3560.6%</td><td class='num'>—</td></tr><tr><td><b>VVV</b></td><td><span class="pill red">Шорт</span> $22.2</td><td><code>cross:3</code></td><td class='num'>2</td><td class='num'>100%</td><td class='num neg'>-0.19$</td><td class='num'>-84.7 б.п.</td><td class='num'>3740.3%</td><td class='num'>—</td></tr><tr><td><b>XPL</b></td><td><span class="pill green">Лонг</span> $18.6</td><td><code>cross:3</code></td><td class='num'>1</td><td class='num'>100%</td><td class='num neg'>-0.05$</td><td class='num'>-46.6 б.п.</td><td class='num'>—</td><td class='num'>—</td></tr><tr><td><b>SKY</b></td><td><span class="pill green">Лонг</span> $17.2</td><td><code>cross:3</code></td><td class='num'>1</td><td class='num'>100%</td><td class='num pos'>+0.28$</td><td class='num'>+171.3 б.п.</td><td class='num'>—</td><td class='num'>0.02</td></tr><tr><td><b>PONS</b></td><td><span class="pill green">Лонг</span> $14.2</td><td><code>cross:3</code></td><td class='num'>2</td><td class='num'>100%</td><td class='num pos'>+0.92$</td><td class='num'>+180.8 б.п.</td><td class='num'>—</td><td class='num'>0.01</td></tr><tr><td><b>JUP</b></td><td><span class="pill green">Лонг</span> $4.5</td><td><code>cross:3</code></td><td class='num'>4</td><td class='num'>100%</td><td class='num pos'>+0.67$</td><td class='num'>+88.2 б.п.</td><td class='num'>—</td><td class='num'>0.01</td></tr><tr><td><b>BTC</b></td><td><span class="pill red">Шорт</span> $2.5</td><td><code>cross:3</code></td><td class='num'>14</td><td class='num'>100%</td><td class='num neg'>-0.01$</td><td class='num'>+0.5 б.п.</td><td class='num'>38628.0%</td><td class='num'>—</td></tr><tr><td><b>ETH</b></td><td><span class="pill gray">Закрыта</span> $0.0</td><td><code>flat</code></td><td class='num'>41</td><td class='num'>77%</td><td class='num pos'>+0.11$</td><td class='num'>+7.9 б.п.</td><td class='num'>—</td><td class='num'>—</td></tr><tr><td><b>NEAR</b></td><td><span class="pill gray">Закрыта</span> $0.0</td><td><code>flat</code></td><td class='num'>2</td><td class='num'>100%</td><td class='num neg'>-0.67$</td><td class='num'>-121.6 б.п.</td><td class='num'>—</td><td class='num'>—</td></tr><tr><td><b>ZRO</b></td><td><span class="pill gray">Закрыта</span> $0.0</td><td><code>flat</code></td><td class='num'>2</td><td class='num'>100%</td><td class='num pos'>+0.02$</td><td class='num'>+6.5 б.п.</td><td class='num'>—</td><td class='num'>—</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-mm" class="panel">
+    <div class="guide-box">
+      <div class="guide-title">💡 Простыми словами: что делает «Маркет-мейкер Avellaneda–Stoikov v2»</div>
+      <div class="guide-grid">
+        <div class="guide-item"><b>Идея:</b> робот одновременно ставит заявку на покупку и продажу в стакане и зарабатывает спред, автоматически сдвигая цены при накоплении позиции.</div>
+        <div class="guide-item"><b>Как читать цифры:</b> <code>Markout +5s &gt; 0</code> — нас не «переезжают» быстрые игроки; <code>LeadPull</code> — сколько раз бот успел убрать ордер по сигналу Binance; графики внизу показывают, как часто исполняются ордера в глубине стакана.</div>
+        <div class="guide-item"><b>Статус сейчас:</b> 🟢 Живой тест на BTC+ETH закрыт в плюс (<b>+0.0165$</b>, 100% Maker, скорость расчёта <b>5.54 мкс</b>).</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Живая мульти-монетная сессия Avellaneda–Stoikov MM v2 (WS bbo+l2Book + Binance Lead-Lag + batchModify + scheduleCancel)</h3>
+      <div class="meta-line">Бенчмарк горячего пути (<code>3 000</code> тиков): <b>p50 = 5.54 мкс</b> · <b>p95 = 5.79 мкс</b> · <b>p99 = 7.12 мкс</b> · <b>177,396</b> тик/с · <code>:59→:05</code> funding overlay встроен.</div>
+      <table>
+        <thead><tr><th>Монета</th><th class="num">Тики (bbo)</th><th class="num">batchMod / LeadPull</th><th class="num">Полуспред</th><th class="num">Сделки</th><th class="num">Оборот · Maker</th><th class="num">Net PnL</th><th class="num">Markout +5s</th></tr></thead>
+        <tbody><tr><td><b>BTC</b></td><td class='num'>24 (20 bbo)</td><td class='num'>9 / 0</td><td class='num'>3.38 б.п.</td><td class='num'>5 (4B/1S)</td><td class='num'>$40.57 · 100%</td><td class='num pos'>+0.0056$</td><td class='num pos'>—</td></tr><tr><td><b>ETH</b></td><td class='num'>20 (16 bbo)</td><td class='num'>7 / 5</td><td class='num'>3.47 б.п.</td><td class='num'>10 (10B/0S)</td><td class='num'>$109.56 · 100%</td><td class='num pos'>+0.0109$</td><td class='num pos'>+4.51 б.п.</td></tr></tbody>
+      </table>
+    </div>
+    <div class="grid-2"><div class="card"><h4>Калибровка λ(δ)=Ae<sup>−κδ</sup> · ETH</h4><div class="meta-line">κ = <b>0.544 1/б.п.</b> · A = 0.080 1/с · R² = <b>0.83</b> · σ<sub>30s</sub> = 7.7 б.п.</div><svg viewBox="0 0 380 160" class="chart-svg"><line x1="38" y1="136" x2="366" y2="136" stroke="#334155" stroke-width="1"/><line x1="38" y1="14" x2="38" y2="136" stroke="#334155" stroke-width="1"/><polyline points="48.2,14.0 58.5,43.0 79.0,82.0 99.5,104.7 140.5,125.4 202.0,133.9 284.0,135.8 366.0,136.0" fill="none" stroke="#10b981" stroke-width="2.2"/><circle cx="48.2" cy="20.6" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="58.5" cy="44.2" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="79.0" cy="66.5" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="99.5" cy="117.3" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="140.5" cy="136.0" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="202.0" cy="136.0" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="284.0" cy="136.0" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="366.0" cy="136.0" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><text x="38" y="22" fill="#94a3b8" font-size="10">λ(δ) 1/s</text><text x="318" y="154" fill="#94a3b8" font-size="10">δ (б.п.)</text></svg></div><div class="card"><h4>Калибровка λ(δ)=Ae<sup>−κδ</sup> · BTC</h4><div class="meta-line">κ = <b>0.327 1/б.п.</b> · A = 0.065 1/с · R² = <b>0.98</b> · σ<sub>30s</sub> = 5.5 б.п.</div><svg viewBox="0 0 380 160" class="chart-svg"><line x1="38" y1="136" x2="366" y2="136" stroke="#334155" stroke-width="1"/><line x1="38" y1="14" x2="38" y2="136" stroke="#334155" stroke-width="1"/><polyline points="48.2,14.0 58.5,32.4 79.0,61.3 99.5,82.1 140.5,108.0 202.0,125.5 284.0,133.2 366.0,135.2" fill="none" stroke="#10b981" stroke-width="2.2"/><circle cx="48.2" cy="14.8" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="58.5" cy="28.5" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="79.0" cy="67.3" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="99.5" cy="79.5" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="140.5" cy="136.0" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="202.0" cy="136.0" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="284.0" cy="136.0" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><circle cx="366.0" cy="136.0" r="3.6" fill="#38bdf8" stroke="#0b1220" stroke-width="1"/><text x="38" y="22" fill="#94a3b8" font-size="10">λ(δ) 1/s</text><text x="318" y="154" fill="#94a3b8" font-size="10">δ (б.п.)</text></svg></div></div>
+  </section>
+
+  <section id="tab-cdex" class="panel">
+    <div class="guide-box">
+      <div class="guide-title">💡 Простыми словами: что такое «Cross-DEX (5 бирж) и HL × Lighter»</div>
+      <div class="guide-grid">
+        <div class="guide-item"><b>Идея:</b> если на Hyperliquid фандинг отрицательный (нам платят за лонг), а на Lighter положительный (нам платят за шорт) — мы открываем встречные позиции и забираем разницу ставок без риска направления цены.</div>
+        <div class="guide-item"><b>Как читать цифры:</b> важен не только <code>Спред APR</code>, но и <code>L2 Slip</code> (проскальзывание стакана) и <code>Окуп.</code> (через сколько часов спред окупит комиссии). Строки с <code>Тонкий</code> или большим slip — ловушки.</div>
+        <div class="guide-item"><b>Статус сейчас:</b> 🟢 4-часовой трекер держит <b>5</b> проверенных пар со средним спредом <b>+29.1% APR</b> и проверяет их живучесть в реальном времени.</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Двуногий Paper-трекер v2: Hyperliquid × Lighter × Extended (Persistence + Slip ≤ 5 б.п. + H1 Basis+Carry)</h3>
+      <div class="meta-line">Баланс: <b>$49,969.23</b> · Persistence ≥ 2 тика, L2 slip ≤ 5 б.п., Basis ≥ −3 б.п., H1-Combo (Basis ≥ +8 б.п.) · Funding +1.44$ · Costs −28.66$</div>
+      <table>
+        <thead><tr><th>Монета</th><th>Площадка / Тип</th><th>Направление</th><th class="num">Нога ($)</th><th class="num">Live APR</th><th class="num">L2 Slip</th><th class="num">Окуп.</th><th class="num">Часов</th><th class="num">Net PnL</th></tr></thead>
+        <tbody><tr><td><b>GRAM</b></td><td><code>lighter</code> <span class='pill gray'>Carry</span></td><td>Long HL / Short lighter</td><td class='num'>$5,000</td><td class='num pos'><b>+49.8%</b></td><td class='num'>9.0 б.п.</td><td class='num'>42ч</td><td class='num'>2.3ч</td><td class='num neg'>-6.44$</td></tr><tr><td><b>XMR</b></td><td><code>lighter</code> <span class='pill gray'>Carry</span></td><td>Long HL / Short lighter</td><td class='num'>$5,000</td><td class='num pos'><b>+35.9%</b></td><td class='num'>11.6 б.п.</td><td class='num'>39ч</td><td class='num'>2.3ч</td><td class='num neg'>-10.40$</td></tr><tr><td><b>UNI</b></td><td><code>lighter</code> <span class='pill gray'>Carry</span></td><td>Long HL / Short lighter</td><td class='num'>$5,000</td><td class='num pos'><b>+20.6%</b></td><td class='num'>2.9 б.п.</td><td class='num'>46ч</td><td class='num'>0.7ч</td><td class='num neg'>-1.04$</td></tr><tr><td><b>SOL</b></td><td><code>lighter</code> <span class='pill gray'>Carry</span></td><td>Short HL / Long lighter</td><td class='num'>$5,000</td><td class='num pos'><b>+20.6%</b></td><td class='num'>0.4 б.п.</td><td class='num'>29ч</td><td class='num'>2.3ч</td><td class='num neg'>-3.59$</td></tr><tr><td><b>NEAR</b></td><td><code>extended</code> <span class='pill green'>H1-Combo</span></td><td>Short HL / Long extended</td><td class='num'>$5,000</td><td class='num pos'><b>+18.8%</b></td><td class='num'>2.8 б.п.</td><td class='num'>2ч</td><td class='num'>0.0ч</td><td class='num neg'>-3.90$</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>5-DEX Кросс-DEX сканер v2 (HL × Lighter × Extended × dYdX v4 × Paradex · L2 VWAP $10k/$50k)</h3>
+      <table>
+        <thead><tr><th>Монета</th><th>Направление</th><th class="num">Спред APR</th><th class="num">L2 Exec Basis $10k</th><th class="num">Slip $10k / $50k</th><th>Глубина</th><th class="num">Объём HL / DEX</th></tr></thead>
+        <tbody><tr><td><b>GRAM</b></td><td>Long HL / Short lighter</td><td class='num pos'><b>56.5%</b></td><td class='num'>-5.8 б.п.</td><td class='num'>8.2 / 16.7 б.п.</td><td><span class="pill gray">Тонкий</span></td><td class='num'>$3.1M / $1.5M</td></tr><tr><td><b>XMR</b></td><td>Long HL / Short lighter</td><td class='num pos'><b>53.0%</b></td><td class='num'>-3.5 б.п.</td><td class='num'>5.3 / 13.4 б.п.</td><td><span class="pill green">$50k OK</span></td><td class='num'>$97.2M / $8.4M</td></tr><tr><td><b>ARB</b></td><td>Long HL / Short extended</td><td class='num pos'><b>28.5%</b></td><td class='num'>-14.9 б.п.</td><td class='num'>7.0 / 22.4 б.п.</td><td><span class="pill green">$50k OK</span></td><td class='num'>$2.3M / $0.6M</td></tr><tr><td><b>ETH</b></td><td>Long HL / Short dydx</td><td class='num pos'><b>20.4%</b></td><td class='num'>-4.7 б.п.</td><td class='num'>1.5 / 4.3 б.п.</td><td><span class="pill green">$50k OK</span></td><td class='num'>$612.4M / $34.6M</td></tr><tr><td><b>NEAR</b></td><td>Short HL / Long extended</td><td class='num pos'><b>18.8%</b></td><td class='num'>+9.8 б.п.</td><td class='num'>6.6 / 11.4 б.п.</td><td><span class="pill green">$50k OK</span></td><td class='num'>$65.0M / $1.0M</td></tr><tr><td><b>SOL</b></td><td>Short HL / Long lighter</td><td class='num pos'><b>18.8%</b></td><td class='num'>+0.5 б.п.</td><td class='num'>1.2 / 1.9 б.п.</td><td><span class="pill green">$50k OK</span></td><td class='num'>$155.4M / $77.8M</td></tr><tr><td><b>ETH</b></td><td>Long HL / Short lighter</td><td class='num pos'><b>16.4%</b></td><td class='num'>+0.2 б.п.</td><td class='num'>0.6 / 0.8 б.п.</td><td><span class="pill green">$50k OK</span></td><td class='num'>$612.4M / $385.6M</td></tr><tr><td><b>BTC</b></td><td>Long HL / Short extended</td><td class='num pos'><b>14.3%</b></td><td class='num'>-15.7 б.п.</td><td class='num'>0.2 / 0.2 б.п.</td><td><span class="pill green">$50k OK</span></td><td class='num'>$2,915.1M / $22.8M</td></tr><tr><td><b>BTC</b></td><td>Long HL / Short paradex</td><td class='num pos'><b>12.5%</b></td><td class='num'>-119.0 б.п.</td><td class='num'>88.0 / 119.2 б.п.</td><td><span class="pill green">$50k OK</span></td><td class='num'>$2,915.1M / $2.8M</td></tr><tr><td><b>UNI</b></td><td>Long HL / Short lighter</td><td class='num pos'><b>11.1%</b></td><td class='num'>-8.9 б.п.</td><td class='num'>8.3 / 12.1 б.п.</td><td><span class="pill gray">Тонкий</span></td><td class='num'>$6.5M / $0.7M</td></tr><tr><td><b>XTEN</b></td><td>Short HL / Long lighter</td><td class='num pos'><b>10.9%</b></td><td class='num'>-385.0 б.п.</td><td class='num'>271.8 / 486.9 б.п.</td><td><span class="pill gray">Тонкий</span></td><td class='num'>$0.8M / $1.5M</td></tr><tr><td><b>PUMP</b></td><td>Long HL / Short extended</td><td class='num pos'><b>10.9%</b></td><td class='num'>+19.4 б.п.</td><td class='num'>3.9 / 11.2 б.п.</td><td><span class="pill green">$50k OK</span></td><td class='num'>$27.9M / $0.7M</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-evm" class="panel">
+    <div class="guide-box">
+      <div class="guide-title">💡 Простыми словами: зачем нужны «HyperEVM (Chain 999) и HLP»</div>
+      <div class="guide-grid">
+        <div class="guide-item"><b>Идея:</b> проверяем разницу цен между спотовыми DEX-пулами внутри блокчейна HyperEVM и фьючерсами Hyperliquid, а также следим за главным пулом ликвидности биржи (HLP).</div>
+        <div class="guide-item"><b>Как читать цифры:</b> <code>Дрейф 0.00 б.п.</code> значит, что ончейн-оракул <code>L1Read</code> абсолютно точен. <code>Peg-Adj</code> убирает ложный арбитраж из-за того, что USDT0 торгуется с дисконтом к USDC.</div>
+        <div class="guide-item"><b>Статус сейчас:</b> 🟢 Ложные арбитражи отфильтрованы, HLP держит <b>$152.4M</b> под <b>+15.66% APR</b>.</div>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <h3>Нативные прекомпилы HyperEVM <code>L1Read</code> (0x0806 / 0x0807 / 0x0809)</h3>
+        <div class="meta-line">EVM блок <code>#52,312,546</code> · L1 блок <code>#1,235,680,830</code> · Газ <code>0.100 Gwei</code></div>
+        <table>
+          <thead><tr><th>Монета</th><th class="num">Idx</th><th class="num">L1Read Mark</th><th class="num">L1Read Oracle</th><th class="num">REST Mark</th><th class="num">Дрейф</th></tr></thead>
+          <tbody><tr><td><b>BTC</b></td><td class='num'>0</td><td class='num'>60,476</td><td class='num'>60,509</td><td class='num'>60,476</td><td class='num pos'>+0.00 б.п.</td></tr><tr><td><b>ETH</b></td><td class='num'>1</td><td class='num'>1,690.3</td><td class='num'>1,691.2</td><td class='num'>1,690.3</td><td class='num pos'>+0.00 б.п.</td></tr><tr><td><b>SOL</b></td><td class='num'>5</td><td class='num'>70.849</td><td class='num'>70.886</td><td class='num'>70.84</td><td class='num pos'>+1.27 б.п.</td></tr><tr><td><b>HYPE</b></td><td class='num'>159</td><td class='num'>60.295</td><td class='num'>60.321</td><td class='num'>60.289</td><td class='num pos'>+1.00 б.п.</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>HLP и дочерние стратегии / ликвидаторы</h3>
+        <table>
+          <thead><tr><th>Волт</th><th class="num">TVL</th><th class="num">APR</th><th class="num">Поз.</th><th class="num">Номинал</th><th class="num">Маржа</th></tr></thead>
+          <tbody><tr><td><b>Hyperliquidity Provider (HLP)</b></td><td class='num'>$152.45M</td><td class='num pos'><b>+15.66%</b></td><td class='num'>0</td><td class='num'>$0.00M</td><td class='num'>0.0%</td></tr><tr><td><b>HLP Strategy A</b></td><td class='num'>$3.13M</td><td class='num neg'><b>-0.16%</b></td><td class='num'>177</td><td class='num'>$2.94M</td><td class='num'>4.7%</td></tr><tr><td><b>HLP Liquidator</b></td><td class='num'>$1.00M</td><td class='num pos'><b>+0.00%</b></td><td class='num'>0</td><td class='num'>$0.00M</td><td class='num'>0.0%</td></tr><tr><td><b>HLP Liquidator 4</b></td><td class='num'>$1.00M</td><td class='num pos'><b>+0.00%</b></td><td class='num'>0</td><td class='num'>$0.00M</td><td class='num'>0.0%</td></tr><tr><td><b>HLP Strategy B</b></td><td class='num'>$3.07M</td><td class='num neg'><b>-1.13%</b></td><td class='num'>177</td><td class='num'>$2.99M</td><td class='num'>4.9%</td></tr><tr><td><b>HLP Strategy X</b></td><td class='num'>$100.94M</td><td class='num pos'><b>+3.67%</b></td><td class='num'>0</td><td class='num'>$0.00M</td><td class='num'>0.0%</td></tr><tr><td><b>HLP Liquidator 3</b></td><td class='num'>$1.00M</td><td class='num neg'><b>-35.73%</b></td><td class='num'>0</td><td class='num'>$0.00M</td><td class='num'>0.0%</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Истинный (Peg-Adjusted) Арбитраж HyperCore ↔ HyperEVM + V3-глубина</h3>
+      <div class="meta-line">Пег <code>PRJX V3 USDC/USDT0 1bp</code>: <code>1 USDC = 1.001108 USDT0</code> (+11.08 б.п.)</div>
+      <table>
+        <thead><tr><th>DEX</th><th>Пул</th><th class="num">Сырой</th><th class="num">Peg-Adj</th><th class="num">Net (0-clip)</th><th class="num">Вирт. глубина</th><th class="num">Slip $25k</th></tr></thead>
+        <tbody><tr><td>PRJX V3</td><td><b>UBTC/USDT0 5bp</b></td><td class='num'>+21.4 б.п.</td><td class='num'>+10.3 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -0.2 б.п.</td><td class='num'>$0.11M</td><td class='num'>2191.1 б.п.</td></tr><tr><td>HyperSwap V3</td><td><b>UETH/WHYPE 30bp</b></td><td class='num'>-28.6 б.п.</td><td class='num'>-28.6 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -5.9 б.п.</td><td class='num'>$0.18M</td><td class='num'>1362.9 б.п.</td></tr><tr><td>HyperSwap V3</td><td><b>WHYPE/USDT0 5bp</b></td><td class='num'>+15.2 б.п.</td><td class='num'>+4.2 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -6.3 б.п.</td><td class='num'>$0.32M</td><td class='num'>792.0 б.п.</td></tr><tr><td>PRJX V3</td><td><b>WHYPE/USDC 5bp</b></td><td class='num'>+1.4 б.п.</td><td class='num'>+1.4 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -8.1 б.п.</td><td class='num'>$53.97M</td><td class='num'>4.6 б.п.</td></tr><tr><td>PRJX V3</td><td><b>WHYPE/USDT0 5bp</b></td><td class='num'>+12.4 б.п.</td><td class='num'>+1.3 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -9.2 б.п.</td><td class='num'>$2.02M</td><td class='num'>123.5 б.п.</td></tr><tr><td>PRJX V3</td><td><b>UETH/WHYPE 30bp</b></td><td class='num'>-23.2 б.п.</td><td class='num'>-23.2 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -11.3 б.п.</td><td class='num'>$5.83M</td><td class='num'>42.9 б.п.</td></tr><tr><td>HyperSwap V3</td><td><b>WHYPE/USDC 30bp</b></td><td class='num'>+18.3 б.п.</td><td class='num'>+18.3 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -16.2 б.п.</td><td class='num'>$2.19M</td><td class='num'>114.3 б.п.</td></tr><tr><td>PRJX V3</td><td><b>UBTC/WHYPE 30bp</b></td><td class='num'>-14.5 б.п.</td><td class='num'>-14.5 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -20.0 б.п.</td><td class='num'>$34.02M</td><td class='num'>7.3 б.п.</td></tr><tr><td>HyperSwap V3</td><td><b>UBTC/WHYPE 30bp</b></td><td class='num'>-13.1 б.п.</td><td class='num'>-13.1 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -21.4 б.п.</td><td class='num'>$7.44M</td><td class='num'>33.6 б.п.</td></tr><tr><td>PRJX V3</td><td><b>UETH/USDT0 30bp</b></td><td class='num'>-2.7 б.п.</td><td class='num'>-13.8 б.п.</td><td class='num'><span class="pill gray">No-Arb</span> -21.8 б.п.</td><td class='num'>$0.02M</td><td class='num'>9999.0 б.п.</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-alpha" class="panel">
+    <div class="guide-box">
+      <div class="guide-title">💡 Простыми словами: что показывают «Ликвидации китов и аудит фандинга :00»</div>
+      <div class="guide-grid">
+        <div class="guide-item"><b>Идея:</b> на Hyperliquid видны точные цены ликвидации крупных трейдеров и фандинг платится каждый час ровно в <code>:00</code>. Мы проверили <b>60,370</b> таких расчётов, чтобы отделить реальный доход от мифов.</div>
+        <div class="guide-item"><b>Как читать вердикты:</b> <code>NO-GO</code> — стратегия теряет деньги после комиссий (не торгуем); <code>MM Overlay</code> — сигнал статистически реален (<code>+2.3…+3.8 б.п.</code>), поэтому мы вшили его бесплатно в сдвиг котировок маркет-мейкера и фильтр экзекутора.</div>
+        <div class="guide-item"><b>Статус сейчас:</b> 🟢 Оба вывода уже работают в коде: экзекутор не лезет в ловушку в <code>:55–:59</code>, а MM сдвигает котировки в <code>:59–:05</code>.</div>
+      </div>
+    </div>
+    <div class="grid-2">
+      <div class="card">
+        <h3>On-Chain Карта ликвидаций направленных китов (H2 · 0–10% от Mark)</h3>
+        <div class="meta-line">Обновлено: <code>2026-11-26 22:30 UTC</code> · кэш лидерборда 6ч · гибридный отбор плечевых китов</div>
+        <table>
+          <thead><tr><th>Монета</th><th class="num">Mark</th><th class="num">Китов</th><th class="num">Кластер 0–10%</th><th class="num">Ближ. стенка</th><th>Магнит</th></tr></thead>
+          <tbody><tr><td><b>ETH</b></td><td class='num'>1,696.1</td><td class='num'>1</td><td class='num'><b>$51.91M</b></td><td class='num'>4.67%</td><td>Upside Squeeze Magnet (Шорт-ликвидации)</td></tr><tr><td><b>HYPE</b></td><td class='num'>62.448</td><td class='num'>3</td><td class='num'><b>$0.30M</b></td><td class='num'>5.69%</td><td>Сбалансировано</td></tr></tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h3>H6 Стресс BookMid ↔ Mark ↔ Oracle &amp; HLP MM PnL Inversion</h3>
+        <div class="meta-line">Режим MM PnL: <span class="pill gray">CALM</span> · HLP Child Equity: <b>$39.21M</b> · Cooldown алертов: <code>4ч</code></div>
+        <table>
+          <thead><tr><th>Монета</th><th class="num">Mid vs Mark</th><th class="num">Mark vs Oracle</th><th>Тип</th><th class="num">Объём 24ч</th><th>Статус</th></tr></thead>
+          <tbody><tr><td><b>INIT</b></td><td class='num'>-2.82 б.п.</td><td class='num'><b>-104.03 б.п.</b></td><td><code>CROWDED_FUNDING_BASIS</code></td><td class='num'>$6.6M</td><td><span class="pill gray">Watch</span></td></tr><tr><td><b>XMR</b></td><td class='num'>+4.89 б.п.</td><td class='num'><b>+22.89 б.п.</b></td><td><code>CROWDED_FUNDING_BASIS</code></td><td class='num'>$132.6M</td><td><span class="pill gray">Watch</span></td></tr><tr><td><b>TRUMP</b></td><td class='num'>-1.15 б.п.</td><td class='num'><b>-13.08 б.п.</b></td><td><code>ORACLE_DECOUPLING</code></td><td class='num'>$7.8M</td><td><span class="pill gray">Watch</span></td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="card">
+      <h3>Каузальное 52-дневное OOS-исследование расчётов фандинга :00 (Dev 65% vs Holdout 35%)</h3>
+      <div class="meta-line">Монет: <b>51</b> · Часовых расчётов: <b>60,370</b> · Нулевой lookahead (<code>f(T0-1h)</code>) · Maker RT 3.0 б.п.</div>
+      <table>
+        <thead><tr><th>Бакет</th><th>Стратегия</th><th class="num">Dev N · Gross (t)</th><th class="num">Holdout N · Gross (t)</th><th class="num">Holdout Net Maker</th><th>Вердикт</th></tr></thead>
+        <tbody><tr><td><code>|APR|&gt;=25% (all)</code></td><td><code>pre_crowding_15m</code></td><td class='num'>2424 · -1.85 (-1.4)</td><td class='num'>3249 · -0.30 (-0.2)</td><td class='num neg'><b>-3.30 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>|APR|&gt;=25% (all)</code></td><td><code>post_unwind_fade_15m</code></td><td class='num'>2424 · +3.32 (+2.4)</td><td class='num'>3249 · +0.41 (+0.3)</td><td class='num neg'><b>-2.59 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>|APR|&gt;=25% (all)</code></td><td><code>post_unwind_fade_30m</code></td><td class='num'>2424 · +6.69 (+3.6)</td><td class='num'>3249 · -3.82 (-2.0)</td><td class='num neg'><b>-6.82 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>|APR|&gt;=25% (all)</code></td><td><code>naive_harvest_15m</code></td><td class='num'>2424 · -4.54 (-2.4)</td><td class='num'>3249 · +2.03 (+1.0)</td><td class='num neg'><b>-0.97 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>|APR|&gt;=50% (all)</code></td><td><code>pre_crowding_15m</code></td><td class='num'>1118 · -3.44 (-1.6)</td><td class='num'>1863 · +0.33 (+0.2)</td><td class='num neg'><b>-2.67 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>|APR|&gt;=50% (all)</code></td><td><code>post_unwind_fade_15m</code></td><td class='num'>1118 · +4.02 (+1.8)</td><td class='num'>1863 · -0.78 (-0.3)</td><td class='num neg'><b>-3.78 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>|APR|&gt;=50% (all)</code></td><td><code>post_unwind_fade_30m</code></td><td class='num'>1118 · +6.51 (+2.2)</td><td class='num'>1863 · -4.80 (-1.7)</td><td class='num neg'><b>-7.80 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>|APR|&gt;=50% (all)</code></td><td><code>naive_harvest_15m</code></td><td class='num'>1118 · -6.48 (-2.0)</td><td class='num'>1863 · +5.57 (+1.9)</td><td class='num pos'><b>+2.57 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&lt;=-25% (neg)</code></td><td><code>pre_crowding_15m</code></td><td class='num'>1890 · -3.29 (-2.2)</td><td class='num'>3055 · -0.53 (-0.4)</td><td class='num neg'><b>-3.53 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&lt;=-25% (neg)</code></td><td><code>post_unwind_fade_15m</code></td><td class='num'>1890 · +3.63 (+2.3)</td><td class='num'>3055 · +1.34 (+0.9)</td><td class='num neg'><b>-1.66 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&lt;=-25% (neg)</code></td><td><code>post_unwind_fade_30m</code></td><td class='num'>1890 · +7.64 (+3.5)</td><td class='num'>3055 · -3.20 (-1.6)</td><td class='num neg'><b>-6.20 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&lt;=-25% (neg)</code></td><td><code>naive_harvest_15m</code></td><td class='num'>1890 · -6.29 (-2.8)</td><td class='num'>3055 · +0.96 (+0.5)</td><td class='num neg'><b>-2.04 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&gt;=+25% (pos)</code></td><td><code>pre_crowding_15m</code></td><td class='num'>534 · +3.23 (+1.2)</td><td class='num'>194 · +3.29 (+0.6)</td><td class='num pos'><b>+0.29 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&gt;=+25% (pos)</code></td><td><code>post_unwind_fade_15m</code></td><td class='num'>534 · +2.22 (+0.9)</td><td class='num'>194 · -14.12 (-2.6)</td><td class='num neg'><b>-17.12 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&gt;=+25% (pos)</code></td><td><code>post_unwind_fade_30m</code></td><td class='num'>534 · +3.32 (+0.9)</td><td class='num'>194 · -13.58 (-2.0)</td><td class='num neg'><b>-16.58 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&gt;=+25% (pos)</code></td><td><code>naive_harvest_15m</code></td><td class='num'>534 · +1.66 (+0.5)</td><td class='num'>194 · +18.83 (+2.4)</td><td class='num pos'><b>+15.83 б.п.</b></td><td><span class="pill amber">MM Overlay</span></td></tr><tr><td><code>APR&gt;=+50% (pos)</code></td><td><code>pre_crowding_15m</code></td><td class='num'>268 · +8.14 (+2.3)</td><td class='num'>112 · +5.00 (+0.8)</td><td class='num pos'><b>+2.00 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&gt;=+50% (pos)</code></td><td><code>post_unwind_fade_15m</code></td><td class='num'>268 · +2.98 (+0.9)</td><td class='num'>112 · -17.35 (-2.4)</td><td class='num neg'><b>-20.35 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&gt;=+50% (pos)</code></td><td><code>post_unwind_fade_30m</code></td><td class='num'>268 · +5.40 (+1.1)</td><td class='num'>112 · -21.30 (-2.4)</td><td class='num neg'><b>-24.30 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&gt;=+50% (pos)</code></td><td><code>naive_harvest_15m</code></td><td class='num'>268 · +6.00 (+1.1)</td><td class='num'>112 · +24.48 (+2.3)</td><td class='num pos'><b>+21.48 б.п.</b></td><td><span class="pill green">GO</span></td></tr><tr><td><code>APR&lt;=-50% + pre15m&gt;0</code></td><td><code>post_unwind_fade_15m</code></td><td class='num'>393 · -4.00 (-1.0)</td><td class='num'>841 · -2.03 (-0.6)</td><td class='num neg'><b>-5.03 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr><tr><td><code>APR&lt;=-50% + pre15m&gt;0</code></td><td><code>post_unwind_fade_30m</code></td><td class='num'>393 · +1.65 (+0.3)</td><td class='num'>841 · -7.17 (-1.5)</td><td class='num neg'><b>-10.17 б.п.</b></td><td><span class="pill red">NO-GO</span></td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="tab-frontier" class="panel">
+    <div class="guide-box">
+      <div class="guide-title">💡 Простыми словами: зачем нужна вкладка «HIP-3, Boros &amp; Yield Stack» (2026)</div>
+      <div class="guide-grid">
+        <div class="guide-item"><b>HIP-3 (акции 24/7):</b> сторонние билдеры (<code>xyz</code>, <code>io</code>, <code>para</code>) запустили перпы на акции и сырьё (<code>NVDA</code>, <code>SP500</code>, <code>GOLD</code>). Когда фандинг на <code>xyz</code> и <code>io</code> расходится — возникает внутрибиржевой арбитраж вообще без мостов.</div>
+        <div class="guide-item"><b>Pendle Boros:</b> позволяет зафиксировать плавающий фандинг Hyperliquid по твёрдой ставке (<code>Fixed Bid</code>) на 28 дней вперёд — убирая риск, что спред схлопнется завтра.</div>
+        <div class="guide-item"><b>HyperEVM Yield Stack:</b> сравнивает чистый доход дельта-нейтральной связки <code>kHYPE + Short HYPE + Boros Fix</code> (с учётом расщепления маржи и буфера ликвидации) против пассивного <code>HLP</code>.</div>
+      </div>
+    </div>
+    <div class="card">
+      <h3>HIP-3 Кросс-билдер арбитраж на HyperCore L1 (нулевой риск моста · Growth Mode &amp; Oracle Guard)</h3>
+      <div class="meta-line">Билдеров: <b>10</b> · Рынков: <b>178</b> · Оборот 24ч: <b>$2.10B</b> · Сессия NY: <code>US_AFTERHOURS</code></div>
+      <table>
+        <thead><tr><th>Тикер</th><th>Ноги (Short / Long)</th><th class="num">Спред APR</th><th>Growth</th><th class="num">Oracle Div</th><th class="num">Exec Basis $5k</th><th class="num">Slip $5k / $25k</th><th class="num">Окуп. M/T</th><th>Режим</th></tr></thead>
+        <tbody><tr><td><b>AAOI</b></td><td><code>S para:AAOI</code> / <code>L xyz:AAOI</code></td><td class='num pos'><b>+79.1%</b></td><td><span class="pill green">⚡ GM</span></td><td class='num'><span class="pill amber">⚠️ 23.1 б.п.</span></td><td class='num'>-54.8 б.п.</td><td class='num'>53.4 / 126.8 б.п.</td><td class='num'>120ч / 122ч</td><td><span class="pill amber">Iso</span></td></tr><tr><td><b>SNDK</b></td><td><code>S xyz:SNDK</code> / <code>L io:SNDK</code></td><td class='num pos'><b>+56.5%</b></td><td><span class="pill green">⚡ GM</span></td><td class='num'>14.9 б.п.</td><td class='num'>-9.5 б.п.</td><td class='num'>8.4 / 9.8 б.п.</td><td class='num'>28ч / 32ч</td><td><span class="pill green">Cross</span></td></tr><tr><td><b>UNITREE</b></td><td><code>S para:UNITREE</code> / <code>L xyz:UNITREE</code></td><td class='num pos'><b>+47.8%</b></td><td><span class="pill green">⚡ GM</span></td><td class='num'>14.0 б.п.</td><td class='num'>-34.8 б.п.</td><td class='num'>26.0 / 87.3 б.п.</td><td class='num'>98ч / 102ч</td><td><span class="pill amber">Iso</span></td></tr><tr><td><b>DRAM</b></td><td><code>S xyz:DRAM</code> / <code>L io:DRAM</code></td><td class='num pos'><b>+42.7%</b></td><td><span class="pill green">⚡ GM</span></td><td class='num'><span class="pill amber">⚠️ 15.3 б.п.</span></td><td class='num'>-13.3 б.п.</td><td class='num'>6.6 / 10.2 б.п.</td><td class='num'>30ч / 35ч</td><td><span class="pill green">Cross</span></td></tr><tr><td><b>LRCX</b></td><td><code>S xyz:LRCX</code> / <code>L para:LRCX</code></td><td class='num pos'><b>+40.5%</b></td><td><span class="pill green">⚡ GM</span></td><td class='num'><span class="pill amber">⚠️ 17.4 б.п.</span></td><td class='num'>-59.2 б.п.</td><td class='num'>54.2 / 158.5 б.п.</td><td class='num'>237ч / 242ч</td><td><span class="pill amber">Iso</span></td></tr><tr><td><b>NVDA</b></td><td><code>S xyz:NVDA</code> / <code>L io:NVDA</code></td><td class='num pos'><b>+39.5%</b></td><td><span class="pill green">⚡ GM</span></td><td class='num'><span class="pill amber">⚠️ 15.2 б.п.</span></td><td class='num'>-9.2 б.п.</td><td class='num'>2.3 / 4.2 б.п.</td><td class='num'>13ч / 18ч</td><td><span class="pill green">Cross</span></td></tr><tr><td><b>AAPL</b></td><td><code>S xyz:AAPL</code> / <code>L io:AAPL</code></td><td class='num pos'><b>+24.4%</b></td><td><span class="pill green">⚡ GM</span></td><td class='num'>4.5 б.п.</td><td class='num'>-8.0 б.п.</td><td class='num'>7.6 / 44.8 б.п.</td><td class='num'>59ч / 68ч</td><td><span class="pill amber">Iso</span></td></tr><tr><td><b>SKHX</b></td><td><code>S xyz:SKHX</code> / <code>L io:SKHX</code></td><td class='num pos'><b>+20.6%</b></td><td><span class="pill green">⚡ GM</span></td><td class='num'><span class="pill amber">⚠️ 32.7 б.п.</span></td><td class='num'>-26.7 б.п.</td><td class='num'>2.2 / 5.3 б.п.</td><td class='num'>24ч / 34ч</td><td><span class="pill green">Cross</span></td></tr><tr><td><b>MU</b></td><td><code>S xyz:MU</code> / <code>L io:MU</code></td><td class='num pos'><b>+10.6%</b></td><td><span class="pill green">⚡ GM</span></td><td class='num'>9.5 б.п.</td><td class='num'>-14.2 б.п.</td><td class='num'>10.1 / 18.2 б.п.</td><td class='num'>176ч / 196ч</td><td><span class="pill amber">Iso</span></td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>Pendle Boros — Фиксация ставок фандинга Hyperliquid и Spread Markets</h3>
+      <div class="meta-line">Просканировано рынков Boros: <b>249</b> · Активных: <b>39</b> · Hyperliquid / Spread: <b>17</b></div>
+      <table>
+        <thead><tr><th>ID</th><th>Рынок Boros</th><th class="num">Срок</th><th class="num">Fixed Bid / Ask</th><th class="num">Float</th><th class="num">Bid − Float</th><th>Идея</th></tr></thead>
+        <tbody><tr><td><code>241</code></td><td><b>Hyperliquid BTC 25 Dec 2026</b></td><td class='num'>28.1д</td><td class='num pos'><b>+6.69%</b> / +7.19%</td><td class='num'>+10.95%</td><td class='num'>-4.26%</td><td>Short Perp + Short Boros (Lock +6.69%)</td></tr><tr><td><code>245</code></td><td><b>Hyperliquid HYPE 25 Dec 2026</b></td><td class='num'>28.1д</td><td class='num pos'><b>+8.94%</b> / +9.37%</td><td class='num'>+10.95%</td><td class='num'>-2.01%</td><td>Short Perp + Short Boros (Lock +8.94%)</td></tr><tr><td><code>244</code></td><td><b>Hyperliquid xyz:BRENTOIL 18 Dec 2026</b></td><td class='num'>21.1д</td><td class='num pos'><b>-25.88%</b> / -20.00%</td><td class='num'>+5.47%</td><td class='num'>-31.36%</td><td>Long Perp + Long Boros (Lock 20.00%)</td></tr><tr><td><code>242</code></td><td><b>Hyperliquid ETH - Gate ETHUSDT 25 Dec 2026</b> <span class="pill amber">SPREAD</span></td><td class='num'>28.3д</td><td class='num pos'><b>+2.28%</b> / +2.30%</td><td class='num'>-5.55%</td><td class='num'>+7.82%</td><td>Short Boros Spread (Lock Fixed &gt; Float)</td></tr><tr><td><code>128</code></td><td><b>Hyperliquid ETH 25 Dec 2026</b></td><td class='num'>28.1д</td><td class='num pos'><b>+6.17%</b> / +6.19%</td><td class='num'>+5.65%</td><td class='num'>+0.52%</td><td>Short Perp + Short Boros (Lock +6.17%)</td></tr><tr><td><code>250</code></td><td><b>Hyperliquid ETH - Gate ETHUSDT 29 Jan 2027</b> <span class="pill amber">SPREAD</span></td><td class='num'>63.3д</td><td class='num pos'><b>+2.58%</b> / +2.60%</td><td class='num'>-5.55%</td><td class='num'>+8.13%</td><td>Short Boros Spread (Lock Fixed &gt; Float)</td></tr><tr><td><code>243</code></td><td><b>Hyperliquid BTC - Gate BTCUSDT 25 Dec 2026</b> <span class="pill amber">SPREAD</span></td><td class='num'>28.3д</td><td class='num pos'><b>+2.07%</b> / +2.09%</td><td class='num'>+0.63%</td><td class='num'>+1.44%</td><td>Watch Spread</td></tr><tr><td><code>247</code></td><td><b>Hyperliquid ETH 29 Jan 2027</b></td><td class='num'>63.1д</td><td class='num pos'><b>+6.44%</b> / +6.46%</td><td class='num'>+5.65%</td><td class='num'>+0.78%</td><td>Short Perp + Short Boros (Lock +6.44%)</td></tr><tr><td><code>249</code></td><td><b>Hyperliquid BTC - Gate BTCUSDT 29 Jan 2027</b> <span class="pill amber">SPREAD</span></td><td class='num'>63.3д</td><td class='num pos'><b>+2.11%</b> / +2.13%</td><td class='num'>+0.63%</td><td class='num'>+1.48%</td><td>Watch Spread</td></tr><tr><td><code>229</code></td><td><b>Hyperliquid BTC 25 Dec 2026</b></td><td class='num'>28.1д</td><td class='num pos'><b>+6.92%</b> / +6.94%</td><td class='num'>+10.95%</td><td class='num'>-4.03%</td><td>Short Perp + Short Boros (Lock +6.92%)</td></tr></tbody>
+      </table>
+    </div>
+    <div class="card">
+      <h3>HyperEVM Composable Delta-Neutral Yield Stack (kHYPE / stHYPE + Short HYPE + Boros vs HLP)</h3>
+      <div class="meta-line">HYPE Funding: <b>+10.95%</b> · kHYPE: <b>1.88%</b> ($564M) · Boros Fix: <b>+8.94%</b> · HLP: <b>15.68%</b></div>
+      <table>
+        <thead><tr><th>Связка</th><th>Тип</th><th class="num">Gross</th><th class="num">Эфф. кап.</th><th class="num">Net на депозит</th><th class="num">Буфер</th><th>Риски</th></tr></thead>
+        <tbody><tr><td><b>Composable Loop: kHYPE -&gt; Felix/HyperLend (50% LTV) -&gt; Short HYPE</b></td><td><span class="pill green">Fixed</span></td><td class='num'>+10.82%</td><td class='num'>100%</td><td class='num pos'><b>+9.07%</b></td><td class='num'>36%</td><td class='muted'>Двусторонний риск ликвидации (обвал HYPE на CDP + ралли HYPE на перпе), рост borrow rate</td></tr><tr><td><b>kHYPE + Short HYPE Perp (Floating)</b></td><td><span class="pill amber">Float</span></td><td class='num'>+12.83%</td><td class='num'>67%</td><td class='num pos'><b>+8.55%</b></td><td class='num'>42%</td><td class='muted'>Падение/отрицательный фандинг HYPE, kHYPE депег</td></tr><tr><td><b>stHYPE + Short HYPE Perp + Boros Fix</b></td><td><span class="pill green">Fixed</span></td><td class='num'>+10.93%</td><td class='num'>67%</td><td class='num pos'><b>+7.29%</b></td><td class='num'>42%</td><td class='muted'>stHYPE ликвидность/депег, доливка маржи при ралли HYPE</td></tr><tr><td><b>kHYPE + Short HYPE + Boros Fix (28d)</b></td><td><span class="pill green">Fixed</span></td><td class='num'>+10.82%</td><td class='num'>67%</td><td class='num pos'><b>+7.21%</b></td><td class='num'>42%</td><td class='muted'>kHYPE депег, контракт Boros/Kinetiq, доливка маржи при ралли HYPE</td></tr><tr><td><b>Benchmark: HLP Vault (Hyperliquidity Provider)</b></td><td><span class="pill gray">Bench</span></td><td class='num'>+15.68%</td><td class='num'>100%</td><td class='num pos'><b>+15.68%</b></td><td class='num'>100%</td><td class='muted'>Токсичный поток / инвентарь ликвидаций (кейс JELLYJELLY), 4д lockup</td></tr><tr><td><b>Benchmark: Liminal Basis (xHYPE)</b></td><td><span class="pill gray">Bench</span></td><td class='num'>+9.07%</td><td class='num'>100%</td><td class='num pos'><b>+9.07%</b></td><td class='num'>100%</td><td class='muted'>Смарт-контракт протокола, плавающий фандинг HYPE</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <footer>
+    hyperliquid-quant-defi · Self-contained offline HTML portfolio showcase · Все боевые ордера изолированы в Hyperliquid Testnet · 135 unit-тестов passed · 7 live crons
+  </footer>
+</div>
+<script>
+function openTab(id, btn) {
+  document.querySelectorAll('.panel').forEach(p => p.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+  document.getElementById('tab-' + id).classList.add('active');
+  btn.classList.add('active');
+}
+</script>
+</body>
+</html>

@@ -1,0 +1,183 @@
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1200" height="416" viewBox="0 0 1200 416"
+     role="img" aria-labelledby="title desc">
+  <title id="title">hyperliquid-quant-defi — Hyperliquid Quantitative Trading &amp; On-Chain DeFi Stack</title>
+  <desc id="desc">Hero board for hyperliquid-quant-defi showing verified live Hyperliquid metrics: 58-hypothesis BBO execution cost audit (1.5 to 5.0 bps, observation-only), 95.7% live Testnet ALO fill rate, 5.62 microsecond Avellaneda-Stoikov market making hot path, and HIP-3 Growth Mode / Cross-DEX / HyperEVM Chain 999 L1Read analytics.</desc>
+
+  <defs>
+    <linearGradient id="bg-grad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#070D17"/>
+      <stop offset="100%" stop-color="#0B1528"/>
+    </linearGradient>
+    <linearGradient id="accent-line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#10B981"/>
+      <stop offset="100%" stop-color="#38BDF8"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Canvas -->
+  <rect width="1200" height="416" rx="22" fill="url(#bg-grad)"/>
+  <rect x="1" y="1" width="1198" height="414" rx="21" fill="none" stroke="#1E293B" stroke-width="2"/>
+
+  <!-- Subtle top accent rule -->
+  <rect x="52" y="38" width="144" height="4" rx="2" fill="url(#accent-line)"/>
+
+  <!-- Left column: Identity & Plain-Language Promise -->
+  <g id="title-block" transform="translate(52 76)">
+    <text x="0" y="0"
+          fill="#38BDF8"
+          font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" font-weight="600" letter-spacing="1.2">
+      HYPERLIQUID L1 · HIP-3 · 5 PERP DEX · HYPEREVM 999
+    </text>
+
+    <text x="0" y="66"
+          fill="#F8FAFC"
+          font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
+          font-size="46" font-weight="800" letter-spacing="-1.0">
+      hyperliquid-quant-defi
+    </text>
+
+    <text x="0" y="114"
+          fill="#CBD5E1"
+          font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
+          font-size="22" font-weight="400">
+      Avellaneda-Stoikov MM, HIP-3 Growth Mode arb,
+    </text>
+    <text x="0" y="146"
+          fill="#CBD5E1"
+          font-family="-apple-system, BlinkMacSystemFont, Segoe UI, Helvetica, Arial, sans-serif"
+          font-size="22" font-weight="400">
+      Pendle Boros fixed funding &amp; HyperEVM DeFi stack.
+    </text>
+
+    <!-- Project-native bid/ask depth strip motif -->
+    <g transform="translate(0 184)">
+      <rect x="0" y="0" width="215" height="10" rx="5" fill="#10B981" fill-opacity="0.25"/>
+      <rect x="0" y="0" width="156" height="10" rx="5" fill="#10B981"/>
+      <rect x="225" y="0" width="215" height="10" rx="5" fill="#38BDF8" fill-opacity="0.22"/>
+      <rect x="225" y="0" width="138" height="10" rx="5" fill="#38BDF8"/>
+      <text x="0" y="34"
+            fill="#94A3B8"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="18">
+        fast-cancel ALO · bbo+VPIN · Lead-Lag · L1Read · ADL
+      </text>
+    </g>
+
+    <!-- Bottom metadata line -->
+    <g transform="translate(0 274)">
+      <circle cx="8" cy="-6" r="6" fill="#10B981"/>
+      <text x="24" y="0"
+            fill="#E2E8F0"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="18" font-weight="600">
+        135 tests passed · 7 live crons · Testnet isolated
+      </text>
+    </g>
+  </g>
+
+  <!-- Right column: Verified Live Telemetry Proof Board -->
+  <g id="proof-board" transform="translate(672 34)">
+    <rect x="0" y="0" width="476" height="348" rx="16" fill="#0F172A" stroke="#1E293B" stroke-width="1.5"/>
+
+    <text x="24" y="34"
+          fill="#94A3B8"
+          font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+          font-size="18" font-weight="600" letter-spacing="0.8">
+      VERIFIED LIVE TELEMETRY
+    </text>
+    <line x1="24" y1="48" x2="452" y2="48" stroke="#1E293B" stroke-width="1.5"/>
+
+    <!-- Row 1 -->
+    <g transform="translate(24 86)">
+      <text x="0" y="0"
+            fill="#CBD5E1"
+            font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+            font-size="18" font-weight="500">
+        58-Hyp Cost Audit
+      </text>
+      <text x="428" y="0" text-anchor="end"
+            fill="#F59E0B"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="24" font-weight="700">
+        1.5→5.0 bps
+      </text>
+      <text x="0" y="24"
+            fill="#64748B"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="16">
+        BBO ALO fill 55% · Ex-INIT -0.37% (obs-only)
+      </text>
+    </g>
+    <line x1="24" y1="122" x2="452" y2="122" stroke="#1E293B" stroke-width="1"/>
+
+    <!-- Row 2 -->
+    <g transform="translate(24 156)">
+      <text x="0" y="0"
+            fill="#CBD5E1"
+            font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+            font-size="18" font-weight="500">
+        Testnet ALO Execution
+      </text>
+      <text x="428" y="0" text-anchor="end"
+            fill="#F8FAFC"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="24" font-weight="700">
+        95.7% Fill
+      </text>
+      <text x="0" y="24"
+            fill="#64748B"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="16">
+        onlyIsolated guard · ADL Rank · +2.33 bps mk
+      </text>
+    </g>
+    <line x1="24" y1="192" x2="452" y2="192" stroke="#1E293B" stroke-width="1"/>
+
+    <!-- Row 3 -->
+    <g transform="translate(24 226)">
+      <text x="0" y="0"
+            fill="#CBD5E1"
+            font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+            font-size="18" font-weight="500">
+        A-S Market Maker v2
+      </text>
+      <text x="428" y="0" text-anchor="end"
+            fill="#38BDF8"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="24" font-weight="700">
+        5.62 &#181;s p50
+      </text>
+      <text x="0" y="24"
+            fill="#64748B"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="16">
+        100% Maker · +4.51 bps 5s markout · 175k/s
+      </text>
+    </g>
+    <line x1="24" y1="262" x2="452" y2="262" stroke="#1E293B" stroke-width="1"/>
+
+    <!-- Row 4 -->
+    <g transform="translate(24 296)">
+      <text x="0" y="0"
+            fill="#CBD5E1"
+            font-family="-apple-system, BlinkMacSystemFont, Segoe UI, sans-serif"
+            font-size="18" font-weight="500">
+        HIP-3 &amp; Cross-DEX L2
+      </text>
+      <text x="428" y="0" text-anchor="end"
+            fill="#10B981"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="24" font-weight="700">
+        +77.5% NVDA
+      </text>
+      <text x="0" y="24"
+            fill="#64748B"
+            font-family="ui-monospace, SFMono-Regular, Menlo, monospace"
+            font-size="16">
+        Growth Mode · Boros Fixed · L1Read 0.00 bps
+      </text>
+    </g>
+  </g>
+</svg>
