@@ -515,6 +515,8 @@ class HyperliquidClient:
     """Official Hyperliquid SDK bridge (defaults to Testnet; mainnet requires explicit opt-in)."""
 
     def __init__(self, account_address: str, api_wallet_private_key: str, *, use_testnet: bool = True):
+        if not use_testnet:
+            require_mainnet_execution_opt_in()
         try:
             from eth_account import Account
             from hyperliquid.exchange import Exchange
@@ -522,11 +524,7 @@ class HyperliquidClient:
             from hyperliquid.utils import constants
         except ImportError as error:  # pragma: no cover - protected by extra dependency
             raise MicroExecutionError("hyperliquid_sdk_missing") from error
-        if not use_testnet:
-            require_mainnet_execution_opt_in()
-            api_url = constants.MAINNET_API_URL
-        else:
-            api_url = constants.TESTNET_API_URL
+        api_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
         self.account_address = account_address
         self.api_url = api_url
         self._info = Info(api_url, skip_ws=True, timeout=10.0)
