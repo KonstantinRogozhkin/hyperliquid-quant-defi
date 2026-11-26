@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <a href="docs/wiki/Home.md"><b>Full Technical Docs &amp; Wiki (8 pages)</b></a> ·
+  <a href="https://github.com/KonstantinRogozhkin/hyperliquid-quant-defi/wiki"><b>Full Technical Wiki (9 pages)</b></a> ·
   <a href="docs/reports/2026-11-26/hl_defi_trader_portfolio_brief.md"><b>Portfolio &amp; Case Studies (EN + RU)</b></a> ·
   <a href="docs/reports/2026-11-26/hl_trading_tear_sheet.md"><b>Executive Tear-Sheet</b></a> ·
   <a href="docs/reports/2026-11-26/hl_desk_dashboard.html"><b>Offline 6-Tab HTML Dashboard</b></a>
@@ -18,7 +18,7 @@ Standalone Python package **`hl_quant`** (`src/hl_quant/`, zero external monorep
 | Module | Scope | Verified Result | Report / Proof |
 |---|---|---|---|
 | **6-Family Metamodel Audit** | 58 hypotheses + 60m live `bbo` ALO audit (19 alts) | Ideal `1.5 bps`: `+32.18% APR / Sh 3.11`; at **measured `5.0 bps` BBO cost** (`55%` fill, negative 30s markout): collapses to 1 carry layer, **Ex-`INIT` −0.37% / Sh −0.19** → honestly kept **observation-only** (`5.0 bps` paper) | [BBO ALO Audit](docs/reports/2026-11-26/hl_alo_fill_portfolio_coins.md) · [Real-Cost Metamodel](docs/reports/2026-11-26/hl_metamodel_real_costs.md) · [Slow Rev Test](docs/reports/2026-11-26/hl_xs_rev_slow_variants.md) |
-| **Testnet `ALO` Executor & Attribution** | 4h `Alo` rebalancer + 09:00 UTC daily audit | **95.7% real `ALO` Fill Rate (`22/23`)**, VW Markout **`+2.33 bps`**, exact `Unified Account` sync, `onlyIsolated` guard, **isolated/cross `ADL Rank`** & **size-scaled / Growth `0.1×` API quota health** | [Testnet Execution Docs](docs/wiki/Hyperliquid-Testnet-Execution-and-Attribution.md) |
+| **Testnet `ALO` Executor & Attribution** | 4h `Alo` rebalancer + 09:00 UTC daily audit | **95.7% real `ALO` Fill Rate (`22/23`)**, VW Markout **`+2.33 bps`**, exact `Unified Account` sync, `onlyIsolated` guard, **isolated/cross `ADL Rank`** & **size-scaled / Growth `0.1×` API quota health** | [Testnet Execution Wiki](https://github.com/KonstantinRogozhkin/hyperliquid-quant-defi/wiki/Hyperliquid-Testnet-Execution-and-Attribution) |
 | **Avellaneda–Stoikov MM v2** | Mainnet WS $\kappa$-fit + live `BTC+ETH` Testnet | `ETH κ=0.544`, `BTC κ=0.327`; **100% Maker, +$0.0165 net PnL, ETH +4.51 bps 5s markout**; **`p50 = 5.62 µs`**; **`f: true` fast-cancel priority**, pure `Alo` batch guard, `Standard` mempool check, **rolling VPIN** & **adaptive `1 req/$` (`0.1×` Growth) throttle** | [Calibration Report](docs/reports/2026-11-26/hl_mm_ws_calibration.md) |
 | **5-DEX Scanner v2 + Cross-DEX Paper v2** | 810 perps + 4h **HL × Lighter × Extended** cron | Persistence Gate (`>=2` ticks), tight L2 cap (`<=5 bps`), **H1 Basis+Carry Combo** live on Extended (`NEAR +18.8% APR`, `+13.6 bps` exec basis, **2h payback**) | [5-DEX Scan](docs/reports/2026-11-26/hl_cross_dex_v2_scan.md) · [Paper v2 Log](docs/reports/2026-11-26/hl_cross_dex_paper_live.md) |
 | **HIP-3 Builder-Perps (`xyz`/`io`/`para`)** | **10 builders, 178 markets, `$2.2B/24h`** + **Growth Mode** & **Oracle Div Guard** | Zero-bridge same-chain arb in **Growth Mode (`0.90 bps` taker / `0.30 bps` maker, 30d cooldown tracker, independent DEX margin)**: **`xyz:NVDA / io:NVDA` `+77.5% APR` (`5h/8h` payback)**, **`SKHX +75.2%` (`⚠️ 46.0 bps` oracle div flagged!)**, 4h persistence tracker | [HIP-3 Live](docs/reports/2026-11-26/hl_hip3_builder_arb_live.md) · [Frontier Persistence](docs/reports/2026-11-26/hl_frontier_persistence_live.md) |
