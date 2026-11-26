@@ -129,14 +129,22 @@ def collect_funding(
     )
     rows["time"] = pd.to_datetime(rows["time_ms"].astype("int64"), unit="ms", utc=True)
     rows["available_at"] = rows["time"]
+    if rows.empty:
+        status = STATUS_EMPTY
+        truncated_start = False
+    else:
+        oldest_ms = int(rows["time_ms"].min())
+        # Funding settles every 1h-8h; a gap > 24h after requested start_ms indicates provider history truncation (e.g. OKX).
+        truncated_start = oldest_ms > start_ms + 24 * HOUR_MS
+        status = STATUS_PARTIAL_HISTORY if truncated_start else STATUS_COMPLETE
     return Collected(
         dataset=f"{venue}_funding",
         params={"coin": symbol, "start_ms": start_ms, "end_ms": end_ms},
         pages=pages,
         rows=rows,
-        status=STATUS_EMPTY if rows.empty else STATUS_COMPLETE,
+        status=status,
         observed_at_ms=observed,
-        notes={"page_count": len(pages)},
+        notes={"page_count": len(pages), "truncated_start": truncated_start},
         provider=venue,
     )
 

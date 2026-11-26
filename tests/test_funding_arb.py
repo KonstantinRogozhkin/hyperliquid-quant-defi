@@ -69,10 +69,21 @@ def test_cex_funding_is_paid_on_the_long_leg():
 def test_basis_divergence_hits_short_hl_leg():
     n = 60
     hl_px = np.full(n, 100.0)
-    hl_px[40:] = 101.0  # HL rallies 1% relative to CEX while we are short HL
+    hl_px[40:] = 101.0  # bar 40 opens at h_40 and closes at h_41 at 101 -> rally occurs over (h_40, h_41]
     sim = fa.simulate(_panel(n=n, hl_px=hl_px), P, NO_COST)
     assert sim.loc[T0 + 39 * H, "position"] == 1
-    assert sim.loc[T0 + 39 * H, "basis_pnl"] == pytest.approx(-0.01 / 2)
+    assert sim.loc[T0 + 39 * H, "basis_pnl"] == pytest.approx(0.0)
+    assert sim.loc[T0 + 40 * H, "position"] == 1
+    assert sim.loc[T0 + 40 * H, "basis_pnl"] == pytest.approx(-0.01 / 2)
+
+
+def test_first_hour_after_entry_captures_price_leg():
+    n = 60
+    hl_px = np.full(n, 100.0)
+    hl_px[WARM:] = 102.0  # immediate +2% rally during the very first held hour (h_WARM, h_{WARM+1}]
+    sim = fa.simulate(_panel(n=n, hl_px=hl_px), P, NO_COST)
+    assert sim.iloc[WARM]["position"] == 1
+    assert sim.iloc[WARM]["basis_pnl"] == pytest.approx(-0.02 / 2)
 
 
 def test_costs_charge_both_legs_on_entry_and_exit():

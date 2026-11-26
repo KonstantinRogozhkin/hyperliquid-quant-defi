@@ -41,10 +41,11 @@ class CrossDexPaperConfig:
     min_exec_basis_bps: float = -3.0  # refuse entries heavily underwater on live L2 basis
     min_persistence_ticks: int = 2  # consecutive ticks >= entry_apr_pct required for pure carry
     max_breakeven_hours: float = 96.0  # reject pairs taking > 4 days to recover entry cost
-    hl_fee_bps: float = 1.5  # HL Tier-0 maker fee
+    hl_fee_bps: float = 4.5  # HL Tier-0 taker fee (cross-DEX L2 entries cross the book)
     lighter_fee_bps: float = 0.0  # Lighter standard 0% fee
     extended_fee_bps: float = 2.0  # Extended conservative maker/taker fee
     bridge_drag_bps: float = 1.5  # amortized cross-DEX margin rebalance cost per entry
+    max_missing_ticks: int = 3  # tolerate transient missing quotes before assuming delisting
     enable_extended: bool = True  # scan Extended alongside Lighter
     enable_basis_carry_combo: bool = True  # H1: immediate entry on favorable basis + positive carry
     combo_min_exec_basis_bps: float = 8.0
@@ -178,15 +179,29 @@ def run_cross_dex_paper_tick(
     for coin in list(positions.keys()):
         pos = positions[coin]
         other_dex = str(pos.get("other_dex") or "lighter")
+        venue_online = bool(hl_q) and bool(venue_quotes.get(other_dex))
         h = hl_q.get(coin)
         oth = (venue_quotes.get(other_dex) or {}).get(coin)
+        if not h or not oth:
+            if not venue_online:
+                # Venue feed outage: hold position untouched rather than force-closing on synthetic slippage.
+                continue
+            missing_n = int(pos.get("missing_quote_ticks", 0)) + 1
+            pos["missing_quote_ticks"] = missing_n
+            if missing_n < cfg.max_missing_ticks:
+                continue
+            should_exit = True
+        else:
+            pos["missing_quote_ticks"] = 0
+            live_dir_apr = float(pos.get("live_spread_apr_pct", 0.0))
+            live_basis = float(pos.get("live_mark_basis_bps", 0.0))
+            is_combo = pos.get("entry_type") == "basis_carry_combo"
+            should_exit = (
+                (live_dir_apr < cfg.exit_apr_pct and live_basis <= 1.0)
+                if is_combo
+                else (live_dir_apr < cfg.exit_apr_pct)
+            )
         live_dir_apr = float(pos.get("live_spread_apr_pct", 0.0))
-        live_basis = float(pos.get("live_mark_basis_bps", 0.0))
-        is_combo = pos.get("entry_type") == "basis_carry_combo"
-
-        should_exit = (not h or not oth) or (
-            (live_dir_apr < cfg.exit_apr_pct and live_basis <= 1.0) if is_combo else (live_dir_apr < cfg.exit_apr_pct)
-        )
         if should_exit:
             notional = float(pos["leg_notional_usd"])
             short_hl_exit = float(pos["hl_sign"]) > 0
@@ -315,7 +330,8 @@ def run_cross_dex_paper_tick(
 
             oth_fee = cfg.other_fee_bps(other_dex)
             entry_cost_bps = cfg.hl_fee_bps + oth_fee + cfg.bridge_drag_bps + l2_slip
-            est_rt_cost_bps = max(0.0, 2.0 * (cfg.hl_fee_bps + oth_fee + l2_slip) + cfg.bridge_drag_bps - max(0.0, exec_basis))
+            # exec_basis already incorporates entry VWAP slippage; add 1x l2_slip for estimated exit slippage.
+            est_rt_cost_bps = max(0.0, 2.0 * (cfg.hl_fee_bps + oth_fee) + l2_slip + cfg.bridge_drag_bps - exec_basis)
             hourly_bps = spread_apr / (cds.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
             if be_hours > cfg.max_breakeven_hours:

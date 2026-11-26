@@ -97,8 +97,9 @@ def simulate_portfolio_weights(
 
         hl_f = panel["hl_fund_next"].fillna(0.0).to_numpy(dtype=float)
         cex_f = panel["cex_fund_next"].fillna(0.0).to_numpy(dtype=float)
-        next_hl = panel["hl_ret"].shift(-1).fillna(0.0).to_numpy(dtype=float)
-        next_cex = panel["cex_ret"].shift(-1).fillna(0.0).to_numpy(dtype=float)
+        # panel["*_ret"][k] is already the close-to-close return over (h_k, h_{k+1}].
+        next_hl = panel["hl_ret"].fillna(0.0).to_numpy(dtype=float)
+        next_cex = panel["cex_ret"].fillna(0.0).to_numpy(dtype=float)
 
         fund = w * (hl_f - cex_f) * scale
         basis = w * (next_cex - next_hl) * scale

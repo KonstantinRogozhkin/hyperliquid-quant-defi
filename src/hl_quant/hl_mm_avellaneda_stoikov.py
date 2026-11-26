@@ -34,6 +34,7 @@ from hl_quant.hl_testnet_executor import (
     AssetSpec,
     ExchangeAdapter,
     PlannedOrder,
+    extract_hl_order_statuses,
     fetch_testnet_meta,
     round_hl_price,
     round_hl_size,
@@ -916,9 +917,35 @@ def simulate_avellaneda_stoikov_on_l2(
 # --------------------------------------------------------------------------- Live Hyperliquid Testnet MM loop
 
 
+def _fill_dedup_key(
+    fl: dict[str, Any],
+    coin: str,
+    f_oid: int,
+    f_side: str,
+    f_sz: float,
+    f_time: int,
+) -> tuple[Any, ...]:
+    """Build a collision-free fill deduplication key prioritizing Hyperliquid's unique ``tid``."""
+    tid = fl.get("tid")
+    if tid is not None:
+        try:
+            return ("tid", int(tid))
+        except (TypeError, ValueError):
+            return ("tid", str(tid))
+    return ("fallback", coin, f_oid, f_side, f_sz, f_time, str(fl.get("hash") or ""))
+
+
 def _extract_order_oid(resp: dict[str, Any]) -> tuple[int | None, str]:
-    inner = resp.get("response") if isinstance(resp, dict) else None
-    statuses = (((inner or {}).get("response") or {}).get("data") or {}).get("statuses") or []
+    if not isinstance(resp, dict):
+        return None, "invalid_response"
+    inner = resp.get("response")
+    if inner is None:
+        if resp.get("mode") == "dry_run":
+            return None, "simulated_alo"
+        return None, str(resp.get("status", "unknown"))
+    statuses, err_msg = extract_hl_order_statuses(inner)
+    if err_msg is not None:
+        return None, f"error:{err_msg}"
     for st in statuses:
         if not isinstance(st, dict):
             continue
@@ -957,7 +984,7 @@ def run_live_mm_session(
 
     active_orders: dict[str, dict[str, Any]] = {}  # {"buy": {oid, px, sz}, "sell": ...}
     all_mm_oids: set[int] = set()
-    seen_fill_keys: set[tuple[int, str, float]] = set()
+    seen_fill_keys: set[tuple[Any, ...]] = set()
     cleanup_cancelled = 0
 
     try:
@@ -1034,7 +1061,7 @@ def run_live_mm_session(
                     f_sz = abs(float(fl.get("sz", 0.0)))
                     f_px = float(fl.get("px", 0.0))
                     f_side = "buy" if str(fl.get("side")) == "B" else "sell"
-                    key = (f_oid, f_side, f_sz)
+                    key = _fill_dedup_key(fl, coin, f_oid, f_side, f_sz, f_time)
                     if key in seen_fill_keys:
                         continue
                     seen_fill_keys.add(key)
@@ -1642,7 +1669,7 @@ async def run_multi_coin_mm_ws_session(
     specs: dict[str, AssetSpec] = {}
     active_orders: dict[str, dict[str, dict[str, Any]]] = {c: {} for c in coin_list}
     all_mm_oids: dict[str, set[int]] = {c: set() for c in coin_list}
-    seen_fill_keys: set[tuple[str, int, str, float, int]] = set()
+    seen_fill_keys: set[tuple[Any, ...]] = set()
     ledgers: dict[str, _InventoryLedger] = {c: _InventoryLedger(maker_fee_bps=params.maker_fee_bps) for c in coin_list}
     vol_ests: dict[str, EWMAVolatilityEstimator] = {
         c: EWMAVolatilityEstimator(
@@ -1774,7 +1801,7 @@ async def run_multi_coin_mm_ws_session(
                     f_sz = abs(float(fl.get("sz", 0.0)))
                     f_px = float(fl.get("px", 0.0))
                     f_side = "buy" if str(fl.get("side")) == "B" else "sell"
-                    key = (c_name, f_oid, f_side, f_sz, f_time)
+                    key = _fill_dedup_key(fl, c_name, f_oid, f_side, f_sz, f_time)
                     if key in seen_fill_keys:
                         continue
                     seen_fill_keys.add(key)
@@ -2026,7 +2053,7 @@ async def run_multi_coin_mm_ws_session(
                     f_sz = abs(float(fl.get("sz", 0.0)))
                     f_px = float(fl.get("px", 0.0))
                     f_side = "buy" if str(fl.get("side")) == "B" else "sell"
-                    key = (c_name, f_oid, f_side, f_sz, f_time)
+                    key = _fill_dedup_key(fl, c_name, f_oid, f_side, f_sz, f_time)
                     if key in seen_fill_keys:
                         continue
                     seen_fill_keys.add(key)

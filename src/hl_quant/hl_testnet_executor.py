@@ -202,9 +202,10 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
                 spot_total = float(bal.get("total", 0.0))
                 spot_hold = float(bal.get("hold", 0.0))
                 if spot_total > 0:
-                    is_unified = abstraction in {"unifiedAccount", "portfolioMargin"} or (
-                        withdrawable <= 0.0 and (spot_hold > 0.0 or perps_eq <= 0.0)
-                    )
+                    if abstraction:
+                        is_unified = abstraction in {"unifiedAccount", "portfolioMargin"}
+                    else:
+                        is_unified = withdrawable <= 0.0 and (spot_hold > 0.0 or perps_eq <= 0.0)
                     if is_unified:
                         equity = spot_total
                         free_margin = max(0.0, spot_total - spot_hold)
@@ -448,6 +449,28 @@ class DryRunAdapter:
         return {"mode": "dry_run", "status": "ok", "time": trigger_time_ms}
 
 
+def extract_hl_order_statuses(resp: Any) -> tuple[list[Any], str | None]:
+    """Safely extract ``response.data.statuses`` from any Hyperliquid order/modify response.
+
+    Hyperliquid returns ``{"status": "err", "response": "<error message>"}`` on rate-limits
+    or wallet/action errors where ``response`` is a string rather than a dict.
+    """
+    if not isinstance(resp, dict):
+        return [], f"invalid_response:{type(resp).__name__}"
+    status = str(resp.get("status") or "")
+    inner = resp.get("response")
+    if status == "err" or isinstance(inner, str):
+        err_msg = inner if isinstance(inner, str) else str(inner or "unknown_error")
+        return [], err_msg
+    if not isinstance(inner, dict):
+        return [], None
+    data = inner.get("data")
+    if not isinstance(data, dict):
+        return [], None
+    statuses = data.get("statuses")
+    return (statuses if isinstance(statuses, list) else []), None
+
+
 class HyperliquidTestnetSDKAdapter:
     """Live Hyperliquid Testnet adapter via ``hyperliquid-python-sdk`` (hard-pinned to Testnet)."""
 
@@ -490,36 +513,13 @@ class HyperliquidTestnetSDKAdapter:
         ]
         if not reqs:
             return []
-        if fast and hasattr(self._exchange, "_post_action"):
-            try:
-                from hyperliquid.utils.signing import get_timestamp_ms, sign_l1_action
-
-                ts_ms = get_timestamp_ms()
-                cancel_action = {
-                    "type": "cancel",
-                    "cancels": [
-                        {"a": self._exchange.info.name_to_asset(r["coin"]), "o": r["oid"], "f": True}
-                        for r in reqs
-                    ],
-                }
-                sig = sign_l1_action(
-                    self._exchange.wallet,
-                    cancel_action,
-                    self._exchange.vault_address,
-                    ts_ms,
-                    self._exchange.expires_after,
-                    False,  # hard-pinned to Testnet
-                )
-                resp = self._exchange._post_action(cancel_action, sig, ts_ms)
-                if isinstance(resp, dict) and resp.get("status") == "ok":
-                    return [{"mode": "testnet_live", "fast": True, "bulk_count": len(reqs), "requests": reqs, "response": resp}]
-            except Exception:
-                pass
+        # Official Hyperliquid SDK cancel/bulk_cancel uses canonical {"a": asset, "o": oid} L1 actions
+        # prioritized in the HyperCore mempool; never inject non-standard action fields that break signing.
         if len(reqs) == 1:
             resp = self._exchange.cancel(reqs[0]["coin"], reqs[0]["oid"])
-            return [{"mode": "testnet_live", "fast": False, "coin": reqs[0]["coin"], "oid": reqs[0]["oid"], "response": resp}]
+            return [{"mode": "testnet_live", "fast": bool(fast), "coin": reqs[0]["coin"], "oid": reqs[0]["oid"], "response": resp}]
         resp = self._exchange.bulk_cancel(reqs)
-        return [{"mode": "testnet_live", "fast": False, "bulk_count": len(reqs), "requests": reqs, "response": resp}]
+        return [{"mode": "testnet_live", "fast": bool(fast), "bulk_count": len(reqs), "requests": reqs, "response": resp}]
 
     def place_bulk_alo_orders(self, orders: list[PlannedOrder]) -> list[dict[str, Any]]:
         if not orders:
@@ -541,17 +541,15 @@ class HyperliquidTestnetSDKAdapter:
             for o in orders
         ]
         resp = self._exchange.bulk_orders(reqs)
-        statuses = (((resp or {}).get("response") or {}).get("data") or {}).get("statuses") or []
+        statuses, err_msg = extract_hl_order_statuses(resp)
         out: list[dict[str, Any]] = []
         for idx, o in enumerate(orders):
-            st = [statuses[idx]] if idx < len(statuses) else []
-            out.append(
-                {
-                    "mode": "testnet_live",
-                    "order": o.to_dict(),
-                    "response": {"status": (resp or {}).get("status", "ok"), "response": {"data": {"statuses": st}}},
-                }
-            )
+            if err_msg is not None:
+                item_resp: dict[str, Any] = {"status": "err", "response": err_msg}
+            else:
+                st = [statuses[idx]] if idx < len(statuses) else []
+                item_resp = {"status": (resp or {}).get("status", "ok"), "response": {"data": {"statuses": st}}}
+            out.append({"mode": "testnet_live", "order": o.to_dict(), "response": item_resp})
         return out
 
     def modify_bulk_alo_orders(self, modifications: list[tuple[int, PlannedOrder]]) -> list[dict[str, Any]]:
@@ -572,18 +570,15 @@ class HyperliquidTestnetSDKAdapter:
             for oid, o in modifications
         ]
         resp = self._exchange.bulk_modify_orders_new(reqs)
-        statuses = (((resp or {}).get("response") or {}).get("data") or {}).get("statuses") or []
+        statuses, err_msg = extract_hl_order_statuses(resp)
         out: list[dict[str, Any]] = []
         for idx, (oid, o) in enumerate(modifications):
-            st = [statuses[idx]] if idx < len(statuses) else []
-            out.append(
-                {
-                    "mode": "testnet_live",
-                    "prev_oid": int(oid),
-                    "order": o.to_dict(),
-                    "response": {"status": (resp or {}).get("status", "ok"), "response": {"data": {"statuses": st}}},
-                }
-            )
+            if err_msg is not None:
+                item_resp: dict[str, Any] = {"status": "err", "response": err_msg}
+            else:
+                st = [statuses[idx]] if idx < len(statuses) else []
+                item_resp = {"status": (resp or {}).get("status", "ok"), "response": {"data": {"statuses": st}}}
+            out.append({"mode": "testnet_live", "prev_oid": int(oid), "order": o.to_dict(), "response": item_resp})
         return out
 
     def set_leverage(self, coin: str, leverage: int, *, is_cross: bool) -> dict[str, Any]:
@@ -626,6 +621,7 @@ def execute_rebalance_cycle(
     audit_log_path: Path | None = None,
     now_ms: int | None = None,
     funding_apr_by_coin: dict[str, float] | None = None,
+    cancel_unmanaged_orders: bool = False,
 ) -> dict[str, Any]:
     """Run one complete Testnet rebalance cycle: kill-switch -> cancel stale -> place sliced ALO orders.
 
@@ -635,7 +631,14 @@ def execute_rebalance_cycle(
     hwm = max(float(high_water_mark_usd or 0.0), 0.0) or account.equity_usd
     violations = check_kill_switch(account, target_weights, bbo, limits, high_water_mark_usd=hwm, now_ms=now_ms)
 
-    cancelled = adapter.cancel_all_open_orders(account.open_orders) if account.open_orders else []
+    # On kill-switch emergency, cancel ALL open orders; during normal rebalance, cancel only
+    # orders belonging to the rebalance coin scope so concurrent MM quotes on other coins survive.
+    if violations or cancel_unmanaged_orders:
+        orders_to_cancel = list(account.open_orders)
+    else:
+        managed_coins = set(target_weights.keys()) | set(account.positions_sz.keys())
+        orders_to_cancel = [o for o in account.open_orders if str(o.get("coin") or "") in managed_coins]
+    cancelled = adapter.cancel_all_open_orders(orders_to_cancel) if orders_to_cancel else []
     if violations:
         summary = {
             "status": "kill_switch_triggered",
@@ -703,18 +706,38 @@ def execute_rebalance_cycle(
     return summary
 
 
-def neutralize_target_weights(weights: dict[str, float], *, max_gross: float = 0.90) -> dict[str, float]:
-    """Re-center signed weights to dollar-neutral (``sum(w) == 0``) and cap gross exposure."""
+def neutralize_target_weights(
+    weights: dict[str, float],
+    *,
+    max_gross: float = 0.90,
+    max_single_coin_weight: float = 0.25,
+) -> dict[str, float]:
+    """Re-center signed weights to dollar-neutral (``sum(w) == 0``) while honoring gross & single-coin caps."""
     clean = {c: float(w) for c, w in weights.items() if math.isfinite(w) and abs(w) >= 1e-4}
     if len(clean) < 2:
+        if len(clean) == 1 and max_single_coin_weight > 0:
+            c, w = next(iter(clean.items()))
+            if abs(w) > max_single_coin_weight:
+                return {c: round(math.copysign(max_single_coin_weight, w), 6)}
         return clean
     mean_w = sum(clean.values()) / len(clean)
     centered = {c: w - mean_w for c, w in clean.items()}
     gross = sum(abs(w) for w in centered.values())
+    max_abs = max((abs(w) for w in centered.values()), default=0.0)
+    scale = 1.0
     if gross > max_gross and gross > 1e-9:
-        scale = max_gross / gross
+        scale = min(scale, max_gross / gross)
+    if max_single_coin_weight > 0 and max_abs > max_single_coin_weight:
+        scale = min(scale, max_single_coin_weight / max_abs)
+    if scale < 1.0:
         centered = {c: w * scale for c, w in centered.items()}
-    return {c: round(w, 6) for c, w in centered.items() if abs(w) >= 1e-4}
+    out = {c: round(w, 6) for c, w in centered.items() if abs(w) >= 1e-4}
+    if max_single_coin_weight > 0:
+        out = {
+            c: (math.copysign(max_single_coin_weight, w) if abs(w) > max_single_coin_weight else w)
+            for c, w in out.items()
+        }
+    return out
 
 
 def update_high_water_mark(hwm_path: Path, equity_usd: float) -> float:
@@ -774,10 +797,12 @@ def format_testnet_telegram_rich_html(
             o = rec.get("order") or rec
             side_txt = "🟢 Купить" if o.get("side") == "buy" else "🔴 Продать"
             resp = rec.get("response") or {}
-            st_txt = str(resp.get("status", rec.get("status", "ok")))
+            st_txt = str(resp.get("status", rec.get("status", "ok"))) if isinstance(resp, dict) else str(resp)
             if isinstance(resp, dict):
-                statuses = (((resp.get("response") or {}).get("data") or {}).get("statuses") or [])
-                if statuses and isinstance(statuses[0], dict):
+                statuses, err_msg = extract_hl_order_statuses(resp)
+                if err_msg is not None:
+                    st_txt = f"err: {err_msg[:60]}"
+                elif statuses and isinstance(statuses[0], dict):
                     st_txt = next(iter(statuses[0].keys()))
             rows.append(
                 "<tr>"

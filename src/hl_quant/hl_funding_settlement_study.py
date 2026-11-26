@@ -351,14 +351,9 @@ async def fetch_settlement_dataset(
             if coin and mark > 0 and oi >= min_oi_usd and vol >= min_vol_usd:
                 candidates.append({"coin": coin, "oi_usd": oi, "vol_usd": vol, "abs_fund": abs(fund)})
 
-        by_fund = sorted(candidates, key=lambda x: -x["abs_fund"])[: max_coins // 2 + 5]
-        by_oi = sorted(candidates, key=lambda x: -x["oi_usd"])[:max_coins]
-        selected_map: dict[str, dict[str, Any]] = {}
-        for item in by_fund + by_oi:
-            selected_map.setdefault(item["coin"], item)
-            if len(selected_map) >= max_coins:
-                break
-        selected = list(selected_map.values())
+        # Rank strictly by liquidity (OI, then 24h volume) — never pre-select by current
+        # end-of-window funding magnitude, which introduces lookahead selection bias.
+        selected = sorted(candidates, key=lambda x: (-x["oi_usd"], -x["vol_usd"], x["coin"]))[:max_coins]
 
         sem = asyncio.Semaphore(4)
 

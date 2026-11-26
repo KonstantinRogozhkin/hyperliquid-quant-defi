@@ -429,9 +429,9 @@ def grade_forward_outcomes(
         return 0
 
     horizons = (
-        ("ret_15m_bps", 14 * 60_000, 45 * 60_000),
-        ("ret_1h_bps", 55 * 60_000, 120 * 60_000),
-        ("ret_4h_bps", 230 * 60_000, 360 * 60_000),
+        ("ret_15m_bps", 14 * 60_000, 25 * 60_000),
+        ("ret_1h_bps", 55 * 60_000, 75 * 60_000),
+        ("ret_4h_bps", 230 * 60_000, 260 * 60_000),
     )
     updated = 0
     for col, min_dt, max_dt in horizons:
@@ -529,11 +529,16 @@ def run_onchain_event_tick(
             prev_snapshot = None
 
     with httpx.Client(timeout=20.0) as client:
-        if mark_prices is None or (perps_raw is None and mark_prices is None):
-            perps, _ = evm.fetch_hypercore_markets(client)
-            marks = {coin: _f(info.get("mark_px")) for coin, info in perps.items() if _f(info.get("mark_px")) > 0}
+        if mark_prices is None or perps_raw is None:
+            fetched_perps, _ = evm.fetch_hypercore_markets(client)
+            perps = dict(perps_raw) if perps_raw is not None else fetched_perps
+            marks = (
+                dict(mark_prices)
+                if mark_prices is not None
+                else {coin: _f(info.get("mark_px")) for coin, info in fetched_perps.items() if _f(info.get("mark_px")) > 0}
+            )
         else:
-            perps = dict(perps_raw) if perps_raw is not None else {}
+            perps = dict(perps_raw)
             marks = dict(mark_prices)
 
         if evm_snap is None:

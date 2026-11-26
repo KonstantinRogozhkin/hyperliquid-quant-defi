@@ -245,29 +245,34 @@ def fetch_hyperevm_yield_inputs(
     morpho_feusd_apy = morpho_feusd_tvl = hyperlend_khype_tvl = felix_whype_tvl = 0.0
     liminal_apy = hlp_apr = hlp_tvl = 0.0
     rl = client.get(defillama_url, timeout=25.0)
-    if rl.status_code == 200:
-        for p in (rl.json() or {}).get("data") or []:
-            proj = str(p.get("project") or "").lower()
-            sym = str(p.get("symbol") or "").upper()
-            chain = str(p.get("chain") or "").lower()
-            tvl = _f(p.get("tvlUsd"))
-            apy = _f(p.get("apy"))
-            if "hyperliquid" not in chain and "hyperevm" not in chain:
-                continue
-            if proj == "kinetiq-khype" and sym == "KHYPE":
-                khype_apy, khype_tvl = apy, tvl
-            elif proj == "sthype" and sym == "STHYPE":
-                sthype_apy, sthype_tvl = apy, tvl
-            elif proj == "morpho-blue" and "FEUSD" in sym and tvl > morpho_feusd_tvl:
-                morpho_feusd_apy, morpho_feusd_tvl = apy, tvl
-            elif proj == "hyperlend-pooled" and sym == "KHYPE":
-                hyperlend_khype_tvl = max(hyperlend_khype_tvl, tvl)
-            elif proj == "felix-cdp" and sym == "WHYPE":
-                felix_whype_tvl = max(felix_whype_tvl, tvl)
-            elif proj == "liminal-basis" and "HYPE" in sym:
-                liminal_apy = max(liminal_apy, apy)
-            elif proj == "hyperliquid-hlp":
-                hlp_apr, hlp_tvl = apy, tvl
+    if rl.status_code != 200:
+        raise RuntimeError(f"DeFiLlama pools fetch failed with HTTP {rl.status_code}; refusing to emit zero yields")
+    dl_payload = rl.json()
+    dl_pools = (dl_payload or {}).get("data") if isinstance(dl_payload, dict) else None
+    if not isinstance(dl_pools, list) or not dl_pools:
+        raise RuntimeError("DeFiLlama pools payload is empty or malformed; refusing to emit zero yields")
+    for p in dl_pools:
+        proj = str(p.get("project") or "").lower()
+        sym = str(p.get("symbol") or "").upper()
+        chain = str(p.get("chain") or "").lower()
+        tvl = _f(p.get("tvlUsd"))
+        apy = _f(p.get("apy"))
+        if "hyperliquid" not in chain and "hyperevm" not in chain:
+            continue
+        if proj == "kinetiq-khype" and sym == "KHYPE":
+            khype_apy, khype_tvl = apy, tvl
+        elif proj == "sthype" and sym == "STHYPE":
+            sthype_apy, sthype_tvl = apy, tvl
+        elif proj == "morpho-blue" and "FEUSD" in sym and tvl > morpho_feusd_tvl:
+            morpho_feusd_apy, morpho_feusd_tvl = apy, tvl
+        elif proj == "hyperlend-pooled" and sym == "KHYPE":
+            hyperlend_khype_tvl = max(hyperlend_khype_tvl, tvl)
+        elif proj == "felix-cdp" and sym == "WHYPE":
+            felix_whype_tvl = max(felix_whype_tvl, tvl)
+        elif proj == "liminal-basis" and "HYPE" in sym:
+            liminal_apy = max(liminal_apy, apy)
+        elif proj == "hyperliquid-hlp":
+            hlp_apr, hlp_tvl = apy, tvl
 
     return HyperEvmYieldInputs(
         observed_at_ms=now_ms,

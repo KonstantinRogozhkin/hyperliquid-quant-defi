@@ -122,8 +122,8 @@ def parse_boros_market(
     else:
         if bid_pct >= 6.0 and days >= 7.0:
             action = f"Short Perp + Short Boros (Lock {bid_pct:+.2f}%)"
-        elif bid_pct <= -10.0 and days >= 7.0:
-            action = f"Long Perp + Long Boros (Lock {abs(ask_pct):.2f}%)"
+        elif ask_pct <= -10.0 and days >= 7.0:
+            action = f"Long Perp + Long Boros (Lock {-ask_pct:+.2f}%)"
         elif float_minus_fixed >= 3.0:
             action = "Long Boros YU (Float > Ask)"
         else:

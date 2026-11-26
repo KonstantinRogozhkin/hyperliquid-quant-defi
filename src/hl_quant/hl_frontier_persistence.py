@@ -59,51 +59,78 @@ def compute_hip3_persistence_summary(
     min_apr_pct: float = 20.0,
     max_oracle_div_bps: float = 25.0,
 ) -> list[dict[str, Any]]:
-    """Summarize multi-tick persistence of HIP-3 cross-builder spreads (clean, same-direction vs oracle-divergent)."""
+    """Summarize multi-tick persistence of HIP-3 cross-builder spreads (clean, same-direction, gap-aware)."""
     if hip3_df.empty or "base_symbol" not in hip3_df.columns:
         return []
+    all_ts = sorted(int(x) for x in hip3_df["ts_ms"].dropna().astype("int64").unique().tolist())
+    if not all_ts:
+        return []
+    latest_global_ts = all_ts[-1]
+    ts_index = {ts: idx for idx, ts in enumerate(all_ts)}
+
     out: list[dict[str, Any]] = []
     for sym, grp in hip3_df.sort_values("ts_ms", kind="stable").groupby("base_symbol", sort=False):
-        aprs = grp["spread_apr_pct"].astype(float).tolist()
-        odivs = grp["oracle_divergence_bps"].astype(float).tolist()
-        dirs = list(zip(grp["short_symbol"].astype(str), grp["long_symbol"].astype(str), strict=False))
-        latest_dir = dirs[-1]
+        # Deduplicate per ts_ms keeping last row for this symbol
+        grp_dedup = grp.drop_duplicates(subset=["ts_ms"], keep="last")
+        by_ts = {int(r["ts_ms"]): r for _, r in grp_dedup.iterrows()}
+        dirs = [(str(r["short_symbol"]), str(r["long_symbol"])) for _, r in grp_dedup.iterrows()]
         direction_flips = sum(1 for i in range(1, len(dirs)) if dirs[i] != dirs[i - 1])
-        qual = [
-            (a >= min_apr_pct and d <= max_oracle_div_bps and cur_dir == latest_dir)
-            for a, d, cur_dir in zip(aprs, odivs, dirs, strict=False)
-        ]
-        # Trailing consecutive ticks meeting APR >= min_apr_pct (raw) and clean (oracle div <= cap + unchanged legs)
+        last = grp_dedup.iloc[-1]
+        last_ts = int(last["ts_ms"])
+        active_in_latest = last_ts == latest_global_ts
+        ticks_since_last_seen = (len(all_ts) - 1) - ts_index[last_ts]
+        latest_dir = (str(last["short_symbol"]), str(last["long_symbol"]))
+
+        # Walk backward over the GLOBAL tick timeline from latest_global_ts:
+        # any missing tick breaks both raw_apr_streak and clean_streak immediately.
         raw_streak = 0
-        for a in reversed(aprs):
-            if a >= min_apr_pct:
+        for ts in reversed(all_ts):
+            row = by_ts.get(ts)
+            if row is not None and float(row["spread_apr_pct"]) >= min_apr_pct:
                 raw_streak += 1
             else:
                 break
+
         clean_streak = 0
-        for ok in reversed(qual):
-            if ok:
+        for ts in reversed(all_ts):
+            row = by_ts.get(ts)
+            if (
+                row is not None
+                and float(row["spread_apr_pct"]) >= min_apr_pct
+                and float(row["oracle_divergence_bps"]) <= max_oracle_div_bps
+                and (str(row["short_symbol"]), str(row["long_symbol"])) == latest_dir
+            ):
                 clean_streak += 1
             else:
                 break
-        last = grp.iloc[-1]
+
         out.append(
             {
                 "base_symbol": str(sym),
                 "short_symbol": str(last["short_symbol"]),
                 "long_symbol": str(last["long_symbol"]),
-                "ticks_seen": int(len(grp)),
+                "ticks_seen": int(len(grp_dedup)),
+                "active_in_latest_tick": active_in_latest,
+                "ticks_since_last_seen": int(ticks_since_last_seen),
                 "raw_apr_streak": raw_streak,
                 "clean_streak": clean_streak,
                 "direction_flips": direction_flips,
                 "latest_apr_pct": round(float(last["spread_apr_pct"]), 2),
-                "median_apr_pct": round(float(grp["spread_apr_pct"].median()), 2),
-                "median_oracle_div_bps": round(float(grp["oracle_divergence_bps"].median()), 2),
+                "median_apr_pct": round(float(grp_dedup["spread_apr_pct"].median()), 2),
+                "median_oracle_div_bps": round(float(grp_dedup["oracle_divergence_bps"].median()), 2),
                 "both_growth_mode": bool(last["both_growth_mode"]),
                 "any_only_isolated": bool(last["any_only_isolated"]),
             }
         )
-    out.sort(key=lambda r: (-r["clean_streak"], r["direction_flips"], -r["raw_apr_streak"], -r["median_apr_pct"]))
+    out.sort(
+        key=lambda r: (
+            not r["active_in_latest_tick"],
+            -r["clean_streak"],
+            r["direction_flips"],
+            -r["raw_apr_streak"],
+            -r["median_apr_pct"],
+        )
+    )
     return out
 
 

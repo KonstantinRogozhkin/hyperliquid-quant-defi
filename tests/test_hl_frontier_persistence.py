@@ -265,3 +265,58 @@ def test_hip3_persistence_sorting_prefers_steady_over_flipped():
     assert summary[0]["clean_streak"] == 2 and summary[0]["direction_flips"] == 0
     assert summary[1]["clean_streak"] == 1 and summary[1]["direction_flips"] == 0
     assert summary[2]["clean_streak"] == 1 and summary[2]["direction_flips"] == 1
+
+
+def test_hip3_persistence_breaks_streak_when_symbol_disappears():
+    df = pd.DataFrame(
+        [
+            # STALE appeared in ticks 1 and 2 with huge APR, then vanished on tick 3
+            {
+                "ts_ms": 1,
+                "base_symbol": "STALE",
+                "short_symbol": "xyz:STALE",
+                "long_symbol": "io:STALE",
+                "spread_apr_pct": 120.0,
+                "oracle_divergence_bps": 2.0,
+                "both_growth_mode": True,
+                "any_only_isolated": False,
+            },
+            {
+                "ts_ms": 2,
+                "base_symbol": "STALE",
+                "short_symbol": "xyz:STALE",
+                "long_symbol": "io:STALE",
+                "spread_apr_pct": 120.0,
+                "oracle_divergence_bps": 2.0,
+                "both_growth_mode": True,
+                "any_only_isolated": False,
+            },
+            # AAPL is present in tick 3 (and missed tick 2 -> gap breaks streak at 1)
+            {
+                "ts_ms": 1,
+                "base_symbol": "AAPL",
+                "short_symbol": "xyz:AAPL",
+                "long_symbol": "io:AAPL",
+                "spread_apr_pct": 30.0,
+                "oracle_divergence_bps": 4.0,
+                "both_growth_mode": True,
+                "any_only_isolated": False,
+            },
+            {
+                "ts_ms": 3,
+                "base_symbol": "AAPL",
+                "short_symbol": "xyz:AAPL",
+                "long_symbol": "io:AAPL",
+                "spread_apr_pct": 30.0,
+                "oracle_divergence_bps": 4.0,
+                "both_growth_mode": True,
+                "any_only_isolated": False,
+            },
+        ]
+    )
+    summary = fp.compute_hip3_persistence_summary(df)
+    assert [r["base_symbol"] for r in summary] == ["AAPL", "STALE"]
+    aapl, stale = summary[0], summary[1]
+    assert aapl["active_in_latest_tick"] is True and aapl["clean_streak"] == 1 and aapl["raw_apr_streak"] == 1
+    assert stale["active_in_latest_tick"] is False and stale["clean_streak"] == 0 and stale["raw_apr_streak"] == 0
+    assert stale["ticks_since_last_seen"] == 1

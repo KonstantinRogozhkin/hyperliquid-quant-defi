@@ -36,14 +36,19 @@ ARTIFACT_FILES: dict[str, str] = {
 
 
 def sanitize_json(value: Any) -> Any:
-    """Recursively convert NaN/Inf, NumPy scalars, Timestamps, and Paths into strict JSON values."""
-    if value is None or isinstance(value, (bool, str, int)):
-        return value
+    """Recursively convert NaN/Inf, NaT, NumPy scalars, Timestamps, and Paths into strict JSON values."""
+    if value is None or value is pd.NaT or isinstance(value, (bool, str, int)):
+        return None if value is pd.NaT else value
     if isinstance(value, float):
         return None if (math.isnan(value) or math.isinf(value)) else value
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, datetime):
+        try:
+            if pd.isna(value):
+                return None
+        except Exception:
+            pass
         return value.isoformat()
     if isinstance(value, dict):
         return {str(k): sanitize_json(v) for k, v in value.items()}
