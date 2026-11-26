@@ -16,10 +16,20 @@ def test_sanitize_json_strips_nan_and_inf():
         "b": float("inf"),
         "c": float("-inf"),
         "d": 12.5,
-        "nested": [{"x": float("nan"), "y": "ok"}],
+        "nat": pd.NaT,
+        "ts": pd.Timestamp("2026-11-26T20:00:00Z"),
+        "nested": [{"x": float("nan"), "y": "ok", "z": pd.NaT}],
     }
     clean = sanitize_json(raw)
-    assert clean == {"a": None, "b": None, "c": None, "d": 12.5, "nested": [{"x": None, "y": "ok"}]}
+    assert clean == {
+        "a": None,
+        "b": None,
+        "c": None,
+        "d": 12.5,
+        "nat": None,
+        "ts": "2026-11-26T20:00:00+00:00",
+        "nested": [{"x": None, "y": "ok", "z": None}],
+    }
 
 
 def test_api_health_and_build_info(tmp_path: Path):

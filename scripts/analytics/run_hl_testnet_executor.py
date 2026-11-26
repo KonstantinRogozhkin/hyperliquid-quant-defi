@@ -83,6 +83,12 @@ def main(
     account_addr = os.getenv("HL_TESTNET_ACCOUNT_ADDRESS", "").strip()
     priv_key = os.getenv("HL_TESTNET_PRIVATE_KEY", "").strip()
 
+    limits = ex.RiskLimits(
+        max_child_usd=max_child_usd,
+        allow_only_isolated=allow_only_isolated,
+        default_isolated_leverage=default_isolated_leverage,
+        default_cross_leverage=default_cross_leverage,
+    )
     with httpx.Client(timeout=15.0) as client:
         meta = ex.fetch_testnet_meta(client)
         # Keep only coins listed on Hyperliquid Testnet (and skip isolated-only coins unless opted in)
@@ -93,7 +99,11 @@ def main(
             if c in meta and (allow_only_isolated or not meta[c].only_isolated)
         }
         if neutralize_net and targets is None:
-            valid_targets = ex.neutralize_target_weights(valid_targets, max_gross=0.90)
+            valid_targets = ex.neutralize_target_weights(
+                valid_targets,
+                max_gross=min(0.90, limits.max_gross_leverage),
+                max_single_coin_weight=limits.max_single_coin_weight,
+            )
         if account_addr:
             account = ex.fetch_testnet_account(client, account_addr)
         else:
@@ -115,13 +125,6 @@ def main(
         adapter = ex.HyperliquidTestnetSDKAdapter(priv_key, account_addr)
     else:
         adapter = ex.DryRunAdapter()
-
-    limits = ex.RiskLimits(
-        max_child_usd=max_child_usd,
-        allow_only_isolated=allow_only_isolated,
-        default_isolated_leverage=default_isolated_leverage,
-        default_cross_leverage=default_cross_leverage,
-    )
     # The drawdown gate needs the peak equity of the real account across runs; the
     # simulated dry-run account has constant equity and keeps no high-water mark.
     stored_hwm = ex.load_high_water_mark(hwm_state) if account_addr else 0.0

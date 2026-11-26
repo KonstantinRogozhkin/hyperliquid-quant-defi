@@ -105,11 +105,11 @@ def build_wide_market(bundle: pd.DataFrame) -> WideMarket:
     bn_close = piv("binance_close")
     okx_close = piv("okx_close")
 
-    # Next-hour close-to-close return over (h_t, h_{t+1}]
-    hl_ret_next = (hl_close.shift(-1) / hl_close - 1.0).fillna(0.0)
-    by_ret_next = (by_close.shift(-1) / by_close - 1.0).fillna(0.0)
-    bn_ret_next = (bn_close.shift(-1) / bn_close - 1.0).fillna(0.0)
-    okx_ret_next = (okx_close.shift(-1) / okx_close - 1.0).fillna(0.0)
+    # Close of bar opening at h_t is price at h_{t+1}; return over (h_t, h_{t+1}] is close_t / close_{t-1} - 1.
+    hl_ret_next = (hl_close / hl_close.shift(1) - 1.0).fillna(0.0)
+    by_ret_next = (by_close / by_close.shift(1) - 1.0).fillna(0.0)
+    bn_ret_next = (bn_close / bn_close.shift(1) - 1.0).fillna(0.0)
+    okx_ret_next = (okx_close / okx_close.shift(1) - 1.0).fillna(0.0)
 
     return WideMarket(
         hours=hours,
@@ -505,9 +505,12 @@ def cross_sectional_weights(
                         target[j] = -0.5 / k
             if ema_alpha < 1.0:
                 cur_w = ema_alpha * target + (1.0 - ema_alpha) * cur_w
-                # Re-center and cap gross to 1.0
+                target_gross = float(np.abs(target).sum())
                 gross = float(np.abs(cur_w).sum())
-                if gross > 1e-9:
+                if target_gross <= 1e-9:
+                    # Target is flat: let positions decay cleanly to zero without re-inflating gross to 1.0.
+                    cur_w = np.where(np.abs(cur_w) < 1e-3, 0.0, cur_w)
+                elif gross > 1.0:
                     cur_w = cur_w / gross
             else:
                 cur_w = target

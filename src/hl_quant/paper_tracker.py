@@ -224,7 +224,7 @@ def _last_known(df: pd.DataFrame, coin: str, tick_hour_ms: int) -> float:
     return float(series.iloc[-1]) if not series.empty else float("nan")
 
 
-def _append_parquet(path: Path, new_df: pd.DataFrame) -> None:
+def _append_parquet(path: Path, new_df: pd.DataFrame, *, dedup_subset: list[str] | None = None) -> None:
     if new_df.empty:
         return
     if path.exists():
@@ -232,6 +232,8 @@ def _append_parquet(path: Path, new_df: pd.DataFrame) -> None:
         combined = pd.concat([old, new_df], ignore_index=True)
     else:
         combined = new_df
+    if dedup_subset and all(col in combined.columns for col in dedup_subset):
+        combined = combined.drop_duplicates(subset=dedup_subset, keep="last").reset_index(drop=True)
     tmp = path.with_suffix(".tmp.parquet")
     combined.to_parquet(tmp, index=False)
     tmp.replace(path)
@@ -423,9 +425,9 @@ def run_paper_tick(
         "median_l2_spread_bps": median_l2_bps,
     }
 
-    _append_parquet(ticks_path, pd.DataFrame([tick_row]))
+    _append_parquet(ticks_path, pd.DataFrame([tick_row]), dedup_subset=["tick_hour_ms"])
     if trade_rows:
-        _append_parquet(trades_path, pd.DataFrame(trade_rows))
+        _append_parquet(trades_path, pd.DataFrame(trade_rows), dedup_subset=["tick_hour_ms", "coin", "venue", "side"])
 
     state_out = {
         "starting_capital_usd": float(state["starting_capital_usd"]),

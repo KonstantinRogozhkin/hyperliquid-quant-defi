@@ -18,6 +18,8 @@ from typing import Any
 import httpx
 import pandas as pd
 
+from hl_quant.hl_testnet_executor import extract_hl_order_statuses
+
 TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
 
 
@@ -141,8 +143,13 @@ def fetch_post_trade_snapshot(
     }
 
 
-def extract_audit_oids(audit_log_path: Path | None) -> set[int]:
-    """Extract all resting/filled order IDs submitted by our executor from ``hl_testnet_audit.jsonl``."""
+def extract_audit_oids(audit_log_path: Path | None, *, min_ts_ms: int | None = None) -> set[int]:
+    """Extract all resting/filled order IDs submitted by our executor from ``hl_testnet_audit.jsonl``.
+
+    When ``min_ts_ms`` is supplied (e.g. oldest timestamp covered by Hyperliquid's 2000-fill
+    ``userFills`` cap), older audit records outside the exchange fill window are excluded so
+    evicted fills cannot artificially depress ``real_alo_fill_rate_pct``.
+    """
     oids: set[int] = set()
     if audit_log_path is None or not audit_log_path.is_file():
         return oids
@@ -154,9 +161,15 @@ def extract_audit_oids(audit_log_path: Path | None) -> set[int]:
             rec = json.loads(line)
         except ValueError:
             continue
+        if min_ts_ms is not None:
+            rec_ts = int(rec.get("ts_ms") or 0)
+            if rec_ts > 0 and rec_ts < min_ts_ms:
+                continue
         for ord_rec in rec.get("orders") or []:
             resp = ord_rec.get("response") or {}
-            statuses = (((resp.get("response") or {}).get("data") or {}).get("statuses") or [])
+            statuses, err_msg = extract_hl_order_statuses(resp)
+            if err_msg is not None:
+                continue
             for st in statuses:
                 if not isinstance(st, dict):
                     continue
@@ -228,9 +241,10 @@ def compute_post_trade_attribution(
             pos_map[coin] = p
 
     abstraction = str(snapshot.get("user_abstraction") or "")
-    is_unified = abstraction in {"unifiedAccount", "portfolioMargin"} or (
-        spot_usdc > 0 and withdrawable <= 0.0 and (spot_hold > 0.0 or perps_eq <= 0.0)
-    )
+    if abstraction:
+        is_unified = abstraction in {"unifiedAccount", "portfolioMargin"}
+    else:
+        is_unified = spot_usdc > 0 and withdrawable <= 0.0 and (spot_hold > 0.0 or perps_eq <= 0.0)
     if is_unified and spot_usdc > 0:
         # Verified against HL ``portfolio`` API: Unified Account ``spot.USDC.total``
         # already reflects locked perp margin and live unrealized PnL.
@@ -298,8 +312,13 @@ def compute_post_trade_attribution(
             fund_by_coin[coin] = fund_by_coin.get(coin, 0.0) + usdc
         tot_funding += usdc
 
-    # Audit ALO order fill rate against local executor audit trail
-    audit_oids = extract_audit_oids(audit_log_path)
+    # Audit ALO order fill rate against local executor audit trail (window-aligned when userFills hits 2000 cap)
+    audit_min_ts_ms: int | None = None
+    if len(fills) >= 1900:
+        fill_times = [int(fl["time"]) for fl in fills if fl.get("time") is not None]
+        if fill_times:
+            audit_min_ts_ms = min(fill_times)
+    audit_oids = extract_audit_oids(audit_log_path, min_ts_ms=audit_min_ts_ms)
     resting_oids = {int(o["oid"]) for o in open_orders if isinstance(o, dict) and o.get("oid") is not None}
     audit_filled = len(audit_oids & filled_oids)
     audit_resting = len(audit_oids & resting_oids)

@@ -16,6 +16,7 @@ from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from hashlib import sha256
 import hmac
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any, Callable, Iterable, Mapping
@@ -29,6 +30,8 @@ import yaml
 BINANCE = "https://api.binance.com"
 BYBIT = "https://api.bybit.com"
 HYPERLIQUID = "https://api.hyperliquid.xyz"
+MAINNET_EXECUTION_ACK_ENV = "HL_ALLOW_MAINNET_MICRO_EXECUTION"
+MAINNET_EXECUTION_ACK_VALUE = "I_UNDERSTAND_REAL_MONEY"
 ASSETS = ("BTC", "ETH")
 FORBIDDEN_ARTIFACT_KEYS = {
     "address",
@@ -137,8 +140,14 @@ class MicroExecutionContract:
             raise MicroExecutionError("contract_actual_spot_notional_floor_invalid")
         if not Decimal("0") <= self.max_bybit_short_weight_deviation_fraction <= Decimal("0.05"):
             raise MicroExecutionError("contract_short_weight_tolerance_invalid")
-        if self.execution_mode != "mainnet_only":
-            raise MicroExecutionError("contract_must_be_mainnet_only")
+        if self.execution_mode not in {"testnet_only", "mainnet_only"}:
+            raise MicroExecutionError("contract_execution_mode_invalid")
+
+
+def require_mainnet_execution_opt_in() -> None:
+    """Fail-closed guard preventing accidental real-money mainnet order submission."""
+    if os.environ.get(MAINNET_EXECUTION_ACK_ENV, "").strip() != MAINNET_EXECUTION_ACK_VALUE:
+        raise MicroExecutionError("mainnet_execution_disabled_by_safety_guard")
 
 
 def build_contract(config_path: Path, *, run_id: str | None = None) -> MicroExecutionContract:
@@ -390,6 +399,7 @@ class BinanceClient:
         return response.json()
 
     def create_ioc(self, *, symbol: str, side: str, quantity: Decimal, price: Decimal, client_id: str) -> dict[str, Any]:
+        require_mainnet_execution_opt_in()
         return self._signed(
             "POST",
             "/api/v3/order",
@@ -479,6 +489,7 @@ class BybitClient:
         return payload.get("result") or {}
 
     def create_ioc(self, *, symbol: str, side: str, quantity: Decimal, price: Decimal, client_id: str, reduce_only: bool) -> dict[str, Any]:
+        require_mainnet_execution_opt_in()
         return self._private(
             "POST",
             "/v5/order/create",
@@ -501,9 +512,11 @@ class BybitClient:
 
 
 class HyperliquidClient:
-    """Official Hyperliquid SDK bridge.  The private key stays process-local."""
+    """Official Hyperliquid SDK bridge (defaults to Testnet; mainnet requires explicit opt-in)."""
 
-    def __init__(self, account_address: str, api_wallet_private_key: str):
+    def __init__(self, account_address: str, api_wallet_private_key: str, *, use_testnet: bool = True):
+        if not use_testnet:
+            require_mainnet_execution_opt_in()
         try:
             from eth_account import Account
             from hyperliquid.exchange import Exchange
@@ -511,10 +524,12 @@ class HyperliquidClient:
             from hyperliquid.utils import constants
         except ImportError as error:  # pragma: no cover - protected by extra dependency
             raise MicroExecutionError("hyperliquid_sdk_missing") from error
+        api_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
         self.account_address = account_address
-        self._info = Info(constants.MAINNET_API_URL, skip_ws=True, timeout=10.0)
+        self.api_url = api_url
+        self._info = Info(api_url, skip_ws=True, timeout=10.0)
         self._wallet = Account.from_key(api_wallet_private_key)
-        self._exchange = Exchange(self._wallet, base_url=constants.MAINNET_API_URL, account_address=account_address, timeout=10.0)
+        self._exchange = Exchange(self._wallet, base_url=api_url, account_address=account_address, timeout=10.0)
 
     @property
     def api_wallet_address(self) -> str:
@@ -807,7 +822,19 @@ def _aggregate_fills(rows: Iterable[Mapping[str, Any]], *, venue: str, side: str
     return total_qty, {"fill_count": len(matching), "maker_count": maker_count, "taker_count": len(matching) - maker_count, "fee_bps": fee_bps}
 
 
-def _shortfall_bps(rows: Iterable[Mapping[str, Any]], *, venue: str, symbol: str, side: str, protected_price: Decimal) -> float | None:
+def _shortfall_bps(
+    rows: Iterable[Mapping[str, Any]],
+    *,
+    venue: str,
+    symbol: str,
+    side: str,
+    arrival_price: Decimal | None = None,
+    protected_price: Decimal | None = None,
+) -> float | None:
+    """Implementation shortfall in bps relative to arrival touch price (positive = adverse slippage)."""
+    ref_price = arrival_price if arrival_price is not None else protected_price
+    if ref_price is None or ref_price <= 0:
+        return None
     quantity, summary = _aggregate_fills(rows, venue=venue, side=side, symbol=symbol)
     if quantity <= 0 or summary["fill_count"] == 0:
         return None
@@ -820,7 +847,7 @@ def _shortfall_bps(rows: Iterable[Mapping[str, Any]], *, venue: str, symbol: str
 
     matching = [row for row in rows if str(row.get("symbol") or row.get("coin") or "") == symbol and is_side(row)]
     avg = sum((_decimal(row.get(quantity_key)) * _decimal(row.get(price_key)) for row in matching), Decimal("0")) / quantity
-    return float((avg - protected_price) / protected_price * Decimal("10000")) * (1 if side == "buy" else -1)
+    return float((avg - ref_price) / ref_price * Decimal("10000")) * (1 if side == "buy" else -1)
 
 
 def _run_parallel(calls: Mapping[str, Callable[[], Any]]) -> tuple[dict[str, Any], int]:
@@ -1264,7 +1291,7 @@ class MicroExecutionRunner:
             if not exit_ok or not binance_flat or exit_snapshot["bybit"]["has_target_position"] or exit_snapshot["hyperliquid"]["has_target_position"]:
                 unwound = self._safe_unwind(asset, filled={"binance": max(Decimal("0"), binance_position_qty - exit_qty["binance"]), "bybit": max(Decimal("0"), y_filled - exit_qty["bybit"]), "hyperliquid": max(Decimal("0"), h_filled - exit_qty["hyperliquid"])}, books=exit_books, client_tag=tag)
                 return {"asset": asset, "status": "failed_safe_unwind" if unwound else "failed_manual_intervention", "entry_span_ms": exit_start - start_ms, "exit_span_ms": int(time.time() * 1000) - exit_start, "delta_mismatch_fraction": float(delta_mismatch), "entry_snapshot": entry_snapshot, "exit_snapshot": exit_snapshot, "safe_unwind_attempted": True}
-            return {"asset": asset, "status": "completed", "entry_span_ms": exit_start - start_ms - self.contract.hold_seconds * 1000, "exit_span_ms": int(time.time() * 1000) - exit_start, "delta_mismatch_fraction": float(delta_mismatch), "entry_snapshot": entry_snapshot, "exit_snapshot": exit_snapshot, "entry": {"fills": {"binance": b_summary, "bybit": _aggregate_fills(all_fills["bybit"], venue="bybit", side="sell", symbol=perp)[1], "hyperliquid": _aggregate_fills(all_fills["hyperliquid"], venue="hyperliquid", side="sell", symbol=asset)[1]}}, "exit": {"fills": {"binance": _aggregate_fills(exit_fills["binance"], venue="binance", side="sell", symbol=symbol)[1], "bybit": _aggregate_fills(exit_fills["bybit"], venue="bybit", side="buy", symbol=perp)[1], "hyperliquid": _aggregate_fills(exit_fills["hyperliquid"], venue="hyperliquid", side="buy", symbol=asset)[1]}}, "implementation_shortfall_bps": {"binance_entry": _shortfall_bps(all_fills["binance"], venue="binance", symbol=symbol, side="buy", protected_price=protected["binance"]), "bybit_entry": _shortfall_bps(all_fills["bybit"], venue="bybit", symbol=perp, side="sell", protected_price=protected["bybit"]), "hyperliquid_entry": _shortfall_bps(all_fills["hyperliquid"], venue="hyperliquid", symbol=asset, side="sell", protected_price=protected["hyperliquid"]), }, "safe_unwind_attempted": False}
+            return {"asset": asset, "status": "completed", "entry_span_ms": exit_start - start_ms - self.contract.hold_seconds * 1000, "exit_span_ms": int(time.time() * 1000) - exit_start, "delta_mismatch_fraction": float(delta_mismatch), "entry_snapshot": entry_snapshot, "exit_snapshot": exit_snapshot, "entry": {"fills": {"binance": b_summary, "bybit": _aggregate_fills(all_fills["bybit"], venue="bybit", side="sell", symbol=perp)[1], "hyperliquid": _aggregate_fills(all_fills["hyperliquid"], venue="hyperliquid", side="sell", symbol=asset)[1]}}, "exit": {"fills": {"binance": _aggregate_fills(exit_fills["binance"], venue="binance", side="sell", symbol=symbol)[1], "bybit": _aggregate_fills(exit_fills["bybit"], venue="bybit", side="buy", symbol=perp)[1], "hyperliquid": _aggregate_fills(exit_fills["hyperliquid"], venue="hyperliquid", side="buy", symbol=asset)[1]}}, "implementation_shortfall_bps": {"binance_entry": _shortfall_bps(all_fills["binance"], venue="binance", symbol=symbol, side="buy", arrival_price=b_price), "bybit_entry": _shortfall_bps(all_fills["bybit"], venue="bybit", symbol=perp, side="sell", arrival_price=y_price), "hyperliquid_entry": _shortfall_bps(all_fills["hyperliquid"], venue="hyperliquid", symbol=asset, side="sell", arrival_price=h_price), }, "safe_unwind_attempted": False}
         except Exception as error:
             # If we cannot prove state, attempt all currently known legs and force stop before the next asset.
             unwound = self._safe_unwind(asset, filled={"binance": Decimal("0"), "bybit": Decimal("0"), "hyperliquid": Decimal("0")}, books=books, client_tag=tag)

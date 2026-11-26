@@ -334,9 +334,11 @@ def scan_hip3_cross_builder_arb(
         be_h: float | None = None
         be_h_taker: float | None = None
         if sl5 is not None and eb5 is not None:
-            rt_m = opp.est_rt_maker_fee_bps if opp.both_growth_mode else round_trip_fee_bps
-            net_cost_m = max(0.0, rt_m + 2.0 * sl5 - max(0.0, eb5))
-            net_cost_t = max(0.0, opp.est_rt_taker_fee_bps + 2.0 * sl5 - max(0.0, eb5))
+            # Always respect per-builder deployerFeeScale in est_rt_maker_fee_bps (not only in Growth Mode).
+            # eb5 already prices entry VWAP slippage, so adding 1x sl5 accounts for estimated exit slippage without double-counting.
+            rt_m = opp.est_rt_maker_fee_bps if opp.est_rt_maker_fee_bps > 0 else round_trip_fee_bps
+            net_cost_m = max(0.0, rt_m + sl5 - eb5)
+            net_cost_t = max(0.0, opp.est_rt_taker_fee_bps + sl5 - eb5)
             hourly_bps = opp.spread_apr_pct / (HOURS_PER_YEAR * 100.0) * 1e4
             if hourly_bps > 1e-9:
                 be_h = round(net_cost_m / hourly_bps, 1)
