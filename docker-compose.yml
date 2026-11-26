@@ -1,0 +1,56 @@
+# Local full-stack Docker Compose for building and previewing on http://localhost:8080
+# Uses your local ./data directory (read-only for backend). Add `--profile worker` to run the scheduler locally.
+
+name: hyperliquid-quant-defi-local
+
+services:
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      target: backend
+      args:
+        BUILD_SHA: ${DEPLOY_SHA:-local}
+    environment:
+      HL_DATA_DIR: /app/data
+      HL_DATA_ROOT: /app/data/paper
+      HL_BUILD_SHA: ${DEPLOY_SHA:-local}
+    volumes:
+      - ./data:/app/data:ro
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+      target: frontend
+      args:
+        BUILD_SHA: ${DEPLOY_SHA:-local}
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:80"
+    restart: unless-stopped
+
+  worker:
+    profiles: ["worker"]
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+      target: worker
+      args:
+        BUILD_SHA: ${DEPLOY_SHA:-local}
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      HL_DATA_DIR: /app/data
+      HL_DATA_ROOT: /app/data/paper
+      HL_BUILD_SHA: ${DEPLOY_SHA:-local}
+      HL_ENABLE_TESTNET_EXECUTION: ${HL_ENABLE_TESTNET_EXECUTION:-false}
+    volumes:
+      - ./data:/app/data:rw
+    restart: unless-stopped

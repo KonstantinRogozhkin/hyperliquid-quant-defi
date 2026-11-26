@@ -1,0 +1,61 @@
+# Production Dokploy stack for Hyperliquid Quant DeFi (frontend + backend + worker).
+# TLS terminates at Dokploy Traefik, which routes the configured domain to `frontend` port 80.
+# All secrets live exclusively in Dokploy Environment (never committed to git).
+
+name: hyperliquid-quant-defi
+
+services:
+  backend:
+    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_NAMESPACE:-konstantinrogozhkin}/hl-backend:sha-${DEPLOY_SHA:?set DEPLOY_SHA}
+    environment:
+      HL_DATA_DIR: /app/data
+      HL_DATA_ROOT: /app/data/paper
+      HL_BUILD_SHA: ${DEPLOY_SHA}
+    volumes:
+      - hl-data:/app/data:ro
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 4
+      start_period: 10s
+    restart: unless-stopped
+
+  frontend:
+    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_NAMESPACE:-konstantinrogozhkin}/hl-frontend:sha-${DEPLOY_SHA:?set DEPLOY_SHA}
+    depends_on:
+      backend:
+        condition: service_healthy
+    expose:
+      - "80"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/nginx-health >/dev/null 2>&1 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+    restart: unless-stopped
+
+  worker:
+    image: ${IMAGE_REGISTRY:-ghcr.io}/${IMAGE_NAMESPACE:-konstantinrogozhkin}/hl-worker:sha-${DEPLOY_SHA:?set DEPLOY_SHA}
+    environment:
+      HL_DATA_DIR: /app/data
+      HL_DATA_ROOT: /app/data/paper
+      HL_BUILD_SHA: ${DEPLOY_SHA}
+      HL_WORKER_BOOTSTRAP_READONLY: ${HL_WORKER_BOOTSTRAP_READONLY:-true}
+      HL_TELEGRAM_ENABLED: ${HL_TELEGRAM_ENABLED:-true}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
+      # Least privilege: execution stays OFF unless explicitly enabled in Dokploy env.
+      HL_ENABLE_TESTNET_EXECUTION: ${HL_ENABLE_TESTNET_EXECUTION:-false}
+      HL_TESTNET_PRIVATE_KEY: ${HL_TESTNET_PRIVATE_KEY:-}
+      HL_TESTNET_ACCOUNT_ADDRESS: ${HL_TESTNET_ACCOUNT_ADDRESS:-}
+      HL_TESTNET_MAX_CHILD_USD: ${HL_TESTNET_MAX_CHILD_USD:-250}
+      HL_PAPER_MAX_COINS: ${HL_PAPER_MAX_COINS:-35}
+      HL_SNAPSHOT_COINS: ${HL_SNAPSHOT_COINS:-BTC,ETH,SOL,HYPE,DOGE,XRP,SUI,ENA,WIF,kPEPE,AVAX,LINK,TAO}
+    volumes:
+      - hl-data:/app/data:rw
+    restart: unless-stopped
+
+volumes:
+  hl-data:
