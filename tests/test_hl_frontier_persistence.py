@@ -10,7 +10,16 @@ from hl_quant import hl_hip3_builder_arb as hip3_mod
 from hl_quant import hl_hyperevm_yield_stack as ys_mod
 
 
-def _fake_snaps(ts_ms: int, nvda_apr: float, nvda_oracle_div: float):
+def _fake_snaps(
+    ts_ms: int,
+    nvda_apr: float,
+    nvda_oracle_div: float,
+    *,
+    short_symbol: str = "xyz:NVDA",
+    long_symbol: str = "io:NVDA",
+    short_dex: str = "xyz",
+    long_dex: str = "io",
+):
     hip3 = hip3_mod.Hip3ScannerSnapshot(
         observed_at_ms=ts_ms,
         ny_session="NY_REGULAR",
@@ -20,10 +29,10 @@ def _fake_snaps(ts_ms: int, nvda_apr: float, nvda_oracle_div: float):
         cross_builder_opps=[
             hip3_mod.Hip3CrossBuilderOpp(
                 base_symbol="NVDA",
-                short_symbol="xyz:NVDA",
-                long_symbol="io:NVDA",
-                short_dex="xyz",
-                long_dex="io",
+                short_symbol=short_symbol,
+                long_symbol=long_symbol,
+                short_dex=short_dex,
+                long_dex=long_dex,
                 short_apr_pct=nvda_apr + 5.0,
                 long_apr_pct=5.0,
                 spread_apr_pct=nvda_apr,
@@ -131,6 +140,7 @@ def test_frontier_persistence_appends_parquets_and_tracks_clean_streak(tmp_path:
     assert r2["total_logged"] == {"hip3_rows": 2, "boros_rows": 2, "yield_rows": 2}
     assert r2["hip3_persistence"][0]["raw_apr_streak"] == 2
     assert r2["hip3_persistence"][0]["clean_streak"] == 2
+    assert r2["hip3_persistence"][0]["direction_flips"] == 0
     assert (tmp_path / "hl_hip3_arb" / "snapshot.json").is_file()
     assert (tmp_path / "hl_boros" / "snapshot.json").is_file()
     assert (tmp_path / "hl_hyperevm_yield_stack" / "snapshot.json").is_file()
@@ -143,5 +153,115 @@ def test_frontier_persistence_appends_parquets_and_tracks_clean_streak(tmp_path:
     )
     assert r3["hip3_persistence"][0]["raw_apr_streak"] == 3
     assert r3["hip3_persistence"][0]["clean_streak"] == 0
+    assert r3["hip3_persistence"][0]["direction_flips"] == 0
     md = fp.format_frontier_persistence_markdown(r3)
-    assert "NVDA" in md and "⚡ GM" in md
+    assert "NVDA" in md and "⚡ GM" in md and "Перевор." in md
+
+
+def test_frontier_persistence_resets_clean_streak_on_direction_flip(tmp_path: Path):
+    t0 = 1_795_800_000_000
+    # Ticks 1 & 2: steady S xyz:NVDA / L io:NVDA -> clean_streak=2, direction_flips=0
+    h1, b1, y1 = _fake_snaps(t0, nvda_apr=45.0, nvda_oracle_div=8.0)
+    fp.run_frontier_persistence_tick(data_root=tmp_path, now_ms=t0, hip3_snap=h1, boros_snap=b1, yield_snap=y1)
+
+    h2, b2, y2 = _fake_snaps(t0 + 4 * 3600_000, nvda_apr=50.0, nvda_oracle_div=9.0)
+    r2 = fp.run_frontier_persistence_tick(
+        data_root=tmp_path, now_ms=t0 + 4 * 3600_000, hip3_snap=h2, boros_snap=b2, yield_snap=y2
+    )
+    assert r2["hip3_persistence"][0]["clean_streak"] == 2
+    assert r2["hip3_persistence"][0]["direction_flips"] == 0
+
+    # Tick 3: direction flips to S io:NVDA / L xyz:NVDA despite high APR & low oracle div
+    h3, b3, y3 = _fake_snaps(
+        t0 + 8 * 3600_000,
+        nvda_apr=60.0,
+        nvda_oracle_div=7.0,
+        short_symbol="io:NVDA",
+        long_symbol="xyz:NVDA",
+        short_dex="io",
+        long_dex="xyz",
+    )
+    r3 = fp.run_frontier_persistence_tick(
+        data_root=tmp_path, now_ms=t0 + 8 * 3600_000, hip3_snap=h3, boros_snap=b3, yield_snap=y3
+    )
+    row3 = r3["hip3_persistence"][0]
+    assert row3["raw_apr_streak"] == 3
+    assert row3["clean_streak"] == 1
+    assert row3["direction_flips"] == 1
+    assert row3["short_symbol"] == "io:NVDA"
+    assert row3["long_symbol"] == "xyz:NVDA"
+
+    # Tick 4: flips back to S xyz:NVDA / L io:NVDA -> clean_streak remains 1, flips=2
+    h4, b4, y4 = _fake_snaps(t0 + 12 * 3600_000, nvda_apr=42.0, nvda_oracle_div=6.0)
+    r4 = fp.run_frontier_persistence_tick(
+        data_root=tmp_path, now_ms=t0 + 12 * 3600_000, hip3_snap=h4, boros_snap=b4, yield_snap=y4
+    )
+    row4 = r4["hip3_persistence"][0]
+    assert row4["raw_apr_streak"] == 4
+    assert row4["clean_streak"] == 1
+    assert row4["direction_flips"] == 2
+
+
+def test_hip3_persistence_sorting_prefers_steady_over_flipped():
+    df = pd.DataFrame(
+        [
+            # AAPL: steady direction across 2 ticks, lower APR (30%)
+            {
+                "ts_ms": 1,
+                "base_symbol": "AAPL",
+                "short_symbol": "xyz:AAPL",
+                "long_symbol": "io:AAPL",
+                "spread_apr_pct": 30.0,
+                "oracle_divergence_bps": 4.0,
+                "both_growth_mode": True,
+                "any_only_isolated": False,
+            },
+            {
+                "ts_ms": 2,
+                "base_symbol": "AAPL",
+                "short_symbol": "xyz:AAPL",
+                "long_symbol": "io:AAPL",
+                "spread_apr_pct": 30.0,
+                "oracle_divergence_bps": 4.0,
+                "both_growth_mode": True,
+                "any_only_isolated": False,
+            },
+            # NVDA: flipped direction, higher APR (60%) -> clean_streak=1, flips=1
+            {
+                "ts_ms": 1,
+                "base_symbol": "NVDA",
+                "short_symbol": "xyz:NVDA",
+                "long_symbol": "io:NVDA",
+                "spread_apr_pct": 60.0,
+                "oracle_divergence_bps": 5.0,
+                "both_growth_mode": True,
+                "any_only_isolated": False,
+            },
+            {
+                "ts_ms": 2,
+                "base_symbol": "NVDA",
+                "short_symbol": "io:NVDA",
+                "long_symbol": "xyz:NVDA",
+                "spread_apr_pct": 60.0,
+                "oracle_divergence_bps": 5.0,
+                "both_growth_mode": True,
+                "any_only_isolated": False,
+            },
+            # MSFT: single clean tick (clean_streak=1, flips=0, lower APR 25%) -> beats flipped NVDA on flips tie-breaker
+            {
+                "ts_ms": 2,
+                "base_symbol": "MSFT",
+                "short_symbol": "xyz:MSFT",
+                "long_symbol": "io:MSFT",
+                "spread_apr_pct": 25.0,
+                "oracle_divergence_bps": 5.0,
+                "both_growth_mode": True,
+                "any_only_isolated": False,
+            },
+        ]
+    )
+    summary = fp.compute_hip3_persistence_summary(df)
+    assert [r["base_symbol"] for r in summary] == ["AAPL", "MSFT", "NVDA"]
+    assert summary[0]["clean_streak"] == 2 and summary[0]["direction_flips"] == 0
+    assert summary[1]["clean_streak"] == 1 and summary[1]["direction_flips"] == 0
+    assert summary[2]["clean_streak"] == 1 and summary[2]["direction_flips"] == 1

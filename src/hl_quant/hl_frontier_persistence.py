@@ -59,18 +59,21 @@ def compute_hip3_persistence_summary(
     min_apr_pct: float = 20.0,
     max_oracle_div_bps: float = 25.0,
 ) -> list[dict[str, Any]]:
-    """Summarize multi-tick persistence of HIP-3 cross-builder spreads (clean vs oracle-divergent)."""
+    """Summarize multi-tick persistence of HIP-3 cross-builder spreads (clean, same-direction vs oracle-divergent)."""
     if hip3_df.empty or "base_symbol" not in hip3_df.columns:
         return []
     out: list[dict[str, Any]] = []
-    for sym, grp in hip3_df.sort_values("ts_ms").groupby("base_symbol", sort=False):
+    for sym, grp in hip3_df.sort_values("ts_ms", kind="stable").groupby("base_symbol", sort=False):
         aprs = grp["spread_apr_pct"].astype(float).tolist()
         odivs = grp["oracle_divergence_bps"].astype(float).tolist()
+        dirs = list(zip(grp["short_symbol"].astype(str), grp["long_symbol"].astype(str), strict=False))
+        latest_dir = dirs[-1]
+        direction_flips = sum(1 for i in range(1, len(dirs)) if dirs[i] != dirs[i - 1])
         qual = [
-            (a >= min_apr_pct and d <= max_oracle_div_bps)
-            for a, d in zip(aprs, odivs, strict=False)
+            (a >= min_apr_pct and d <= max_oracle_div_bps and cur_dir == latest_dir)
+            for a, d, cur_dir in zip(aprs, odivs, dirs, strict=False)
         ]
-        # Trailing consecutive ticks meeting APR >= min_apr_pct (raw) and clean (oracle div <= cap)
+        # Trailing consecutive ticks meeting APR >= min_apr_pct (raw) and clean (oracle div <= cap + unchanged legs)
         raw_streak = 0
         for a in reversed(aprs):
             if a >= min_apr_pct:
@@ -92,6 +95,7 @@ def compute_hip3_persistence_summary(
                 "ticks_seen": int(len(grp)),
                 "raw_apr_streak": raw_streak,
                 "clean_streak": clean_streak,
+                "direction_flips": direction_flips,
                 "latest_apr_pct": round(float(last["spread_apr_pct"]), 2),
                 "median_apr_pct": round(float(grp["spread_apr_pct"].median()), 2),
                 "median_oracle_div_bps": round(float(grp["oracle_divergence_bps"].median()), 2),
@@ -99,7 +103,7 @@ def compute_hip3_persistence_summary(
                 "any_only_isolated": bool(last["any_only_isolated"]),
             }
         )
-    out.sort(key=lambda r: (-r["clean_streak"], -r["raw_apr_streak"], -r["median_apr_pct"]))
+    out.sort(key=lambda r: (-r["clean_streak"], r["direction_flips"], -r["raw_apr_streak"], -r["median_apr_pct"]))
     return out
 
 
@@ -214,16 +218,17 @@ def format_frontier_persistence_markdown(summary: dict[str, Any]) -> str:
         f"- **Сессия NY:** `{summary['ny_session']}` · **HLP Benchmark:** `{summary['hlp_apr_pct']:+.2f}% APR`",
         f"- **Накоплено записей:** HIP-3 `{summary['total_logged']['hip3_rows']}`, Boros `{summary['total_logged']['boros_rows']}`, Yield Stack `{summary['total_logged']['yield_rows']}`",
         "",
-        "## Персистентность кросс-билдер спредов HIP-3 (порог ≥ 20% APR, чистый Oracle Div ≤ 25 б.п.)",
+        "## Персистентность кросс-билдер спредов HIP-3 (порог ≥ 20% APR, Oracle Div ≤ 25 б.п., одно направление ног)",
         "",
-        "| Тикер | Ноги | Тиков | Серия ≥20% | Чистая серия | Текущий APR | Медиана APR | Мед. Oracle Div | Growth |",
-        "|---|---|---:|---:|---:|---:|---:|---:|---|",
+        "| Тикер | Ноги | Тиков | Серия ≥20% | Чистая серия | Перевор. | Текущий APR | Медиана APR | Мед. Oracle Div | Growth |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---|",
     ]
     for r in summary.get("hip3_persistence") or []:
         gm = "⚡ GM" if r["both_growth_mode"] else "Std"
+        flips = int(r.get("direction_flips", 0))
         lines.append(
             f"| **{r['base_symbol']}** | `S {r['short_symbol']} / L {r['long_symbol']}` | {r['ticks_seen']} | "
-            f"{r['raw_apr_streak']} | **{r['clean_streak']}** | {r['latest_apr_pct']:+.1f}% | "
+            f"{r['raw_apr_streak']} | **{r['clean_streak']}** | {flips} | {r['latest_apr_pct']:+.1f}% | "
             f"{r['median_apr_pct']:+.1f}% | {r['median_oracle_div_bps']:.1f} б.п. | {gm} |"
         )
     return "\n".join(lines) + "\n"
