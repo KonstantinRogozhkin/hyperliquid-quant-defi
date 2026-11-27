@@ -165,7 +165,7 @@ def _markout_at_horizon_bps(
 
 
 def count_audit_actions(audit_log_path: Path | None, *, min_ts_ms: int | None = None) -> int:
-    """Count API actions recorded by the executor: every placement attempt + every cancel."""
+    """Count API actions recorded by the executor: every placement attempt + every cancel (skipping dry-run)."""
     if audit_log_path is None or not audit_log_path.is_file():
         return 0
     n = 0
@@ -177,11 +177,16 @@ def count_audit_actions(audit_log_path: Path | None, *, min_ts_ms: int | None = 
             rec = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(rec, dict) or rec.get("mode") == "dry_run":
+            continue
         if min_ts_ms is not None:
             rec_ts = int(rec.get("ts_ms") or 0)
             if 0 < rec_ts < min_ts_ms:
                 continue
-        n += len(rec.get("orders") or []) + int(rec.get("cancelled_count") or 0)
+        live_orders = [
+            o for o in (rec.get("orders") or []) if isinstance(o, dict) and o.get("mode") != "dry_run"
+        ]
+        n += len(live_orders) + int(rec.get("cancelled_count") or 0)
     return n
 
 
@@ -194,6 +199,8 @@ def _f(v: object, default: float = 0.0) -> float:
 
 
 USER_FUNDING_PAGE_CAP = 500
+USER_LEDGER_PAGE_CAP = 500
+USER_FILLS_PAGE_CAP = 2_000
 
 
 def _post_info_with_retry(
@@ -272,6 +279,131 @@ def fetch_all_user_funding(
     return all_rows
 
 
+def fetch_all_user_ledger_updates(
+    client: httpx.Client,
+    account_address: str,
+    *,
+    info_url: str = TESTNET_INFO_URL,
+    start_time_ms: int = 0,
+    page_cap: int = USER_LEDGER_PAGE_CAP,
+    max_pages: int = 50,
+) -> list[dict[str, Any]]:
+    """Paginate ``userNonFundingLedgerUpdates`` forward by ``startTime`` so deposits/transfers never truncate."""
+    all_rows: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    cursor_ms = int(start_time_ms)
+    for _ in range(max_pages):
+        resp = _post_info_with_retry(
+            client,
+            info_url,
+            {"type": "userNonFundingLedgerUpdates", "user": account_address, "startTime": cursor_ms},
+        )
+        page = resp.json()
+        if not isinstance(page, list) or not page:
+            break
+        max_time = cursor_ms
+        for item in page:
+            if not isinstance(item, dict):
+                continue
+            t = int(_f(item.get("time")))
+            delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+            dedup_key = (
+                t,
+                str(item.get("hash") or ""),
+                str(delta.get("type") or ""),
+                str(delta.get("usdc") or delta.get("amount") or ""),
+            )
+            if dedup_key not in seen_keys:
+                seen_keys.add(dedup_key)
+                all_rows.append(item)
+            if t > max_time:
+                max_time = t
+        if len(page) < page_cap or max_time <= cursor_ms:
+            break
+        cursor_ms = max_time + 1
+    return all_rows
+
+
+def _fill_row_key(fl: dict[str, Any]) -> tuple[Any, ...]:
+    tid = fl.get("tid")
+    if tid not in (None, ""):
+        return ("tid", str(tid))
+    return (
+        "fill",
+        int(_f(fl.get("time"))),
+        str(fl.get("coin") or ""),
+        str(fl.get("oid") or ""),
+        str(fl.get("side") or ""),
+        str(fl.get("sz") or ""),
+        str(fl.get("px") or ""),
+        str(fl.get("hash") or ""),
+    )
+
+
+def fetch_all_user_fills(
+    client: httpx.Client,
+    account_address: str,
+    *,
+    info_url: str = TESTNET_INFO_URL,
+    start_time_ms: int = 0,
+    page_cap: int = USER_FILLS_PAGE_CAP,
+    max_pages: int = 50,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Fetch ``userFills`` and paginate ``userFillsByTime`` when ``>= page_cap`` fills exist."""
+    raw = _post_info_with_retry(client, info_url, {"type": "userFills", "user": account_address}).json()
+    initial = [r for r in raw if isinstance(r, dict)] if isinstance(raw, list) else []
+    if len(initial) < page_cap:
+        return initial, True
+
+    try:
+        all_rows: list[dict[str, Any]] = []
+        seen_keys: set[tuple[Any, ...]] = set()
+        cursor_ms = int(start_time_ms)
+        completed_all_pages = False
+        for _ in range(max_pages):
+            resp = _post_info_with_retry(
+                client,
+                info_url,
+                {"type": "userFillsByTime", "user": account_address, "startTime": cursor_ms},
+            )
+            page = resp.json()
+            if not isinstance(page, list) or not page:
+                if all_rows:
+                    completed_all_pages = True
+                break
+            max_time = cursor_ms
+            for item in page:
+                if not isinstance(item, dict):
+                    continue
+                t = int(_f(item.get("time")))
+                key = _fill_row_key(item)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_rows.append(item)
+                if t > max_time:
+                    max_time = t
+            if len(page) < page_cap:
+                completed_all_pages = True
+                break
+            if max_time <= cursor_ms:
+                break
+            cursor_ms = max_time + 1
+        if not all_rows:
+            return initial, False
+        for item in initial:
+            t = int(_f(item.get("time")))
+            if t < start_time_ms:
+                continue
+            key = _fill_row_key(item)
+            if key not in seen_keys:
+                seen_keys.add(key)
+                all_rows.append(item)
+        all_rows.sort(key=lambda r: int(_f(r.get("time"))))
+        return all_rows, (completed_all_pages and start_time_ms == 0)
+    except Exception:
+        return initial, False
+
+
 def fetch_post_trade_snapshot(
     client: httpx.Client,
     account_address: str,
@@ -280,7 +412,9 @@ def fetch_post_trade_snapshot(
     start_time_ms: int = 0,
 ) -> dict[str, Any]:
     """Fetch all read-only post-trade endpoints from Hyperliquid for ``account_address``."""
-    fills = _post_info_with_retry(client, info_url, {"type": "userFills", "user": account_address}).json()
+    fills_list, fills_complete = fetch_all_user_fills(
+        client, account_address, info_url=info_url, start_time_ms=start_time_ms
+    )
     funding = fetch_all_user_funding(client, account_address, info_url=info_url, start_time_ms=start_time_ms)
     ch = _post_info_with_retry(client, info_url, {"type": "clearinghouseState", "user": account_address}).json()
     spot = _post_info_with_retry(client, info_url, {"type": "spotClearinghouseState", "user": account_address}).json()
@@ -288,15 +422,27 @@ def fetch_post_trade_snapshot(
     mids_raw = _post_info_with_retry(client, info_url, {"type": "allMids"}).json()
     mids = {str(k): _f(v) for k, v in (mids_raw or {}).items()} if isinstance(mids_raw, dict) else {}
 
+    mark_prices: dict[str, float] = {}
+    try:
+        mc_raw = _post_info_with_retry(client, info_url, {"type": "metaAndAssetCtxs"}).json()
+        if isinstance(mc_raw, list) and len(mc_raw) == 2 and isinstance(mc_raw[0], dict) and isinstance(mc_raw[1], list):
+            for u, ctx in zip(mc_raw[0].get("universe") or [], mc_raw[1], strict=False):
+                if isinstance(u, dict) and isinstance(ctx, dict):
+                    cname = str(u.get("name") or "").strip()
+                    mpx = _f(ctx.get("markPx"))
+                    if cname and mpx > 0:
+                        mark_prices[cname] = mpx
+    except Exception:
+        mark_prices = {}
+
     user_abstraction = ""
     try:
-        ua_r = client.post(info_url, json={"type": "userAbstraction", "user": account_address})
-        if ua_r.status_code == 200 and isinstance(ua_r.json(), str):
+        ua_r = _post_info_with_retry(client, info_url, {"type": "userAbstraction", "user": account_address})
+        if isinstance(ua_r.json(), str):
             user_abstraction = str(ua_r.json())
     except Exception:
         user_abstraction = ""
 
-    fills_list = fills if isinstance(fills, list) else []
     try:
         markout_series = fetch_markout_series(client, fills_list, info_url=info_url)
     except Exception:
@@ -304,12 +450,9 @@ def fetch_post_trade_snapshot(
 
     ledger_updates: list[dict[str, Any]] = []
     try:
-        lu_r = client.post(
-            info_url,
-            json={"type": "userNonFundingLedgerUpdates", "user": account_address, "startTime": int(start_time_ms)},
+        ledger_updates = fetch_all_user_ledger_updates(
+            client, account_address, info_url=info_url, start_time_ms=int(start_time_ms)
         )
-        if lu_r.status_code == 200 and isinstance(lu_r.json(), list):
-            ledger_updates = lu_r.json()
     except Exception:
         ledger_updates = []
 
@@ -319,12 +462,14 @@ def fetch_post_trade_snapshot(
         "markout_series": markout_series,
         "user_abstraction": user_abstraction,
         "ledger_updates": ledger_updates,
-        "fills": fills if isinstance(fills, list) else [],
+        "fills": fills_list,
+        "fills_complete": fills_complete,
         "funding": funding if isinstance(funding, list) else [],
         "clearinghouse": ch if isinstance(ch, dict) else {},
         "spot": spot if isinstance(spot, dict) else {},
         "open_orders": open_orders if isinstance(open_orders, list) else [],
         "all_mids": mids,
+        "mark_prices": mark_prices,
     }
 
 
@@ -346,11 +491,15 @@ def extract_audit_oids(audit_log_path: Path | None, *, min_ts_ms: int | None = N
             rec = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(rec, dict) or rec.get("mode") == "dry_run":
+            continue
         if min_ts_ms is not None:
             rec_ts = int(rec.get("ts_ms") or 0)
             if rec_ts > 0 and rec_ts < min_ts_ms:
                 continue
         for ord_rec in rec.get("orders") or []:
+            if not isinstance(ord_rec, dict) or ord_rec.get("mode") == "dry_run":
+                continue
             resp = ord_rec.get("response") or {}
             statuses, err_msg = extract_hl_order_statuses(resp)
             if err_msg is not None:
@@ -441,15 +590,19 @@ def load_paper_comparison(
     paper_ret_pct = (paper_eq / start_cap - 1.0) * 100.0 if start_cap > 0 else 0.0
     if deposited_capital_usd is not None and deposited_capital_usd > 0.0:
         testnet_start = float(deposited_capital_usd)
+        attributed_ret_pct = (testnet_net_pnl_usd / testnet_start) * 100.0
+        testnet_ret_pct = (testnet_equity_usd - testnet_start) / testnet_start * 100.0
     else:
         testnet_start = max(1.0, testnet_equity_usd - testnet_net_pnl_usd)
-    testnet_ret_pct = (testnet_net_pnl_usd / testnet_start) * 100.0
+        attributed_ret_pct = (testnet_net_pnl_usd / testnet_start) * 100.0
+        testnet_ret_pct = attributed_ret_pct
     return {
         "paper_ticks": int(len(ticks)),
         "paper_equity_usd": round(paper_eq, 2),
         "paper_return_pct": round(paper_ret_pct, 4),
         "testnet_deposited_usd": round(testnet_start, 2),
         "testnet_return_pct": round(testnet_ret_pct, 4),
+        "attributed_return_pct": round(attributed_ret_pct, 4),
         "tracking_diff_pct": round(testnet_ret_pct - paper_ret_pct, 4),
     }
 
@@ -470,6 +623,9 @@ def compute_post_trade_attribution(
     spot: dict[str, Any] = snapshot.get("spot") or {}
     open_orders: list[dict[str, Any]] = snapshot.get("open_orders") or []
     mids: dict[str, float] = snapshot.get("all_mids") or {}
+    mark_prices: dict[str, float] = {
+        str(k): _f(v) for k, v in (snapshot.get("mark_prices") or {}).items() if _f(v) > 0
+    }
     markout_series: dict[str, list[tuple[int, float]]] = {
         str(k): [(int(t), float(c)) for t, c in v] for k, v in (snapshot.get("markout_series") or {}).items()
     }
@@ -501,8 +657,10 @@ def compute_post_trade_attribution(
         # Verified against HL ``portfolio`` API: Unified Account ``spot.USDC.total``
         # already reflects locked perp margin and live unrealized PnL.
         total_eq = spot_usdc
+        eff_withdrawable = max(0.0, spot_usdc - spot_hold)
     else:
         total_eq = perps_eq + spot_usdc
+        eff_withdrawable = withdrawable
 
     # Aggregate fills by coin
     fill_stats: dict[str, dict[str, float]] = {}
@@ -588,7 +746,7 @@ def compute_post_trade_attribution(
 
     # Audit ALO order fill rate against local executor audit trail (window-aligned when userFills hits 2000 cap)
     audit_min_ts_ms: int | None = None
-    if len(fills) >= 1900:
+    if len(fills) >= 1900 and not snapshot.get("fills_complete"):
         fill_times = [int(fl["time"]) for fl in fills if fl.get("time") is not None]
         if fill_times:
             audit_min_ts_ms = min(fill_times)
@@ -621,30 +779,34 @@ def compute_post_trade_attribution(
         liq_raw = p.get("liquidationPx")
         liq_px = _f(liq_raw) if liq_raw is not None and _f(liq_raw) > 0 else None
         cur_mid = mids.get(coin, entry_px)
+        mark_px = mark_prices.get(coin) or mids.get(coin) or entry_px
 
         liq_dist: float | None = None
-        if liq_px is not None and cur_mid > 0 and abs(szi) > 1e-12:
-            liq_dist = abs(cur_mid - liq_px) / cur_mid * 100.0
+        if liq_px is not None and mark_px > 0 and abs(szi) > 1e-12:
+            if szi > 0:
+                liq_dist = max(0.0, (mark_px - liq_px) / mark_px * 100.0)
+            else:
+                liq_dist = max(0.0, (liq_px - mark_px) / mark_px * 100.0)
             liq_dists.append(liq_dist)
             if liq_dist < liq_warn_threshold_pct:
-                liq_warnings.append(f"{coin} ({lev_mode}): до ликв. {liq_dist:.1f}% (mid {cur_mid:g}, liq {liq_px:g})")
+                liq_warnings.append(f"{coin} ({lev_mode}): до ликв. {liq_dist:.1f}% (mark {mark_px:g}, liq {liq_px:g})")
 
         # Hyperliquid ADL Queue Priority Monitor:
         # ADL Rank ≈ (Mark/Entry for long, Entry/Mark for short) × (Notional / Denominator)
         # Strictly profitable positions (unreal > 0) can be auto-deleveraged.
         # Denominator scope: isolated positions use their isolated `marginUsed` (not whole account!);
-        # cross positions use the DEX's accountValue (`total_eq`).
+        # cross positions use Perps collateral (`total_eq` on Unified Account, `perps_eq` on Standard Account).
         adl_rank: float | None = None
-        if abs(szi) > 1e-12 and unreal > 0.0 and entry_px > 0.0 and cur_mid > 0.0:
+        if abs(szi) > 1e-12 and unreal > 0.0 and entry_px > 0.0 and mark_px > 0.0:
             lev_type = str(lev_info.get("type") or "cross").lower()
             lev_val = max(1.0, _f(lev_info.get("value"), 1.0))
             if lev_type == "isolated":
                 iso_margin = _f(p.get("marginUsed"))
                 denom = iso_margin if iso_margin > 0.0 else (pos_usd / lev_val)
             else:
-                denom = total_eq
+                denom = total_eq if (is_unified and spot_usdc > 0) else perps_eq
             if denom > 0.0:
-                pnl_ratio = (cur_mid / entry_px) if szi > 0 else (entry_px / cur_mid)
+                pnl_ratio = (mark_px / entry_px) if szi > 0 else (entry_px / mark_px)
                 eff_lev = pos_usd / denom
                 adl_rank = round(max(1.0, pnl_ratio) * eff_lev, 3)
                 upnl_pct = unreal / max(pos_usd, 1.0) * 100.0
@@ -658,7 +820,7 @@ def compute_post_trade_attribution(
 
         fs = fill_stats.get(coin, {})
         c_vol = float(fs.get("vol", 0.0))
-        c_maker_pct = (float(fs.get("maker_vol", 0.0)) / c_vol * 100.0) if c_vol > 0 else 100.0
+        c_maker_pct = (float(fs.get("maker_vol", 0.0)) / c_vol * 100.0) if c_vol > 0 else 0.0
         c_real = float(fs.get("realized", 0.0))
         c_fees = -float(fs.get("fees", 0.0))
         c_fund = float(fund_by_coin.get(coin, 0.0))
@@ -778,7 +940,7 @@ def compute_post_trade_attribution(
         audit_actions_count=audit_actions,
         audit_fill_volume_usd=round(audit_vol, 2),
         mixed_account_warning=mixed_warning,
-        withdrawable_usd=round(withdrawable, 4),
+        withdrawable_usd=round(eff_withdrawable, 4),
         deposited_capital_usd=round(eff_dep_cap, 4),
         account_return_pct=round(acct_ret_pct, 4),
     )

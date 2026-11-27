@@ -40,6 +40,13 @@ def _load_dotenv(path: Path) -> None:
             os.environ[k] = v.strip().strip('"').strip("'")
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".tmp{path.suffix}")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
 @app.command()
 def main(
     account_address: str | None = typer.Option(None, help="Default: $HL_TESTNET_ACCOUNT_ADDRESS"),
@@ -61,8 +68,8 @@ def main(
 
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "report.md").write_text(md)
-        (output_dir / "attribution.json").write_text(json.dumps(attr.to_dict(), indent=2))
+        _atomic_write_text(output_dir / "report.md", md)
+        _atomic_write_text(output_dir / "attribution.json", json.dumps(attr.to_dict(), indent=2))
         if snap["fills"]:
             pd.DataFrame(snap["fills"]).to_parquet(output_dir / "fills.parquet", index=False)
 

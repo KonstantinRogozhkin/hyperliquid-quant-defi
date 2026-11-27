@@ -27,6 +27,13 @@ from hl_quant import hl_testnet_executor as ex  # noqa: E402
 app = typer.Typer(add_completion=False, help=__doc__)
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".tmp{path.suffix}")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
 @app.command()
 def main(
     coins: str = typer.Option("ETH,BTC", help="Comma-separated coins to record & calibrate"),
@@ -110,11 +117,10 @@ def main(
 
     md = "\n".join(md_lines + sweep_blocks) + "\n"
     capture_dir.mkdir(parents=True, exist_ok=True)
-    (capture_dir / "calibration.json").write_text(json.dumps(calibrations, indent=2))
-    (capture_dir / "calibration_report.md").write_text(md)
+    _atomic_write_text(capture_dir / "calibration.json", json.dumps(calibrations, indent=2))
+    _atomic_write_text(capture_dir / "calibration_report.md", md)
     if report_path is not None:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(md)
+        _atomic_write_text(report_path, md)
     typer.echo(md)
 
 

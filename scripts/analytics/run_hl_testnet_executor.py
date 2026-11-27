@@ -10,6 +10,7 @@ sliced post-only ``ALO`` child orders.
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -74,7 +75,9 @@ def main(
     default_cross_leverage: int = typer.Option(3, help="Default cross-margin leverage applied before new entries"),
     neutralize_net: bool = typer.Option(True, help="Re-center HL weights to dollar-neutral for single-venue Testnet"),
     telegram: bool = typer.Option(False, help="Send Rich HTML summary to Telegram"),
-    audit_log: Path = typer.Option(ROOT / "data/paper/hl_testnet_audit.jsonl", help="Append-only execution audit log"),
+    audit_log: Path | None = typer.Option(
+        None, help="Append-only execution audit log (default: data/paper/hl_testnet_audit.jsonl in live mode)"
+    ),
     hwm_state: Path = typer.Option(
         ROOT / "data/paper/hl_testnet_hwm.json", help="Persisted equity high-water mark for the drawdown kill-switch"
     ),
@@ -124,17 +127,45 @@ def main(
             if ex.safe_int(o.get("oid")) in mm_order_oids
         }
         foreign_coin_set.discard("")
+        if foreign_coin_set:
+            valid_targets = {c: w for c, w in valid_targets.items() if c not in foreign_coin_set}
         coins_to_quote = sorted(set(valid_targets.keys()) | set(account.positions_sz.keys()))
         book_tops = ex.fetch_testnet_book_tops(client, coins_to_quote)
         bbo = ex.two_sided_bbo(book_tops)
         try:
-            # Oracle prices let the executor close positions whose Testnet book is one-sided/empty.
-            reference_px = {c: ctx.oracle_px for c, ctx in risk.fetch_testnet_asset_ctxs(client).items()}
+            # Oracle prices let the executor close positions whose Testnet book is one-sided/empty
+            # and cap HWM ratcheting against thin-book mark spikes.
+            asset_ctxs = risk.fetch_testnet_asset_ctxs(client)
+            reference_px = {c: ctx.oracle_px for c, ctx in asset_ctxs.items()}
         except (httpx.HTTPError, ValueError):
+            asset_ctxs = {}
             reference_px = {}
         skipped_unquoted: list[str] = []
-        # Strategy intent for coins that may lack a book: orphan unwinds keep holdings within it.
-        intended_targets = dict(valid_targets)
+        mm_gross_w = (
+            sum(
+                abs(float(account.position_notional_usd.get(c, 0.0) or 0.0)) / account.equity_usd
+                for c in foreign_coin_set
+                if abs(float(account.positions_sz.get(c, 0.0) or 0.0)) > 1e-12
+            )
+            if account.equity_usd > 0
+            else 0.0
+        )
+        base_max_gross = max(0.0, min(0.90, limits.max_gross_leverage) - mm_gross_w)
+        # Neutralize/cap strategy intent across all valid coins first so orphan_target_weights is
+        # dollar-centered and respects single-coin caps instead of raw un-centered hl_weights.
+        if targets is None and neutralize_net:
+            intended_targets = ex.neutralize_target_weights(
+                valid_targets,
+                max_gross=base_max_gross,
+                max_single_coin_weight=limits.max_single_coin_weight,
+            )
+        else:
+            intended_targets = {
+                c: math.copysign(min(abs(w), limits.max_single_coin_weight), w)
+                if limits.max_single_coin_weight > 0
+                else w
+                for c, w in valid_targets.items()
+            }
         if targets is None:
             valid_targets, skipped_unquoted = ex.filter_unquoted_targets(
                 valid_targets,
@@ -152,6 +183,7 @@ def main(
                         bbo,
                         book_tops,
                         reference_px,
+                        limits=limits,
                         exclude_coins=foreign_coin_set,
                         target_weights=intended_targets,
                     )
@@ -186,10 +218,13 @@ def main(
         adapter = ex.HyperliquidTestnetSDKAdapter(priv_key, account_addr)
     else:
         adapter = ex.DryRunAdapter()
-    # The drawdown gate needs the peak equity of the real account across runs; the
-    # simulated dry-run account has constant equity and keeps no high-water mark.
+    # Cap HWM ratcheting at oracle-adjusted equity so thin-book mark spikes cannot inflate HWM,
+    # and never mutate persisted HWM or production audit log during dry-run executions.
     stored_hwm = ex.load_high_water_mark(hwm_state) if account_addr else 0.0
-    hwm = max(stored_hwm, account.equity_usd)
+    oracle_eq = risk.oracle_adjusted_equity_usd(account, asset_ctxs) if asset_ctxs else account.equity_usd
+    ratchet_eq = oracle_eq if (math.isfinite(oracle_eq) and oracle_eq > 0.0) else 0.0
+    hwm = max(stored_hwm, ratchet_eq)
+    eff_audit_log = audit_log if audit_log is not None else ((ROOT / "data/paper/hl_testnet_audit.jsonl") if execute_testnet else None)
     result = ex.execute_rebalance_cycle(
         account,
         valid_targets,
@@ -198,7 +233,7 @@ def main(
         adapter,
         limits=limits,
         high_water_mark_usd=hwm,
-        audit_log_path=audit_log,
+        audit_log_path=eff_audit_log,
         funding_apr_by_coin=funding_apr_by_coin,
         skipped_unquoted_coins=skipped_unquoted,
         book_tops=book_tops,
@@ -207,7 +242,7 @@ def main(
         foreign_coins=foreign_coin_set,
         orphan_target_weights=intended_targets,
     )
-    if account_addr:
+    if execute_testnet and account_addr and math.isfinite(account.equity_usd) and account.equity_usd > 0.0 and hwm > 0.0:
         ex.save_high_water_mark(hwm_state, hwm)
     tg_resp = None
     if telegram:
@@ -226,7 +261,7 @@ def main(
                 "valid_target_coins": len(valid_targets),
                 "filtered_isolated_coins": filtered_isolated,
                 "quoted_coins": len(bbo),
-                **{k: v for k, v in result.items() if k != "orders"},
+                **{k: v for k, v in result.items() if k not in {"orders", "mode"}},
                 "telegram": tg_resp,
                 "sample_orders": result["orders"][:5],
             },

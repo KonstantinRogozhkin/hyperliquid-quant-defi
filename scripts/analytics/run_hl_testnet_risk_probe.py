@@ -10,6 +10,7 @@ and atomically writes ``hl_testnet_risk/latest.json`` for ``/api/v1/overview`` a
 from __future__ import annotations
 
 import json
+import math
 import os
 from pathlib import Path
 import sys
@@ -56,9 +57,16 @@ def main(
         asset_ctxs = risk.fetch_testnet_asset_ctxs(client)
         book_sides = risk.fetch_book_sides(client, list(account.positions_sz))
 
+    stored_hwm = ex.load_high_water_mark(hwm_state)
+    if stored_hwm <= 0.0 and not hwm_state.is_file():
+        oracle_eq = risk.oracle_adjusted_equity_usd(account, asset_ctxs)
+        if math.isfinite(oracle_eq) and oracle_eq > 0.0:
+            ex.save_high_water_mark(hwm_state, oracle_eq)
+            stored_hwm = oracle_eq
+
     snapshot = risk.build_risk_snapshot(
         account,
-        high_water_mark_usd=ex.load_high_water_mark(hwm_state),
+        high_water_mark_usd=stored_hwm,
         asset_ctxs=asset_ctxs,
         book_sides=book_sides,
     )

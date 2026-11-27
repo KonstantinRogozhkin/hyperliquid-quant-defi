@@ -65,18 +65,16 @@ def parse_asset_ctxs(payload: Any) -> dict[str, AssetCtx]:
 
 
 def fetch_testnet_asset_ctxs(client: httpx.Client) -> dict[str, AssetCtx]:
-    resp = client.post(ex.TESTNET_INFO_URL, json={"type": "metaAndAssetCtxs"})
-    resp.raise_for_status()
+    resp = ex._post_testnet_info(client, {"type": "metaAndAssetCtxs"})
     return parse_asset_ctxs(resp.json())
 
 
 def fetch_book_sides(client: httpx.Client, coins: list[str]) -> dict[str, str]:
-    """Return ``{coin: "two_sided" | "bid_only" | "ask_only" | "empty"}`` from Testnet ``l2Book``."""
+    """Return ``{coin: "two_sided" | "bid_only" | "ask_only" | "empty" | "unknown"}`` from Testnet ``l2Book``."""
     out: dict[str, str] = {}
     for coin in sorted(set(coins)):
         try:
-            resp = client.post(ex.TESTNET_INFO_URL, json={"type": "l2Book", "coin": coin})
-            resp.raise_for_status()
+            resp = ex._post_testnet_info(client, {"type": "l2Book", "coin": coin})
             levels = (resp.json() or {}).get("levels")
         except (httpx.HTTPError, ValueError, AttributeError):
             out[coin] = "unknown"
@@ -89,6 +87,27 @@ def fetch_book_sides(client: httpx.Client, coins: list[str]) -> dict[str, str]:
             "two_sided" if has_bid and has_ask else "bid_only" if has_bid else "ask_only" if has_ask else "empty"
         )
     return out
+
+
+def oracle_adjusted_equity_usd(account: ex.AccountSnapshot, asset_ctxs: dict[str, AssetCtx]) -> float:
+    """Cap account equity at oracle-repriced equity so thin-book mark spikes cannot inflate HWM."""
+    equity = float(account.equity_usd)
+    if not asset_ctxs or not math.isfinite(equity):
+        return equity
+    upnl_mark = 0.0
+    upnl_oracle = 0.0
+    for coin, raw_szi in account.positions_sz.items():
+        szi = float(raw_szi or 0.0)
+        if abs(szi) <= 1e-12:
+            continue
+        u_mark = float(account.position_unrealized_pnl_usd.get(coin, 0.0) or 0.0)
+        entry = account.position_entry_px.get(coin)
+        ctx = asset_ctxs.get(coin)
+        oracle_px = ctx.oracle_px if ctx else None
+        u_oracle = szi * (oracle_px - entry) if (oracle_px and entry) else u_mark
+        upnl_mark += u_mark
+        upnl_oracle += u_oracle
+    return min(equity, equity - max(0.0, upnl_mark - upnl_oracle))
 
 
 def build_risk_snapshot(
@@ -116,6 +135,7 @@ def build_risk_snapshot(
     orphan_notional = 0.0
     orphan_upnl = 0.0
     orphans: dict[str, dict[str, Any]] = {}
+    unknown_books = 0
     max_dev_pct = 0.0
     max_dev_coin = ""
     for coin in sorted(account.positions_sz):
@@ -132,7 +152,9 @@ def build_risk_snapshot(
         u_oracle = szi * (oracle_px - entry) if (oracle_px and entry) else u_mark
         dev_pct = ((mark_px / oracle_px) - 1.0) * 100.0 if (mark_px and oracle_px) else 0.0
         book = book_sides.get(coin, "unknown")
-        is_orphan = book != "two_sided"
+        if book == "unknown":
+            unknown_books += 1
+        is_orphan = book in {"empty", "bid_only", "ask_only"}
 
         gross += abs(notional)
         upnl_mark += u_mark
@@ -186,6 +208,7 @@ def build_risk_snapshot(
         "orphan_positions": orphans,
         "orphan_notional_usd": round(orphan_notional, 4),
         "orphan_unrealized_pnl_usd": round(orphan_upnl, 4),
+        "unknown_books": unknown_books,
         "open_orders": len(account.open_orders),
         "per_coin": per_coin,
     }

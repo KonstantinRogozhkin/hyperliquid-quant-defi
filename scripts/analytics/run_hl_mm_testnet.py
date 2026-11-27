@@ -45,6 +45,13 @@ def _load_dotenv(path: Path) -> None:
             os.environ[k] = v.strip().strip('"').strip("'")
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".tmp{path.suffix}")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
 @app.command()
 def main(
     coin: str = typer.Option("ETH", help="Single cross-margin Testnet asset to market-make"),
@@ -135,9 +142,10 @@ def main(
     output_dir.mkdir(parents=True, exist_ok=True)
     md_parts = [mm.format_mm_report_markdown(s, params) for s in summaries.values()]
     md = "\n---\n\n".join(md_parts)
-    (output_dir / "report.md").write_text(md)
-    (output_dir / "summary.json").write_text(
-        json.dumps({"params": params.to_dict(), "summaries": {k: v.to_dict() for k, v in summaries.items()}}, indent=2)
+    _atomic_write_text(output_dir / "report.md", md)
+    _atomic_write_text(
+        output_dir / "summary.json",
+        json.dumps({"params": params.to_dict(), "summaries": {k: v.to_dict() for k, v in summaries.items()}}, indent=2),
     )
     if not quotes_df.empty:
         quotes_df.to_parquet(output_dir / "quotes.parquet", index=False)
