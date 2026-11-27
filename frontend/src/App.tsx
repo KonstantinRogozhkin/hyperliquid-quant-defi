@@ -937,7 +937,16 @@ export default function App() {
                           <td className="num">{rec.placed_count}</td>
                           <td className="num">{fmtUsd(rec.total_notional_usd)}</td>
                           <td className="num">{fmtUsd(rec.high_water_mark_usd)}</td>
-                          <td className="mono">{rec.violations.length ? rec.violations.join(", ") : "—"}</td>
+                          <td className="mono">
+                            {[
+                              rec.violations.length ? rec.violations.join(", ") : "",
+                              rec.skipped_unquoted_coins?.length
+                                ? `skipped (no BBO): ${rec.skipped_unquoted_coins.join(", ")}`
+                                : "",
+                            ]
+                              .filter(Boolean)
+                              .join(" · ") || "—"}
+                          </td>
                         </tr>
                       ))}
                       {(data?.testnet_audit_recent ?? []).length === 0 && (

@@ -156,3 +156,95 @@ def test_cross_dex_paper_v2_persistence_gate_tight_l2_and_h1_basis_carry_combo(t
         assert r2["state"]["positions"]["SOL"]["entry_type"] == "carry_persistent"
         assert "XMR" not in r2["state"]["positions"]
         assert r2["gated_stats"]["skipped_l2_slip"] >= 1
+
+
+def test_cross_dex_h1_combo_enforces_venue_fee_floor_and_exits_on_negative_funding_or_time_stop(tmp_path: Path):
+    def fake_book(dex: str, sym: str):
+        if sym == "ETH":
+            # +11 bps basis on Extended: above 8 bps legacy floor, but BELOW Extended's 14.5 bps RT fee+bridge!
+            if dex == "hyperliquid":
+                return ([(1999.9, 20.0)], [(2000.0, 20.0)])
+            return ([(2002.2, 20.0)], [(2002.3, 20.0)])
+        # NEAR: +20 bps basis on Extended (covers 14.5 bps RT fee+bridge!)
+        if dex == "hyperliquid":
+            return ([(2.9999, 10_000.0)], [(3.0000, 10_000.0)])
+        return ([(3.0060, 10_000.0)], [(3.0061, 10_000.0)])
+
+    t0 = 1_795_900_000_000
+    cfg = cdp.CrossDexPaperConfig(combo_max_hold_hours=48.0)
+    with httpx.Client() as client:
+        # Tick 1: ETH (13% APR, +11 bps basis < 14.5 bps Extended RT fee) must be blocked;
+        # NEAR (20% APR, +20 bps basis >= 14.5 bps) opens via H1 combo.
+        r1 = cdp.run_cross_dex_paper_tick(
+            client,
+            state_dir=tmp_path,
+            cfg=cfg,
+            now_ms=t0,
+            hl_quotes={
+                "ETH": _q("hyperliquid", "ETH", 2000.0, -13.0),
+                "NEAR": _q("hyperliquid", "NEAR", 3.0000, -20.0),
+            },
+            lighter_quotes={},
+            extended_quotes={
+                "ETH": _q("extended", "ETH", 2002.2, 0.0),
+                "NEAR": _q("extended", "NEAR", 3.0060, 0.0),
+            },
+            book_fetcher=fake_book,
+        )
+        assert "ETH" not in r1["state"]["positions"]
+        assert "NEAR" in r1["state"]["positions"]
+        assert r1["state"]["positions"]["NEAR"]["entry_type"] == "basis_carry_combo"
+
+        # Tick 2 (+4h): NEAR funding flips NEGATIVE (-5% APR) while structural mark basis is still +20 bps -> MUST exit!
+        r2 = cdp.run_cross_dex_paper_tick(
+            client,
+            state_dir=tmp_path,
+            cfg=cfg,
+            now_ms=t0 + 4 * 3_600_000,
+            hl_quotes={"NEAR": _q("hyperliquid", "NEAR", 3.0000, +5.0)},
+            lighter_quotes={},
+            extended_quotes={"NEAR": _q("extended", "NEAR", 3.0060, 0.0)},
+            book_fetcher=fake_book,
+        )
+        assert r2["state"]["positions"] == {}
+        assert r2["trades"][0]["action"] == "CLOSE"
+
+    # Separate directory: test combo_max_hold_hours time-stop when carry decays to 3% (<5%) and basis stays stuck at +20 bps
+    dir2 = tmp_path / "timestop"
+    with httpx.Client() as client:
+        r_open = cdp.run_cross_dex_paper_tick(
+            client,
+            state_dir=dir2,
+            cfg=cdp.CrossDexPaperConfig(combo_max_hold_hours=8.0),
+            now_ms=t0,
+            hl_quotes={"NEAR": _q("hyperliquid", "NEAR", 3.0000, -20.0)},
+            lighter_quotes={},
+            extended_quotes={"NEAR": _q("extended", "NEAR", 3.0060, 0.0)},
+            book_fetcher=fake_book,
+        )
+        assert "NEAR" in r_open["state"]["positions"]
+        # At +4h with 3% carry and +20 bps basis: still held (< 8h cap)
+        r_mid = cdp.run_cross_dex_paper_tick(
+            client,
+            state_dir=dir2,
+            cfg=cdp.CrossDexPaperConfig(combo_max_hold_hours=8.0),
+            now_ms=t0 + 4 * 3_600_000,
+            hl_quotes={"NEAR": _q("hyperliquid", "NEAR", 3.0000, -3.0)},
+            lighter_quotes={},
+            extended_quotes={"NEAR": _q("extended", "NEAR", 3.0060, 0.0)},
+            book_fetcher=fake_book,
+        )
+        assert "NEAR" in r_mid["state"]["positions"]
+        # At +8h with 3% carry and stuck +20 bps basis: hits time-stop -> closes cleanly!
+        r_stop = cdp.run_cross_dex_paper_tick(
+            client,
+            state_dir=dir2,
+            cfg=cdp.CrossDexPaperConfig(combo_max_hold_hours=8.0),
+            now_ms=t0 + 8 * 3_600_000,
+            hl_quotes={"NEAR": _q("hyperliquid", "NEAR", 3.0000, -3.0)},
+            lighter_quotes={},
+            extended_quotes={"NEAR": _q("extended", "NEAR", 3.0060, 0.0)},
+            book_fetcher=fake_book,
+        )
+        assert r_stop["state"]["positions"] == {}
+        assert r_stop["trades"][0]["action"] == "CLOSE"

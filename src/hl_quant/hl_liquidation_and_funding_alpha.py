@@ -405,15 +405,43 @@ async def run_liquidation_and_funding_alpha_scan(
             cached_wallets = None
 
     async with httpx.AsyncClient(timeout=25.0) as client:
+        async def _req_with_retry(
+            method: str,
+            url: str,
+            *,
+            json_body: dict[str, Any] | None = None,
+            max_attempts: int = 3,
+        ) -> httpx.Response | None:
+            last_resp: httpx.Response | None = None
+            for attempt in range(max_attempts):
+                try:
+                    resp = (
+                        await client.post(url, json=json_body)
+                        if method == "POST"
+                        else await client.get(url)
+                    )
+                    last_resp = resp
+                    if resp.status_code not in (429, 500, 502, 503, 504):
+                        return resp
+                except httpx.HTTPError:
+                    pass
+                if attempt + 1 < max_attempts:
+                    await asyncio.sleep(0.8 * (attempt + 1))
+            return last_resp
+
         # 1. Fetch perp mark prices + funding + OI (and leaderboard only on cache miss)
         if cached_wallets is not None:
-            perp_resp = await client.post(info_url, json={"type": "metaAndAssetCtxs"})
+            perp_resp = await _req_with_retry("POST", info_url, json_body={"type": "metaAndAssetCtxs"})
+            if perp_resp is None:
+                raise RuntimeError("Failed to fetch metaAndAssetCtxs after retries")
             perp_resp.raise_for_status()
             wallets = cached_wallets
         else:
-            perp_task = client.post(info_url, json={"type": "metaAndAssetCtxs"})
-            lb_task = client.get(leaderboard_url)
+            perp_task = _req_with_retry("POST", info_url, json_body={"type": "metaAndAssetCtxs"})
+            lb_task = _req_with_retry("GET", leaderboard_url)
             perp_resp, lb_resp = await asyncio.gather(perp_task, lb_task)
+            if perp_resp is None or lb_resp is None:
+                raise RuntimeError("Failed to fetch Hyperliquid meta/leaderboard after retries")
             perp_resp.raise_for_status()
             lb_resp.raise_for_status()
             lb_rows = (lb_resp.json() or {}).get("leaderboardRows") or []
@@ -439,14 +467,14 @@ async def run_liquidation_and_funding_alpha_scan(
             oi_usd = _f(ctx.get("openInterest")) * mark
             perp_info.append({"coin": coin, "mark_px": mark, "oi_usd": oi_usd, "funding": _f(ctx.get("funding"))})
 
-        # 2. Fetch whale clearinghouseStates concurrently with rate-friendly semaphore
-        sem = asyncio.Semaphore(10)
+        # 2. Fetch whale clearinghouseStates concurrently with rate-friendly semaphore + 429 retry
+        sem = asyncio.Semaphore(6)
 
         async def _fetch_wallet(w: str) -> tuple[str, dict[str, Any]]:
             async with sem:
                 try:
-                    r = await client.post(info_url, json={"type": "clearinghouseState", "user": w})
-                    if r.status_code == 200:
+                    r = await _req_with_retry("POST", info_url, json_body={"type": "clearinghouseState", "user": w})
+                    if r is not None and r.status_code == 200:
                         return w, r.json() or {}
                 except Exception:
                     pass
@@ -471,11 +499,12 @@ async def run_liquidation_and_funding_alpha_scan(
         async def _fetch_candles(p: dict[str, Any]) -> HourlyFundingMicroRow | None:
             async with sem:
                 try:
-                    r = await client.post(
+                    r = await _req_with_retry(
+                        "POST",
                         info_url,
-                        json={"type": "candleSnapshot", "req": {"coin": p["coin"], "interval": "1m", "startTime": start_ms, "endTime": now_ms}},
+                        json_body={"type": "candleSnapshot", "req": {"coin": p["coin"], "interval": "1m", "startTime": start_ms, "endTime": now_ms}},
                     )
-                    if r.status_code != 200:
+                    if r is None or r.status_code != 200:
                         return None
                     return compute_hourly_settlement_microstructure(
                         r.json() or [],

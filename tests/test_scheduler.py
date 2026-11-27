@@ -256,3 +256,31 @@ def test_readonly_job_retries_once_while_testnet_executor_never_retries(tmp_path
     by_name = {j["name"]: j for j in status["jobs"]}
     assert by_name["onchain_events"]["last_error"] is None
     assert by_name["testnet_executor"]["last_error"] == "exit_code=1"
+
+
+def test_worker_preserves_last_known_job_state_across_restarts(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("HL_ENABLE_TESTNET_EXECUTION", raising=False)
+    monkeypatch.delenv("HL_TESTNET_ACCOUNT_ADDRESS", raising=False)
+    status_path = tmp_path / "paper" / "hl_worker_status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "service": "hl-worker",
+                "jobs": [
+                    {"name": "market_snapshot", "state": "ok", "last_exit_code": 0, "runs_ok": 12, "runs_failed": 0},
+                    {"name": "onchain_events", "state": "failed", "last_exit_code": 1, "runs_ok": 5, "runs_failed": 1, "last_error": "boom"},
+                    {"name": "metamodel_paper", "state": "running", "last_exit_code": 0, "runs_ok": 3, "runs_failed": 0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    sched = WorkerScheduler(data_dir=tmp_path, telegram_enabled=False)
+    published = sched.publish_status()
+    by_name = {j["name"]: j for j in published["jobs"]}
+    assert by_name["market_snapshot"]["state"] == "ok"
+    assert by_name["onchain_events"]["state"] == "failed"
+    assert by_name["metamodel_paper"]["state"] == "ok"
+    assert by_name["cross_dex_paper"]["state"] == "idle"
+    assert by_name["testnet_executor"]["state"] == "disabled"
