@@ -1,6 +1,6 @@
 # `hyperliquid-quant-defi` (`hl_quant`) — Техническая Wiki
 
-Добро пожаловать в полную инженерную документацию автономного стека **`hyperliquid-quant-defi`** (`src/hl_quant/`, **135 unit-тестов** на GitHub Actions CI, **7 автоматических cron-контуров**, нулевые внешние зависимости от монорепозиториев).
+Добро пожаловать в полную инженерную документацию автономного full-stack стека **`hyperliquid-quant-defi`** (`src/hl_quant/` + **FastAPI API** + **React/Vite/TS SPA** + **9-job Docker worker** + **GHCR & Dokploy CI/CD**, **168+ unit-тестов** за PR-only Ruleset `tests` + `frontend`, нулевые внешние зависимости от монорепозиториев).
 
 ---
 
@@ -50,7 +50,8 @@ flowchart LR
 | [⛓️ HyperEVM Chain 999 (`L1Read`, Пег `USDT0`, V3 глубина) и HLP](HyperEVM-DeFi-and-HLP-Scanner) | Прямые `eth_call` чтения HyperSwap/PRJX V3, `L1Read` (`0.00 б.п.`), поправка на пег `USDT0/USDC` (`+11.08 б.п.`), HLP TVL `$152.5M` |
 | [🏛️ HIP-3 (`Growth Mode`, `Oracle Div`), Pendle Boros и Yield Stack](HIP3-Boros-and-HyperEVM-Yield-Stack) | `xyz/io/para` кросс-билдер арбитраж (`NVDA +77.5%`, `SKHX ⚠️ 46.0 б.п.` oracle div, независимая маржа, 30д кулдаун), Pendle Boros, `kHYPE+Boros` vs HLP, 4ч Persistence Tracker |
 | [🏆 Карта ликвидаций, `:00` OOS (52d / 60k), H6 и HTML-дашборд](Liquidation-Heatmap-Funding-Alpha-and-Tear-Sheet) | Направленные киты H2 (`ETH $52M`), 3 режима H6 (`CRASH_BOOK_STRESS` vs `CROWDED_FUNDING_BASIS`), Deposit-Clean HLP `pnlHistory`, 52d `:00` OOS и 6-вкладочный дашборд |
-| [⚙️ Операции, 7 кронов и Runbook](Operations-Crons-and-Runbook) | Все 7 расписаний cron, однокомандный установщик `install_all_hl_crons.sh`, `.env`, команды запуска, тесты и CI |
+| [🐳 Docker, Dokploy & Full-Stack CI/CD](Docker-Dokploy-Fullstack-CICD) | 3-контейнерный стек (`frontend` Nginx+React/TS SPA, `backend` FastAPI, `worker` 9-job UTC scheduler), GHCR immutable `:sha-*` образы, `deploy_dokploy.py` и Ruleset `main` |
+| [⚙️ Операции, кроны и Runbook](Operations-Crons-and-Runbook) | 7 локальных кронов и 9 контейнерных задач, `install_all_hl_crons.sh`, `.env`, команды запуска, тесты и CI |
 
 ---
 
@@ -70,8 +71,8 @@ flowchart LR
 ## Быстрый старт
 
 ```bash
-uv sync --extra dev --extra testnet
-make lint      # ruff check src scripts tests
-make test      # 135 unit tests (~3s)
-make dashboard # rebuild offline 6-tab HTML dashboard
+uv sync --all-extras
+make lint       # ruff check src scripts tests
+make test       # 168+ unit tests (~3.5s)
+make docker-up  # local Nginx + React SPA + FastAPI on http://localhost:8080
 ```

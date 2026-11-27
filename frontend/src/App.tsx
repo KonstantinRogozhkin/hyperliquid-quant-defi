@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { EquityCurveChart, KappaCalibrationChart } from "./components/Charts";
-import type { BuildInfo, OverviewPayload } from "./types";
+import type { BuildInfo, CoinAttributionRow, OverviewPayload } from "./types";
 
 type TabId = "overview" | "frontier" | "crossdex" | "onchain" | "execution" | "ops";
 
@@ -52,7 +52,9 @@ export default function App() {
 
   // Interactive filters
   const [steadyOnly, setSteadyOnly] = useState<boolean>(false);
+  const [activeOnly, setActiveOnly] = useState<boolean>(true);
   const [hip3Query, setHip3Query] = useState<string>("");
+  const [posQuery, setPosQuery] = useState<string>("");
   const [crossDexMinApr, setCrossDexMinApr] = useState<number>(0);
   const [settlementSplit, setSettlementSplit] = useState<string>("OOS");
 
@@ -100,11 +102,23 @@ export default function App() {
     const rows = data?.frontier_history?.hip3_persistence ?? [];
     const q = hip3Query.trim().toUpperCase();
     return rows.filter((r) => {
+      if (activeOnly && r.active_in_latest_tick === false) return false;
       if (steadyOnly && ((r.direction_flips ?? 0) > 0 || r.clean_streak < 1)) return false;
       if (q && !r.base_symbol.toUpperCase().includes(q)) return false;
       return true;
     });
-  }, [data, steadyOnly, hip3Query]);
+  }, [data, activeOnly, steadyOnly, hip3Query]);
+
+  const paperPositionsFiltered = useMemo(() => {
+    const rows = data?.paper_positions ?? [];
+    const q = posQuery.trim().toUpperCase();
+    return q ? rows.filter((r) => r.coin.toUpperCase().includes(q)) : rows;
+  }, [data, posQuery]);
+
+  const perCoinAttribution = useMemo(() => {
+    const raw = data?.attribution?.per_coin;
+    return Array.isArray(raw) ? (raw as CoinAttributionRow[]) : [];
+  }, [data]);
 
   const crossDexFiltered = useMemo(() => {
     return (data?.cross_dex_all ?? []).filter((r) => r.spread_apr_pct >= crossDexMinApr);
@@ -302,6 +316,66 @@ export default function App() {
                   </div>
                 </section>
               </div>
+
+              <section className="card">
+                <div className="section-header">
+                  <div>
+                    <h2 className="section-title">Metamodel Open Positions (Live Paper Ledger)</h2>
+                    <div className="section-sub">
+                      {data?.paper_positions?.length ?? 0} active HL × CEX positions sorted by |HL weight|
+                    </div>
+                  </div>
+                  <input
+                    className="input"
+                    placeholder="Filter coin (e.g. BTC, ETH)"
+                    value={posQuery}
+                    onChange={(e) => setPosQuery(e.target.value)}
+                  />
+                </div>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Coin</th>
+                        <th className="num">HL Weight</th>
+                        <th>CEX Venue</th>
+                        <th className="num">CEX Weight</th>
+                        <th className="num">Last HL Px</th>
+                        <th className="num">L2 Spread</th>
+                        <th className="num">Cum PnL</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {paperPositionsFiltered.map((p) => (
+                        <tr key={p.coin}>
+                          <td>
+                            <strong>{p.coin}</strong>
+                          </td>
+                          <td className={`num ${p.hl_weight >= 0 ? "pos" : "neg"}`}>
+                            {fmtPct(p.hl_weight * 100, 2)}
+                          </td>
+                          <td>
+                            {p.cex_venue ? <span className="badge badge-cyan">{p.cex_venue}</span> : <span className="muted">HL-only</span>}
+                          </td>
+                          <td className="num">{p.cex_weight ? fmtPct(p.cex_weight * 100, 2) : "—"}</td>
+                          <td className="num">{fmtUsd(p.last_hl_px, 4)}</td>
+                          <td className="num">{fmtBps(p.l2_spread_bps, 2)}</td>
+                          <td className={`num ${p.cum_pnl_usd >= 0 ? "pos" : "neg"}`}>
+                            {fmtUsd(p.cum_pnl_usd)}
+                          </td>
+                        </tr>
+                      ))}
+                      {paperPositionsFiltered.length === 0 && (
+                        <tr>
+                          <td colSpan={7} className="muted">
+                            No active metamodel positions matching filter.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
             </div>
           )}
 
@@ -312,7 +386,7 @@ export default function App() {
                   <div>
                     <h2 className="section-title">HIP-3 Cross-Builder Spread Persistence</h2>
                     <div className="section-sub">
-                      Clean streak requires APR ≥ 20%, Oracle Div ≤ 25 bps, and unchanged leg direction
+                      Clean streak requires APR ≥ 20%, Oracle Div ≤ 25 bps, unchanged legs, and no missing ticks
                     </div>
                   </div>
                   <div className="filter-row">
@@ -322,6 +396,14 @@ export default function App() {
                       value={hip3Query}
                       onChange={(e) => setHip3Query(e.target.value)}
                     />
+                    <label className="checkbox-label">
+                      <input
+                        type="checkbox"
+                        checked={activeOnly}
+                        onChange={(e) => setActiveOnly(e.target.checked)}
+                      />
+                      Active only
+                    </label>
                     <label className="checkbox-label">
                       <input
                         type="checkbox"
@@ -337,6 +419,7 @@ export default function App() {
                     <thead>
                       <tr>
                         <th>Ticker</th>
+                        <th>Status</th>
                         <th>Legs</th>
                         <th className="num">Ticks</th>
                         <th className="num">Raw ≥20%</th>
@@ -353,6 +436,13 @@ export default function App() {
                         <tr key={r.base_symbol}>
                           <td>
                             <strong>{r.base_symbol}</strong>
+                          </td>
+                          <td>
+                            <span className={`badge ${r.active_in_latest_tick === false ? "badge-warn" : "badge-ok"}`}>
+                              {r.active_in_latest_tick === false
+                                ? `Stale (-${r.ticks_since_last_seen ?? 1}t)`
+                                : "Active"}
+                            </span>
                           </td>
                           <td className="mono">{`S ${r.short_symbol} / L ${r.long_symbol}`}</td>
                           <td className="num">{r.ticks_seen}</td>
@@ -381,7 +471,7 @@ export default function App() {
                       ))}
                       {hip3PersistenceFiltered.length === 0 && (
                         <tr>
-                          <td colSpan={10} className="muted">
+                          <td colSpan={11} className="muted">
                             No HIP-3 persistence rows matching filters.
                           </td>
                         </tr>
@@ -744,12 +834,121 @@ export default function App() {
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Volume & Funding PnL</div>
-                  <div className="kpi-value">{fmtUsd(data?.attribution?.total_volume_usd)}</div>
-                  <div className="kpi-sub">
-                    Funding {fmtUsd(data?.attribution?.funding_pnl_usd)} · Fees{" "}
-                    {fmtUsd(data?.attribution?.fees_usd)}
+                  <div className="kpi-label">API Quota & Min Liq Dist</div>
+                  <div className="kpi-value">
+                    {String(data?.attribution?.api_quota_health ?? "—")}
                   </div>
+                  <div className="kpi-sub">
+                    Min liq dist {fmtPct(data?.attribution?.min_liq_distance_pct, 1, false)} · Volume{" "}
+                    {fmtUsd(data?.attribution?.total_volume_usd)}
+                  </div>
+                </div>
+              </section>
+
+              <section className="card">
+                <div className="section-header">
+                  <h2 className="section-title">Per-Coin Testnet Attribution, Liq Distance & ADL Rank</h2>
+                  <span className="section-sub">{perCoinAttribution.length} tracked coins</span>
+                </div>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Coin</th>
+                        <th className="num">Position USD</th>
+                        <th>Leverage</th>
+                        <th className="num">Fills</th>
+                        <th className="num">Maker %</th>
+                        <th className="num">Net PnL</th>
+                        <th className="num">VW Markout</th>
+                        <th className="num">Liq Dist</th>
+                        <th className="num">ADL Rank</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {perCoinAttribution.map((c) => (
+                        <tr key={c.coin}>
+                          <td>
+                            <strong>{c.coin}</strong>
+                          </td>
+                          <td className={`num ${c.position_sz >= 0 ? "pos" : "neg"}`}>
+                            {c.position_sz >= 0 ? "L " : "S "}
+                            {fmtUsd(c.position_usd)}
+                          </td>
+                          <td className="mono">{c.leverage_mode}</td>
+                          <td className="num">{c.fills_count}</td>
+                          <td className="num">{fmtPct(c.maker_share_pct, 0, false)}</td>
+                          <td className={`num ${c.net_pnl_usd >= 0 ? "pos" : "neg"}`}>{fmtUsd(c.net_pnl_usd)}</td>
+                          <td className="num">{fmtBps(c.vw_markout_bps, 1)}</td>
+                          <td className={`num ${(c.liq_distance_pct ?? 999) < 20 ? "warn" : ""}`}>
+                            {c.liq_distance_pct !== null ? fmtPct(c.liq_distance_pct, 1, false) : "—"}
+                          </td>
+                          <td className="num">
+                            {c.adl_rank_score !== null ? (
+                              <span className={`badge ${c.adl_rank_score >= 2.0 ? "badge-warn" : "badge-ok"}`}>
+                                {c.adl_rank_score.toFixed(2)}
+                              </span>
+                            ) : (
+                              "—"
+                            )}
+                          </td>
+                        </tr>
+                      ))}
+                      {perCoinAttribution.length === 0 && (
+                        <tr>
+                          <td colSpan={9} className="muted">
+                            No per-coin attribution snapshot yet.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section className="card">
+                <div className="section-header">
+                  <h2 className="section-title">Recent Testnet ALO Rebalance Cycles</h2>
+                  <span className="section-sub">Newest first from hl_testnet_audit.jsonl</span>
+                </div>
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Time (UTC)</th>
+                        <th>Status</th>
+                        <th className="num">Cancelled</th>
+                        <th className="num">Placed ALO</th>
+                        <th className="num">Notional</th>
+                        <th className="num">HWM</th>
+                        <th>Violations</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {(data?.testnet_audit_recent ?? []).map((rec, idx) => (
+                        <tr key={idx}>
+                          <td className="mono">{rec.observed_at_utc ?? "—"}</td>
+                          <td>
+                            <span className={`badge ${rec.status === "ok" ? "badge-ok" : "badge-danger"}`}>
+                              {rec.status}
+                            </span>
+                          </td>
+                          <td className="num">{rec.cancelled_count}</td>
+                          <td className="num">{rec.placed_count}</td>
+                          <td className="num">{fmtUsd(rec.total_notional_usd)}</td>
+                          <td className="num">{fmtUsd(rec.high_water_mark_usd)}</td>
+                          <td className="mono">{rec.violations.length ? rec.violations.join(", ") : "—"}</td>
+                        </tr>
+                      ))}
+                      {(data?.testnet_audit_recent ?? []).length === 0 && (
+                        <tr>
+                          <td colSpan={7} className="muted">
+                            No rebalance audit records yet.
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
                 </div>
               </section>
 

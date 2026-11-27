@@ -43,6 +43,8 @@ export interface Hip3PersistenceRow {
   short_symbol: string;
   long_symbol: string;
   ticks_seen: number;
+  active_in_latest_tick?: boolean;
+  ticks_since_last_seen?: number;
   raw_apr_streak: number;
   clean_streak: number;
   direction_flips?: number;
@@ -51,6 +53,45 @@ export interface Hip3PersistenceRow {
   median_oracle_div_bps: number;
   both_growth_mode: boolean;
   any_only_isolated: boolean;
+}
+
+export interface PaperPositionRow {
+  coin: string;
+  hl_weight: number;
+  cex_weight: number;
+  cex_venue: string;
+  last_hl_px: number | null;
+  l2_spread_bps: number | null;
+  cum_pnl_usd: number;
+}
+
+export interface TestnetAuditRecord {
+  ts_ms: number;
+  observed_at_utc: string | null;
+  status: string;
+  violations: string[];
+  cancelled_count: number;
+  placed_count: number;
+  total_notional_usd: number;
+  high_water_mark_usd: number;
+  blocked_isolated_coins: string[];
+}
+
+export interface CoinAttributionRow {
+  coin: string;
+  position_sz: number;
+  position_usd: number;
+  entry_px: number;
+  current_mid: number;
+  leverage_mode: string;
+  liq_px: number | null;
+  liq_distance_pct: number | null;
+  fills_count: number;
+  fill_volume_usd: number;
+  maker_share_pct: number;
+  net_pnl_usd: number;
+  vw_markout_bps: number | null;
+  adl_rank_score: number | null;
 }
 
 export interface Hip3Opp {
@@ -168,6 +209,8 @@ export interface OverviewPayload {
     active_positions: number;
   } | null;
   paper_ticks?: PaperTick[];
+  paper_positions?: PaperPositionRow[];
+  testnet_audit_recent?: TestnetAuditRecord[];
   latency_bench?: {
     iterations: number;
     p50_us: number;

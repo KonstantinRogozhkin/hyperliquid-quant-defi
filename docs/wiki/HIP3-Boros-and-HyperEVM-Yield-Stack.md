@@ -56,4 +56,4 @@
 
 ## 4. 4-часовой Frontier Persistence Tracker (`hl_frontier_persistence.py`, cron `20 */4 * * *`)
 
-Каждые 4 часа в 100% read-only режиме собирает единый срез **HIP-3 + Pendle Boros + HyperEVM Yield Stack**, обновляет `snapshot.json` всех трёх модулей для HTML-дашборда и накапливает append-only Parquet-историю (`data/paper/hl_frontier_history/`) для измерения реальной живучести (`clean_streak` при `APR >= 20%` и `Oracle Div <= 25 б.п.`) и динамики ставок Boros vs HLP.
+Каждые 4 часа в 100% read-only режиме собирает единый срез **HIP-3 + Pendle Boros + HyperEVM Yield Stack**, обновляет `snapshot.json` всех трёх модулей и накапливает append-only Parquet-историю (`data/paper/hl_frontier_history/`). Для каждого тикера считается `clean_streak` (непрерывная серия последних глобальных тиков с `APR >= 20%`, `Oracle Div <= 25 б.п.` и неизменным направлением ног `(short_symbol, long_symbol)`), `direction_flips` (число переворотов ног) и `active_in_latest_tick` (пропавшие из последнего тика символы сразу обнуляют серию и уходят вниз рейтинга).
