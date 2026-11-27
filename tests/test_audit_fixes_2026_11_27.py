@@ -209,3 +209,46 @@ def test_markout_uses_fixed_horizon_not_current_mid() -> None:
     attr = pta.compute_post_trade_attribution(snapshot)
     assert attr.vw_mark_drift_bps == pytest.approx(426.59, abs=0.05)
     assert attr.vw_markout_bps == pytest.approx(0.74, abs=0.05)  # true 60s markout is tiny
+
+
+def test_markout_series_drops_unfinished_candle() -> None:
+    now = 1_795_700_000_000
+    bars = [{"T": now - 1, "c": "1.0"}, {"T": now + 30_000, "c": "2.0"}]
+    transport = httpx.MockTransport(lambda req: httpx.Response(200, json=bars))
+    with httpx.Client(transport=transport) as c:
+        series = pta.fetch_markout_series(c, [{"coin": "X", "time": now - 10_000}], now_ms=now)
+    assert series == {"X": [(now - 1, 1.0)]}
+
+
+def test_fill_ownership_uses_full_audit_set_when_fill_window_capped(tmp_path: Path) -> None:
+    audit = tmp_path / "audit.jsonl"
+    old_ts, new_ts = 1_000, 10_000_000
+    rec = lambda ts, oid: json.dumps({"ts_ms": ts, "orders": [{"response": {"response": {"data": {"statuses": [{"resting": {"oid": oid}}]}}}}]})  # noqa: E731
+    audit.write_text(rec(old_ts, 1) + "\n" + rec(new_ts, 2) + "\n")
+    fills = [{"coin": "BTC", "px": "100", "sz": "1", "side": "B", "oid": 1, "time": new_ts + i, "fee": "0"} for i in range(1900)]
+    fills.append({"coin": "BTC", "px": "100", "sz": "1", "side": "B", "oid": 2, "time": new_ts + 5000, "fee": "0"})
+    snap = {"fills": fills, "all_mids": {}, "clearinghouse": {}, "spot": {}, "open_orders": [], "funding": []}
+    attr = pta.compute_post_trade_attribution(snap, audit_log_path=audit)
+    assert attr.audit_fill_volume_usd == pytest.approx(190_100.0)
+    assert attr.mixed_account_warning == ""
+
+
+def test_ops_lock_skips_when_held(tmp_path: Path) -> None:
+    import fcntl
+    import os
+    import sys
+
+    from hl_quant import ops_lock
+
+    lock = tmp_path / "x.flock"
+    marker = tmp_path / "ran"
+    cmd = [sys.executable, "-c", f"open({str(marker)!r}, 'w').write('1')"]
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert ops_lock.run_locked(lock, cmd) == 0
+        assert not marker.exists()
+    finally:
+        os.close(fd)
+    assert ops_lock.run_locked(lock, cmd) == 0
+    assert marker.exists()

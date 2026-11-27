@@ -124,8 +124,12 @@ def fetch_markout_series(
             )
             if r.status_code != 200 or not isinstance(r.json(), list):
                 continue
+            # Drop the still-forming candle (scheduled close T in the future): its price is not a
+            # completed post-horizon close and would change on the next run.
             pts = sorted(
-                (int(_f(b.get("T"))), _f(b.get("c"))) for b in r.json() if isinstance(b, dict) and _f(b.get("c")) > 0
+                (int(_f(b.get("T"))), _f(b.get("c")))
+                for b in r.json()
+                if isinstance(b, dict) and _f(b.get("c")) > 0 and 0 < int(_f(b.get("T"))) < end_ms
             )
             if pts:
                 out[coin] = pts
@@ -443,6 +447,9 @@ def compute_post_trade_attribution(
         if fill_times:
             audit_min_ts_ms = min(fill_times)
     audit_oids = extract_audit_oids(audit_log_path, min_ts_ms=audit_min_ts_ms)
+    # Fill OWNERSHIP must use every audited order: an order placed before the userFills window
+    # boundary can still fill inside it. The window filter applies only to rate/count metrics.
+    all_audit_oids = extract_audit_oids(audit_log_path) if audit_min_ts_ms is not None else audit_oids
     resting_oids = {int(o["oid"]) for o in open_orders if isinstance(o, dict) and o.get("oid") is not None}
     audit_filled = len(audit_oids & filled_oids)
     audit_resting = len(audit_oids & resting_oids)
@@ -552,7 +559,7 @@ def compute_post_trade_attribution(
     api_reqs_per_usd: float | None = None
     api_quota_health = "OK"
     audit_actions = count_audit_actions(audit_log_path, min_ts_ms=audit_min_ts_ms)
-    audit_vol = sum(v for oid, v in fill_by_oid_vol.items() if oid in audit_oids)
+    audit_vol = sum(v for oid, v in fill_by_oid_vol.items() if oid in all_audit_oids)
     if len(audit_oids) > 0 or audit_actions > 0:
         vol_weight = 0.1 if is_growth_mode else 1.0
         eff_vol = max(audit_vol * vol_weight, 1.0)
@@ -572,9 +579,9 @@ def compute_post_trade_attribution(
 
     # Account hygiene: fills that do not belong to audited executor orders mean the address is shared
     # with MM / manual trading, so maker share, markout and PnL attribution are contaminated.
-    foreign_fill_vol = max(0.0, tot_vol - audit_vol) if audit_oids else 0.0
+    foreign_fill_vol = max(0.0, tot_vol - audit_vol) if all_audit_oids else 0.0
     mixed_warning = ""
-    if audit_oids and tot_vol > 0 and foreign_fill_vol / tot_vol > 0.05:
+    if all_audit_oids and tot_vol > 0 and foreign_fill_vol / tot_vol > 0.05:
         mixed_warning = (
             f"{foreign_fill_vol / tot_vol * 100.0:.0f}% fill volume is not from audited executor orders "
             "(MM/manual fills share this address) — attribution is contaminated"
