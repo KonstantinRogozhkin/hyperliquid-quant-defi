@@ -59,8 +59,8 @@ make bench-mm
 .venv/bin/python scripts/analytics/run_hl_frontier_persistence_tick.py
 .venv/bin/python scripts/analytics/run_hl_hip3_paper_tick.py
 
-# Безопасный перенос локальных macOS-кронов на 13-джобовый Dokploy worker (с бэкапом)
-python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl-quant.95-217-163-111.sslip.io --apply
+# Безопасный перенос локальных macOS-кронов на 16-джобовый Dokploy worker (с бэкапом)
+python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl-quant.example.com --apply
 
 # Пересборка автономного 6-вкладочного HTML-дашборда
 make dashboard

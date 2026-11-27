@@ -12,7 +12,7 @@
 1. Тянет последние 20 дней 1h-истории Hyperliquid + 3 CEX-ног (**Bybit**, **Binance**, **OKX**) — на 7 из 10 ликвидных монет спред фандинга HL против OKX оказался шире, чем против Bybit/Binance.
 2. Запрашивает **живой L2 стакан** (`l2Book`) по каждой отслеживаемой монете Hyperliquid.
 3. Рассчитывает целевые веса метамодели (`carry_best_cex` + `xs_rev` + `xs_mom`) с жёсткой долларовой нейтральностью (`net_exposure ~ 0`).
-4. Начисляет почасовой фандинг строго на полуоткрытом интервале `[prev_hour, tick_hour)` без off-by-one пропусков.
+4. Начисляет почасовой фандинг строго на полуоткрытом интервале `(prev_hour_ms, tick_hour_ms]` (включая расчёт `:00` на границе `tick_hour_ms`) без off-by-one пропусков и без двойного учёта на стыке тиков.
 5. Списывает **измеренную полную стоимость HL-сделки** (PR #19): по умолчанию `--hl-fee-bps 5.0 --hl-spread-fraction 0.0` (учитывает реальный fill rate, adverse selection и добор тейкером из `hl_alo_fill_portfolio_coins.md`), CEX-нога: `2.0 + 0.5 * live_l2_spread_bps`. Трекер работает в режиме **observation-only**.
 6. Пишет идемпотентный журнал в `data/paper/hl_metamodel/` (`state.json`, `ticks.parquet`, `trades.parquet`) с накопительным PnL за 24ч / 7д и в разрезе каждой монеты (`cum_pnl_usd`).
 7. Отправляет понятную сводку на русском языке в Telegram через нативный **`sendRichMessage`** (`<table bordered striped>`).
@@ -65,12 +65,12 @@
 
 ---
 
-## 4. Двуногий Cross-DEX Paper-трекер: Hyperliquid × Lighter (`hl_cross_dex_paper.py`)
+## 4. Двуногий Cross-DEX Paper-трекер v2: Hyperliquid × Lighter × Extended (`hl_cross_dex_paper.py`)
 
-**Файлы:** `src/hl_quant/hl_cross_dex_paper.py`, `scripts/analytics/run_hl_cross_dex_paper_tick.py`, `scripts/ops/run_hl_cross_dex_paper_tick.sh`, `tests/test_hl_cross_dex_paper.py`.
+**Файлы:** `src/hl_quant/hl_cross_dex_paper.py`, `scripts/analytics/run_hl_cross_dex_paper_tick.py`, `scripts/ops/run_hl_cross_dex_paper_tick.sh`, артефакты `data/paper/hl_cross_dex_paper/`, тесты `tests/test_hl_cross_dex_paper.py`.
 
-Проверяет на реальных тиках, держатся ли широкие кросс-DEX спреды (`15%–62% APR`) дольше их времени окупаемости по L2-стакану:
-- **Вход:** спред `>= 15% APR`, живое L2-проскальзывание на клипе `5k USD/ногу <= 12 б.п.`, окупаемость `<= 96 ч`, до `5` дельта-нейтральных пар (`1.0x` gross).
+Проверяет на реальных 4-часовых тиках, держатся ли кросс-DEX спреды на **Hyperliquid × Lighter × Extended** дольше их времени окупаемости по L2-стакану:
+- **Persistence Gate (`>= 2` разнесённых тика, включая H1 Basis+Carry combo):** отсекает минутные спайки фандинга до открытия бумажной пары.
+- **Жёсткий лимит L2-проскальзывания (`<= 5.0 б.п.` на клипе `5k USD/ногу`):** защищает от входа в тонкие стаканы, кредит за выгодный базис ограничен марк-спредом (`mark-capped basis credit`), а оценка NAV учитывает полные издержки выхода (`exit-cost liquidation NAV`) и защиту от недоступности одной из площадок (`venue-outage guard`).
+- **Вход и H1 Combo:** классический фандинг-спред `>= 15% APR` (окупаемость `<= 96 ч`) либо комбинированный вход **H1 Basis+Carry** (`NEAR +18.8% APR` на Extended с `+13.6 б.п.` исполнимым базисом и окупаемостью **2 ч**), до `5` дельта-нейтральных пар (`1.0x` gross).
 - **Гистерезис выхода:** держит открытую пару, пока живой направленный спред не упадёт ниже `5% APR` или не перевернётся.
-- **Первый живой тик (50k USD paper-депозит, 2026-11-26 17:34 UTC):** открыто 5 пар со средним спредом **+33.1% APR** и общей стоимостью входа с учётом L2-стакана `−19.19 USD` (`−3.8 б.п.`, окупаемость `~34 ч`):
-  - `XMR` (`+62.6% APR`, slip `11.6 б.п.`), `GRAM` (`+46.7%`, `9.0 б.п.`), `NEAR` (`+25.0%`, `2.1 б.п.`), `SOL` (`+16.1%`, `0.4 б.п.`), `BTC` (`+15.0%`, `0.3 б.п.`).

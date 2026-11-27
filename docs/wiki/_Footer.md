@@ -1,1 +1,1 @@
-`hyperliquid-quant-defi` (`hl_quant`) · 135 unit tests (GitHub Actions CI) · 7 local crons · Testnet isolated (`https://api.hyperliquid-testnet.xyz`)
+`hyperliquid-quant-defi` (`hl_quant`) · 291+ pytest + 28+ Vitest checks (GitHub Actions CI) · 16 UTC worker jobs · Testnet isolated (`https://api.hyperliquid-testnet.xyz`)

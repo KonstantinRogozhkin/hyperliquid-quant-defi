@@ -10,17 +10,32 @@ const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "S
 const MONTH_LABELS_RU = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"];
 const MONTH_NAMES_EN = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const MONTH_NAMES_RU = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
+const MAX_STEP_BACK_MS = 2 * 86_400_000;
 
 function fmtNum(v: number | null | undefined, digits = 2, suffix = "", signed = false): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "—";
-  const prefix = signed && v >= 0 ? "+" : "";
-  return `${prefix}${v.toFixed(digits)}${suffix}`;
+  const norm = Math.abs(v) < 0.5 * Math.pow(10, -digits) ? 0 : v;
+  const prefix = signed && norm >= 0 ? "+" : "";
+  return `${prefix}${norm.toFixed(digits)}${suffix}`;
 }
 
 function fmtUsd(v: number | null | undefined, digits = 2): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "—";
-  if (Math.abs(v) >= 1_000_000) return `$${(v / 1_000_000).toFixed(2)}M`;
-  return `$${v.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+  const abs = Math.abs(v);
+  const sign = v < 0 && abs >= 0.5 * Math.pow(10, -digits) ? "-" : "";
+  if (abs >= 1_000_000_000) return `${sign}$${(abs / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(2)}M`;
+  return `${sign}$${abs.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+}
+
+function signCls(v: number | null | undefined): string {
+  if (v === null || v === undefined || !Number.isFinite(v)) return "";
+  return v > 0 ? "pos" : v < 0 ? "neg" : "";
+}
+
+function shortCorrHeader(label: string, maxLen = 14): string {
+  const clean = label.trim();
+  return clean.length <= maxLen ? clean : `${clean.slice(0, maxLen - 1)}…`;
 }
 
 function corrCellStyle(rho: number | null): { backgroundColor: string; color: string } {
@@ -34,9 +49,11 @@ function corrCellStyle(rho: number | null): { backgroundColor: string; color: st
 export function AnalyticsRiskTab({
   analytics,
   overview,
+  analyticsError = null,
 }: {
   analytics: AnalyticsPayload | null;
   overview: OverviewPayload | null;
+  analyticsError?: string | null;
 }) {
   const { lang, t, p } = useLang();
   const [feeMode, setFeeMode] = useState<"gross" | "net">("net");
@@ -93,18 +110,25 @@ export function AnalyticsRiskTab({
     };
 
     let globalMaxMs: number | null = null;
-    if (periodDays > 0) {
-      for (const id of keys) {
-        if (hiddenSeries[id]) continue;
-        const ds = curvesMap[id]?.dates ?? [];
-        if (ds.length > 0) {
-          const ms = parseMs(ds[ds.length - 1]);
-          if (ms !== null && (globalMaxMs === null || ms > globalMaxMs)) {
-            globalMaxMs = ms;
+    let earliestStrategyMs: number | null = null;
+    for (const id of keys) {
+      if (hiddenSeries[id]) continue;
+      const c = curvesMap[id];
+      const ds = c?.dates ?? [];
+      if (ds.length > 0) {
+        const lastMs = parseMs(ds[ds.length - 1]);
+        if (lastMs !== null && (globalMaxMs === null || lastMs > globalMaxMs)) {
+          globalMaxMs = lastMs;
+        }
+        if (!c.is_benchmark) {
+          const firstMs = parseMs(ds[0]);
+          if (firstMs !== null && (earliestStrategyMs === null || firstMs < earliestStrategyMs)) {
+            earliestStrategyMs = firstMs;
           }
         }
       }
     }
+
     const cutoffMs = periodDays > 0 && globalMaxMs !== null ? globalMaxMs - periodDays * 86_400_000 : null;
 
     keys.forEach((id, idx) => {
@@ -112,22 +136,49 @@ export function AnalyticsRiskTab({
       const c = curvesMap[id];
       const rawShares = feeMode === "gross" ? c.gross_shares : c.net_shares;
       let startIdx = 0;
+
       if (cutoffMs !== null && c.dates.length === rawShares.length && c.dates.length > 0) {
         const found = c.dates.findIndex((d) => {
           const ms = parseMs(d);
           return ms !== null && ms >= cutoffMs;
         });
         if (found === -1) {
-          startIdx = Math.max(0, rawShares.length - 2);
-        } else {
-          // Include one anchor point at/just before cutoff when available so window rebasing is exact
-          startIdx = found > 0 && (parseMs(c.dates[found]) ?? 0) > cutoffMs ? found - 1 : found;
+          // Stale series with zero observations inside the requested window: omit instead of plotting old tail.
+          return;
         }
+        const foundMs = parseMs(c.dates[found]);
+        const prevMs = found > 0 ? parseMs(c.dates[found - 1]) : null;
+        const canStepBack =
+          found > 0 &&
+          foundMs !== null &&
+          foundMs > cutoffMs &&
+          prevMs !== null &&
+          cutoffMs - prevMs <= MAX_STEP_BACK_MS;
+        startIdx = canStepBack ? found - 1 : found;
       } else if (periodDays > 0) {
+        if (rawShares.length === 0) return;
         startIdx = Math.max(0, rawShares.length - periodDays);
+      } else if (rebaseWindow && c.is_benchmark && earliestStrategyMs !== null && c.dates.length === rawShares.length) {
+        // In "All" mode with Rebase enabled, align long-history benchmarks to the earliest desk strategy inception.
+        const found = c.dates.findIndex((d) => {
+          const ms = parseMs(d);
+          return ms !== null && ms >= earliestStrategyMs;
+        });
+        if (found > 0) {
+          const foundMs = parseMs(c.dates[found]);
+          const prevMs = parseMs(c.dates[found - 1]);
+          const canStepBack =
+            foundMs !== null &&
+            foundMs > earliestStrategyMs &&
+            prevMs !== null &&
+            earliestStrategyMs - prevMs <= MAX_STEP_BACK_MS;
+          startIdx = canStepBack ? found - 1 : found;
+        }
       }
+
       const subShares = rawShares.slice(startIdx);
       const subDates = c.dates.slice(startIdx);
+      if (subShares.length === 0) return;
       if (subDates.length > longestDates.length) longestDates = subDates;
       const cleanShares: number[] = [];
       let lastValid = 1;
@@ -137,7 +188,9 @@ export function AnalyticsRiskTab({
         }
         cleanShares.push(lastValid);
       }
-      const base = rebaseWindow ? (cleanShares[0] || 1) : 1;
+      // Benchmarks always rebase on finite windows (7D/30D/90D) so a 370d base never distorts short-window comparison.
+      const shouldRebase = rebaseWindow || (c.is_benchmark && periodDays > 0);
+      const base = shouldRebase ? (cleanShares[0] || 1) : 1;
       const pctVals = cleanShares.map((s) => (base > 0 ? (s / base - 1) * 100 : 0));
       lines.push({
         id,
@@ -172,14 +225,39 @@ export function AnalyticsRiskTab({
   };
 
   const exportCsv = () => {
-    const header = ["Strategy", "Category", "7D", "30D", "YTD", "All-Time", "Sharpe90D", "Sortino90D", "MaxDD%", "PosDays%", "SharePrice"];
+    const feeTag = feeMode.toUpperCase();
+    const metricTag = `${feeTag}_${showMode.toUpperCase()}`;
+    const header = [
+      "Strategy",
+      "Category",
+      `7D_${metricTag}`,
+      `30D_${metricTag}`,
+      `YTD_${metricTag}`,
+      `AllTime_${metricTag}`,
+      `Sharpe90D_${feeTag}`,
+      `Sortino90D_${feeTag}`,
+      `MaxDD%_${feeTag}`,
+      `DDRecovDays_${feeTag}`,
+      `PosDays%_${feeTag}`,
+      `WinLossStreak_${feeTag}`,
+      `SharePx_${feeTag}`,
+    ];
     const lines = filteredLeaderboard.map((r) => {
       const h = getHorizons(r);
       const sh = feeMode === "gross" ? r.sharpe_gross : r.sharpe_net;
       const so = feeMode === "gross" ? r.sortino_gross : r.sortino_net;
       const dd = feeMode === "gross" ? r.max_dd_gross_pct : r.max_dd_net_pct;
-      const sp = feeMode === "gross" ? r.share_price_gross : r.share_price_net;
-      return [r.name, r.category, h["7d"], h["30d"], h.ytd, h.all_time, sh, so, dd, r.positive_days_pct, sp]
+      const ddRec =
+        feeMode === "gross"
+          ? r.dd_recovery_days
+          : (r.dd_recovery_net_days !== undefined ? r.dd_recovery_net_days : r.dd_recovery_days);
+      const posDays = feeMode === "net" ? (r.positive_days_net_pct ?? r.positive_days_pct) : r.positive_days_pct;
+      const winStreak = feeMode === "net" ? (r.longest_win_streak_net ?? r.longest_win_streak) : r.longest_win_streak;
+      const lossStreak = feeMode === "net" ? (r.longest_loss_streak_net ?? r.longest_loss_streak) : r.longest_loss_streak;
+      const sp = r.is_benchmark ? r.spot_price_usd : feeMode === "net" ? r.share_price_net : r.share_price_gross;
+      const wl =
+        winStreak !== undefined && lossStreak !== undefined ? `${winStreak}d/${lossStreak}d` : "";
+      return [r.name, r.category, h["7d"], h["30d"], h.ytd, h.all_time, sh, so, dd, ddRec, posDays, wl, sp]
         .map(csvCell)
         .join(",");
     });
@@ -203,21 +281,28 @@ export function AnalyticsRiskTab({
 
   return (
     <div className="stack">
+      {analyticsError && (
+        <div className="error-box" role="alert">
+          <strong>{t("Analytics feed error:", "Ошибка фида аналитики:")}</strong> {analyticsError}
+          {analytics?.generated_at_utc
+            ? ` (${t("showing last cached snapshot from", "показан последний кэшированный снимок от")} ${analytics.generated_at_utc})`
+            : ""}
+        </div>
+      )}
+
       {/* 1. Master Portfolio & Spot+Perp Flagship KPI Strip */}
       <section className="kpi-grid">
         <div className="card">
           <KpiLabel k="kpiAutopilot" />
           <div className="kpi-value">{fmtUsd(autopilot?.gross_equity_usd)}</div>
           <div className="kpi-sub">
-            Gross {fmtNum(autopilot?.gross_return_pct, 2, "%", true)} · Net HWM{" "}
+            {t("Gross", "Брутто")} {fmtNum(autopilot?.gross_return_pct, 2, "%", true)} · {t("Net HWM", "Нетто HWM")}{" "}
             {fmtNum(autopilot?.net_return_pct, 2, "%", true)}
           </div>
         </div>
         <div className="card">
           <KpiLabel k="kpiAutopilotLev" />
-          <div className="kpi-value">
-            {autopilot?.risk_telemetry ? `${fmtNum(autopilot.risk_telemetry.gross_leverage, 2)}x` : "—"}
-          </div>
+          <div className="kpi-value">{fmtNum(autopilot?.risk_telemetry?.gross_leverage, 2, "x")}</div>
           <div className="kpi-sub">
             CTA {fmtNum(autopilot?.risk_telemetry?.directional_sleeve_pct, 1, "%")} (≤5%) · {t("Drift", "Отклонение")}{" "}
             {fmtNum(autopilot?.risk_telemetry?.max_weight_drift_pct, 2, "%")}
@@ -227,15 +312,13 @@ export function AnalyticsRiskTab({
           <KpiLabel k="kpiSpotPerp" />
           <div className="kpi-value">{fmtUsd(spotPerp?.equity_usd)}</div>
           <div className="kpi-sub">
-            Blended APR {fmtNum(spotPerp?.blended_portfolio_apr_pct, 2, "%", true)} · HLP{" "}
+            {t("Blended APR", "Смеш. APR")} {fmtNum(spotPerp?.blended_portfolio_apr_pct, 2, "%", true)} · HLP{" "}
             {fmtNum(spotPerp?.hlp_reserve_share_pct, 1, "%")}
           </div>
         </div>
         <div className="card">
           <KpiLabel k="kpiSpotPerpLev" />
-          <div className="kpi-value">
-            {spotPerp?.risk_telemetry ? `${fmtNum(spotPerp.risk_telemetry.gross_leverage, 2)}x` : "—"}
-          </div>
+          <div className="kpi-value">{fmtNum(spotPerp?.risk_telemetry?.gross_leverage, 2, "x")}</div>
           <div className="kpi-sub">
             {t("30D max", "Макс. 30Д")} {fmtNum(spotPerp?.risk_telemetry?.leverage_30d_max, 2, "x")} · Δ{" "}
             {fmtNum(spotPerp?.risk_telemetry?.net_delta_pct, 3, "%", true)}
@@ -257,8 +340,8 @@ export function AnalyticsRiskTab({
             <SectionTitle k="secLeaderboard" />
             <div className="section-sub">
               {t(
-                "Trailing 90D Sharpe & Sortino · HWM Net-of-Fee simulation · Negative returns never annualized",
-                "Шарп и Сортино за последние 90Д · симуляция net после комиссий с HWM · отрицательная доходность не пересчитывается в годовую",
+                "Trailing 90D Sharpe & Sortino · HWM Net-of-Fee simulation · APY requires ≥ 14d & non-negative return",
+                "Шарп и Сортино за последние 90Д · симуляция net с HWM · APY требует ≥ 14д и неотрицательной доходности",
               )}
             </div>
           </div>
@@ -267,6 +350,7 @@ export function AnalyticsRiskTab({
               <button
                 type="button"
                 className={`btn btn-sm ${feeMode === "gross" ? "tab-active" : ""}`}
+                aria-pressed={feeMode === "gross"}
                 onClick={() => setFeeMode("gross")}
               >
                 {t("Gross", "Брутто")}
@@ -274,6 +358,7 @@ export function AnalyticsRiskTab({
               <button
                 type="button"
                 className={`btn btn-sm ${feeMode === "net" ? "tab-active" : ""}`}
+                aria-pressed={feeMode === "net"}
                 onClick={() => setFeeMode("net")}
               >
                 {t("Net (HWM)", "Нетто (HWM)")}
@@ -283,6 +368,7 @@ export function AnalyticsRiskTab({
               <button
                 type="button"
                 className={`btn btn-sm ${showMode === "returns" ? "tab-active" : ""}`}
+                aria-pressed={showMode === "returns"}
                 onClick={() => setShowMode("returns")}
               >
                 {t("Returns", "Доходность")}
@@ -290,6 +376,7 @@ export function AnalyticsRiskTab({
               <button
                 type="button"
                 className={`btn btn-sm ${showMode === "apy" ? "tab-active" : ""}`}
+                aria-pressed={showMode === "apy"}
                 onClick={() => setShowMode("apy")}
               >
                 APY
@@ -307,7 +394,12 @@ export function AnalyticsRiskTab({
                 </option>
               ))}
             </select>
-            <button type="button" className="btn btn-sm" onClick={() => setShowMethodology((v) => !v)}>
+            <button
+              type="button"
+              className="btn btn-sm"
+              aria-expanded={showMethodology}
+              onClick={() => setShowMethodology((v) => !v)}
+            >
               {showMethodology ? t("Hide Methodology", "Скрыть методику") : t("How calculated", "Как считается")}
             </button>
             <button type="button" className="btn btn-sm" onClick={exportCsv}>
@@ -323,17 +415,22 @@ export function AnalyticsRiskTab({
                 <strong>Методика (стандарт Neutral Trade):</strong> Шарп и Сортино считаются по дневным
                 лог-доходностям за последние 90 дней (годовой пересчёт на 365 дней). Net-значения учитывают постоянную
                 годовую комиссию за управление и комиссию за результат по High-Water Mark (HWM) — только выше
-                предыдущего пика net NAV. В режиме APY отрицательная доходность за период показывается как
-                &laquo;—&raquo; (в годовую не пересчитывается; переключитесь на «Доходность», чтобы увидеть убытки).
-                Плюсовые дни, серии побед/поражений и восстановление после просадки считаются по дневным закрытиям NAV.
+                предыдущего пика net NAV. В режиме APY пересчёт в годовые требует не менее 14 календарных дней
+                истории (<code>apy_min_days = 14</code>) и неотрицательного результата, поэтому прочерк &laquo;—&raquo;
+                означает либо окно короче 14 дней (включая колонку 7Д), либо отрицательную доходность за период
+                (переключитесь на «Доходность», чтобы увидеть короткие окна и убытки). Плюсовые дни, серии
+                побед/поражений и восстановление после просадки считаются по дневным закрытиям выбранного режима
+                (Gross или Net).
               </>
             ) : (
               <>
                 <strong>Methodology (Neutral Trade Standard):</strong> Sharpe &amp; Sortino use trailing 90-day daily log
                 returns (365d annualization). Net figures apply continuous annual management fee + High-Water Mark (HWM)
-                performance fee strictly above peak net NAV. Under APY view, negative period returns are shown as
-                &ldquo;—&rdquo; (never annualized; switch to Returns for period losses). Positive days, win/loss streaks,
-                and drawdown recovery days use daily NAV closes.
+                performance fee strictly above peak net NAV. Under APY view, annualization requires at least 14 elapsed
+                days (<code>apy_min_days = 14</code>) and a non-negative return, so &ldquo;—&rdquo; indicates either
+                &lt; 14 days of history (including the 7D column) or a negative period return (switch to Returns for
+                short windows and losses). Positive days, win/loss streaks, and drawdown recovery days use daily NAV
+                closes in the active fee mode (Gross or Net).
               </>
             )}
           </div>
@@ -372,6 +469,11 @@ export function AnalyticsRiskTab({
                   feeMode === "gross"
                     ? (r.current_underwater_days ?? 0)
                     : (r.current_underwater_net_days ?? r.current_underwater_days ?? 0);
+                const posDays = feeMode === "net" ? (r.positive_days_net_pct ?? r.positive_days_pct) : r.positive_days_pct;
+                const winStreak =
+                  feeMode === "net" ? (r.longest_win_streak_net ?? r.longest_win_streak) : r.longest_win_streak;
+                const lossStreak =
+                  feeMode === "net" ? (r.longest_loss_streak_net ?? r.longest_loss_streak) : r.longest_loss_streak;
                 const sp = r.is_benchmark ? r.spot_price_usd : feeMode === "gross" ? r.share_price_gross : r.share_price_net;
                 return (
                   <tr key={r.id}>
@@ -384,7 +486,7 @@ export function AnalyticsRiskTab({
                     </td>
                     {(["7d", "30d", "ytd", "all_time"] as const).map((k) => {
                       const val = h[k];
-                      const cls = val === null ? "muted" : val >= 0 ? "pos" : "neg";
+                      const cls = val === null ? "muted" : val > 0 ? "pos" : val < 0 ? "neg" : "";
                       return (
                         <td key={k} className={`num ${cls}`}>
                           {fmtNum(val, 2, "%", true)}
@@ -395,33 +497,35 @@ export function AnalyticsRiskTab({
                     <td className="num">{fmtNum(so, 2)}</td>
                     <td className={`num ${dd > 5 ? "neg" : ""}`}>{fmtNum(dd, 2, "%")}</td>
                     <td className="num">
-                      {ddRec !== null && ddRec !== undefined ? `${fmtNum(ddRec, 1)}${dayUnit}` : "—"}
+                      {fmtNum(ddRec, 1, dayUnit)}
                       {ddUnder > 0 ? (
                         <div className="section-sub neg">
-                          {t("underwater", "под водой")} {fmtNum(ddUnder, 1)}
-                          {dayUnit}
+                          {t("underwater", "под водой")} {fmtNum(ddUnder, 1, dayUnit)}
                         </div>
                       ) : null}
                     </td>
-                    <td className="num">{fmtNum(r.positive_days_pct, 1, "%")}</td>
+                    <td className="num">{fmtNum(posDays, 1, "%")}</td>
                     <td className="num">
-                      {r.longest_win_streak}
-                      {dayUnit} / {r.longest_loss_streak}
-                      {dayUnit}
+                      {winStreak !== undefined && lossStreak !== undefined && Number.isFinite(winStreak) && Number.isFinite(lossStreak)
+                        ? `${fmtNum(winStreak, 0, dayUnit)} / ${fmtNum(lossStreak, 0, dayUnit)}`
+                        : "—"}
                     </td>
-                    <td className="num">
-                      {r.is_benchmark ? fmtUsd(sp, 2) : sp !== null && sp !== undefined ? `$${fmtNum(sp, 4)}` : "—"}
-                    </td>
+                    <td className="num">{fmtUsd(sp, r.is_benchmark ? 2 : 4)}</td>
                   </tr>
                 );
               })}
               {filteredLeaderboard.length === 0 && (
                 <tr>
                   <td colSpan={13} className="muted">
-                    {t(
-                      "No strategy ticks persisted yet. Run Spot+Perp or Autopilot ticks to populate analytics.",
-                      "Тиков стратегий пока нет. Запустите тики Spot+Perp или Autopilot, чтобы заполнить аналитику.",
-                    )}
+                    {analyticsError && !analytics
+                      ? t(
+                          "Analytics endpoint unavailable — check the error banner above.",
+                          "Эндпоинт аналитики недоступен — проверьте сообщение об ошибке выше.",
+                        )
+                      : t(
+                          "No strategy ticks persisted yet. Run Spot+Perp or Autopilot ticks to populate analytics.",
+                          "Тиков стратегий пока нет. Запустите тики Spot+Perp или Autopilot, чтобы заполнить аналитику.",
+                        )}
                   </td>
                 </tr>
               )}
@@ -437,8 +541,8 @@ export function AnalyticsRiskTab({
             <SectionTitle k="secCumPerf" suffix={` (${modeLabel})`} />
             <div className="section-sub">
               {t(
-                "Toggle strategies & benchmarks · rebase to window start",
-                "Включайте/выключайте стратегии и бенчмарки · отсчёт от начала окна",
+                "Toggle strategies & benchmarks · benchmarks rebase to window start (or earliest strategy in All)",
+                "Переключайте стратегии и бенчмарки · бенчмарки нормируются к началу окна (или старту первой стратегии в «Всё»)",
               )}
             </div>
           </div>
@@ -448,14 +552,15 @@ export function AnalyticsRiskTab({
               { label: t("30D", "30Д"), days: 30 },
               { label: t("90D", "90Д"), days: 90 },
               { label: t("All", "Всё"), days: 0 },
-            ].map((p) => (
+            ].map((pd) => (
               <button
-                key={p.label}
+                key={pd.label}
                 type="button"
-                className={`btn btn-sm ${periodDays === p.days ? "tab-active" : ""}`}
-                onClick={() => setPeriodDays(p.days)}
+                className={`btn btn-sm ${periodDays === pd.days ? "tab-active" : ""}`}
+                aria-pressed={periodDays === pd.days}
+                onClick={() => setPeriodDays(pd.days)}
               >
-                {p.label}
+                {pd.label}
               </button>
             ))}
             <label className="checkbox-label">
@@ -480,6 +585,7 @@ export function AnalyticsRiskTab({
                 key={c.id}
                 type="button"
                 className="pill"
+                aria-pressed={!off}
                 style={{
                   opacity: off ? 0.4 : 1,
                   borderColor: off ? "var(--border)" : color,
@@ -508,23 +614,26 @@ export function AnalyticsRiskTab({
               </div>
             </div>
           </div>
-          {corr && corr.ids.length > 0 ? (
+          {corr && corr.ids.length >= 2 && corr.overlap_days >= 3 ? (
             <div className="table-wrap">
               <table>
                 <thead>
                   <tr>
                     <Th k="colCorrStrategy" />
-                    {corr.ids.map((id) => (
-                      <Th
-                        key={id}
-                        num
-                        label={id.slice(0, 10)}
-                        tip={t(
-                          `Correlation of each row strategy with "${corr.labels?.[id] ?? id}" (−1…+1).`,
-                          `Корреляция стратегии из строки со стратегией «${corr.labels?.[id] ?? id}» (от −1 до +1).`,
-                        )}
-                      />
-                    ))}
+                    {corr.ids.map((id) => {
+                      const fullLabel = corr.labels?.[id] ?? id;
+                      return (
+                        <Th
+                          key={id}
+                          num
+                          label={shortCorrHeader(fullLabel)}
+                          tip={t(
+                            `Correlation of each row strategy with "${fullLabel}" (−1…+1).`,
+                            `Корреляция стратегии из строки со стратегией «${fullLabel}» (от −1 до +1).`,
+                          )}
+                        />
+                      );
+                    })}
                   </tr>
                 </thead>
                 <tbody>
@@ -550,8 +659,8 @@ export function AnalyticsRiskTab({
           ) : (
             <div className="muted">
               {t(
-                "Waiting for at least 3 overlapping days across desk strategies.",
-                "Ждём минимум 3 общих дня у стратегий.",
+                "Waiting for at least 2 strategies with ≥ 3 overlapping days.",
+                "Ждём минимум 2 стратегии с ≥ 3 общими днями.",
               )}
             </div>
           )}
@@ -563,16 +672,16 @@ export function AnalyticsRiskTab({
               <SectionTitle k="secOls" />
               <div className="section-sub">
                 {t("Proof of market neutrality (β ≈ 0) against", "Проверка рыночной нейтральности (β ≈ 0) относительно")}{" "}
-                {activeFactor} ({factorBlock?.factor_days ?? 0}
-                {dayUnit})
+                {activeFactor} ({fmtNum(factorBlock?.factor_days ?? 0, 0, dayUnit)})
               </div>
             </div>
-            <div className="filter-row">
+            <div className="filter-row" role="group" aria-label={t("Market factor", "Рыночный фактор")}>
               {factors.map((f) => (
                 <button
                   key={f}
                   type="button"
                   className={`btn btn-sm ${activeFactor === f ? "tab-active" : ""}`}
+                  aria-pressed={activeFactor === f}
                   onClick={() => setSelectedFactor(f)}
                 >
                   {f}
@@ -599,9 +708,17 @@ export function AnalyticsRiskTab({
                       return (
                         <tr
                           key={r.id}
+                          className="row-interactive"
+                          tabIndex={0}
+                          aria-selected={active}
                           onClick={() => setSelectedOlsStrat(r.id)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" || e.key === " ") {
+                              e.preventDefault();
+                              setSelectedOlsStrat(r.id);
+                            }
+                          }}
                           style={{
-                            cursor: "pointer",
                             backgroundColor: active ? "rgba(56, 189, 248, 0.10)" : undefined,
                           }}
                         >
@@ -610,7 +727,7 @@ export function AnalyticsRiskTab({
                           </td>
                           <td className="num">{fmtNum(r.beta, 3)}</td>
                           <td className="num">{fmtNum(r.r2_pct, 1, "%")}</td>
-                          <td className={`num ${(r.alpha_ann_pct ?? 0) >= 0 ? "pos" : "neg"}`}>
+                          <td className={`num ${signCls(r.alpha_ann_pct)}`}>
                             {fmtNum(r.alpha_ann_pct, 1, "%", true)}
                           </td>
                           <td className="num">{r.days}</td>
@@ -694,13 +811,13 @@ export function AnalyticsRiskTab({
                       return (
                         <td
                           key={m}
-                          className={`num ${v === undefined ? "muted" : v >= 0 ? "pos" : "neg"}`}
+                          className={`num ${v === undefined ? "muted" : signCls(v)}`}
                         >
                           {v === undefined ? "—" : fmtNum(v, 2, "%", true)}
                         </td>
                       );
                     })}
-                    <td className={`num ${(yr.ytd ?? 0) >= 0 ? "pos" : "neg"}`}>
+                    <td className={`num ${signCls(yr.ytd)}`}>
                       <strong>{fmtNum(yr.ytd, 2, "%", true)}</strong>
                     </td>
                   </tr>
@@ -750,9 +867,9 @@ export function AnalyticsRiskTab({
                     <td>
                       <strong>{row.strategy}</strong>
                     </td>
-                    <td className="num">{fmtNum(row.current_leverage, 2)}x</td>
-                    <td className="num">{fmtNum(row.leverage_30d_avg, 2)}x</td>
-                    <td className="num">{fmtNum(row.leverage_30d_max, 2)}x</td>
+                    <td className="num">{fmtNum(row.current_leverage, 2, "x")}</td>
+                    <td className="num">{fmtNum(row.leverage_30d_avg, 2, "x")}</td>
+                    <td className="num">{fmtNum(row.leverage_30d_max, 2, "x")}</td>
                     <td className="num">{fmtNum(row.net_exposure_pct, 2, "%", true)}</td>
                     <td className="num">
                       <span className={`badge ${row.nav_guard_triggers > 0 ? "badge-warn" : "badge-ok"}`}>
@@ -773,27 +890,27 @@ export function AnalyticsRiskTab({
                   <div className="bar-meta">
                     <span>{v.label}</span>
                     <span className="mono">
-                      {fmtUsd(v.usd, 0)} ({fmtNum(v.share_pct, 1)}%)
+                      {fmtUsd(v.usd, 0)} ({fmtNum(v.share_pct, 1, "%")})
                     </span>
                   </div>
                   <div className="bar-track">
-                    <div className="bar-fill" style={{ width: `${Math.min(100, v.share_pct)}%` }} />
+                    <div className="bar-fill" style={{ width: `${Math.min(100, Math.max(0, v.share_pct))}%` }} />
                   </div>
                 </div>
               ))}
             </div>
             <div>
               <KpiLabel k="blkTierConc" />
-              {(risk?.asset_tier_concentration ?? []).map((t) => (
-                <div key={t.label} className="bar-row">
+              {(risk?.asset_tier_concentration ?? []).map((tr) => (
+                <div key={tr.label} className="bar-row">
                   <div className="bar-meta">
-                    <span>{t.label}</span>
+                    <span>{tr.label}</span>
                     <span className="mono">
-                      {fmtUsd(t.usd, 0)} ({fmtNum(t.share_pct, 1)}%)
+                      {fmtUsd(tr.usd, 0)} ({fmtNum(tr.share_pct, 1, "%")})
                     </span>
                   </div>
                   <div className="bar-track">
-                    <div className="bar-fill bar-fill-green" style={{ width: `${Math.min(100, t.share_pct)}%` }} />
+                    <div className="bar-fill bar-fill-green" style={{ width: `${Math.min(100, Math.max(0, tr.share_pct))}%` }} />
                   </div>
                 </div>
               ))}
@@ -832,8 +949,8 @@ export function AnalyticsRiskTab({
                       <strong>{s.name}</strong>
                     </td>
                     <td>{s.category}</td>
-                    <td className="num">{fmtNum(s.target_weight_pct, 1)}%</td>
-                    <td className="num">{fmtNum(s.actual_weight_pct, 1)}%</td>
+                    <td className="num">{fmtNum(s.target_weight_pct, 1, "%")}</td>
+                    <td className="num">{fmtNum(s.actual_weight_pct, 1, "%")}</td>
                     <td className={`num ${Math.abs(s.drift_pct) >= 3 ? "warn" : ""}`}>
                       {fmtNum(s.drift_pct, 2, "%", true)}
                     </td>
@@ -881,13 +998,13 @@ export function AnalyticsRiskTab({
                           <span className="muted mono">{o.spot_pair}</span>
                         </td>
                         <td>{o.asset_tier}</td>
-                        <td className="num pos">{fmtNum(o.funding_apr_pct, 2, "%", true)}</td>
-                        <td className="num">{fmtNum(o.net_deposit_apr_pct, 2, "%", true)}</td>
+                        <td className={`num ${signCls(o.funding_apr_pct)}`}>{fmtNum(o.funding_apr_pct, 2, "%", true)}</td>
+                        <td className={`num ${signCls(o.net_deposit_apr_pct)}`}>{fmtNum(o.net_deposit_apr_pct, 2, "%", true)}</td>
                         <td className="num">{fmtNum(o.exec_basis_bps, 1, " bps", true)}</td>
                         <td className="num">{fmtNum(o.entry_l2_slip_bps, 1, " bps")}</td>
                         <td>
                           <span className={`badge ${o.eligible ? "badge-ok" : "badge-warn"}`}>
-                            {o.eligible ? "ELIGIBLE" : o.reject_reason || "SKIP"}
+                            {o.eligible ? t("ELIGIBLE", "ДОПУЩЕН") : o.reject_reason || t("SKIP", "ПРОПУСК")}
                           </span>
                         </td>
                       </tr>

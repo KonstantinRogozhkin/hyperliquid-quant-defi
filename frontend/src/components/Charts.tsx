@@ -45,8 +45,11 @@ export function MultiSeriesChart({
   const pb = 26;
 
   const allVals = valid.flatMap((s) => s.values);
-  const minVal = Math.min(...allVals);
-  const maxVal = Math.max(...allVals);
+  const rawMin = Math.min(...allVals);
+  const rawMax = Math.max(...allVals);
+  const isFlat = Math.abs(rawMax - rawMin) < 1e-6;
+  const minVal = isFlat ? rawMin - 1.0 : rawMin;
+  const maxVal = isFlat ? rawMax + 1.0 : rawMax;
   const span = Math.max(maxVal - minVal, 1e-4);
   const maxLen = Math.max(...valid.map((s) => s.values.length), 2);
 
@@ -71,7 +74,8 @@ export function MultiSeriesChart({
     pl + ((width - pl - pr) * i) / Math.max(len - 1, 1);
   const sxTime = (ms: number) =>
     pl + ((width - pl - pr) * (ms - minTs)) / Math.max(maxTs - minTs, 1);
-  const sy = (v: number) => height - pb - ((height - pt - pb) * (v - minVal)) / span;
+  const sy = (v: number) =>
+    isFlat ? pt + (height - pt - pb) / 2 : height - pb - ((height - pt - pb) * (v - minVal)) / span;
   const zeroY = minVal <= 0 && maxVal >= 0 ? sy(0) : null;
 
   const firstDate = useTimeAxis
@@ -91,7 +95,8 @@ export function MultiSeriesChart({
       >
         {[0, 0.25, 0.5, 0.75, 1].map((frac, idx) => {
           const y = pt + (height - pt - pb) * frac;
-          const v = maxVal - span * frac;
+          const rawTick = maxVal - span * frac;
+          const v = Math.abs(rawTick) < 0.05 ? 0 : rawTick;
           return (
             <g key={idx}>
               <line x1={pl} y1={y} x2={width - pr} y2={y} stroke="#1e293b" strokeWidth="1" />
@@ -128,12 +133,47 @@ export function MultiSeriesChart({
         <text x={pl} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
           {firstDate || `t=0`}
         </text>
-        <text x={width - pr - 72} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+        <text x={width - pr} y={height - 6} textAnchor="end" fill="#94a3b8" fontSize="10" fontFamily="monospace">
           {lastDate || `t=${maxLen - 1}`}
         </text>
       </svg>
     </div>
   );
+}
+
+/**
+ * Clip the OLS regression line `y = alphaDailyPct + beta * x` to `[-maxAbsX, maxAbsX] × [-maxAbsY, maxAbsY]`
+ * using Liang-Barsky parametric intersection so the drawn segment preserves the exact slope `beta`
+ * and intercept `(0, alphaDailyPct)` even when steep factor betas exit the top/bottom of the viewport.
+ */
+export function clipOlsLineToBox(
+  alphaDailyPct: number,
+  beta: number,
+  maxAbsX: number,
+  maxAbsY: number,
+): { x1: number; y1: number; x2: number; y2: number } | null {
+  const x0 = -maxAbsX;
+  const dx = 2 * maxAbsX;
+  const y0 = alphaDailyPct + beta * x0;
+  const dy = beta * dx;
+
+  if (Math.abs(dy) <= 1e-12) {
+    if (Math.abs(y0) > maxAbsY) return null;
+    return { x1: -maxAbsX, y1: y0, x2: maxAbsX, y2: y0 };
+  }
+
+  const t1 = (-maxAbsY - y0) / dy;
+  const t2 = (maxAbsY - y0) / dy;
+  const tMin = Math.max(0, Math.min(t1, t2));
+  const tMax = Math.min(1, Math.max(t1, t2));
+  if (tMin > tMax) return null;
+
+  return {
+    x1: x0 + tMin * dx,
+    y1: y0 + tMin * dy,
+    x2: x0 + tMax * dx,
+    y2: y0 + tMax * dy,
+  };
 }
 
 export function OlsScatterChart({
@@ -177,8 +217,7 @@ export function OlsScatterChart({
   const sy = (y: number) => height - pb - ((height - pt - pb) * (y + maxAbsY)) / (2 * maxAbsY);
 
   const alphaDailyPct = (alphaAnnPct ?? 0) / 365;
-  const yLeft = alphaDailyPct + beta * -maxAbsX;
-  const yRight = alphaDailyPct + beta * maxAbsX;
+  const clipped = clipOlsLineToBox(alphaDailyPct, beta, maxAbsX, maxAbsY);
 
   return (
     <svg
@@ -189,21 +228,24 @@ export function OlsScatterChart({
     >
       <line x1={pl} y1={sy(0)} x2={width - pr} y2={sy(0)} stroke="#334155" strokeWidth="1" />
       <line x1={sx(0)} y1={pt} x2={sx(0)} y2={height - pb} stroke="#334155" strokeWidth="1" />
-      <line
-        x1={sx(-maxAbsX)}
-        y1={sy(Math.max(-maxAbsY, Math.min(maxAbsY, yLeft)))}
-        x2={sx(maxAbsX)}
-        y2={sy(Math.max(-maxAbsY, Math.min(maxAbsY, yRight)))}
-        stroke="#f59e0b"
-        strokeWidth="2"
-      />
+      {clipped && (
+        <line
+          data-testid="ols-regression-line"
+          x1={sx(clipped.x1)}
+          y1={sy(clipped.y1)}
+          x2={sx(clipped.x2)}
+          y2={sy(clipped.y2)}
+          stroke="#f59e0b"
+          strokeWidth="2"
+        />
+      )}
       {points.map((p, idx) => (
         <circle key={idx} cx={sx(p.factor_ret_pct)} cy={sy(p.strat_ret_pct)} r="3.2" fill="#38bdf8" fillOpacity="0.8" />
       ))}
       <text x={pl} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
         {factorName} -{maxAbsX.toFixed(1)}%
       </text>
-      <text x={width - pr - 64} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+      <text x={width - pr} y={height - 6} textAnchor="end" fill="#94a3b8" fontSize="10" fontFamily="monospace">
         +{maxAbsX.toFixed(1)}%
       </text>
       <text x={4} y={pt + 8} fill="#94a3b8" fontSize="10" fontFamily="monospace">
@@ -218,10 +260,12 @@ export function OlsScatterChart({
 
 export function EquityCurveChart({
   values,
+  initialValue = null,
   stroke = "#10b981",
   height = 130,
 }: {
   values: number[];
+  initialValue?: number | null;
   stroke?: string;
   height?: number;
 }) {
@@ -234,11 +278,12 @@ export function EquityCurveChart({
   const padY = 14;
   const minVal = Math.min(...values);
   const maxVal = Math.max(...values);
+  const isFlat = Math.abs(maxVal - minVal) < 1e-9;
   const span = Math.max(maxVal - minVal, 1e-6);
 
   const coords = values.map((v, i) => {
     const x = padX + ((width - 2 * padX) * i) / (values.length - 1);
-    const y = height - padY - ((height - 2 * padY) * (v - minVal)) / span;
+    const y = isFlat ? height / 2 : height - padY - ((height - 2 * padY) * (v - minVal)) / span;
     return [x, y] as const;
   });
 
@@ -246,7 +291,8 @@ export function EquityCurveChart({
   const polygon = `${padX},${height - padY} ${polyline} ${width - padX},${height - padY}`;
   const first = values[0];
   const last = values[values.length - 1];
-  const pct = first > 0 ? ((last - first) / first) * 100 : 0;
+  const base = typeof initialValue === "number" && Number.isFinite(initialValue) && initialValue > 0 ? initialValue : first;
+  const pct = base > 0 ? ((last - base) / base) * 100 : 0;
 
   return (
     <div>
@@ -262,7 +308,7 @@ export function EquityCurveChart({
           {t("Min", "Мин")} ${minVal.toLocaleString("en-US", { maximumFractionDigits: 2 })} · {t("Max", "Макс")} $
           {maxVal.toLocaleString("en-US", { maximumFractionDigits: 2 })}
         </span>
-        <span className={`mono ${pct >= 0 ? "pos" : "neg"}`}>
+        <span className={`mono ${pct > 0 ? "pos" : pct < 0 ? "neg" : ""}`}>
           {pct >= 0 ? "+" : ""}
           {pct.toFixed(3)}% ({values.length} {p(values.length, "tick", "ticks", "тик", "тика", "тиков")})
         </span>
@@ -301,7 +347,7 @@ export function KappaCalibrationChart({ cal }: { cal: CoinCalibration }) {
       <text x={pl} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
         0 bps
       </text>
-      <text x={width - pr - 36} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+      <text x={width - pr} y={height - 6} textAnchor="end" fill="#94a3b8" fontSize="10" fontFamily="monospace">
         {maxX.toFixed(1)} bps
       </text>
       <text x={4} y={pt + 8} fill="#94a3b8" fontSize="10" fontFamily="monospace">
