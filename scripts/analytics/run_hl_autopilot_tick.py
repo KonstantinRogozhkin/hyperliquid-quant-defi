@@ -40,7 +40,7 @@ def main(
 
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(
-            (ROOT / ".env", ROOT.parent / "ResearchLAB" / "system" / ".env")
+            (ROOT / ".env",)
         )
         if token and chat_id:
             try:

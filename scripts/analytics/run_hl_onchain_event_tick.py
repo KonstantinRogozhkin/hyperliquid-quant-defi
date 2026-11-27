@@ -56,7 +56,7 @@ def main(
         typer.echo(f"alerts_suppressed_by_cooldown={res['suppressed_alert_keys']}", err=True)
     if should_send:
         token, chat_id, thread_id = pt.load_telegram_credentials(
-            (ROOT / ".env", ROOT.parent / "ResearchLAB" / "system" / ".env")
+            (ROOT / ".env",)
         )
         if token and chat_id:
             try:

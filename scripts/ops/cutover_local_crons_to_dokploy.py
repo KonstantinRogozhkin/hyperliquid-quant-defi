@@ -35,7 +35,14 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BACKUP_DIR = ROOT / "data" / "crontab_backups"
-DEFAULT_REQUIRED_JOBS = ("market_snapshot", "metamodel_paper", "frontier_persistence", "onchain_events")
+DEFAULT_REQUIRED_JOBS = (
+    "market_snapshot",
+    "metamodel_paper",
+    "frontier_persistence",
+    "onchain_events",
+    "spot_perp_paper",
+    "autopilot_allocator",
+)
 
 BEGIN_RE = re.compile(r"^#\s*BEGIN\s+(?:hyperliquid-quant-defi|Spy2Money\s+BackTester(?:\s+hl|\s+hyperliquid)?)\s+(?P<label>.+?)\s*$")
 END_RE = re.compile(r"^#\s*END\s+(?:hyperliquid-quant-defi|Spy2Money\s+BackTester(?:\s+hl|\s+hyperliquid)?)\s+(?P<label>.+?)\s*$")

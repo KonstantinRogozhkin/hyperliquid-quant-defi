@@ -42,8 +42,8 @@ def test_job_schedule_matching(tmp_path: Path):
     assert jobs["settlement_study"].should_run_at(datetime(2026, 11, 26, 5, 34, tzinfo=timezone.utc))
     assert not jobs["settlement_study"].should_run_at(datetime(2026, 11, 26, 17, 34, tzinfo=timezone.utc))
 
-    assert jobs["testnet_attribution"].should_run_at(datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc))
-    assert not jobs["testnet_attribution"].should_run_at(datetime(2026, 11, 26, 18, 0, tzinfo=timezone.utc))
+    assert jobs["testnet_attribution"].should_run_at(datetime(2026, 11, 26, 8, 22, tzinfo=timezone.utc))
+    assert not jobs["testnet_attribution"].should_run_at(datetime(2026, 11, 26, 9, 22, tzinfo=timezone.utc))
 
     # Settlement study must write report under writable data_dir (never read-only /app/docs)
     settle_cmd = jobs["settlement_study"].build_command(Path("/app"), tmp_path, False)

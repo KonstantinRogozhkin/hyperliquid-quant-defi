@@ -79,8 +79,8 @@ def test_render_prometheus_metrics_emits_valid_exposition_lines():
     assert 'hl_build_info{service="hl-backend",sha="cc0dfbc08495"} 1' in text
     assert "hl_worker_heartbeat_age_seconds 30" in text
     assert "hl_worker_up 1" in text
-    assert 'hl_worker_job_ok{job="hip3_paper",worker_job="hip3_paper"} 1' in text
-    assert 'hl_worker_job_failed{job="onchain_events",worker_job="onchain_events"} 1' in text
+    assert 'hl_worker_job_ok{worker_job="hip3_paper"} 1' in text
+    assert 'hl_worker_job_failed{worker_job="onchain_events"} 1' in text
     assert "hl_testnet_equity_usd 1004.16" in text
     assert "hl_testnet_last_cycle_skipped_unquoted 2" in text
     assert "hl_hip3_paper_equity_usd 49996.135" in text
@@ -103,3 +103,26 @@ def test_render_prometheus_metrics_emits_valid_exposition_lines():
     for ln in sample_lines:
         val = float(ln.rsplit(" ", 1)[1])
         assert math.isfinite(val), ln
+
+    # Strict OpenMetrics / `promtool check metrics` type & suffix validation + live drawdown check
+    assert 'hl_strategy_max_dd_pct{strategy="testnet_alo_live",category="Live Testnet",mode="testnet"} 0.2374' in text
+    types_by_name: dict[str, str] = {}
+    seen_families: set[str] = set()
+    current_family: str | None = None
+    for ln in text.splitlines():
+        if not ln:
+            continue
+        if ln.startswith("# TYPE "):
+            _, _, rest = ln.partition("# TYPE ")
+            fam, mtype = rest.split(" ", 1)
+            assert fam not in seen_families, f"Interleaved/duplicate TYPE header for {fam}"
+            seen_families.add(fam)
+            types_by_name[fam] = mtype
+            current_family = fam
+            if mtype == "counter":
+                assert fam.endswith("_total"), f"Counter {fam} must end with _total (promtool check metrics)"
+            else:
+                assert not fam.endswith("_total"), f"Non-counter {fam} ({mtype}) must not end with _total"
+        elif not ln.startswith("#"):
+            fam = ln.split("{", 1)[0].split(" ", 1)[0]
+            assert fam == current_family, f"Sample {fam} interleaved outside family {current_family}"

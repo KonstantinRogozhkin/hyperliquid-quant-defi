@@ -91,6 +91,18 @@ def simulate_hwm_net_series(
     return net
 
 
+def _inception_anchor_date_str(first_date: str) -> str:
+    """Stamp inception anchor 4h before an intraday ISO tick or 1d before a daily YYYY-MM-DD bar."""
+    first = str(first_date)
+    try:
+        if "T" in first:
+            dt = datetime.fromisoformat(first.replace("Z", "+00:00")) - pd.Timedelta(hours=4)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return (datetime.fromisoformat(first) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        return first
+
+
 def simulate_net_series_from_inception(
     dates: list[str],
     gross_shares: list[float],
@@ -104,8 +116,9 @@ def simulate_net_series_from_inception(
         return simulate_hwm_net_series(
             dates, gross_shares, mgmt_fee_annual_pct=mgmt_fee_annual_pct, perf_fee_pct=perf_fee_pct
         )
+    anchor_dt = _inception_anchor_date_str(dates[0]) if dates else ""
     full = simulate_hwm_net_series(
-        [dates[0], *dates],
+        [anchor_dt, *dates] if dates else [],
         [float(inception_share), *gross_shares],
         mgmt_fee_annual_pct=mgmt_fee_annual_pct,
         perf_fee_pct=perf_fee_pct,
@@ -113,19 +126,26 @@ def simulate_net_series_from_inception(
     return full[1:]
 
 
+def _clean_zero(x: float) -> float:
+    """Normalize IEEE ``-0.0`` (from rounding tiny negatives) to ``0.0`` for JSON output."""
+    return 0.0 if x == 0 else x
+
+
 def _annualize_return_pct(ret_pct: float, days: float, *, min_days: float = MIN_APY_DAYS) -> float | None:
     """Neutral Trade methodology: annualize positive returns; never annualize negative returns.
 
     ``ret_pct`` must be the *unrounded* period return. Returns ``None`` when the elapsed span is
-    shorter than ``min_days`` (no APY is shown for too-short histories).
+    shorter than ``min_days`` (no APY is shown for too-short histories) and for negative returns:
+    a raw period loss is not an APY, and publishing it under ``*_apy`` made a 30d loss look like
+    an annual one. The period return itself stays available under ``*_returns``.
     """
     if days < min_days or days <= 0.0:
         return None
     if ret_pct < 0.0:
-        return round(ret_pct, 2)
+        return None
     base = 1.0 + ret_pct / 100.0
     if base <= 0.0:
-        return round(ret_pct, 2)
+        return None
     ann = (base ** (TRADING_DAYS_PER_YEAR / days) - 1.0) * 100.0
     return round(min(ann, 9999.0), 2)
 
@@ -191,22 +211,28 @@ def _daily_closes(dates_dt: list[datetime], shares: list[float]) -> list[float]:
 
 def _compute_drawdown_stats(
     dates_dt: list[datetime], shares: list[float], *, inception_share: float | None = None
-) -> tuple[float, int]:
-    """Return ``(max_dd_pct_positive, max_recovery_days)`` (peak seeded at the inception share)."""
+) -> tuple[float, float | None, float]:
+    """Return ``(max_dd_pct, max_recovery_days, current_underwater_days)``.
+
+    ``max_recovery_days`` covers *completed* peak-to-recovery spans only (``None`` when no
+    drawdown has ever recovered); a still-open drawdown is reported separately as
+    ``current_underwater_days`` (0.0 when at a high-water mark). Days keep one decimal so
+    intraday spans are not rounded up to a full day. The peak is seeded at the inception share.
+    """
     if not shares or (len(shares) < 2 and inception_share is None):
-        return 0.0, 0
+        return 0.0, None, 0.0
     peak = max(shares[0], inception_share) if inception_share is not None else shares[0]
     peak_dt = dates_dt[0]
     max_dd = 0.0
-    max_rec_days = 0
+    max_rec_days: float | None = None
     in_dd = False
     dd_start_dt = dates_dt[0]
 
     for dt, val in zip(dates_dt, shares, strict=False):
         if val >= peak:
             if in_dd:
-                rec_days = int(round((dt - dd_start_dt).total_seconds() / 86_400.0))
-                max_rec_days = max(max_rec_days, rec_days)
+                rec_days = (dt - dd_start_dt).total_seconds() / 86_400.0
+                max_rec_days = rec_days if max_rec_days is None else max(max_rec_days, rec_days)
                 in_dd = False
             peak = val
             peak_dt = dt
@@ -218,10 +244,9 @@ def _compute_drawdown_stats(
                 in_dd = True
                 dd_start_dt = peak_dt
 
-    if in_dd:
-        ongoing = int(round((dates_dt[-1] - dd_start_dt).total_seconds() / 86_400.0))
-        max_rec_days = max(max_rec_days, ongoing)
-    return round(max_dd, 2), max_rec_days
+    underwater = (dates_dt[-1] - dd_start_dt).total_seconds() / 86_400.0 if in_dd else 0.0
+    rec_out = round(max_rec_days, 1) if max_rec_days is not None else None
+    return round(max_dd, 2), rec_out, round(max(0.0, underwater), 1)
 
 
 def _compute_streaks(log_rets: np.ndarray) -> tuple[float | None, int, int]:
@@ -314,7 +339,14 @@ def compute_series_performance(
     def _ratios(series: list[float]) -> tuple[float | None, float | None]:
         if unique_cal_days < 5 or len(series) < 5:
             return None, None
-        sub = np.asarray(series[-91:], dtype=float)
+        # Always resample to UTC calendar-day closes (never raw 4h intraday ticks) and prepend
+        # `inception_share` when inside the trailing 90d window so Day-1 entry costs are included.
+        daily_vals = _daily_closes(dates_dt, series)
+        if inception_share is not None and inception_share > 0 and len(daily_vals) <= 90:
+            daily_vals = [float(inception_share), *daily_vals]
+        else:
+            daily_vals = daily_vals[-91:]
+        sub = np.asarray(daily_vals, dtype=float)
         sub = sub[sub > 0]
         if len(sub) < 3:
             return None, None
@@ -325,12 +357,10 @@ def compute_series_performance(
         std_d = float(np.std(lr, ddof=1))
         sh = round((mean_d / std_d) * math.sqrt(TRADING_DAYS_PER_YEAR), 2) if std_d > 1e-10 else None
         down = lr[lr < 0.0]
-        if len(down) >= 2:
-            # Downside deviation over ALL periods (standard Sortino target semi-deviation).
+        if len(down) >= 1:
+            # Target downside semi-deviation over ALL periods: sqrt((1/N) * sum(min(r_i, 0)^2)).
             d_std = float(np.sqrt(np.sum(down * down) / len(lr)))
             so = round((mean_d / d_std) * math.sqrt(TRADING_DAYS_PER_YEAR), 2) if d_std > 1e-10 else None
-        elif len(down) == 0 and mean_d > 0:
-            so = 99.0
         else:
             so = None
         return sh, so
@@ -349,8 +379,12 @@ def compute_series_performance(
         sharpe_g, sortino_g = _ratios(gross_shares)
         sharpe_n, sortino_n = _ratios(net_s)
 
-    max_dd_g, dd_rec_days = _compute_drawdown_stats(dates_dt, gross_shares, inception_share=inception_share)
-    max_dd_n, _ = _compute_drawdown_stats(dates_dt, net_s, inception_share=inception_share)
+    max_dd_g, dd_rec_days, underwater_days = _compute_drawdown_stats(
+        dates_dt, gross_shares, inception_share=inception_share
+    )
+    max_dd_n, dd_rec_net_days, underwater_net_days = _compute_drawdown_stats(
+        dates_dt, net_s, inception_share=inception_share
+    )
     elapsed_days = max((dates_dt[-1] - dates_dt[0]).total_seconds() / 86_400.0, 0.0) if dates_dt else 0.0
 
     return {
@@ -377,6 +411,9 @@ def compute_series_performance(
         "max_dd_gross_pct": max_dd_g,
         "max_dd_net_pct": max_dd_n,
         "dd_recovery_days": dd_rec_days,
+        "current_underwater_days": underwater_days,
+        "dd_recovery_net_days": dd_rec_net_days,
+        "current_underwater_net_days": underwater_net_days,
         "positive_days_pct": pos_days_pct,
         "longest_win_streak": win_streak,
         "longest_loss_streak": loss_streak,
@@ -397,23 +434,36 @@ def compute_monthly_returns(
     month_end = df.groupby(["year", "month"], as_index=False).last().sort_values(["year", "month"])
 
     rows_by_year: dict[int, dict[str, Any]] = {}
-    prev_val = float(inception_share) if inception_share is not None and inception_share > 0 else float(shares[0])
+    has_anchor = inception_share is not None and inception_share > 0
+    prev_val = float(inception_share) if has_anchor else float(shares[0])
+    first_dt = dates_dt[0]
+    # Year-start reference (unrounded): prior year-end close, or the inception anchor. Without an
+    # anchor the first year's YTD is only defined if history starts on Jan 1 (mirrors _window_return).
+    year_start: dict[int, float | None] = {}
+    first_year = int(month_end.iloc[0]["year"])
+    if has_anchor or (first_dt.month == 1 and first_dt.day == 1):
+        year_start[first_year] = prev_val
+    else:
+        year_start[first_year] = None
+    year_last: dict[int, float] = {}
     for _, rec in month_end.iterrows():
         yr = int(rec["year"])
         mo = int(rec["month"])
         cur_val = float(rec["share"])
-        r_pct = round((cur_val / prev_val - 1.0) * 100.0, 2) if prev_val > 0 else 0.0
+        if yr not in year_start:
+            year_start[yr] = prev_val
+        r_pct = _clean_zero(round((cur_val / prev_val - 1.0) * 100.0, 2)) if prev_val > 0 else 0.0
         prev_val = cur_val
+        year_last[yr] = cur_val
         if yr not in rows_by_year:
             rows_by_year[yr] = {"year": yr, "months": {}, "ytd": None}
         rows_by_year[yr]["months"][str(mo)] = r_pct
 
-    # Compute YTD compound per year
-    for _yr, entry in rows_by_year.items():
-        comp = 1.0
-        for v in entry["months"].values():
-            comp *= 1.0 + v / 100.0
-        entry["ytd"] = round((comp - 1.0) * 100.0, 2)
+    # YTD from unrounded year-start / year-end closes (compounding rounded months drifts by 0.01%).
+    for yr, entry in rows_by_year.items():
+        base = year_start.get(yr)
+        if base is not None and base > 0:
+            entry["ytd"] = _clean_zero(round((year_last[yr] / base - 1.0) * 100.0, 2))
 
     return [rows_by_year[y] for y in sorted(rows_by_year.keys(), reverse=True)]
 
@@ -623,8 +673,29 @@ def _load_benchmarks(data_root: Path) -> dict[str, tuple[list[str], list[float]]
     return out
 
 
+TIER_HLP = "HLP Vault"
+TIER_CASH = "Cash / USDC"
+TIER_GOLD = "Gold RWA"
+TIER_CTA_CRYPTO = "Crypto - Directional CTA"
+# Engine-specific bucket names that describe the same risk; merged so one risk = one row.
+_CANONICAL_TIER = {
+    "HLP Vault Reserve": TIER_HLP,
+    "HLP / USDC Reserve": TIER_HLP,
+    "Free USDC Buffer": TIER_CASH,
+    "Cash (HIP-3 sleeve)": TIER_CASH,
+    "Cash / HLP (Spot+Perp sleeve)": TIER_CASH,
+    "Cash (CTA sleeve)": TIER_CASH,
+    "Cash (Cross-DEX sleeve)": TIER_CASH,
+}
+_GOLD_COINS = {"PAXG", "XAUT", "XAUT0"}
+
+
+def canonical_tier(label: str) -> str:
+    return _CANONICAL_TIER.get(str(label), str(label))
+
+
 _SLEEVE_TIER_LABEL = {
-    "hlp_savings_reserve": "HLP / USDC Reserve",
+    "hlp_savings_reserve": TIER_HLP,
     "crisis_cta": "Crypto - Directional CTA",
     "cross_dex_paper": "Crypto - Cross-DEX Neutral",
     "metamodel_paper": "Crypto - Multi-Factor Neutral",
@@ -640,7 +711,8 @@ def _autopilot_look_through_tiers(
 
     def _add(label: str, usd: float) -> None:
         if usd > 0:
-            out[label] = round(out.get(label, 0.0) + usd, 2)
+            key = canonical_tier(label)
+            out[key] = round(out.get(key, 0.0) + usd, 2)
 
     for sleeve, alloc_raw in (ap.get("sleeve_allocations_usd") or {}).items():
         alloc = _f(alloc_raw)
@@ -666,8 +738,80 @@ def _autopilot_look_through_tiers(
                 _add(_SLEEVE_TIER_LABEL["hip3_paper"], alloc * frac)
                 _add("Cash (HIP-3 sleeve)", alloc * (1.0 - frac))
                 continue
+        if sleeve == "crisis_cta":
+            # Look through CTA weights (fractions of the CTA allocation): gold shorts are not crypto,
+            # and the unlevered remainder of the sleeve is idle cash, not directional exposure.
+            weights = ((ap.get("cta_state") or {}).get("weights") or {}) if isinstance(ap.get("cta_state"), dict) else {}
+            abs_w = {str(c).upper(): abs(_f(w)) for c, w in weights.items() if abs(_f(w)) > 0}
+            gross_w = sum(abs_w.values())
+            # Levered CTA (gross > 1x) cannot exceed the sleeve's NAV in a concentration table:
+            # scale the whole asset mix proportionally (order-independent), no residual cash.
+            scale = alloc * (1.0 / gross_w if gross_w > 1.0 else 1.0)
+            used = 0.0
+            for coin, w in abs_w.items():
+                exp = w * scale
+                used += exp
+                _add(TIER_GOLD if coin in _GOLD_COINS else TIER_CTA_CRYPTO, exp)
+            _add("Cash (CTA sleeve)", alloc - used)
+            continue
         _add(_SLEEVE_TIER_LABEL.get(str(sleeve), str(sleeve)), alloc)
     return out
+
+
+def metamodel_position_gross(pos: dict[str, Any]) -> float:
+    """Gross weight of one metamodel position: |HL| + sum of |per-venue CEX legs|.
+
+    ``cex_weight`` is the *signed* sum of the venue legs, so opposing Bybit/Binance legs would
+    cancel; it is used only for legacy states without ``cex_legs``.
+    """
+    legs = pos.get("cex_legs")
+    if isinstance(legs, dict) and legs:
+        cex_gross = sum(abs(_f(w)) for w in legs.values())
+    else:
+        cex_gross = abs(_f(pos.get("cex_weight")))
+    return abs(_f(pos.get("hl_weight"))) + cex_gross
+
+
+def _leverage_history_stats(
+    ticks_path: Path,
+    current_leverage: float,
+    *,
+    now_ms: int | None = None,
+    window_days: float = 30.0,
+) -> tuple[float, float]:
+    """``(avg, max)`` gross leverage over the trailing window from a tick ledger.
+
+    Uses ``gross_leverage`` when the ledger records it, ``gross_hl + gross_cex`` (metamodel), else
+    ``gross_notional_usd / equity_usd``.
+    Falls back to the current leverage only when no history exists (never copies it silently
+    when history is available).
+    """
+    vals: list[float] = []
+    if ticks_path.is_file():
+        try:
+            df = pd.read_parquet(ticks_path)
+        except Exception:
+            df = pd.DataFrame()
+        ts_col = next((c for c in ("ts_ms", "tick_ms", "tick_hour_ms") if c in df.columns), None)
+        ts = pd.to_numeric(df[ts_col], errors="coerce") if (ts_col is not None and not df.empty) else None
+        if ts is not None and ts.notna().any():
+            ref_ms = int(now_ms) if now_ms is not None else int(ts.max())
+            mask = ts >= ref_ms - int(window_days * 86_400_000)
+            if "gross_leverage" in df.columns:
+                lev = pd.to_numeric(df.loc[mask, "gross_leverage"], errors="coerce")
+            elif {"gross_hl", "gross_cex"} <= set(df.columns):  # metamodel paper_tracker ledger
+                lev = pd.to_numeric(df.loc[mask, "gross_hl"], errors="coerce") + pd.to_numeric(
+                    df.loc[mask, "gross_cex"], errors="coerce"
+                )
+            elif {"gross_notional_usd", "equity_usd"} <= set(df.columns):
+                ntl = pd.to_numeric(df.loc[mask, "gross_notional_usd"], errors="coerce")
+                eq = pd.to_numeric(df.loc[mask, "equity_usd"], errors="coerce")
+                lev = ntl / eq.where(eq > 0)
+            else:
+                lev = pd.Series(dtype=float)
+            vals = [float(x) for x in lev.dropna().tolist() if math.isfinite(float(x))]
+    vals.append(float(current_leverage))
+    return round(sum(vals) / len(vals), 3), round(max(vals), 3)
 
 
 def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
@@ -676,6 +820,7 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
     sp = _read_json(data_root / "hl_spot_perp_paper" / "state.json")
     cd = _read_json(data_root / "hl_cross_dex_paper" / "state.json")
     h3 = _read_json(data_root / "hl_hip3_paper" / "state.json")
+    mm = _read_json(data_root / "hl_metamodel" / "state.json")
 
     venue_usd: dict[str, float] = {}
     tier_usd: dict[str, float] = {}
@@ -712,7 +857,8 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
             }
         )
         for t, amt in (rt.get("asset_tier_breakdown_usd") or {}).items():
-            tier_usd[str(t)] = round(tier_usd.get(str(t), 0.0) + _f(amt), 2)
+            key = canonical_tier(str(t))
+            tier_usd[key] = round(tier_usd.get(key, 0.0) + _f(amt), 2)
         if not ap:
             for v, amt in (rt.get("venue_breakdown_usd") or {}).items():
                 venue_usd[str(v)] = round(venue_usd.get(str(v), 0.0) + _f(amt), 2)
@@ -722,30 +868,32 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
         cd_eq = max(_f(cd.get("equity_usd"), 100_000.0), 1.0)
         cd_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in cd_pos.values() if isinstance(p, dict))
         lev = round(cd_gross / cd_eq, 3)
+        cd_avg, cd_max = _leverage_history_stats(data_root / "hl_cross_dex_paper" / "ticks.parquet", lev)
         leverage_rows.append(
             {
                 "strategy": "Cross-DEX (HL×Lighter×Ext)",
                 "current_leverage": lev,
-                "leverage_30d_avg": lev,
-                "leverage_30d_max": lev,
+                "leverage_30d_avg": cd_avg,
+                "leverage_30d_max": cd_max,
                 "net_exposure_pct": 0.0,
                 "nav_guard_triggers": 0,
             }
         )
         if not ap:
-            venue_usd["HL × Lighter/Extended"] = round(venue_usd.get("HL × Lighter/Extended", 0.0) + cd_eq, 2)
+            venue_usd["HL x Lighter/Extended"] = round(venue_usd.get("HL x Lighter/Extended", 0.0) + cd_eq, 2)
 
     if h3:
         h3_pos = h3.get("positions") or {}
         h3_eq = max(_f(h3.get("equity_usd"), 50_000.0), 1.0)
         h3_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in h3_pos.values() if isinstance(p, dict))
         lev = round(h3_gross / h3_eq, 3)
+        h3_avg, h3_max = _leverage_history_stats(data_root / "hl_hip3_paper" / "ticks.parquet", lev)
         leverage_rows.append(
             {
                 "strategy": "HIP-3 Split-Margin",
                 "current_leverage": lev,
-                "leverage_30d_avg": lev,
-                "leverage_30d_max": lev,
+                "leverage_30d_avg": h3_avg,
+                "leverage_30d_max": h3_max,
                 "net_exposure_pct": 0.0,
                 "nav_guard_triggers": 0,
             }
@@ -755,6 +903,25 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
             tier_usd["US Equities / HIP-3 Builders"] = round(tier_usd.get("US Equities / HIP-3 Builders", 0.0) + eq_deployed, 2)
         if not ap:
             venue_usd["HIP-3 Builders"] = round(venue_usd.get("HIP-3 Builders", 0.0) + h3_eq, 2)
+
+    if mm:
+        mm_pos = mm.get("positions") or {}
+        mm_eq = max(_f(mm.get("equity_usd"), 100_000.0), 1.0)
+        mm_lev = round(sum(metamodel_position_gross(p) for p in mm_pos.values() if isinstance(p, dict)), 3)
+        mm_net = sum(_f(p.get("hl_weight")) + _f(p.get("cex_weight")) for p in mm_pos.values() if isinstance(p, dict))
+        mm_avg, mm_max = _leverage_history_stats(data_root / "hl_metamodel" / "ticks.parquet", mm_lev)
+        leverage_rows.append(
+            {
+                "strategy": "Metamodel (HL x CEX)",
+                "current_leverage": mm_lev,
+                "leverage_30d_avg": mm_avg,
+                "leverage_30d_max": mm_max,
+                "net_exposure_pct": round(mm_net * 100.0, 3),
+                "nav_guard_triggers": int(mm.get("nav_guard_triggers", 0) or 0),
+            }
+        )
+        if not ap:
+            venue_usd["HL x CEX"] = round(venue_usd.get("HL x CEX", 0.0) + mm_eq, 2)
 
     # Asset-tier concentration must describe the SAME portfolio as venue concentration. When the
     # Autopilot master vault exists, both are derived from its sleeve allocations (look-through into
@@ -780,6 +947,30 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
         "asset_tier_concentration": _to_pct_rows(tier_usd),
         "total_nav_guard_triggers": total_nav_guard_triggers,
     }
+
+
+def _with_inception_anchor(
+    dates: list[str], gross: list[float], net: list[float] | None
+) -> tuple[list[str], list[float], list[float] | None]:
+    """Prepend the inception share 1.0 that max-DD / returns are measured from.
+
+    The first stored tick already includes entry costs, so without the anchor the drawn curve
+    starts below 1.0 while ``max_dd_gross_pct`` is measured from 1.0. The anchor is stamped one
+    second (intraday ISO series) or one day (daily series) before the first observation.
+    """
+    if not dates or not gross or abs(float(gross[0]) - 1.0) < 1e-12:
+        return dates, gross, net
+    first = str(dates[0])
+    try:
+        if "T" in first:
+            dt = datetime.fromisoformat(first.replace("Z", "+00:00")) - pd.Timedelta(seconds=1)
+            anchor_date = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        else:
+            anchor_date = (datetime.fromisoformat(first) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        return dates, gross, net
+    net_out = [1.0, *net] if net else net
+    return [anchor_date, *dates], [1.0, *gross], net_out
 
 
 def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
@@ -867,14 +1058,16 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
             inception_share=1.0,
         )
         leaderboard.append(row)
+        curve_dates, curve_g, curve_n = _with_inception_anchor(dates, gross_s, net_s)
         curves[spec["id"]] = {
             "id": spec["id"],
             "name": spec["name"],
             "category": spec["category"],
             "is_benchmark": False,
-            "dates": dates,
-            "gross_shares": gross_s,
-            "net_shares": net_s,
+            "dates": curve_dates,
+            "gross_shares": curve_g,
+            "net_shares": curve_n,
+            "inception_share": 1.0,
         }
         # Normalize date index to YYYY-MM-DD for cross-strategy correlation & benchmark OLS
         day_keys = [d[:10] for d in dates]
@@ -896,7 +1089,7 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
             dates=b_dates,
             gross_shares=b_shares,
             net_shares=b_shares,
-            equity_usd=b_closes[-1],
+            equity_usd=None,  # a buy & hold benchmark has no NAV; its price is in spot_price_usd
             mgmt_fee_pct=0.0,
             perf_fee_pct=0.0,
             is_benchmark=True,
@@ -928,7 +1121,9 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
             "annualization_basis_days": 365,
             "negative_returns_annualized": False,
             "apy_min_elapsed_days": MIN_APY_DAYS,
-            "return_anchor": "Strategies: inception share 1.0 = starting_capital_usd; benchmarks: first close",
+            "return_anchor": "Strategies: inception share 1.0 = starting_capital_usd (prepended to curves); benchmarks: first close",
+            "negative_apy": "null — negative period returns are reported only under *_returns",
+            "dd_recovery_days": "Longest completed peak-to-recovery span (null if none); open drawdowns in current_underwater_days",
             "days_tracked": "Distinct UTC calendar days with observations (not tick count)",
             "net_fee_model": "Continuous annual management fee + High-Water Mark (HWM) performance fee on net NAV",
             "correlation_method": "Pearson rho on overlapping UTC daily log returns (lower-triangular)",

@@ -182,7 +182,7 @@ class SpotPerpPaperConfig:
     min_perp_vol_usd: float = 1_000_000.0
     entry_apr_pct: float = 8.0  # Enter when positive funding >= 8% APR
     exit_apr_pct: float = 2.0  # Hysteresis exit if funding stays below 2% APR
-    hard_flip_apr_pct: float = -5.0  # Immediate exit on deep negative funding flip
+    hard_flip_apr_pct: float = -15.0  # Immediate exit only on deep negative funding flip (mild <-5% uses streak confirm)
     exit_confirm_ticks: int = 2  # Consecutive low-APR ticks before soft exit
     min_clean_streak: int = 2  # Consecutive eligible ticks before entry
     # Wall-clock spacing between streak increments: manual re-runs / worker restarts inside the
@@ -771,6 +771,20 @@ def run_spot_perp_paper_tick(
                         and held_h >= cfg.min_hold_hours_before_soft_exit
                     ):
                         exit_reason = f"funding_decay({opp.funding_apr_pct:+.1f}%)"
+                elif (
+                    cfg.require_hlp_hurdle
+                    and bool(pos.get("payback_achieved"))
+                    and float(pos.get("hours_held", 0.0)) >= max(24.0, cfg.min_hold_hours_before_soft_exit)
+                    and opp.net_deposit_apr_pct < hlp_apr * 0.65
+                ):
+                    low_apr_streaks[base] = advance_streak(
+                        low_apr_streaks.get(base),
+                        qualifies=True,
+                        now_ms=ts_ms,
+                        min_spacing_hours=cfg.min_streak_spacing_hours,
+                    )
+                    if streak_count(low_apr_streaks[base]) >= cfg.exit_confirm_ticks:
+                        exit_reason = f"hlp_opportunity_cost({opp.net_deposit_apr_pct:+.1f}%<HLP {hlp_apr:+.1f}%)"
                 else:
                     low_apr_streaks[base] = advance_streak(None, qualifies=False, now_ms=ts_ms)
 

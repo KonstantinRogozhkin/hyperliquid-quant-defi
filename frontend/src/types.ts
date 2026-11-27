@@ -76,6 +76,7 @@ export interface TestnetAuditRecord {
   high_water_mark_usd: number;
   blocked_isolated_coins: string[];
   skipped_unquoted_coins?: string[];
+  orphan_positions?: Record<string, number>;
 }
 
 export interface CoinAttributionRow {
@@ -485,7 +486,12 @@ export interface LeaderboardRow {
   sortino_net: number | null;
   max_dd_gross_pct: number;
   max_dd_net_pct: number;
-  dd_recovery_days: number;
+  /** Longest completed peak-to-recovery span in days (null if no drawdown has recovered yet). */
+  dd_recovery_days: number | null;
+  /** Length of the still-open drawdown in days (0 at a high-water mark). */
+  current_underwater_days?: number;
+  dd_recovery_net_days?: number | null;
+  current_underwater_net_days?: number;
   positive_days_pct: number | null;
   longest_win_streak: number;
   longest_loss_streak: number;

@@ -31,6 +31,30 @@ HYPERCORE_INFO_URL = "https://api.hyperliquid.xyz/info"
 HYPERCORE_LEADERBOARD_URL = "https://stats-data.hyperliquid.xyz/Mainnet/leaderboard"
 
 
+# Machine-facing enums (JSON/API). Human-readable Russian labels are applied only in renderers.
+CASCADE_DOWNSIDE = "downside_cascade"
+CASCADE_UPSIDE = "upside_squeeze"
+CASCADE_BALANCED = "balanced"
+_CASCADE_LABELS_RU = {
+    CASCADE_DOWNSIDE: "Downside Cascade Magnet (Лонг-ликвидации)",
+    CASCADE_UPSIDE: "Upside Squeeze Magnet (Шорт-ликвидации)",
+    CASCADE_BALANCED: "Сбалансировано",
+}
+_SIDE_LABELS_RU = {"short": "Шорт", "long": "Лонг"}
+# Distance weights for the 0-2 / 2-5 / 5-10% liquidation bands in cascade_bias.
+BIAS_W_0_2 = 1.0
+BIAS_W_2_5 = 0.6
+BIAS_W_5_10 = 0.3
+
+
+def cascade_bias_label(bias: object) -> str:
+    return _CASCADE_LABELS_RU.get(str(bias), str(bias))
+
+
+def side_label(side: object) -> str:
+    return _SIDE_LABELS_RU.get(str(side), str(side))
+
+
 @dataclass(frozen=True, slots=True)
 class WhaleLiqPosition:
     wallet: str
@@ -76,7 +100,7 @@ class HourlyFundingMicroRow:
     avg_post_5m_bps: float  # signed in funding-receiver direction: T0 -> T+5m
     net_capture_1m_bps: float  # |funding_hourly_bps| + avg_post_1m_bps - 3.0 (2x maker)
     net_capture_5m_bps: float  # |funding_hourly_bps| + avg_post_5m_bps - 3.0 (2x maker)
-    receiver_side: str  # "Short" (if funding > 0) or "Long" (if funding < 0)
+    receiver_side: str  # machine enum: "short" (if funding > 0) or "long" (if funding < 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -261,14 +285,16 @@ def aggregate_liquidation_clusters(positions: list[WhaleLiqPosition], mark_price
         tot_0_10 = l02 + l25 + l510 + s02 + s25 + s510
         if tot_0_10 <= 0:
             continue
-        long_near = l02 + l25
-        short_near = s02 + s25
+        # Distance-weighted over the SAME 0-10% band that the H2 alert fires on, so a wall that is
+        # 100% long liquidations at 5-10% can no longer be reported as "balanced".
+        long_near = l02 * BIAS_W_0_2 + l25 * BIAS_W_2_5 + l510 * BIAS_W_5_10
+        short_near = s02 * BIAS_W_0_2 + s25 * BIAS_W_2_5 + s510 * BIAS_W_5_10
         if long_near > short_near * 1.5 and long_near >= 250_000:
-            bias = "Downside Cascade Magnet (Лонг-ликвидации)"
+            bias = CASCADE_DOWNSIDE
         elif short_near > long_near * 1.5 and short_near >= 250_000:
-            bias = "Upside Squeeze Magnet (Шорт-ликвидации)"
+            bias = CASCADE_UPSIDE
         else:
-            bias = "Сбалансировано"
+            bias = CASCADE_BALANCED
 
         long_dists.sort()
         short_dists.sort()
@@ -326,7 +352,7 @@ def compute_hourly_settlement_microstructure(
 
     # Funding receiver sign: if funding > 0, receiver is SHORT (-1); if funding < 0, receiver is LONG (+1)
     recv_sgn = -1.0 if funding_hourly > 0 else 1.0
-    receiver_side = "Шорт" if funding_hourly > 0 else "Лонг"
+    receiver_side = "short" if funding_hourly > 0 else "long"
     fund_bps = funding_hourly * 1e4
     fund_apr = funding_hourly * 24.0 * 365.0 * 100.0
 
@@ -558,7 +584,7 @@ def format_liq_funding_markdown(snap: LiquidationAndFundingAlphaSnapshot) -> str
             f"| **{c.coin}** | {c.mark_px:,.5g} | {c.whales_count} | "
             f"${c.long_liq_0_2_usd/1e6:,.2f}M / ${c.long_liq_2_5_usd/1e6:,.2f}M | "
             f"${c.short_liq_0_2_usd/1e6:,.2f}M / ${c.short_liq_2_5_usd/1e6:,.2f}M | "
-            f"**${c.total_0_10_usd/1e6:,.2f}M** | {near_txt} | {c.cascade_bias} |"
+            f"**${c.total_0_10_usd/1e6:,.2f}M** | {near_txt} | {cascade_bias_label(c.cascade_bias)} |"
         )
 
     lines += [
@@ -571,7 +597,7 @@ def format_liq_funding_markdown(snap: LiquidationAndFundingAlphaSnapshot) -> str
     for f in snap.funding_micro:
         dot = "🟢" if f.net_capture_5m_bps > 0 else "⚪"
         lines.append(
-            f"| **{f.coin}** | {f.receiver_side} | {f.funding_hourly_bps:+.3f} б.п. | **{f.funding_apr_pct:+.1f}%** | "
+            f"| **{f.coin}** | {side_label(f.receiver_side)} | {f.funding_hourly_bps:+.3f} б.п. | **{f.funding_apr_pct:+.1f}%** | "
             f"{f.settlements_measured} | {f.avg_pre_5m_bps:+.2f} | {f.avg_post_1m_bps:+.2f} | {f.avg_post_5m_bps:+.2f} | "
             f"{f.net_capture_1m_bps:+.2f} б.п. | {dot} **{f.net_capture_5m_bps:+.2f} б.п.** |"
         )
@@ -598,7 +624,7 @@ def format_liq_funding_telegram_rich_html(snap: LiquidationAndFundingAlphaSnapsh
         for c in snap.clusters[:6]:
             l05 = (c.long_liq_0_2_usd + c.long_liq_2_5_usd) / 1e6
             s05 = (c.short_liq_0_2_usd + c.short_liq_2_5_usd) / 1e6
-            tag = "🔴 Вниз" if "Downside" in c.cascade_bias else ("🟢 Вверх" if "Upside" in c.cascade_bias else "⚪ Баланс")
+            tag = "🔴 Вниз" if c.cascade_bias == CASCADE_DOWNSIDE else ("🟢 Вверх" if c.cascade_bias == CASCADE_UPSIDE else "⚪ Баланс")
             rows.append(
                 "<tr>"
                 f'<td align="left"><b>{html.escape(c.coin)}</b></td>'
@@ -622,7 +648,7 @@ def format_liq_funding_telegram_rich_html(snap: LiquidationAndFundingAlphaSnapsh
             dot = "🟢" if f.net_capture_5m_bps > 0 else "⚪"
             f_rows.append(
                 "<tr>"
-                f'<td align="left"><b>{html.escape(f.coin)}</b> ({html.escape(f.receiver_side)})</td>'
+                f'<td align="left"><b>{html.escape(f.coin)}</b> ({html.escape(side_label(f.receiver_side))})</td>'
                 f'<td align="right">{f.funding_apr_pct:+.0f}%</td>'
                 f'<td align="right">{f.avg_post_5m_bps:+.1f} б.п.</td>'
                 f'<td align="right">{dot} {f.net_capture_5m_bps:+.1f} б.п.</td>'

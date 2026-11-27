@@ -50,7 +50,9 @@ def sanitize_json(value: Any) -> Any:
     if value is None or value is pd.NaT or isinstance(value, (bool, str, int)):
         return None if value is pd.NaT else value
     if isinstance(value, float):
-        return None if (math.isnan(value) or math.isinf(value)) else value
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return 0.0 if value == 0 else value  # normalize IEEE -0.0
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, datetime):
@@ -172,6 +174,7 @@ def _audit_record(rec: dict[str, Any]) -> dict[str, Any]:
         "high_water_mark_usd": float(rec.get("high_water_mark_usd", 0.0) or 0.0),
         "blocked_isolated_coins": list(rec.get("blocked_isolated_coins") or []),
         "skipped_unquoted_coins": list(rec.get("skipped_unquoted_coins") or []),
+        "orphan_positions": dict(rec.get("orphan_positions") or {}),
     }
 
 

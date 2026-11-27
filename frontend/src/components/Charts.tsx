@@ -5,6 +5,14 @@ export interface SeriesLine {
   name: string;
   color: string;
   values: number[];
+  dates?: string[];
+}
+
+function parseDateMs(raw: string): number | null {
+  if (!raw) return null;
+  const iso = raw.includes("T") ? raw : `${raw}T00:00:00Z`;
+  const ms = Date.parse(iso);
+  return Number.isFinite(ms) ? ms : null;
 }
 
 export function MultiSeriesChart({
@@ -33,13 +41,36 @@ export function MultiSeriesChart({
   const span = Math.max(maxVal - minVal, 1e-4);
   const maxLen = Math.max(...valid.map((s) => s.values.length), 2);
 
+  // Align multi-resolution series (4h strategy ticks vs 1d benchmarks) on true calendar timestamps
+  // whenever per-series `dates` are present; fall back to index-based spacing otherwise.
+  const parsedSeriesDates = valid.map((s) =>
+    s.dates && s.dates.length === s.values.length ? s.dates.map(parseDateMs) : null,
+  );
+  const canUseTimeAxis = parsedSeriesDates.every(
+    (arr) => arr !== null && arr.every((ms): ms is number => ms !== null),
+  );
+  let minTs = 0;
+  let maxTs = 0;
+  if (canUseTimeAxis) {
+    const allTs = (parsedSeriesDates as number[][]).flat();
+    minTs = Math.min(...allTs);
+    maxTs = Math.max(...allTs);
+  }
+  const useTimeAxis = canUseTimeAxis && maxTs > minTs;
+
   const sx = (i: number, len: number) =>
     pl + ((width - pl - pr) * i) / Math.max(len - 1, 1);
+  const sxTime = (ms: number) =>
+    pl + ((width - pl - pr) * (ms - minTs)) / Math.max(maxTs - minTs, 1);
   const sy = (v: number) => height - pb - ((height - pt - pb) * (v - minVal)) / span;
   const zeroY = minVal <= 0 && maxVal >= 0 ? sy(0) : null;
 
-  const firstDate = dates[0]?.slice(0, 10) ?? "";
-  const lastDate = dates[dates.length - 1]?.slice(0, 10) ?? "";
+  const firstDate = useTimeAxis
+    ? new Date(minTs).toISOString().slice(0, 10)
+    : (dates[0]?.slice(0, 10) ?? "");
+  const lastDate = useTimeAxis
+    ? new Date(maxTs).toISOString().slice(0, 10)
+    : (dates[dates.length - 1]?.slice(0, 10) ?? "");
 
   return (
     <div>
@@ -64,10 +95,14 @@ export function MultiSeriesChart({
         {zeroY !== null && (
           <line x1={pl} y1={zeroY} x2={width - pr} y2={zeroY} stroke="#475569" strokeDasharray="4 4" strokeWidth="1" />
         )}
-        {valid.map((s) => {
+        {valid.map((s, sIdx) => {
+          const tsArr = useTimeAxis ? (parsedSeriesDates[sIdx] as number[]) : null;
           const offset = maxLen - s.values.length;
           const pts = s.values
-            .map((v, i) => `${sx(i + offset, maxLen).toFixed(1)},${sy(v).toFixed(1)}`)
+            .map((v, i) => {
+              const xCoord = tsArr ? sxTime(tsArr[i]) : sx(i + offset, maxLen);
+              return `${xCoord.toFixed(1)},${sy(v).toFixed(1)}`;
+            })
             .join(" ");
           return (
             <polyline

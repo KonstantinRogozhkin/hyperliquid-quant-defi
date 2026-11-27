@@ -43,12 +43,20 @@ class StrategyBucketStats:
     std_bps: float
     t_stat: float
     win_rate_pct: float
-    net_maker_bps: float  # mean_gross_bps - 3.0 (2x 1.5 bps maker)
+    net_maker_bps: float  # mean_gross_bps - maker_rt_bps (default 3.0 = 2x 1.5 bps maker)
     net_taker_bps: float  # mean_gross_bps - 9.0 (2x 4.5 bps taker)
     sharpe_event: float  # per-event mean / std (net maker)
     top1_coin: str = ""
     ex_top1_gross_bps: float = 0.0
     ex_top1_t_stat: float = 0.0
+    # Settlements at the same :00 timestamp across correlated coins are not independent draws:
+    # t-stat on per-timestamp cross-sectional means (cluster-robust by settlement hour).
+    t_stat_clustered: float = 0.0
+    clusters: int = 0
+    maker_rt_bps: float = 3.0
+    # Net after a stressed passive-execution cost (live alt fills measured ~5 bps one-way).
+    net_maker_stress_bps: float = 0.0
+    stress_rt_bps: float = 10.0
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -212,12 +220,28 @@ def build_coin_settlement_events_15m(
     return pd.DataFrame(rows)
 
 
+def _clustered_t_stat(sub: pd.DataFrame, strat: str) -> tuple[float, int]:
+    """t-stat of the mean using one observation per settlement timestamp (cross-sectional mean)."""
+    if "t0_ms" not in sub.columns or sub.empty:
+        return 0.0, 0
+    g = sub.groupby("t0_ms")[strat].mean().to_numpy(dtype=np.float64)
+    n = len(g)
+    if n < 2:
+        return 0.0, n
+    sd = float(np.std(g, ddof=1))
+    return ((float(np.mean(g)) / (sd / math.sqrt(n))) if sd > 1e-9 else 0.0), n
+
+
+MIN_COLLECTION_RATIO = 0.8
+
+
 def evaluate_settlement_strategies(
     events_df: pd.DataFrame,
     *,
     dev_fraction: float = 0.65,
     maker_rt_bps: float = 3.0,
     taker_rt_bps: float = 9.0,
+    stress_rt_bps: float = 10.0,
 ) -> pd.DataFrame:
     """Evaluate event strategies across Dev / Holdout splits, funding buckets, and Ex-Top1-Coin."""
     if events_df.empty:
@@ -282,6 +306,7 @@ def evaluate_settlement_strategies(
                 net_m = mu - maker_rt_bps
                 net_t = mu - taker_rt_bps
                 sh_ev = (net_m / sd) if sd > 1e-9 else 0.0
+                t_cl, n_cl = _clustered_t_stat(sub, strat)
 
                 # Ex-Top1-Coin robustness audit (protects against single-coin outliers like INIT)
                 top1_coin = ""
@@ -312,6 +337,11 @@ def evaluate_settlement_strategies(
                         top1_coin=top1_coin,
                         ex_top1_gross_bps=round(ex_mu, 3),
                         ex_top1_t_stat=round(ex_t, 2),
+                        t_stat_clustered=round(t_cl, 2),
+                        clusters=n_cl,
+                        maker_rt_bps=float(maker_rt_bps),
+                        net_maker_stress_bps=round(mu - stress_rt_bps, 3),
+                        stress_rt_bps=float(stress_rt_bps),
                     ).to_dict()
                 )
     return pd.DataFrame(out_rows)
@@ -458,6 +488,11 @@ async def fetch_settlement_dataset(
         "total_settlement_events": int(len(combined)),
         "span_days": span_days,
     }
+    collected = int(meta["coins_collected"])
+    ratio = (collected / len(selected)) if selected else 0.0
+    meta["collection_ratio"] = round(ratio, 4)
+    # A run that silently lost most of its universe (HTTP 429 etc.) must not publish as healthy.
+    meta["degraded"] = bool(ratio < MIN_COLLECTION_RATIO)
     return combined, meta
 
 
@@ -484,6 +519,12 @@ async def fetch_17d_settlement_dataset(
 
 
 def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any]) -> str:
+    maker_rt = (
+        float(stats_df["maker_rt_bps"].iloc[0]) if (not stats_df.empty and "maker_rt_bps" in stats_df.columns) else 3.0
+    )
+    stress_rt = (
+        float(stats_df["stress_rt_bps"].iloc[0]) if (not stats_df.empty and "stress_rt_bps" in stats_df.columns) else 10.0
+    )
     ts = datetime.fromtimestamp(meta["observed_at_ms"] / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     iv = meta.get("bar_interval", "5m")
     span = meta.get("span_days", 0)
@@ -492,9 +533,16 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
         "",
         f"- **Выборка:** `{meta['coins_collected']}` монет, **{meta['total_settlement_events']:,}** часовых расчётов `:00` за **{span} дней** (свечи `{iv}` + полный пагинированный `fundingHistory`).",
         "- **Строгая каузальность:** сигнал для часа `T0` использует **только** прошлую ставку `f(T0 - 1h)`; разделение по времени: **Dev (первые 65%)** vs **Holdout (последние 35%)** + аудит **Ex-Top1-Coin**.",
-        "- **Комиссии:** Maker round-trip `3.0 б.п.` (`2 × 1.5`), Taker round-trip `9.0 б.п.` (`2 × 4.5`).",
+        f"- **Комиссии:** Maker round-trip `{maker_rt:.1f} б.п.`, Taker round-trip `9.0 б.п.` (`2 × 4.5`); стресс-сценарий исполнения `{stress_rt:.1f} б.п.` RT. "
+        "Вердикт требует `t >= 2` и по наивному, и по кластеризованному (по часу `:00`) t-stat.",
         "",
     ]
+    if meta.get("degraded"):
+        lines.insert(
+            3,
+            f"- ⚠️ **DEGRADED:** собрано `{meta.get('coins_collected')}` из `{meta.get('coins_requested')}` монет "
+            f"(`{float(meta.get('collection_ratio', 0.0)) * 100:.0f}%`); выводы ниже не репрезентативны.",
+        )
     if stats_df.empty:
         lines.append("Недостаточно экстремальных событий фандинга в выбранном окне.")
         return "\n".join(lines) + "\n"
@@ -516,11 +564,12 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
         ex_g = float(h.get("ex_top1_gross_bps", h["mean_gross_bps"]))
         ex_t = float(h.get("ex_top1_t_stat", h["t_stat"]))
         top_c = str(h.get("top1_coin", ""))
+        h_t_cl = float(h.get("t_stat_clustered", h["t_stat"]))
         go = (
             (float(d["net_maker_bps"]) > 0.0)
             and (float(h["net_maker_bps"]) > 0.0)
-            and (float(h["t_stat"]) >= 2.0)
-            and ((ex_g - 3.0) > 0.0)
+            and (min(float(h["t_stat"]), h_t_cl) >= 2.0)
+            and ((ex_g - maker_rt) > 0.0)
         )
         verdict = (
             "🟢 **GO (Maker)**"
@@ -528,7 +577,7 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
             else ("🟡 Gross/Overlay" if float(d["mean_gross_bps"]) > 1.0 and float(h["mean_gross_bps"]) > 1.0 and float(h["t_stat"]) >= 2.0 else "🔴 NO-GO")
         )
         if go:
-            winners.append((b_name, strat, float(h["net_maker_bps"]), float(h["t_stat"]), int(h["events"]), ex_g - 3.0))
+            winners.append((b_name, strat, float(h["net_maker_bps"]), float(h["t_stat"]), int(h["events"]), ex_g - maker_rt))
         ex_txt = f"{ex_g:+.2f} ({ex_t:+.1f}) ex-{top_c}" if top_c else f"{ex_g:+.2f}"
         lines.append(
             f"| `{b_name}` | `{strat}` | {int(d['events'])} | {d['mean_gross_bps']:+.2f} ({d['t_stat']:+.1f}) | "
@@ -589,8 +638,15 @@ def format_settlement_study_telegram_rich_html(stats_df: pd.DataFrame, meta: dic
                 "</tr>"
             )
     iv = meta.get("bar_interval", "5m")
+    deg_note = (
+        f"<p>⚠️ <b>DEGRADED ({meta.get('coins_collected')}/{meta.get('coins_requested')} монет):</b> "
+        "неполный сбор из-за лимитов API; предыдущий stats.parquet сохранён.</p>"
+        if meta.get("degraded")
+        else ""
+    )
     return (
         f"<h1>🔬 OOS-аудит фандинга :00 ({meta['span_days']:.0f}д · {html.escape(str(iv))}, Hyperliquid)</h1>"
+        f"{deg_note}"
         f"<p><b>Выборка:</b> {meta['coins_collected']} монет · <b>{meta['total_settlement_events']:,}</b> расчётов (Dev 65% vs Holdout 35%, Ex-Top1-Coin).</p>"
         f'<table bordered striped>{"".join(rows)}</table>'
         f"<footer>Hyperliquid Mainnet {html.escape(str(iv))} candles + paginated fundingHistory</footer>"

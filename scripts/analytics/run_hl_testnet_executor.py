@@ -118,10 +118,20 @@ def main(
                 max_missing_fraction=limits.max_unquoted_coin_fraction,
             )
             if neutralize_net:
+                orphan_net_w = 0.0
+                orphan_gross_w = 0.0
+                if account.equity_usd > 0:
+                    for c, sz in account.positions_sz.items():
+                        if abs(sz) > 1e-12 and c not in bbo:
+                            ntl = float(account.position_notional_usd.get(c, 0.0) or 0.0)
+                            orphan_net_w += ntl / account.equity_usd
+                            orphan_gross_w += abs(ntl) / account.equity_usd
+                rem_gross = max(0.0, min(0.90, limits.max_gross_leverage) - orphan_gross_w)
                 valid_targets = ex.neutralize_target_weights(
                     valid_targets,
-                    max_gross=min(0.90, limits.max_gross_leverage),
+                    max_gross=rem_gross,
                     max_single_coin_weight=limits.max_single_coin_weight,
+                    fixed_net_weight=orphan_net_w,
                 )
         funding_apr_by_coin = ex.fetch_testnet_funding_apr(client)
 
@@ -153,7 +163,7 @@ def main(
     tg_resp = None
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(
-            (ROOT / ".env", ROOT.parent / "ResearchLAB" / "system" / ".env")
+            (ROOT / ".env",)
         )
         if token and chat_id:
             rich_html = ex.format_testnet_telegram_rich_html(account, result, bbo, hwm_usd=hwm)

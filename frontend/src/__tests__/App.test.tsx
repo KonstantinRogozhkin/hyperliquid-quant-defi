@@ -829,4 +829,80 @@ describe("App", () => {
     await user.click(screen.getByRole("button", { name: "How calculated" }));
     expect(screen.getByText(/Methodology \(Neutral Trade Standard\)/i)).toBeInTheDocument();
   });
+
+  it("maps backend holdout/dev settlement splits to OOS/IS filters and renders Testnet orphan positions", async () => {
+    const overview = makeOverview({
+      settlement_stats: [
+        {
+          strategy: "post_unwind_fade_15m",
+          bucket: "APR>=+50% (pos)",
+          split: "holdout",
+          events: 215,
+          mean_gross_bps: 5.8,
+          t_stat: 3.12,
+          win_rate_pct: 59.0,
+          net_maker_bps: 2.8,
+          net_taker_bps: -3.2,
+        },
+        {
+          strategy: "pre_crowding_15m",
+          bucket: "|APR|>=25% (all)",
+          split: "dev",
+          events: 561,
+          mean_gross_bps: 3.49,
+          t_stat: 1.55,
+          win_rate_pct: 53.1,
+          net_maker_bps: 0.49,
+          net_taker_bps: -5.51,
+        },
+      ],
+      testnet_audit_recent: [
+        {
+          ts_ms: 1795700000000,
+          observed_at_utc: "2026-11-27 16:10 UTC",
+          status: "ok",
+          violations: [],
+          cancelled_count: 2,
+          placed_count: 6,
+          total_notional_usd: 320,
+          high_water_mark_usd: 1006.55,
+          blocked_isolated_coins: [],
+          skipped_unquoted_coins: ["PONS"],
+          orphan_positions: { SKY: -975, VVV: 1.71 },
+        },
+      ],
+    });
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/api/v1/overview")) {
+        return new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ service: "hl-frontend", sha: BASE_SHA, built_at: "" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    // Default "OOS" filter matches backend `split: "holdout"`
+    expect(screen.getByText("post_unwind_fade_15m")).toBeInTheDocument();
+    expect(screen.queryByText("pre_crowding_15m")).not.toBeInTheDocument();
+
+    // Switching to "IS" matches backend `split: "dev"`
+    const splitSelect = screen.getByDisplayValue("OOS only");
+    await user.selectOptions(splitSelect, "IS");
+    expect(screen.getByText("pre_crowding_15m")).toBeInTheDocument();
+    expect(screen.queryByText("post_unwind_fade_15m")).not.toBeInTheDocument();
+
+    // Testnet tab surfaces orphan_positions
+    await user.click(screen.getByRole("button", { name: "Testnet & MM" }));
+    expect(screen.getByText(/orphans: SKY, VVV/)).toBeInTheDocument();
+  });
 });

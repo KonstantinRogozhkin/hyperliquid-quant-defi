@@ -10,6 +10,7 @@ on:
       - "config/**"
       - "frontend/**"
       - "docker/**"
+      - "docs/grafana/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/ci.yml"
@@ -54,7 +55,7 @@ jobs:
           fi
           echo "Changed files:"
           printf '%s\n' "$CHANGED"
-          if printf '%s\n' "$CHANGED" | grep -Eq '^(src/|tests/|scripts/.*\.py$|config/|pyproject\.toml$|uv\.lock$|docker/backend\.Dockerfile$|\.github/workflows/ci\.yml$)'; then
+          if printf '%s\n' "$CHANGED" | grep -Eq '^(src/|tests/|scripts/.*\.py$|config/|docs/grafana/|pyproject\.toml$|uv\.lock$|docker/backend\.Dockerfile$|\.github/workflows/ci\.yml$)'; then
             echo "run_py=true" >> "$GITHUB_OUTPUT"
           else
             echo "run_py=false" >> "$GITHUB_OUTPUT"

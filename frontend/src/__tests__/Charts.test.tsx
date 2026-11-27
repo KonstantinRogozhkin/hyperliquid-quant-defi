@@ -85,6 +85,37 @@ describe("Charts", () => {
     expect(shortFirstX).toBeGreaterThan(longFirstX);
   });
 
+  it("aligns multi-resolution 4h strategy ticks against 1d benchmarks by timestamp", () => {
+    const { container } = render(
+      <MultiSeriesChart
+        dates={["2026-11-20", "2026-11-27"]}
+        series={[
+          {
+            id: "btc",
+            name: "BTC",
+            color: "#f59e0b",
+            values: [0, -10],
+            dates: ["2026-11-20", "2026-11-27T16:00:00Z"],
+          },
+          {
+            id: "sp",
+            name: "Spot+Perp",
+            color: "#10b981",
+            values: [0, 0.2, 0.4],
+            dates: ["2026-11-27T08:00:00Z", "2026-11-27T12:00:00Z", "2026-11-27T16:00:00Z"],
+          },
+        ]}
+      />,
+    );
+    const lines = container.querySelectorAll("polyline");
+    expect(lines).toHaveLength(2);
+    const btcStartX = Number(lines[0].getAttribute("points")!.split(" ")[0].split(",")[0]);
+    const btcEndX = Number(lines[0].getAttribute("points")!.split(" ")[1].split(",")[0]);
+    const spStartX = Number(lines[1].getAttribute("points")!.split(" ")[0].split(",")[0]);
+    // Spot+Perp started on Nov 27 (last ~10% of the 7-day window), so its X start must be near the right edge
+    expect(spStartX).toBeGreaterThan(btcStartX + 0.85 * (btcEndX - btcStartX));
+  });
+
   it("renders OlsScatterChart with scatter points and fitted regression line", () => {
     const { container } = render(
       <OlsScatterChart

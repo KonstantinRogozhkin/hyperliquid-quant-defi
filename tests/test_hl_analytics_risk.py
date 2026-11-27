@@ -104,7 +104,7 @@ def test_full_analytics_payload_leaderboard_correlation_ols_and_risk_exposure(tm
     # Neutral Trade rule: negative benchmark returns must NOT be annualized under APY
     btc_row = lb["bench_btc"]
     if (btc_row["gross_returns"]["all_time"] or 0.0) < 0:
-        assert btc_row["gross_apy"]["all_time"] == btc_row["gross_returns"]["all_time"]
+        assert btc_row["gross_apy"]["all_time"] is None  # a period loss is not an APY
 
     # Spot+Perp positive steady carry -> high Sharpe, net return <= gross return, monthly matrix present
     sp_row = lb["spot_perp"]

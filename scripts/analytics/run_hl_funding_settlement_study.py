@@ -58,26 +58,34 @@ def main(
     md = fss.format_settlement_study_markdown(stats_df, meta)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    if not events_df.empty:
+    degraded = bool(meta.get("degraded"))
+    if degraded:
+        # Keep the last representative events/stats; only publish meta + report flagged DEGRADED.
+        typer.echo(
+            f"settlement_study_degraded coins={meta.get('coins_collected')}/{meta.get('coins_requested')}",
+            err=True,
+        )
+    if not events_df.empty and not degraded:
         tmp_ev = output_dir / "events.tmp.parquet"
         events_df.to_parquet(tmp_ev, index=False)
         tmp_ev.replace(output_dir / "events.parquet")
-    if not stats_df.empty:
+    if not stats_df.empty and not degraded:
         tmp_st = output_dir / "stats.tmp.parquet"
         stats_df.to_parquet(tmp_st, index=False)
         tmp_st.replace(output_dir / "stats.parquet")
-    tmp_meta = output_dir / "meta.tmp.json"
+    # meta.json describes the PUBLISHED dataset (events/stats). A degraded attempt must not relabel
+    # the retained results, so its metadata goes to last_attempt.json instead.
+    meta_name = "last_attempt.json" if degraded else "meta.json"
+    tmp_meta = output_dir / f"{meta_name}.tmp"
     tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    tmp_meta.replace(output_dir / "meta.json")
+    tmp_meta.replace(output_dir / meta_name)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_rep = report_path.with_suffix(".tmp.md")
     tmp_rep.write_text(md, encoding="utf-8")
     tmp_rep.replace(report_path)
 
-    if telegram:
-        token, chat_id, thread_id = pt.load_telegram_credentials(
-            (ROOT / ".env", ROOT.parent / "ResearchLAB" / "system" / ".env")
-        )
+    if telegram and not degraded:
+        token, chat_id, thread_id = pt.load_telegram_credentials((ROOT / ".env",))
         if token and chat_id:
             try:
                 rich = fss.format_settlement_study_telegram_rich_html(stats_df, meta)
@@ -87,6 +95,8 @@ def main(
                 typer.echo(f"telegram_warn={exc}", err=True)
 
     typer.echo(md)
+    if degraded:
+        raise typer.Exit(code=2)  # surfaces as a failed worker job instead of a silent "ok"
 
 
 if __name__ == "__main__":

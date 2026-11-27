@@ -49,6 +49,18 @@ function shortSha(sha?: string | null): string {
   return sha.length > 8 ? sha.slice(0, 8) : sha;
 }
 
+const CASCADE_BIAS_LABELS: Record<string, string> = {
+  downside_cascade: "Downside Cascade (лонг-ликвидации)",
+  upside_squeeze: "Upside Squeeze (шорт-ликвидации)",
+  balanced: "Сбалансировано",
+};
+
+function cascadeBiasLabel(bias: unknown): string {
+  if (bias === null || bias === undefined || bias === "") return "—";
+  const key = String(bias);
+  return CASCADE_BIAS_LABELS[key] ?? key;
+}
+
 export default function App() {
   const [tab, setTab] = useState<TabId>("overview");
   const [data, setData] = useState<OverviewPayload | null>(null);
@@ -147,7 +159,14 @@ export default function App() {
   const settlementFiltered = useMemo(() => {
     const rows = data?.settlement_stats ?? [];
     if (settlementSplit === "ALL") return rows.slice(0, 20);
-    return rows.filter((r) => String(r.split).toUpperCase() === settlementSplit).slice(0, 20);
+    return rows
+      .filter((r) => {
+        const sp = String(r.split ?? "").trim().toUpperCase();
+        if (settlementSplit === "OOS") return sp === "OOS" || sp === "HOLDOUT";
+        if (settlementSplit === "IS") return sp === "IS" || sp === "DEV";
+        return sp === settlementSplit;
+      })
+      .slice(0, 20);
   }, [data, settlementSplit]);
 
   const beSha = data?.build_info?.sha ?? "dev";
@@ -884,7 +903,7 @@ export default function App() {
                             <td className="num">{fmtPct(c.nearest_long_dist_pct, 1, false)}</td>
                             <td className="num">{fmtPct(c.nearest_short_dist_pct, 1, false)}</td>
                             <td>
-                              <span className="badge">{String(c.cascade_bias ?? "—")}</span>
+                              <span className="badge">{cascadeBiasLabel(c.cascade_bias)}</span>
                             </td>
                           </tr>
                         ))}
@@ -1072,6 +1091,9 @@ export default function App() {
                               rec.violations.length ? rec.violations.join(", ") : "",
                               rec.skipped_unquoted_coins?.length
                                 ? `skipped (no BBO): ${rec.skipped_unquoted_coins.join(", ")}`
+                                : "",
+                              rec.orphan_positions && Object.keys(rec.orphan_positions).length
+                                ? `orphans: ${Object.keys(rec.orphan_positions).join(", ")}`
                                 : "",
                             ]
                               .filter(Boolean)

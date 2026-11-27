@@ -181,6 +181,14 @@ class ArrivalCalibrationResult:
     r2_fit: float
     implied_min_half_spread_bps: float
     depth_curve: list[dict[str, float]]
+    # 1/kappa alone (adverse-selection term) — the old ``implied_min_half_spread_bps``.
+    adverse_term_bps: float = 0.0
+    maker_fee_bps: float = 0.0
+    n_windows: int = 0
+    fit_points: int = 0
+    observed_at_ms: int = 0
+    # False when the sample is too short / too thin for the kappa fit to be trusted.
+    calibration_ok: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -1313,6 +1321,10 @@ def calibrate_as_arrival_intensity(
     horizon_sec: float = 30.0,
     window_sec: float = 5.0,
     deltas_bps: tuple[float, ...] = (0.5, 1.0, 2.0, 3.0, 5.0, 8.0, 12.0, 16.0),
+    step_sec: float | None = None,
+    maker_fee_bps: float = 1.5,
+    min_windows_ok: int = 50,
+    min_r2_ok: float = 0.5,
 ) -> ArrivalCalibrationResult:
     """Calibrate Avellaneda–Stoikov ``(kappa, A)`` and 1s volatility from recorded L2 + trades.
 
@@ -1355,9 +1367,11 @@ def calibrate_as_arrival_intensity(
         tr_px = tdf["px"].to_numpy(dtype=np.float64)
         tr_is_buy = tdf["side"].astype(str).isin({"buy", "B"}).to_numpy()
 
-    # 3. Stepped quoting windows (step = max(1.0s, window_sec / 2))
+    # 3. Quoting windows. Default step = window length (non-overlapping): overlapping windows
+    #    share fills, violate the independent-trial assumption of the hazard inversion and
+    #    inflate the apparent sample size / R^2.
     win_ms = int(max(1.0, window_sec) * 1000)
-    step_ms = max(1000, win_ms // 2)
+    step_ms = int(max(1.0, step_sec if step_sec is not None else window_sec) * 1000)
     t_start = int(ts[0])
     t_end = int(ts[-1]) - win_ms
     epochs = list(range(t_start, max(t_start + 1, t_end + 1), step_ms))
@@ -1400,13 +1414,14 @@ def calibrate_as_arrival_intensity(
     for d in deltas_bps:
         hits = int(np.sum(exc >= d))
         p_hit = hits / n_trials
-        if hits > 0:
-            p_eff = min(p_hit, 1.0 - 0.5 / n_trials)
-            lam = -math.log(max(1.0 - p_eff, 1e-9)) / max(1.0, window_sec)
-            fit_x.append(float(d))
-            fit_y.append(math.log(max(lam, 1e-9)))
-            fit_w.append(float(hits))
-        else:
+        # Haldane-Anscombe (+0.5) keeps zero-hit deltas in the fit instead of dropping them,
+        # which biased kappa low (only the near-touch, high-hit deltas survived).
+        p_eff = min((hits + 0.5) / (n_trials + 1.0), 1.0 - 0.5 / n_trials)
+        lam = -math.log(max(1.0 - p_eff, 1e-9)) / max(1.0, window_sec)
+        fit_x.append(float(d))
+        fit_y.append(math.log(max(lam, 1e-9)))
+        fit_w.append(float(hits) + 0.5)
+        if hits == 0:
             lam = 0.0
         raw_curve.append({"delta_bps": float(d), "hits": float(hits), "fill_prob": round(p_hit, 4), "lambda_per_sec": round(lam, 6)})
 
@@ -1449,8 +1464,20 @@ def calibrate_as_arrival_intensity(
         kappa_per_bp=round(kappa, 4),
         arrival_a_per_sec=round(a_rate, 4),
         r2_fit=round(r2, 4),
-        implied_min_half_spread_bps=round(1.0 / kappa, 2),
+        # Minimum profitable half-spread: adverse-selection term 1/kappa plus the maker fee paid
+        # on each fill (the inventory term 0.5*gamma*sigma^2*tau is added by the quoting engine).
+        implied_min_half_spread_bps=round(1.0 / kappa + max(0.0, maker_fee_bps), 2),
         depth_curve=depth_curve,
+        adverse_term_bps=round(1.0 / kappa, 2),
+        maker_fee_bps=float(maker_fee_bps),
+        n_windows=len(bid_excursions_bps),
+        fit_points=int(sum(1 for row in raw_curve if row["hits"] > 0)),
+        observed_at_ms=int(ts[-1]),
+        calibration_ok=bool(
+            len(bid_excursions_bps) >= min_windows_ok
+            and r2 >= min_r2_ok
+            and sum(1 for row in raw_curve if row["hits"] > 0) >= 4
+        ),
     )
 
 

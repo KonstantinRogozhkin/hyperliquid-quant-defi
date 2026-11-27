@@ -131,6 +131,16 @@ class AutopilotConfig:
         return asdict(self)
 
 
+def _metamodel_position_gross(pos: dict[str, Any]) -> float:
+    """|HL| + sum |per-venue CEX legs| (``cex_weight`` is a signed net; legacy fallback only)."""
+    legs = pos.get("cex_legs")
+    if isinstance(legs, dict) and legs:
+        cex_gross = sum(abs(_f(w)) for w in legs.values())
+    else:
+        cex_gross = abs(_f(pos.get("cex_weight")))
+    return abs(_f(pos.get("hl_weight"))) + cex_gross
+
+
 # --------------------------------------------------------------------------- Crisis-Alpha CTA Sleeve
 
 
@@ -165,7 +175,12 @@ def fetch_hypercore_daily_closes_with_dates(
                 if not isinstance(b, dict):
                     continue
                 c_px = _f(b.get("c"))
-                t_ms = int(_f(b.get("T") or b.get("t")))
+                close_ms = int(_f(b.get("T"))) if b.get("T") is not None else 0
+                open_ms = int(_f(b.get("t")))
+                # Drop today's still-forming 1d candle (`T > end_ms`) so 20d vol & TSMOM use completed UTC days.
+                if close_ms > end_ms:
+                    continue
+                t_ms = close_ms or open_ms
                 if c_px > 0 and t_ms > 0:
                     d_str = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
                     pts.append({"date": d_str, "close": c_px})
@@ -339,6 +354,7 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
             "equity_usd": _f(sp_st.get("equity_usd"), 100_000.0),
             "starting_capital_usd": _f(sp_st.get("starting_capital_usd"), 100_000.0),
             "leverage": _f(rt.get("gross_leverage"), 1.25),
+            "net_exposure_frac": _f(rt.get("net_delta_pct")) / 100.0,
             "positions_count": len(sp_st.get("positions") or {}),
             "returns": sp_rets,
             "venue": "HyperCore",
@@ -383,14 +399,15 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
     mm_rets = _read_sleeve_tick_returns(data_root / "hl_metamodel" / "ticks.parquet")
     if mm_st:
         mm_pos = mm_st.get("positions") or {}
-        mm_lev = sum(
-            abs(_f(p.get("hl_weight"))) + abs(_f(p.get("cex_weight"))) for p in mm_pos.values() if isinstance(p, dict)
-        )
+        mm_lev = sum(_metamodel_position_gross(p) for p in mm_pos.values() if isinstance(p, dict))
         out["metamodel_paper"] = {
             "active": True,
             "equity_usd": _f(mm_st.get("equity_usd"), 100_000.0),
             "starting_capital_usd": _f(mm_st.get("starting_capital_usd"), 100_000.0),
             "leverage": round(mm_lev, 3),
+            "net_exposure_frac": round(
+                sum(_f(p.get("hl_weight")) + _f(p.get("cex_weight")) for p in mm_pos.values() if isinstance(p, dict)), 6
+            ),
             "positions_count": len(mm_pos),
             "returns": mm_rets,
             "venue": "HL x CEX",
@@ -595,11 +612,14 @@ def run_autopilot_tick(
 
     own_client = client is None and daily_closes is None
     http_client = client or (httpx.Client(timeout=20.0) if own_client else None)
+    live_marks: dict[str, float] = {}
     try:
         if daily_closes is None:
             assert http_client is not None
+            # Fetch >=370 completed UTC days so `hl_benchmarks/daily_closes.json` covers full YTD & 1Y,
+            # while CTA TSMOM slices the trailing 60 completed daily closes below.
             dated_bars = fetch_hypercore_daily_closes_with_dates(
-                http_client, CTA_UNIVERSE, lookback_days=90, now_ms=ts_ms, info_url=info_url
+                http_client, CTA_UNIVERSE, lookback_days=370, now_ms=ts_ms, info_url=info_url
             )
             if dated_bars:
                 _write_json_atomic(
@@ -607,6 +627,15 @@ def run_autopilot_tick(
                     {"updated_at_utc": obs_utc, "benchmarks": dated_bars},
                 )
             closes_map = {c: [float(p["close"]) for p in pts[-60:]] for c, pts in dated_bars.items() if pts}
+            try:
+                m_resp = http_client.post(info_url, json={"type": "allMids"})
+                if m_resp.status_code == 200 and isinstance(m_resp.json(), dict):
+                    for k, v in m_resp.json().items():
+                        px = _f(v)
+                        if px > 0:
+                            live_marks[str(k)] = px
+            except Exception:
+                pass
         else:
             closes_map = dict(daily_closes)
     finally:
@@ -624,13 +653,17 @@ def run_autopilot_tick(
     prev_cta_w: dict[str, float] = dict(cta_state.get("weights") or {})
     prev_cta_px: dict[str, float] = dict(cta_state.get("last_closes") or {})
 
+    cta_mark_map = {
+        c: float(live_marks.get(c) or vals[-1])
+        for c, vals in closes_map.items()
+        if vals
+    }
     cta_tick_ret = 0.0
     if prev_cta_w and prev_ms > 0:
         for coin, w in prev_cta_w.items():
-            c_list = closes_map.get(coin)
+            p1 = cta_mark_map.get(coin, 0.0)
             p0 = _f(prev_cta_px.get(coin))
-            if c_list and p0 > 0:
-                p1 = float(c_list[-1])
+            if p1 > 0 and p0 > 0:
                 cta_tick_ret += w * ((p1 - p0) / p0)
 
     cta_snap = compute_crisis_cta_weights(closes_map, prev_weights=prev_cta_w, cfg=cfg)
@@ -640,7 +673,7 @@ def run_autopilot_tick(
     cta_funding_ret = prev_cta_gross * (cfg.cta_funding_cost_apr_pct / 100.0 / HOURS_PER_YEAR) * dt_hours
     cta_cost_ret = cta_turnover_cost_ret + cta_funding_ret
     cta_net_ret = cta_tick_ret - cta_cost_ret
-    new_last_closes = {c: float(vals[-1]) for c, vals in closes_map.items() if vals}
+    new_last_closes = dict(cta_mark_map)
 
     # 2. Compute target master weights
     target_weights = compute_autopilot_target_weights(
@@ -735,7 +768,17 @@ def run_autopilot_tick(
     rebal_reason = ""
     if should_rebalance:
         rebal_turnover = 0.5 * sum(abs(target_weights[k] - actual_weights.get(k, 0.0)) for k in target_weights)
-        rebal_cost_usd = 0.0 if is_initial else round(gross_before_rebal * rebal_turnover * (cfg.rebalance_cost_bps / 1e4), 4)
+        if is_initial:
+            # Bootstrap = 100% turnover into the trading sleeves (sized off full initial gross capital).
+            # HLP is a vault deposit; the CTA entry cost was already charged above.
+            fundable = sum(
+                prev_gross * w
+                for k, w in target_weights.items()
+                if k not in ("hlp_savings_reserve", "crisis_cta")
+            )
+            rebal_cost_usd = round(fundable * (cfg.rebalance_cost_bps / 1e4), 4)
+        else:
+            rebal_cost_usd = round(gross_before_rebal * rebal_turnover * (cfg.rebalance_cost_bps / 1e4), 4)
         post_eq = max(gross_before_rebal - rebal_cost_usd, 1.0)
         alloc_usd = {k: round(post_eq * w, 2) for k, w in target_weights.items()}
         actual_weights = dict(target_weights)
@@ -812,7 +855,14 @@ def run_autopilot_tick(
 
     weighted_lev = round(weighted_lev, 3)
     lev_30d_avg, lev_30d_max = spa._compute_30d_leverage_stats(ticks_path, weighted_lev, ts_ms)
-    net_dir_pct = round(actual_weights.get("crisis_cta", 0.0) * float(cta_snap["net_exposure"]) * 100.0, 3)
+    cta_dir_pct = round(actual_weights.get("crisis_cta", 0.0) * float(cta_snap["net_exposure"]) * 100.0, 3)
+    # Residual delta of the "neutral" sleeves (e.g. spot_perp spot-vs-perp drift) is directional too.
+    sleeve_dir_pct = sum(
+        actual_weights.get(k, 0.0) * _f(sleeves[k].get("net_exposure_frac"))
+        for k in sleeves
+        if k not in ("crisis_cta", "hlp_savings_reserve")
+    ) * 100.0
+    net_dir_pct = round(cta_dir_pct + sleeve_dir_pct, 3)
 
     if not nav_guard_triggered:
         cta_state["weights"] = cta_snap["weights"]
@@ -865,6 +915,7 @@ def run_autopilot_tick(
                 "leverage_30d_avg": lev_30d_avg,
                 "leverage_30d_max": lev_30d_max,
                 "net_directional_exposure_pct": net_dir_pct,
+                "cta_directional_exposure_pct": cta_dir_pct,
                 "directional_sleeve_pct": round(actual_weights.get("crisis_cta", 0.0) * 100.0, 2),
                 "reserve_sleeve_pct": round(actual_weights.get("hlp_savings_reserve", 0.0) * 100.0, 2),
                 "max_weight_drift_pct": max_drift_pct,
@@ -892,6 +943,7 @@ def run_autopilot_tick(
                 "net_return_pct": net_ret_pct,
                 "gross_leverage": weighted_lev,
                 "net_directional_exposure_pct": net_dir_pct,
+                "cta_directional_exposure_pct": cta_dir_pct,
                 "max_weight_drift_pct": max_drift_pct,
                 "rebalanced": bool(should_rebalance and not is_initial),
                 "rebalance_cost_usd": rebal_cost_usd,

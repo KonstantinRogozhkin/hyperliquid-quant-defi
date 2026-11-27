@@ -358,7 +358,15 @@ def run_hip3_paper_tick(
                 continue
 
             key = f"{opp.base_symbol}:{opp.short_symbol}->{opp.long_symbol}"
-            eff_streak = max(streak_count(new_streaks.get(key)), int(external_streaks.get(key, 0)))
+            local_streak = streak_count(new_streaks.get(key))
+            # The frontier tracker counts streaks at a looser oracle cap (25 bps) with no wall-clock
+            # spacing. It may only bootstrap a cold ledger (first tick ever); once this ledger has its
+            # own history, a pair dirty on earlier ticks must not open on its first clean tick just
+            # because the external count says so (SKHX at 16-25 bps -> 11 bps).
+            if prev_ms <= 0 and local_streak >= 1:
+                eff_streak = max(local_streak, int(external_streaks.get(key, 0)))
+            else:
+                eff_streak = local_streak
             if eff_streak < cfg.min_clean_streak:
                 gated_stats["skipped_streak"] += 1
                 continue

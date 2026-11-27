@@ -1,7 +1,7 @@
 """Container-native UTC job scheduler replacing local macOS crons for Docker / Dokploy.
 
-Runs the 7 core Hyperliquid research/paper/testnet jobs plus 6 read-only dashboard/analytics
-scanners (13 UTC jobs total) in isolated subprocesses with:
+Runs the 9 core Hyperliquid research/paper/testnet jobs plus 6 read-only dashboard/analytics
+scanners (15 UTC jobs total) in isolated subprocesses with:
 - Catch-up slot evaluation + per-job non-overlapping worker threads (so a slow job at :05 never
   skips another job scheduled at :10)
 - Atomic ``hl_worker_status.json`` telemetry
@@ -254,7 +254,8 @@ def build_job_specs() -> list[JobSpec]:
             "--coins",
             os.environ.get("HL_MM_CALIBRATION_COINS", "BTC,ETH"),
             "--duration-sec",
-            os.environ.get("HL_MM_CALIBRATION_SEC", "45"),
+            # >= 300s: 45s gave ~9 independent 5s windows per side, too few for a stable kappa fit.
+            os.environ.get("HL_MM_CALIBRATION_SEC", "300"),
             "--ws-network",
             "mainnet",
             "--capture-dir",
@@ -455,7 +456,7 @@ def build_job_specs() -> list[JobSpec]:
             cron_expr="18 5 * * *",
             minutes=(18,),
             hours=(5,),
-            timeout_s=240,
+            timeout_s=480,
             readonly=True,
             bootstrap_eligible=True,
             build_command=_mm_calibration_cmd,
@@ -477,10 +478,10 @@ def build_job_specs() -> list[JobSpec]:
         ),
         JobSpec(
             name="testnet_attribution",
-            description="Daily Testnet Post-Trade Attribution, ADL Rank & Quota Audit (06:00 UTC)",
-            cron_expr="0 6 * * *",
-            minutes=(0,),
-            hours=(6,),
+            description="4h Testnet Post-Trade Attribution, Margin/Liq & Quota Audit (4h :22)",
+            cron_expr="22 */4 * * *",
+            minutes=(22,),
+            hours=four_hour,
             timeout_s=240,
             readonly=True,
             bootstrap_eligible=True,
@@ -611,6 +612,11 @@ class WorkerScheduler:
                 restored_state = "failed"
             else:
                 restored_state = "idle"
+            last_started = prev.get("last_started_at_utc")
+            if isinstance(last_started, str) and len(last_started) >= 16:
+                # Hydrate in-memory slot guard (`YYYY-MM-DD HH:MM`) so a container restart inside a scheduled
+                # UTC minute never executes `testnet_executor` or paper ledgers a second time.
+                self._last_slot_run[job.name] = last_started[:16]
             self._state[job.name] = {
                 "name": job.name,
                 "description": job.description,
