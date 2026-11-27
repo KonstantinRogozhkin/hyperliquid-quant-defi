@@ -245,7 +245,7 @@ def build_job_specs() -> list[JobSpec]:
             hours=four_hour,
             timeout_s=360,
             readonly=True,
-            bootstrap_eligible=False,
+            bootstrap_eligible=True,
             build_command=_metamodel_cmd,
             is_enabled=_default_enabled,
             has_required_credentials=_default_enabled,
@@ -323,7 +323,7 @@ def build_job_specs() -> list[JobSpec]:
             hours=(6,),
             timeout_s=240,
             readonly=True,
-            bootstrap_eligible=False,
+            bootstrap_eligible=True,
             build_command=_attribution_cmd,
             is_enabled=_testnet_attr_enabled,
             has_required_credentials=_testnet_attr_enabled,
@@ -359,14 +359,18 @@ class WorkerScheduler:
         self.status_path = self.paper_dir / "hl_worker_status.json"
         self.jobs = jobs if jobs is not None else build_job_specs()
         self.max_workers = max(1, int(max_workers))
+        has_tg_token = bool(
+            os.environ.get("TELEGRAM_SIGNAL_BOT_TOKEN", "").strip()
+            or os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+        )
+        has_tg_chat = bool(
+            os.environ.get("TELEGRAM_SIGNAL_CHAT_ID", "").strip()
+            or os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+        )
         self.telegram_enabled = (
             telegram_enabled
             if telegram_enabled is not None
-            else (
-                _env_flag("HL_TELEGRAM_ENABLED", True)
-                and bool(os.environ.get("TELEGRAM_BOT_TOKEN", "").strip())
-                and bool(os.environ.get("TELEGRAM_CHAT_ID", "").strip())
-            )
+            else (_env_flag("HL_TELEGRAM_ENABLED", True) and has_tg_token and has_tg_chat)
         )
         self._runner = runner or self._subprocess_runner
         self.started_at_utc = datetime.now(tz=timezone.utc)
@@ -562,17 +566,38 @@ class WorkerScheduler:
         finally:
             lock.release()
 
+    def _bootstrap_sentinel_for(self, job_name: str) -> Path | None:
+        sentinels = {
+            "onchain_events": self.paper_dir / "hl_onchain_events" / "latest_snapshot.json",
+            "metamodel_paper": self.paper_dir / "hl_metamodel" / "state.json",
+            "cross_dex_paper": self.paper_dir / "hl_cross_dex_paper" / "state.json",
+            "frontier_persistence": self.paper_dir / "hl_frontier_history" / "latest_summary.json",
+            "cross_dex_scan": self.paper_dir / "hl_cross_dex_v2" / "snapshot.json",
+            "hyperevm_defi_scan": self.paper_dir / "hl_hyperevm_defi" / "snapshot.json",
+            "testnet_attribution": self.paper_dir / "hl_testnet_attribution" / "attribution.json",
+        }
+        return sentinels.get(job_name)
+
     def run_bootstrap_readonly(self) -> None:
-        """Seed read-only snapshots on a fresh volume so the dashboard has live data immediately."""
-        sentinel = self.paper_dir / "hl_frontier_history" / "latest_summary.json"
-        if sentinel.is_file():
-            return
-        print("[hl-worker] fresh data volume detected; bootstrapping read-only scans...", flush=True)
+        """Seed missing read-only snapshots on startup so every dashboard tab has live data immediately."""
+        missing_jobs: list[JobSpec] = []
         for job in self.jobs:
+            if not (job.bootstrap_eligible and job.readonly):
+                continue
+            enabled, _ = job.is_enabled()
+            if not enabled:
+                continue
+            sentinel = self._bootstrap_sentinel_for(job.name)
+            if sentinel is None or not sentinel.is_file():
+                missing_jobs.append(job)
+        if not missing_jobs:
+            return
+        names = ", ".join(j.name for j in missing_jobs)
+        print(f"[hl-worker] seeding missing read-only snapshots: {names}", flush=True)
+        for job in missing_jobs:
             if self._stop_event.is_set():
                 break
-            if job.bootstrap_eligible and job.readonly:
-                self.run_job(job)
+            self.run_job(job)
 
     def collect_due_jobs(self, now_utc: datetime, *, max_catchup_minutes: int = 60) -> list[tuple[JobSpec, str]]:
         """Return all ``(job, slot_key)`` pairs due between the last check and ``now_utc`` inclusive."""

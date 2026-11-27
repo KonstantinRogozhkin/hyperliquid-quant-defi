@@ -148,3 +148,60 @@ def test_terminate_active_children_propagates_sigterm(tmp_path: Path):
     t.join(timeout=5.0)
     assert not t.is_alive()
     assert rc_holder and rc_holder[0] != 0
+
+
+def test_telegram_credentials_accept_both_standard_and_signal_env_names(tmp_path: Path, monkeypatch):
+    from hl_quant.paper_tracker import load_telegram_credentials
+
+    for k in (
+        "TELEGRAM_BOT_TOKEN",
+        "TELEGRAM_CHAT_ID",
+        "TELEGRAM_THREAD_ID",
+        "TELEGRAM_SIGNAL_BOT_TOKEN",
+        "TELEGRAM_SIGNAL_CHAT_ID",
+        "TELEGRAM_SIGNAL_THREAD_ID",
+        "HL_TELEGRAM_ENABLED",
+    ):
+        monkeypatch.delenv(k, raising=False)
+
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "bot123")
+    monkeypatch.setenv("TELEGRAM_CHAT_ID", "-10099")
+    monkeypatch.setenv("TELEGRAM_THREAD_ID", "42")
+
+    tok, chat, thread = load_telegram_credentials()
+    assert (tok, chat, thread) == ("bot123", "-10099", "42")
+
+    sched = WorkerScheduler(data_dir=tmp_path)
+    assert sched.telegram_enabled is True
+
+    # TELEGRAM_SIGNAL_* overrides TELEGRAM_* and also enables WorkerScheduler
+    monkeypatch.setenv("TELEGRAM_SIGNAL_BOT_TOKEN", "sig999")
+    monkeypatch.setenv("TELEGRAM_SIGNAL_CHAT_ID", "-10077")
+    monkeypatch.setenv("TELEGRAM_SIGNAL_THREAD_ID", "7")
+    monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+    monkeypatch.delenv("TELEGRAM_CHAT_ID", raising=False)
+
+    assert load_telegram_credentials() == ("sig999", "-10077", "7")
+    sched2 = WorkerScheduler(data_dir=tmp_path)
+    assert sched2.telegram_enabled is True
+
+
+def test_bootstrap_seeds_only_missing_readonly_artifacts(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("HL_TESTNET_ACCOUNT_ADDRESS", raising=False)
+    # Pre-create frontier_history sentinel; metamodel_paper is still missing and must be seeded!
+    frontier = tmp_path / "paper" / "hl_frontier_history" / "latest_summary.json"
+    frontier.parent.mkdir(parents=True, exist_ok=True)
+    frontier.write_text("{}", encoding="utf-8")
+
+    executed: list[str] = []
+
+    def fake_runner(cmd: list[str], _env: dict[str, str], _timeout: int) -> int:
+        executed.append(Path(cmd[1]).name)
+        return 0
+
+    sched = WorkerScheduler(data_dir=tmp_path, telegram_enabled=False, runner=fake_runner)
+    sched.run_bootstrap_readonly()
+    assert "run_hl_frontier_persistence_tick.py" not in executed
+    assert "run_hl_metamodel_paper_tick.py" in executed
+    assert "run_hl_testnet_attribution.py" not in executed  # disabled without address
+    assert "run_hl_testnet_executor.py" not in executed

@@ -445,13 +445,33 @@ def run_paper_tick(
 
 
 def load_telegram_credentials(env_paths: tuple[Path, ...] = ()) -> tuple[str, str, str | None]:
-    """Read Telegram bot token, chat_id, and optional thread_id from env or fallback ``.env`` files."""
+    """Read Telegram bot token, chat_id, and optional thread_id from env or fallback ``.env`` files.
+
+    Accepts both legacy ``TELEGRAM_SIGNAL_*`` and standard ``TELEGRAM_*`` variable names.
+    """
     vals = {
-        "TELEGRAM_SIGNAL_BOT_TOKEN": os.getenv("TELEGRAM_SIGNAL_BOT_TOKEN", "").strip(),
-        "TELEGRAM_SIGNAL_CHAT_ID": os.getenv("TELEGRAM_SIGNAL_CHAT_ID", "").strip(),
-        "TELEGRAM_SIGNAL_THREAD_ID": os.getenv("TELEGRAM_SIGNAL_THREAD_ID", "").strip(),
+        "token": (
+            os.getenv("TELEGRAM_SIGNAL_BOT_TOKEN", "").strip()
+            or os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        ),
+        "chat_id": (
+            os.getenv("TELEGRAM_SIGNAL_CHAT_ID", "").strip()
+            or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        ),
+        "thread_id": (
+            os.getenv("TELEGRAM_SIGNAL_THREAD_ID", "").strip()
+            or os.getenv("TELEGRAM_THREAD_ID", "").strip()
+        ),
     }
-    if not (vals["TELEGRAM_SIGNAL_BOT_TOKEN"] and vals["TELEGRAM_SIGNAL_CHAT_ID"]):
+    key_map = {
+        "TELEGRAM_SIGNAL_BOT_TOKEN": "token",
+        "TELEGRAM_BOT_TOKEN": "token",
+        "TELEGRAM_SIGNAL_CHAT_ID": "chat_id",
+        "TELEGRAM_CHAT_ID": "chat_id",
+        "TELEGRAM_SIGNAL_THREAD_ID": "thread_id",
+        "TELEGRAM_THREAD_ID": "thread_id",
+    }
+    if not (vals["token"] and vals["chat_id"]):
         for path in env_paths:
             if not path.is_file():
                 continue
@@ -460,12 +480,12 @@ def load_telegram_credentials(env_paths: tuple[Path, ...] = ()) -> tuple[str, st
                 if not line or line.startswith("#") or "=" not in line:
                     continue
                 key, val = line.split("=", 1)
-                key = key.strip()
-                if key in vals and not vals[key]:
-                    vals[key] = val.strip().strip('"').strip("'")
-            if vals["TELEGRAM_SIGNAL_BOT_TOKEN"] and vals["TELEGRAM_SIGNAL_CHAT_ID"]:
+                slot = key_map.get(key.strip())
+                if slot and not vals[slot]:
+                    vals[slot] = val.strip().strip('"').strip("'")
+            if vals["token"] and vals["chat_id"]:
                 break
-    return vals["TELEGRAM_SIGNAL_BOT_TOKEN"], vals["TELEGRAM_SIGNAL_CHAT_ID"], vals["TELEGRAM_SIGNAL_THREAD_ID"] or None
+    return vals["token"], vals["chat_id"], vals["thread_id"] or None
 
 
 def format_telegram_summary(result: dict[str, Any], state: dict[str, Any]) -> str:
