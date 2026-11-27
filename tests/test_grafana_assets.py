@@ -191,5 +191,6 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
     assert len(g_rules) >= 9
     for rule in g_rules:
         expr = str(rule["data"][0]["model"]["expr"])
+        assert "bool(" not in expr, f"Invalid PromQL bool(...) function in '{rule['title']}'; use '< bool' / '> bool'"
         for m in metric_re.findall(expr):
             assert m in emitted, f"Grafana alert '{rule['title']}' references unknown metric '{m}'"
