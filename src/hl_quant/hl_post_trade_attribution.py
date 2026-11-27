@@ -190,6 +190,85 @@ def _f(v: object, default: float = 0.0) -> float:
     return x if math.isfinite(x) else default
 
 
+USER_FUNDING_PAGE_CAP = 500
+
+
+def _post_info_with_retry(
+    client: httpx.Client,
+    info_url: str,
+    payload: dict[str, Any],
+    *,
+    max_attempts: int = 3,
+    retry_delay_s: float = 0.25,
+) -> httpx.Response:
+    """POST to Hyperliquid `/info` with bounded retry on HTTP 429 / 5xx / transient transport errors."""
+    import time
+
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = client.post(info_url, json=payload)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < max_attempts:
+                    time.sleep(retry_delay_s * attempt)
+                    continue
+            resp.raise_for_status()
+            return resp
+        except httpx.HTTPError as exc:
+            if isinstance(exc, httpx.HTTPStatusError) and 400 <= exc.response.status_code < 500 and exc.response.status_code != 429:
+                raise
+            last_exc = exc
+            if attempt < max_attempts:
+                time.sleep(retry_delay_s * attempt)
+    assert last_exc is not None
+    raise last_exc
+
+
+def fetch_all_user_funding(
+    client: httpx.Client,
+    account_address: str,
+    *,
+    info_url: str = TESTNET_INFO_URL,
+    start_time_ms: int = 0,
+    page_cap: int = USER_FUNDING_PAGE_CAP,
+    max_pages: int = 50,
+) -> list[dict[str, Any]]:
+    """Paginate Hyperliquid `userFunding` forward by `startTime` so >500 funding events are never truncated."""
+    all_rows: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    cursor_ms = int(start_time_ms)
+    for _ in range(max_pages):
+        resp = _post_info_with_retry(
+            client,
+            info_url,
+            {"type": "userFunding", "user": account_address, "startTime": cursor_ms},
+        )
+        page = resp.json()
+        if not isinstance(page, list) or not page:
+            break
+        max_time = cursor_ms
+        for item in page:
+            if not isinstance(item, dict):
+                continue
+            t = int(_f(item.get("time")))
+            delta = item.get("delta") if isinstance(item.get("delta"), dict) else {}
+            dedup_key = (
+                t,
+                str(delta.get("coin") or item.get("coin") or ""),
+                str(delta.get("usdc") or item.get("usdc") or ""),
+                str(item.get("hash") or ""),
+            )
+            if dedup_key not in seen_keys:
+                seen_keys.add(dedup_key)
+                all_rows.append(item)
+            if t > max_time:
+                max_time = t
+        if len(page) < page_cap or max_time <= cursor_ms:
+            break
+        cursor_ms = max_time + 1
+    return all_rows
+
+
 def fetch_post_trade_snapshot(
     client: httpx.Client,
     account_address: str,
@@ -198,24 +277,12 @@ def fetch_post_trade_snapshot(
     start_time_ms: int = 0,
 ) -> dict[str, Any]:
     """Fetch all read-only post-trade endpoints from Hyperliquid for ``account_address``."""
-    fills_r = client.post(info_url, json={"type": "userFills", "user": account_address})
-    fills_r.raise_for_status()
-    fills = fills_r.json()
-    funding_r = client.post(info_url, json={"type": "userFunding", "user": account_address, "startTime": start_time_ms})
-    funding_r.raise_for_status()
-    funding = funding_r.json()
-    ch_r = client.post(info_url, json={"type": "clearinghouseState", "user": account_address})
-    ch_r.raise_for_status()
-    ch = ch_r.json()
-    spot_r = client.post(info_url, json={"type": "spotClearinghouseState", "user": account_address})
-    spot_r.raise_for_status()
-    spot = spot_r.json()
-    oo_r = client.post(info_url, json={"type": "openOrders", "user": account_address})
-    oo_r.raise_for_status()
-    open_orders = oo_r.json()
-    mids_r = client.post(info_url, json={"type": "allMids"})
-    mids_r.raise_for_status()
-    mids_raw = mids_r.json()
+    fills = _post_info_with_retry(client, info_url, {"type": "userFills", "user": account_address}).json()
+    funding = fetch_all_user_funding(client, account_address, info_url=info_url, start_time_ms=start_time_ms)
+    ch = _post_info_with_retry(client, info_url, {"type": "clearinghouseState", "user": account_address}).json()
+    spot = _post_info_with_retry(client, info_url, {"type": "spotClearinghouseState", "user": account_address}).json()
+    open_orders = _post_info_with_retry(client, info_url, {"type": "openOrders", "user": account_address}).json()
+    mids_raw = _post_info_with_retry(client, info_url, {"type": "allMids"}).json()
     mids = {str(k): _f(v) for k, v in (mids_raw or {}).items()} if isinstance(mids_raw, dict) else {}
 
     user_abstraction = ""

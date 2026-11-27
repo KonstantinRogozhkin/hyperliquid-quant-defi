@@ -435,3 +435,265 @@ def test_dashboard_and_tear_sheet_tolerate_null_fields() -> None:
     assert "Maker 100%" in tg_out
     md_out = ts.format_tear_sheet_markdown(payload)
     assert "κ=0.000" in md_out
+
+
+def test_cross_dex_and_hip3_paper_mtm_uses_fixed_coin_qty_round_trip(tmp_path: Path) -> None:
+    """Round-trip price path (100 -> 200 / 180 -> 100) must net to 0 basis MTM under fixed coin qty."""
+    from hl_quant import cross_dex_scanner as cds
+    from hl_quant import hl_cross_dex_paper as cdp
+    from hl_quant import hl_hip3_builder_arb as hip3
+    from hl_quant import hl_hip3_paper as hp
+
+    def q(dex: str, px: float, apr: float) -> cds.DexMarketQuote:
+        return cds.DexMarketQuote(
+            dex=dex,
+            coin="SOL",
+            raw_symbol="SOL",
+            mark_px=px,
+            funding_rate_h=apr / (cds.HOURS_PER_YEAR * 100.0),
+            funding_apr_pct=apr,
+            day_vol_usd=20_000_000.0,
+            oi_usd=10_000_000.0,
+            spread_bps=1.0,
+        )
+
+    t0 = 1_795_700_000_000
+    cd_dir = tmp_path / "cd"
+    cfg_cd = cdp.CrossDexPaperConfig(slot_notional_usd=5_000.0, min_persistence_ticks=1, entry_apr_pct=15.0)
+    with httpx.Client() as client:
+        cdp.run_cross_dex_paper_tick(
+            client,
+            state_dir=cd_dir,
+            cfg=cfg_cd,
+            now_ms=t0,
+            hl_quotes={"SOL": q("hyperliquid", 100.0, 25.0)},
+            lighter_quotes={"SOL": q("lighter", 100.0, 0.0)},
+            book_fetcher=lambda _d, _s: ([(99.99, 500.0)], [(100.01, 500.0)]),
+        )
+        # Asymmetric surge (HL 100->200, Lighter 100->180)
+        r_mid = cdp.run_cross_dex_paper_tick(
+            client,
+            state_dir=cd_dir,
+            cfg=cfg_cd,
+            now_ms=t0 + 4 * 3_600_000,
+            hl_quotes={"SOL": q("hyperliquid", 200.0, 25.0)},
+            lighter_quotes={"SOL": q("lighter", 180.0, 0.0)},
+            book_fetcher=lambda _d, _s: ([(189.9, 500.0)], [(190.1, 500.0)]),
+        )
+        # Short 50 SOL on HL (-$5,000) + Long 50 SOL on Lighter (+$4,000) => exact -$1,000 basis MTM
+        assert r_mid["state"]["positions"]["SOL"]["cum_basis_mtm_usd"] == pytest.approx(-1_000.0, abs=0.01)
+        # Return both legs to 100.0 -> cumulative basis MTM must return to exact 0.0!
+        r_end = cdp.run_cross_dex_paper_tick(
+            client,
+            state_dir=cd_dir,
+            cfg=cfg_cd,
+            now_ms=t0 + 8 * 3_600_000,
+            hl_quotes={"SOL": q("hyperliquid", 100.0, 25.0)},
+            lighter_quotes={"SOL": q("lighter", 100.0, 0.0)},
+            book_fetcher=lambda _d, _s: ([(99.99, 500.0)], [(100.01, 500.0)]),
+        )
+        assert r_end["state"]["positions"]["SOL"]["cum_basis_mtm_usd"] == pytest.approx(0.0, abs=0.01)
+
+    # Same invariant for HIP-3 paper tracker
+    def mkt(dex: str, px: float, apr: float) -> hip3.Hip3BuilderMarket:
+        return hip3.Hip3BuilderMarket(
+            dex=dex,
+            dex_full_name=dex,
+            base_symbol="NVDA",
+            full_symbol=f"{dex}:NVDA",
+            mark_px=px,
+            oracle_px=px,
+            basis_vs_oracle_bps=0.0,
+            funding_rate_h=apr / (hip3.HOURS_PER_YEAR * 100.0),
+            funding_apr_pct=apr,
+            day_vol_usd=5_000_000.0,
+            oi_usd=2_000_000.0,
+            max_leverage=10,
+            only_isolated=False,
+            growth_mode=True,
+            deployer_fee_scale=0.2,
+            est_maker_fee_bps=0.3,
+            est_taker_fee_bps=0.9,
+        )
+
+    h3_dir = tmp_path / "h3"
+    cfg_h3 = hp.Hip3PaperConfig(slot_notional_usd=5_000.0, min_clean_streak=1, entry_apr_pct=15.0, exit_oracle_div_bps=5000.0)
+    hp.run_hip3_paper_tick(
+        state_dir=h3_dir,
+        cfg=cfg_h3,
+        now_ms=t0,
+        markets=[mkt("io", 100.0, 40.0), mkt("xyz", 100.0, 5.0)],
+        book_fetcher=lambda _s: ([(99.99, 500.0)], [(100.01, 500.0)]),
+    )
+    hp.run_hip3_paper_tick(
+        state_dir=h3_dir,
+        cfg=cfg_h3,
+        now_ms=t0 + 4 * 3_600_000,
+        markets=[mkt("io", 200.0, 40.0), mkt("xyz", 180.0, 5.0)],
+        book_fetcher=lambda _s: ([(189.9, 500.0)], [(190.1, 500.0)]),
+    )
+    r_h3_end = hp.run_hip3_paper_tick(
+        state_dir=h3_dir,
+        cfg=cfg_h3,
+        now_ms=t0 + 8 * 3_600_000,
+        markets=[mkt("io", 100.0, 40.0), mkt("xyz", 100.0, 5.0)],
+        book_fetcher=lambda _s: ([(99.99, 500.0)], [(100.01, 500.0)]),
+    )
+    assert r_h3_end["state"]["positions"]["NVDA"]["cum_basis_mtm_usd"] == pytest.approx(0.0, abs=0.01)
+
+
+def test_ws_mm_live_partial_fill_adverse_halt_and_live_flatten_ledger() -> None:
+    import asyncio
+
+    from hl_quant import hl_mm_avellaneda_stoikov as mm
+
+    class LiveMockAdapter:
+        def __init__(self) -> None:
+            self.next_oid = 100
+            self.cancelled: list[dict] = []
+            self.ioc_orders: list[mm.PlannedOrder] = []
+
+        def set_leverage(self, coin: str, leverage: int, *, is_cross: bool = True) -> dict:
+            return {"status": "ok"}
+
+        def place_alo_order(self, order: mm.PlannedOrder) -> dict:
+            self.next_oid += 1
+            return {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": self.next_oid}}]}}}
+
+        def cancel_all_open_orders(self, open_orders: list[dict], **_kw) -> int:
+            self.cancelled.extend(open_orders)
+            return len(open_orders)
+
+        def place_ioc_order(self, order: mm.PlannedOrder) -> dict:
+            self.ioc_orders.append(order)
+            return {
+                "status": "ok",
+                "response": {
+                    "type": "order",
+                    "data": {"statuses": [{"filled": {"totalSz": str(order.sz), "avgPx": str(order.limit_px), "oid": 999}}]},
+                },
+            }
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        t = json.loads(req.content)["type"]
+        if t == "meta":
+            return httpx.Response(200, json={"universe": [{"name": "ETH", "szDecimals": 4, "maxLeverage": 25}]})
+        if t == "clearinghouseState":
+            return httpx.Response(200, json={"assetPositions": []})
+        return httpx.Response(200, json=[])
+
+    t0 = 1_700_000_000_000
+    # 1. l2Book places resting buy oid=101, sell oid=102
+    # 2. orderUpdates partial fill reduces buy oid=101 remaining sz to 0.01 + 3 toxic buy fills at 2500
+    # 3. 6 seconds later, mid crashes to 2490 (-40 bps <= -20 bps adverse_markout_halt_bps) -> halts & cancels!
+    # 4. flatten_on_exit=True submits live IOC sell and updates ledger to 0 inventory!
+    ws_msgs = [
+        {"channel": "l2Book", "data": {"coin": "ETH", "time": t0, "levels": [[{"px": "2500.0", "sz": "10.0"}], [{"px": "2500.4", "sz": "10.0"}]]}},
+        {"channel": "orderUpdates", "data": [{"status": "open", "order": {"coin": "ETH", "oid": 101, "sz": "0.01"}}]},
+        {
+            "channel": "userFills",
+            "data": {
+                "isSnapshot": False,
+                "fills": [
+                    {"tid": 1, "coin": "ETH", "oid": 101, "side": "B", "px": "2500.0", "sz": "0.01", "fee": "0.0", "time": t0 + 100},
+                    {"tid": 2, "coin": "ETH", "oid": 101, "side": "B", "px": "2500.0", "sz": "0.01", "fee": "0.0", "time": t0 + 200},
+                    {"tid": 3, "coin": "ETH", "oid": 101, "side": "B", "px": "2500.0", "sz": "0.01", "fee": "0.0", "time": t0 + 300},
+                ],
+            },
+        },
+        *[
+            {"channel": "bbo", "data": {"coin": "ETH", "time": t0 + 1_000 + k * 500, "bbo": [{"px": "2489.8", "sz": "10.0"}, {"px": "2490.2", "sz": "10.0"}]}}
+            for k in range(12)
+        ],
+    ]
+    adapter = LiveMockAdapter()
+    mp = pytest.MonkeyPatch()
+    mp.setattr(mm.time, "time", lambda: t0 / 1000.0)
+    try:
+        with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+            summary, _, _ = asyncio.run(
+                mm.run_live_mm_ws_session(
+                    "ETH",
+                    adapter,
+                    account_address="0xabc",
+                    execute_live=True,
+                    flatten_on_exit=True,
+                    params=mm.ASParams(base_order_usd=50.0, max_inventory_usd=500.0, adverse_markout_halt_bps=-20.0),
+                    client=client,
+                    ws_messages=ws_msgs,
+                )
+            )
+    finally:
+        mp.undo()
+
+    assert any(h.startswith("adverse_markout_halt:") for h in summary.halt_events)
+    assert summary.flattened_exit_sz == pytest.approx(0.03)
+    assert summary.end_inventory_sz == pytest.approx(0.0)
+
+
+def test_fetch_all_user_funding_paginates_and_retries_429() -> None:
+    from hl_quant import hl_post_trade_attribution as pta
+
+    calls = {"n": 0}
+    all_events = [
+        {"time": 1_000 + i * 1_000, "hash": f"0x{i}", "delta": {"coin": "BTC", "usdc": "1.25"}}
+        for i in range(7)
+    ]
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        assert body["type"] == "userFunding"
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return httpx.Response(429, json={"error": "rate_limited"})
+        start_t = int(body.get("startTime", 0))
+        slice_rows = [e for e in all_events if e["time"] >= start_t][:3]
+        return httpx.Response(200, json=slice_rows)
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        rows = pta.fetch_all_user_funding(client, "0x123", page_cap=3)
+    assert len(rows) == 7
+    assert [r["time"] for r in rows] == [1_000 + i * 1_000 for i in range(7)]
+
+
+def test_ml_walkforward_target_aligns_1h_price_with_1h_funding() -> None:
+    import pandas as pd
+
+    from hl_quant import alpha_families as af
+
+    # Build a synthetic 260-hour WideMarket where feature X_t positively predicts return over (h_t, h_{t+1}],
+    # while return over (h_{t+1}, h_{t+2}] is pure opposite noise (-X_t).
+    # With aligned fwd_px (horizon_h=1), Ridge learns a positive weight and goes LONG high-X coins!
+    rng = np.random.default_rng(7)
+    n_h = 560
+    coins = [f"C{i}" for i in range(6)]
+    hours = np.arange(n_h, dtype="int64") * 3_600_000
+    sig = rng.normal(0.0, 0.01, size=(n_h, len(coins)))
+    # Cumulative log price so log(hl_close[t] / hl_close[t-1]) == +sig[t] over (h_t, h_{t+1}]
+    px_arr = 100.0 * np.exp(np.cumsum(sig, axis=0))
+    rows = []
+    for ti, h_ms in enumerate(hours):
+        for ci, c in enumerate(coins):
+            rows.append(
+                {
+                    "hour_ms": int(h_ms),
+                    "coin": c,
+                    "hl_close": float(px_arr[ti, ci]),
+                    "bybit_close": float(px_arr[ti, ci]),
+                    "hl_fund_next": 0.0,
+                    "hl_rate_h": 0.0,
+                    "bybit_rate_h": 0.0,
+                    "hl_notional_usd": 5_000_000.0,
+                    "bybit_notional_usd": 5_000_000.0,
+                }
+            )
+    mkt = af.build_wide_market(pd.DataFrame(rows))
+    feat_cache = {"pred": pd.DataFrame(sig, index=hours, columns=coins)}
+    w = af.build_ml_walkforward_weights(
+        mkt,
+        {"horizon_h": 1, "model": "ridge", "top_n": 2, "rebalance_h": 1, "min_vol_usd": 1_000.0, "alpha": 1.0},
+        fold_boundaries=[(370, 520, 555)],
+        feature_cache=feat_cache,
+    )
+    sim = af.simulate_hl_single_venue(mkt, w.loc[hours[520:555]], one_way_cost_bps=0.0)
+    assert float(sim["ret"].sum()) > 0.0

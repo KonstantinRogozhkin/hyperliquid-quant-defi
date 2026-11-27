@@ -187,12 +187,16 @@ def run_hip3_paper_tick(
             notional = float(pos["leg_notional_usd"])
             prev_s = float(pos["last_short_px"])
             prev_l = float(pos["last_long_px"])
-            s_ret = (s_mkt.mark_px - prev_s) / prev_s if prev_s > 0 else 0.0
-            l_ret = (l_mkt.mark_px - prev_l) / prev_l if prev_l > 0 else 0.0
-            # Short leg profits when price drops (-s_ret); long leg profits when price rises (+l_ret).
-            basis_pnl = notional * (-s_ret + l_ret)
+            entry_s = float(pos.get("entry_short_px") or prev_s)
+            entry_l = float(pos.get("entry_long_px") or prev_l)
+            short_qty = float(pos.get("short_qty") or (notional / entry_s if entry_s > 0 else 0.0))
+            long_qty = float(pos.get("long_qty") or (notional / entry_l if entry_l > 0 else 0.0))
+            # Short leg (-short_qty) profits when price drops; long leg (+long_qty) profits when price rises.
+            basis_pnl = -short_qty * (s_mkt.mark_px - prev_s) + long_qty * (l_mkt.mark_px - prev_l)
+            s_notional = short_qty * s_mkt.mark_px
+            l_notional = long_qty * l_mkt.mark_px
             # Short receives positive funding (+s_mkt.funding_rate_h); long pays positive funding (-l_mkt.funding_rate_h).
-            fund_pnl = notional * (s_mkt.funding_rate_h - l_mkt.funding_rate_h) * dt_hours
+            fund_pnl = (s_notional * s_mkt.funding_rate_h - l_notional * l_mkt.funding_rate_h) * dt_hours
 
             live_spread_apr = round(s_mkt.funding_apr_pct - l_mkt.funding_apr_pct, 2)
             live_mark_basis = round((s_mkt.mark_px - l_mkt.mark_px) / l_mkt.mark_px * 1e4, 2) if l_mkt.mark_px > 0 else 0.0
@@ -202,6 +206,10 @@ def run_hip3_paper_tick(
                 else 0.0
             )
 
+            pos["short_qty"] = round(short_qty, 8)
+            pos["long_qty"] = round(long_qty, 8)
+            pos["short_notional_usd"] = round(s_notional, 2)
+            pos["long_notional_usd"] = round(l_notional, 2)
             pos["last_short_px"] = s_mkt.mark_px
             pos["last_long_px"] = l_mkt.mark_px
             pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + dt_hours, 2)
@@ -245,13 +253,20 @@ def run_hip3_paper_tick(
 
             if exit_reason:
                 notional = float(pos["leg_notional_usd"])
+                s_qty = float(pos.get("short_qty") or 0.0)
+                l_qty = float(pos.get("long_qty") or 0.0)
+                exit_notional = (
+                    0.5 * (s_qty * s_mkt.mark_px + l_qty * l_mkt.mark_px)
+                    if (s_mkt and l_mkt and s_qty > 0 and l_qty > 0)
+                    else notional
+                )
                 l2_slip = 2.0
                 if s_mkt and l_mkt:
                     sb, sa = get_book(s_mkt.full_symbol)
                     lb, la = get_book(l_mkt.full_symbol)
                     # Closing reverses legs: buy back short_symbol (ask) & sell long_symbol (bid) -> short_hl=False
                     _, sl, _ = cds.compute_executable_cross_dex_entry_bps(
-                        sb, sa, lb, la, short_hl=False, clip_usd=notional
+                        sb, sa, lb, la, short_hl=False, clip_usd=exit_notional
                     )
                     if sl is not None:
                         l2_slip = sl
@@ -261,7 +276,7 @@ def run_hip3_paper_tick(
                 else:
                     exit_fee_bps = float(pos.get("entry_fee_bps", 1.8))
                 exit_cost_bps = exit_fee_bps + l2_slip
-                exit_cost_usd = notional * exit_cost_bps * 1e-4
+                exit_cost_usd = exit_notional * exit_cost_bps * 1e-4
                 tick_costs_usd += exit_cost_usd
                 pos["cum_cost_usd"] = round(float(pos.get("cum_cost_usd", 0.0)) + exit_cost_usd, 4)
                 final_net = round(pos["cum_funding_usd"] + pos["cum_basis_mtm_usd"] - pos["cum_cost_usd"], 4)
@@ -408,6 +423,10 @@ def run_hip3_paper_tick(
                 "any_only_isolated": bool(opp.any_only_isolated),
                 "margin_mode": "isolated" if opp.any_only_isolated else "cross",
                 "leg_notional_usd": leg_notional,
+                "short_qty": round(leg_notional / s_mkt.mark_px, 8) if s_mkt.mark_px > 0 else 0.0,
+                "long_qty": round(leg_notional / l_mkt.mark_px, 8) if l_mkt.mark_px > 0 else 0.0,
+                "short_notional_usd": leg_notional,
+                "long_notional_usd": leg_notional,
                 "margin_locked_usd": pair_margin,
                 "per_leg_leverage": cfg.per_leg_leverage,
                 "opened_ms": ts_ms,

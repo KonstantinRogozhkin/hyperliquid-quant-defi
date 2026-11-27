@@ -935,15 +935,25 @@ def _fill_dedup_key(
     return ("fallback", coin, f_oid, f_side, f_sz, f_time, str(fl.get("hash") or ""))
 
 
+def _unwrap_sdk_response(resp: dict[str, Any]) -> dict[str, Any] | None:
+    """Accept both ``HyperliquidTestnetSDKAdapter`` wrapper dicts and direct SDK order dicts."""
+    inner = resp.get("response")
+    if isinstance(inner, dict) and ("status" in inner or "response" in inner):
+        return inner
+    if isinstance(inner, dict) and "data" in inner:
+        return resp
+    return None
+
+
 def _extract_order_oid(resp: dict[str, Any]) -> tuple[int | None, str]:
     if not isinstance(resp, dict):
         return None, "invalid_response"
-    inner = resp.get("response")
-    if inner is None:
+    sdk_resp = _unwrap_sdk_response(resp)
+    if sdk_resp is None:
         if resp.get("mode") == "dry_run":
             return None, "simulated_alo"
         return None, str(resp.get("status", "unknown"))
-    statuses, err_msg = extract_hl_order_statuses(inner)
+    statuses, err_msg = extract_hl_order_statuses(sdk_resp)
     if err_msg is not None:
         return None, f"error:{err_msg}"
     for st in statuses:
@@ -958,6 +968,39 @@ def _extract_order_oid(resp: dict[str, Any]) -> tuple[int | None, str]:
     if resp.get("mode") == "dry_run":
         return None, "simulated_alo"
     return None, str(resp.get("status", "unknown"))
+
+
+def _extract_ioc_fill(
+    resp: Any,
+    *,
+    fallback_sz: float,
+    fallback_px: float,
+    execute_live: bool,
+) -> tuple[float, float]:
+    """Extract ``(filled_sz, avg_px)`` from an IOC flatten response (honoring dry-run & live SDK shapes)."""
+    if not execute_live:
+        return fallback_sz, fallback_px
+    if not isinstance(resp, dict):
+        return 0.0, fallback_px
+    sdk_resp = _unwrap_sdk_response(resp)
+    if sdk_resp is None:
+        if resp.get("mode") == "dry_run":
+            return fallback_sz, fallback_px
+        return 0.0, fallback_px
+    statuses, err_msg = extract_hl_order_statuses(sdk_resp)
+    if err_msg is not None:
+        return 0.0, fallback_px
+    filled_sz = 0.0
+    notional = 0.0
+    for st in statuses:
+        if isinstance(st, dict) and isinstance(st.get("filled"), dict):
+            fl = st["filled"]
+            sz = abs(float(fl.get("totalSz") or fl.get("sz") or 0.0))
+            px = float(fl.get("avgPx") or fl.get("px") or fallback_px)
+            filled_sz += sz
+            notional += sz * px
+    avg_px = (notional / filled_sz) if filled_sz > 0 else fallback_px
+    return filled_sz, avg_px
 
 
 def run_live_mm_session(
@@ -1104,11 +1147,28 @@ def run_live_mm_session(
                 halt_events.append(f"drawdown_stop:{cur_net:.2f}$")
                 break
 
-            # 3. Compute Avellaneda–Stoikov quotes
+            # 3. Compute Avellaneda–Stoikov quotes (with adverse-markout widen & halt circuit breaker)
             sigma_tau = vol_est.update(book.observed_ms, book.mid_px)
-            dec = compute_as_quotes(book, spec, inventory_sz=ledger.net_sz, sigma_tau_bps=sigma_tau, params=params)
-            if dec.halt_reason:
-                halt_events.append(dec.halt_reason)
+            adverse_halt: str | None = None
+            tox_mult = 1.0
+            if len(fills) >= 3:
+                mk5 = _compute_vw_markout(fills[-10:], mids_series, 5_000)
+                if mk5 is not None:
+                    if mk5 <= params.adverse_markout_halt_bps:
+                        adverse_halt = f"adverse_markout_halt:{mk5:.1f}bps"
+                    elif mk5 <= params.adverse_markout_widen_bps:
+                        tox_mult = 1.5
+            dec = compute_as_quotes(
+                book,
+                spec,
+                inventory_sz=ledger.net_sz,
+                sigma_tau_bps=sigma_tau,
+                params=params,
+                toxicity_mult=tox_mult,
+            )
+            eff_halt = adverse_halt or dec.halt_reason
+            if eff_halt:
+                halt_events.append(eff_halt)
                 to_cancel = [{"coin": coin, "oid": o["oid"]} for o in active_orders.values() if o.get("oid") is not None]
                 if to_cancel:
                     adapter.cancel_all_open_orders(to_cancel)
@@ -1200,8 +1260,11 @@ def run_live_mm_session(
         else:
             cancel_list = [{"coin": coin, "oid": o.get("oid")} for o in active_orders.values()]
         if cancel_list:
-            adapter.cancel_all_open_orders(cancel_list)
-            cleanup_cancelled = len(cancel_list)
+            try:
+                adapter.cancel_all_open_orders(cancel_list)
+                cleanup_cancelled = len(cancel_list)
+            except Exception:
+                pass
         if owns_client:
             http.close()
 
@@ -1813,15 +1876,25 @@ async def run_multi_coin_mm_ws_session(
 
             if channel == "orderUpdates" and isinstance(data, list) and execute_live:
                 for upd in data:
-                    if not isinstance(upd, dict) or str(upd.get("status") or "") == "open":
+                    if not isinstance(upd, dict):
                         continue
+                    status_str = str(upd.get("status") or "")
                     ord_obj = upd.get("order") or {}
                     c_name = str(ord_obj.get("coin") or "")
                     oid = ord_obj.get("oid")
                     if c_name in active_orders and oid is not None:
                         for side_k in list(active_orders[c_name].keys()):
                             if active_orders[c_name][side_k].get("oid") == int(oid):
-                                active_orders[c_name].pop(side_k, None)
+                                if status_str == "open":
+                                    rem_sz = ord_obj.get("sz")
+                                    if rem_sz is not None:
+                                        rem_val = float(rem_sz)
+                                        if rem_val > 0:
+                                            active_orders[c_name][side_k]["sz"] = rem_val
+                                        else:
+                                            active_orders[c_name].pop(side_k, None)
+                                else:
+                                    active_orders[c_name].pop(side_k, None)
                 return True
 
             if channel == "trades" and isinstance(data, list):
@@ -1868,7 +1941,7 @@ async def run_multi_coin_mm_ws_session(
             st = stats[c_name]
             st["ticks"] += 1
             last_mids[c_name] = book.mid_px
-            st["mids_series"].append((recv_ms, book.mid_px))
+            st["mids_series"].append((book.observed_ms if execute_live else recv_ms, book.mid_px))
 
             # Dry-run touch fills
             if not execute_live:
@@ -1890,11 +1963,15 @@ async def run_multi_coin_mm_ws_session(
             lead_imp = lead_ests[c_name].impulse_bps(recv_ms, book.mid_px) if enable_lead_lag else 0.0
             other_inv_usd = sum(ledgers[k].net_sz * last_mids[k] for k in coin_list if k != c_name and last_mids[k] > 0)
 
+            adverse_halt: str | None = None
             tox_mult = 1.0
             if len(st["fills"]) >= 3:
                 mk5 = _compute_vw_markout(st["fills"][-10:], st["mids_series"], 5_000)
-                if mk5 is not None and mk5 <= params.adverse_markout_widen_bps:
-                    tox_mult = 1.5
+                if mk5 is not None:
+                    if mk5 <= params.adverse_markout_halt_bps:
+                        adverse_halt = f"adverse_markout_halt:{mk5:.1f}bps"
+                    elif mk5 <= params.adverse_markout_widen_bps:
+                        tox_mult = 1.5
             cur_vpin = flow_ests[c_name].vpin(recv_ms)
             if cur_vpin >= params.vpin_widen_threshold:
                 tox_mult = max(tox_mult, 1.35)
@@ -1936,8 +2013,9 @@ async def run_multi_coin_mm_ws_session(
             if not can_act and eff_interval_ms > min_action_interval_ms and elapsed_ms >= min_action_interval_ms:
                 st["rate_limit_throttles"] += 1
 
-            if dec.halt_reason:
-                st["halt_events"].append(dec.halt_reason)
+            eff_halt = adverse_halt or dec.halt_reason
+            if eff_halt:
+                st["halt_events"].append(eff_halt)
                 to_c = [{"coin": c_name, "oid": o["oid"]} for o in active_orders[c_name].values() if o.get("oid") is not None]
                 if to_c:
                     await asyncio.to_thread(adapter.cancel_all_open_orders, to_c)
@@ -2120,10 +2198,15 @@ async def run_multi_coin_mm_ws_session(
                         reduce_only=True,
                     )
                     try:
-                        await asyncio.to_thread(adapter.place_ioc_order, flat_ord)
-                        stats[c_name]["flattened_exit_sz"] = unwind_sz
-                        if not execute_live:
-                            ledgers[c_name].on_fill(unwind_side, mid, unwind_sz, fee_usd=unwind_sz * mid * 4.5e-4)
+                        flat_resp = await asyncio.to_thread(adapter.place_ioc_order, flat_ord)
+                        filled_sz, filled_px = _extract_ioc_fill(
+                            flat_resp, fallback_sz=unwind_sz, fallback_px=mid, execute_live=execute_live
+                        )
+                        if filled_sz > 0:
+                            stats[c_name]["flattened_exit_sz"] = filled_sz
+                            ledgers[c_name].on_fill(
+                                unwind_side, filled_px, filled_sz, fee_usd=filled_sz * filled_px * 4.5e-4
+                            )
                     except Exception:
                         pass
 
