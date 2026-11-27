@@ -16,9 +16,11 @@ from typing import Any
 
 from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse
 import pandas as pd
 
 from hl_quant.hl_portfolio_dashboard import collect_dashboard_payload
+from hl_quant.metrics import PROMETHEUS_CONTENT_TYPE, render_prometheus_metrics
 
 ARTIFACT_FILES: dict[str, str] = {
     "frontier_history": "hl_frontier_history/latest_summary.json",
@@ -249,16 +251,29 @@ def create_app(
         _no_store(response)
         return dict(build_payload)
 
-    @app.get("/api/v1/overview")
-    def overview(response: Response) -> dict[str, Any]:
-        _no_store(response)
+    def _build_overview_payload() -> dict[str, Any]:
         payload = collect_dashboard_payload(resolved_data_root)
         payload["build_info"] = dict(build_payload)
         payload["worker_status"] = _read_json(resolved_data_root / "hl_worker_status.json")
         payload["artifact_freshness"] = collect_artifact_freshness(resolved_data_root)
         payload["paper_positions"] = _read_metamodel_positions(resolved_data_root)
         payload["testnet_audit_recent"] = _read_testnet_audit_tail(resolved_data_root, limit=15)
-        return sanitize_json(payload)
+        return payload
+
+    @app.get("/metrics")
+    @app.get("/api/v1/metrics")
+    def prometheus_metrics() -> PlainTextResponse:
+        body = render_prometheus_metrics(_build_overview_payload())
+        return PlainTextResponse(
+            content=body,
+            media_type=PROMETHEUS_CONTENT_TYPE,
+            headers={"Cache-Control": "no-store"},
+        )
+
+    @app.get("/api/v1/overview")
+    def overview(response: Response) -> dict[str, Any]:
+        _no_store(response)
+        return sanitize_json(_build_overview_payload())
 
     @app.get("/api/v1/metamodel/positions")
     def metamodel_positions(response: Response) -> dict[str, Any]:

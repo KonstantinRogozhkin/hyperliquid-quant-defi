@@ -175,3 +175,12 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert sched_body["artifact_freshness"]["testnet_audit"]["exists"] is True
     for expected_key in ("hip3_paper", "liq_funding_alpha", "mm_calibration", "settlement_study"):
         assert expected_key in sched_body["artifact_freshness"]
+
+    for metrics_path in ("/metrics", "/api/v1/metrics"):
+        r_m = client.get(metrics_path)
+        assert r_m.status_code == 200
+        assert r_m.headers["content-type"].startswith("text/plain")
+        assert r_m.headers["cache-control"] == "no-store"
+        assert 'hl_build_info{service="hl-backend",sha="deadbeef"} 1' in r_m.text
+        assert "hl_hip3_paper_equity_usd 50012.5" in r_m.text
+        assert "hl_testnet_equity_usd 995.5" in r_m.text
