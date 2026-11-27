@@ -206,6 +206,17 @@ def build_job_specs() -> list[JobSpec]:
             cmd.append("--telegram")
         return cmd
 
+    def _autopilot_cmd(root: Path, data_dir: Path, tg: bool) -> list[str]:
+        cmd = [
+            py,
+            str(root / "scripts/analytics/run_hl_autopilot_tick.py"),
+            "--data-root",
+            str(data_dir / "paper"),
+        ]
+        if tg:
+            cmd.append("--telegram")
+        return cmd
+
     def _cross_dex_scan_cmd(root: Path, data_dir: Path, _tg: bool) -> list[str]:
         return [
             py,
@@ -422,6 +433,19 @@ def build_job_specs() -> list[JobSpec]:
             readonly=True,
             bootstrap_eligible=True,
             build_command=_liq_funding_cmd,
+            is_enabled=_default_enabled,
+            has_required_credentials=_default_enabled,
+        ),
+        JobSpec(
+            name="autopilot_allocator",
+            description="Neutral Autopilot Multi-Strategy Allocator + <=5% Crisis-CTA (4h :37)",
+            cron_expr="37 */4 * * *",
+            minutes=(37,),
+            hours=four_hour,
+            timeout_s=180,
+            readonly=True,
+            bootstrap_eligible=True,
+            build_command=_autopilot_cmd,
             is_enabled=_default_enabled,
             has_required_credentials=_default_enabled,
         ),

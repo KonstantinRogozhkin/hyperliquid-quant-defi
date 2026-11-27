@@ -65,6 +65,8 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
     spot_perp_scan = _read_json(data_root / "hl_spot_perp_paper" / "snapshot.json") or _read_json(
         data_root / "hl_spot_perp_arb" / "snapshot.json"
     )
+    autopilot = _read_json(data_root / "hl_autopilot" / "state.json")
+    autopilot_ticks = _read_parquet_records(data_root / "hl_autopilot" / "ticks.parquet")
     boros_snap = _read_json(data_root / "hl_boros" / "snapshot.json")
     yield_snap = _read_json(data_root / "hl_hyperevm_yield_stack" / "snapshot.json")
     frontier_hist = _read_json(data_root / "hl_frontier_history" / "latest_summary.json")
@@ -85,6 +87,8 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
         "spot_perp_paper": spot_perp_paper,
         "spot_perp_paper_ticks": spot_perp_paper_ticks,
         "spot_perp_scan": spot_perp_scan,
+        "autopilot": autopilot,
+        "autopilot_ticks": autopilot_ticks,
         "boros": boros_snap,
         "yield_stack": yield_snap,
         "frontier_history": frontier_hist,
