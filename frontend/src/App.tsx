@@ -384,6 +384,114 @@ export default function App() {
               <section className="card">
                 <div className="section-header">
                   <div>
+                    <h2 className="section-title">HIP-3 Split-Margin Paper Ledger</h2>
+                    <div className="section-sub">
+                      Zero-bridge cross-builder L2 paper (Growth Mode taker fees, independent DEX margin, Oracle Div ≤ 15 bps, half-sized onlyIsolated)
+                    </div>
+                  </div>
+                  <div className="mono muted">
+                    {data?.hip3_paper?.observed_at_utc ?? "awaiting first tick"}
+                    {data?.hip3_paper?.ny_session ? ` · ${data.hip3_paper.ny_session}` : ""}
+                  </div>
+                </div>
+                <div className="kpi-grid">
+                  <div className="card">
+                    <div className="kpi-label">HIP-3 Paper Equity</div>
+                    <div className="kpi-value">{fmtUsd(data?.hip3_paper?.equity_usd)}</div>
+                    <div
+                      className={`kpi-sub ${(data?.hip3_paper?.return_pct ?? 0) >= 0 ? "pos" : "neg"}`}
+                    >
+                      {data?.hip3_paper ? fmtPct(data.hip3_paper.return_pct, 3) : "—"}
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="kpi-label">Split-Margin Locked</div>
+                    <div className="kpi-value">{fmtUsd(data?.hip3_paper?.margin_locked_usd)}</div>
+                    <div className="kpi-sub">
+                      {data?.hip3_paper
+                        ? `${data.hip3_paper.margin_utilization_pct.toFixed(1)}% util · ${Object.keys(data.hip3_paper.positions ?? {}).length} open pairs`
+                        : "—"}
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="kpi-label">Funding / Basis / Fees</div>
+                    <div className="kpi-value">{fmtUsd(data?.hip3_paper?.cum_funding_usd)}</div>
+                    <div className="kpi-sub">
+                      Basis {fmtUsd(data?.hip3_paper?.cum_basis_mtm_usd)} · Fees −
+                      {fmtUsd(data?.hip3_paper?.cum_costs_usd)}
+                    </div>
+                  </div>
+                  <div className="card">
+                    <div className="kpi-label">Closed &amp; Payback</div>
+                    <div className="kpi-value">{data?.hip3_paper?.closed_pairs_count ?? 0}</div>
+                    <div className="kpi-sub">
+                      Payback achieved: {data?.hip3_paper?.payback_achieved_count ?? 0}
+                    </div>
+                  </div>
+                </div>
+                <div className="table-wrap" style={{ marginTop: "0.75rem" }}>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>Ticker</th>
+                        <th>Legs</th>
+                        <th>Mode</th>
+                        <th className="num">Leg Notional</th>
+                        <th className="num">Live APR</th>
+                        <th className="num">Oracle Div</th>
+                        <th className="num">Hours</th>
+                        <th className="num">Funding</th>
+                        <th className="num">Basis MTM</th>
+                        <th className="num">Net PnL</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {Object.values(data?.hip3_paper?.positions ?? {}).map((p) => (
+                        <tr key={p.base_symbol}>
+                          <td>
+                            <strong>{p.base_symbol}</strong>
+                          </td>
+                          <td className="mono">{`S ${p.short_symbol} / L ${p.long_symbol}`}</td>
+                          <td>
+                            <span className={`badge ${p.both_growth_mode ? "badge-cyan" : ""}`}>
+                              {p.both_growth_mode ? "⚡ GM" : "Std"}
+                            </span>{" "}
+                            <span className={`badge ${p.any_only_isolated ? "badge-warn" : "badge-ok"}`}>
+                              {p.any_only_isolated ? "Isolated" : "Cross"}
+                            </span>
+                          </td>
+                          <td className="num">{fmtUsd(p.leg_notional_usd)}</td>
+                          <td className="num pos">{fmtPct(p.live_spread_apr_pct, 1)}</td>
+                          <td className={`num ${p.live_oracle_div_bps > 15 ? "warn" : ""}`}>
+                            {fmtBps(p.live_oracle_div_bps)}
+                          </td>
+                          <td className="num">{p.hours_held.toFixed(1)}h</td>
+                          <td className={`num ${p.cum_funding_usd >= 0 ? "pos" : "neg"}`}>
+                            {fmtUsd(p.cum_funding_usd)}
+                          </td>
+                          <td className={`num ${p.cum_basis_mtm_usd >= 0 ? "pos" : "neg"}`}>
+                            {fmtUsd(p.cum_basis_mtm_usd)}
+                          </td>
+                          <td className={`num ${p.net_pnl_usd >= 0 ? "pos" : "neg"}`}>
+                            <strong>{fmtUsd(p.net_pnl_usd)}</strong>
+                          </td>
+                        </tr>
+                      ))}
+                      {Object.keys(data?.hip3_paper?.positions ?? {}).length === 0 && (
+                        <tr>
+                          <td colSpan={10} className="muted">
+                            No open HIP-3 paper pairs yet (waiting for clean_streak ≥ 2 with Oracle Div ≤ 15 bps).
+                          </td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </section>
+
+              <section className="card">
+                <div className="section-header">
+                  <div>
                     <h2 className="section-title">HIP-3 Cross-Builder Spread Persistence</h2>
                     <div className="section-sub">
                       Clean streak requires APR ≥ 20%, Oracle Div ≤ 25 bps, unchanged legs, and no missing ticks

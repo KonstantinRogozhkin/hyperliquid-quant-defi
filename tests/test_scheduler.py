@@ -13,7 +13,7 @@ from hl_quant.scheduler import WorkerScheduler, app, build_job_specs
 
 def test_job_schedule_matching(tmp_path: Path):
     jobs = {j.name: j for j in build_job_specs()}
-    assert len(jobs) == 12
+    assert len(jobs) == 13
 
     assert jobs["onchain_events"].should_run_at(datetime(2026, 11, 26, 14, 15, tzinfo=timezone.utc))
     assert not jobs["onchain_events"].should_run_at(datetime(2026, 11, 26, 14, 16, tzinfo=timezone.utc))
@@ -23,6 +23,9 @@ def test_job_schedule_matching(tmp_path: Path):
 
     assert jobs["frontier_persistence"].should_run_at(datetime(2026, 11, 26, 8, 20, tzinfo=timezone.utc))
     assert not jobs["frontier_persistence"].should_run_at(datetime(2026, 11, 26, 9, 20, tzinfo=timezone.utc))
+
+    assert jobs["hip3_paper"].should_run_at(datetime(2026, 11, 26, 8, 22, tzinfo=timezone.utc))
+    assert not jobs["hip3_paper"].should_run_at(datetime(2026, 11, 26, 9, 22, tzinfo=timezone.utc))
 
     assert jobs["liq_funding_alpha"].should_run_at(datetime(2026, 11, 26, 8, 35, tzinfo=timezone.utc))
     assert not jobs["liq_funding_alpha"].should_run_at(datetime(2026, 11, 26, 9, 35, tzinfo=timezone.utc))
@@ -217,6 +220,7 @@ def test_bootstrap_seeds_only_missing_readonly_artifacts(tmp_path: Path, monkeyp
     sched = WorkerScheduler(data_dir=tmp_path, telegram_enabled=False, runner=fake_runner)
     sched.run_bootstrap_readonly()
     assert "run_hl_frontier_persistence_tick.py" not in executed
+    assert "run_hl_hip3_paper_tick.py" in executed
     assert "run_hl_metamodel_paper_tick.py" in executed
     assert "run_hl_liquidation_and_funding_alpha.py" in executed
     assert "run_hl_mm_calibration.py" in executed

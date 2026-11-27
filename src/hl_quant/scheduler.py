@@ -1,7 +1,7 @@
 """Container-native UTC job scheduler replacing local macOS crons for Docker / Dokploy.
 
-Runs the 7 core Hyperliquid research/paper/testnet jobs plus 5 read-only dashboard/analytics
-scanners (12 UTC jobs total) in isolated subprocesses with:
+Runs the 7 core Hyperliquid research/paper/testnet jobs plus 6 read-only dashboard/analytics
+scanners (13 UTC jobs total) in isolated subprocesses with:
 - Catch-up slot evaluation + per-job non-overlapping worker threads (so a slow job at :05 never
   skips another job scheduled at :10)
 - Atomic ``hl_worker_status.json`` telemetry
@@ -179,6 +179,19 @@ def build_job_specs() -> list[JobSpec]:
             str(data_dir / "paper"),
         ]
 
+    def _hip3_paper_cmd(root: Path, data_dir: Path, tg: bool) -> list[str]:
+        cmd = [
+            py,
+            str(root / "scripts/analytics/run_hl_hip3_paper_tick.py"),
+            "--state-dir",
+            str(data_dir / "paper/hl_hip3_paper"),
+            "--frontier-summary",
+            str(data_dir / "paper/hl_frontier_history/latest_summary.json"),
+        ]
+        if tg:
+            cmd.append("--telegram")
+        return cmd
+
     def _cross_dex_scan_cmd(root: Path, data_dir: Path, _tg: bool) -> list[str]:
         return [
             py,
@@ -330,6 +343,19 @@ def build_job_specs() -> list[JobSpec]:
             readonly=True,
             bootstrap_eligible=True,
             build_command=_frontier_cmd,
+            is_enabled=_default_enabled,
+            has_required_credentials=_default_enabled,
+        ),
+        JobSpec(
+            name="hip3_paper",
+            description="HIP-3 Cross-Builder Split-Margin L2 Paper Tracker (4h :22)",
+            cron_expr="22 */4 * * *",
+            minutes=(22,),
+            hours=four_hour,
+            timeout_s=240,
+            readonly=True,
+            bootstrap_eligible=True,
+            build_command=_hip3_paper_cmd,
             is_enabled=_default_enabled,
             has_required_credentials=_default_enabled,
         ),
@@ -711,6 +737,7 @@ class WorkerScheduler:
             "metamodel_paper": self.paper_dir / "hl_metamodel" / "state.json",
             "cross_dex_paper": self.paper_dir / "hl_cross_dex_paper" / "state.json",
             "frontier_persistence": self.paper_dir / "hl_frontier_history" / "latest_summary.json",
+            "hip3_paper": self.paper_dir / "hl_hip3_paper" / "state.json",
             "cross_dex_scan": self.paper_dir / "hl_cross_dex_v2" / "opportunities.parquet",
             "hyperevm_defi_scan": self.paper_dir / "hl_hyperevm_defi" / "snapshot.json",
             "liq_funding_alpha": self.paper_dir / "hl_liq_funding_alpha" / "snapshot.json",

@@ -23,6 +23,7 @@ from hl_quant.hl_portfolio_dashboard import collect_dashboard_payload
 ARTIFACT_FILES: dict[str, str] = {
     "frontier_history": "hl_frontier_history/latest_summary.json",
     "hip3": "hl_hip3_arb/snapshot.json",
+    "hip3_paper": "hl_hip3_paper/state.json",
     "boros": "hl_boros/snapshot.json",
     "yield_stack": "hl_hyperevm_yield_stack/snapshot.json",
     "onchain_events": "hl_onchain_events/latest_snapshot.json",
@@ -272,6 +273,10 @@ def create_app(
             {
                 "frontier_history": _read_json(resolved_data_root / "hl_frontier_history" / "latest_summary.json"),
                 "hip3": _read_json(resolved_data_root / "hl_hip3_arb" / "snapshot.json"),
+                "hip3_paper": _read_json(resolved_data_root / "hl_hip3_paper" / "state.json"),
+                "hip3_paper_ticks": _read_parquet_tail(
+                    resolved_data_root / "hl_hip3_paper" / "ticks.parquet", limit=100
+                ),
                 "boros": _read_json(resolved_data_root / "hl_boros" / "snapshot.json"),
                 "yield_stack": _read_json(resolved_data_root / "hl_hyperevm_yield_stack" / "snapshot.json"),
                 "history_tail": _read_parquet_tail(

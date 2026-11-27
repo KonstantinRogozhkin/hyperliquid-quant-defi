@@ -158,6 +158,46 @@ export interface CrossDexPosition {
   entry_exec_basis_bps: number;
 }
 
+export interface Hip3PaperPosition {
+  base_symbol: string;
+  short_symbol: string;
+  long_symbol: string;
+  short_dex: string;
+  long_dex: string;
+  both_growth_mode: boolean;
+  any_only_isolated: boolean;
+  margin_mode: string;
+  leg_notional_usd: number;
+  margin_locked_usd: number;
+  hours_held: number;
+  entry_spread_apr_pct: number;
+  live_spread_apr_pct: number;
+  live_oracle_div_bps: number;
+  entry_l2_slip_bps: number;
+  entry_exec_basis_bps: number;
+  cum_funding_usd: number;
+  cum_basis_mtm_usd: number;
+  cum_cost_usd: number;
+  net_pnl_usd: number;
+  clean_streak: number;
+}
+
+export interface Hip3PaperState {
+  starting_capital_usd: number;
+  equity_usd: number;
+  return_pct: number;
+  margin_locked_usd: number;
+  margin_utilization_pct: number;
+  cum_funding_usd: number;
+  cum_basis_mtm_usd: number;
+  cum_costs_usd: number;
+  observed_at_utc?: string;
+  ny_session?: string;
+  positions: Record<string, Hip3PaperPosition>;
+  closed_pairs_count: number;
+  payback_achieved_count: number;
+}
+
 export interface PaperTick {
   tick_hour_ms: number;
   equity_usd: number;
@@ -240,6 +280,7 @@ export interface OverviewPayload {
     total_hip3_day_vol_usd: number;
     cross_builder_opps: Hip3Opp[];
   } | null;
+  hip3_paper?: Hip3PaperState | null;
   boros?: {
     active_markets_count: number;
     hl_and_spread_count: number;

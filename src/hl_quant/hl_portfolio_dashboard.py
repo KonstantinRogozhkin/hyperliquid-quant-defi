@@ -58,6 +58,8 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
     onchain_events = _read_json(data_root / "hl_onchain_events" / "latest_snapshot.json")
     cross_dex_all = _read_parquet_records(data_root / "hl_cross_dex_v2" / "opportunities.parquet", limit=15)
     hip3_snap = _read_json(data_root / "hl_hip3_arb" / "snapshot.json")
+    hip3_paper = _read_json(data_root / "hl_hip3_paper" / "state.json")
+    hip3_paper_ticks = _read_parquet_records(data_root / "hl_hip3_paper" / "ticks.parquet")
     boros_snap = _read_json(data_root / "hl_boros" / "snapshot.json")
     yield_snap = _read_json(data_root / "hl_hyperevm_yield_stack" / "snapshot.json")
     frontier_hist = _read_json(data_root / "hl_frontier_history" / "latest_summary.json")
@@ -73,6 +75,8 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
         "onchain_events": onchain_events,
         "cross_dex_all": cross_dex_all,
         "hip3": hip3_snap,
+        "hip3_paper": hip3_paper,
+        "hip3_paper_ticks": hip3_paper_ticks,
         "boros": boros_snap,
         "yield_stack": yield_snap,
         "frontier_history": frontier_hist,
