@@ -27,11 +27,11 @@ def test_job_schedule_matching(tmp_path: Path):
     assert jobs["liq_funding_alpha"].should_run_at(datetime(2026, 11, 26, 8, 35, tzinfo=timezone.utc))
     assert not jobs["liq_funding_alpha"].should_run_at(datetime(2026, 11, 26, 9, 35, tzinfo=timezone.utc))
 
-    assert jobs["mm_calibration"].should_run_at(datetime(2026, 11, 26, 5, 15, tzinfo=timezone.utc))
-    assert not jobs["mm_calibration"].should_run_at(datetime(2026, 11, 26, 17, 15, tzinfo=timezone.utc))
+    assert jobs["mm_calibration"].should_run_at(datetime(2026, 11, 26, 5, 18, tzinfo=timezone.utc))
+    assert not jobs["mm_calibration"].should_run_at(datetime(2026, 11, 26, 17, 18, tzinfo=timezone.utc))
 
-    assert jobs["settlement_study"].should_run_at(datetime(2026, 11, 26, 5, 30, tzinfo=timezone.utc))
-    assert not jobs["settlement_study"].should_run_at(datetime(2026, 11, 26, 17, 30, tzinfo=timezone.utc))
+    assert jobs["settlement_study"].should_run_at(datetime(2026, 11, 26, 5, 34, tzinfo=timezone.utc))
+    assert not jobs["settlement_study"].should_run_at(datetime(2026, 11, 26, 17, 34, tzinfo=timezone.utc))
 
     assert jobs["testnet_attribution"].should_run_at(datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc))
     assert not jobs["testnet_attribution"].should_run_at(datetime(2026, 11, 26, 18, 0, tzinfo=timezone.utc))
@@ -126,8 +126,8 @@ def test_scheduler_catches_up_missed_slots_without_dropping_jobs(tmp_path: Path,
     sched = WorkerScheduler(data_dir=tmp_path, telegram_enabled=False, runner=fake_runner)
     # Initial check at 08:04 (nothing due)
     assert sched.tick_minute(datetime(2026, 11, 26, 8, 4, tzinfo=timezone.utc)) == []
-    # Next poll arrives late at 08:16 (simulating a long job): must catch 08:05, 08:10, 08:15!
-    caught = sched.tick_minute(datetime(2026, 11, 26, 8, 16, tzinfo=timezone.utc))
+    # Next poll arrives late at 08:18 (simulating a long job): must catch 08:05, 08:10, 08:15, 08:17!
+    caught = sched.tick_minute(datetime(2026, 11, 26, 8, 18, tzinfo=timezone.utc))
     assert "metamodel_paper" in caught
     assert "cross_dex_paper" in caught
     assert "onchain_events" in caught
@@ -223,3 +223,36 @@ def test_bootstrap_seeds_only_missing_readonly_artifacts(tmp_path: Path, monkeyp
     assert "run_hl_funding_settlement_study.py" in executed
     assert "run_hl_testnet_attribution.py" not in executed  # disabled without address
     assert "run_hl_testnet_executor.py" not in executed
+
+
+def test_readonly_job_retries_once_while_testnet_executor_never_retries(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("HL_ENABLE_TESTNET_EXECUTION", "true")
+    monkeypatch.setenv("HL_TESTNET_PRIVATE_KEY", "0xdeadbeef")
+    monkeypatch.setenv("HL_TESTNET_ACCOUNT_ADDRESS", "0x1234")
+
+    attempts: dict[str, int] = {}
+
+    def flaky_runner(cmd: list[str], _env: dict[str, str], _timeout: int) -> int:
+        script = Path(cmd[1]).name
+        attempts[script] = attempts.get(script, 0) + 1
+        if script == "run_hl_onchain_event_tick.py":
+            return 1 if attempts[script] == 1 else 0
+        return 1  # testnet_executor fails on attempt 1 and must NOT retry
+
+    sched = WorkerScheduler(
+        data_dir=tmp_path,
+        telegram_enabled=False,
+        runner=flaky_runner,
+        readonly_retries=1,
+        readonly_retry_delay_s=0.0,
+    )
+    jobs = {j.name: j for j in sched.jobs}
+    assert sched.run_job(jobs["onchain_events"]) == 0
+    assert attempts["run_hl_onchain_event_tick.py"] == 2
+
+    assert sched.run_job(jobs["testnet_executor"]) == 1
+    assert attempts["run_hl_testnet_executor.py"] == 1
+    status = json.loads((tmp_path / "paper" / "hl_worker_status.json").read_text(encoding="utf-8"))
+    by_name = {j["name"]: j for j in status["jobs"]}
+    assert by_name["onchain_events"]["last_error"] is None
+    assert by_name["testnet_executor"]["last_error"] == "exit_code=1"

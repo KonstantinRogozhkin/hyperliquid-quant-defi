@@ -21,6 +21,7 @@ from pathlib import Path
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from typing import Any, Callable
@@ -308,9 +309,9 @@ def build_job_specs() -> list[JobSpec]:
         ),
         JobSpec(
             name="cross_dex_paper",
-            description="HL x Lighter/Extended Dual-Leg Paper Tick (4h :15)",
-            cron_expr="15 */4 * * *",
-            minutes=(15,),
+            description="HL x Lighter/Extended Dual-Leg Paper Tick (4h :17)",
+            cron_expr="17 */4 * * *",
+            minutes=(17,),
             hours=four_hour,
             timeout_s=240,
             readonly=True,
@@ -347,9 +348,9 @@ def build_job_specs() -> list[JobSpec]:
         ),
         JobSpec(
             name="hyperevm_defi_scan",
-            description="HyperEVM Chain 999 L1Read + V3 Depth + HLP Scan (4h :30)",
-            cron_expr="30 */4 * * *",
-            minutes=(30,),
+            description="HyperEVM Chain 999 L1Read + V3 Depth + HLP Scan (4h :32)",
+            cron_expr="32 */4 * * *",
+            minutes=(32,),
             hours=four_hour,
             timeout_s=240,
             readonly=True,
@@ -373,9 +374,9 @@ def build_job_specs() -> list[JobSpec]:
         ),
         JobSpec(
             name="mm_calibration",
-            description="Avellaneda-Stoikov Empirical Kappa WS Calibration (daily 05:15 UTC)",
-            cron_expr="15 5 * * *",
-            minutes=(15,),
+            description="Avellaneda-Stoikov Empirical Kappa WS Calibration (daily 05:18 UTC)",
+            cron_expr="18 5 * * *",
+            minutes=(18,),
             hours=(5,),
             timeout_s=240,
             readonly=True,
@@ -386,9 +387,9 @@ def build_job_specs() -> list[JobSpec]:
         ),
         JobSpec(
             name="settlement_study",
-            description=":00 Hourly Funding Settlement OOS Study Refresh (daily 05:30 UTC)",
-            cron_expr="30 5 * * *",
-            minutes=(30,),
+            description=":00 Hourly Funding Settlement OOS Study Refresh (daily 05:34 UTC)",
+            cron_expr="34 5 * * *",
+            minutes=(34,),
             hours=(5,),
             timeout_s=300,
             readonly=True,
@@ -432,6 +433,8 @@ class WorkerScheduler:
         telegram_enabled: bool | None = None,
         runner: Callable[[list[str], dict[str, str], int], int] | None = None,
         max_workers: int = 4,
+        readonly_retries: int = 1,
+        readonly_retry_delay_s: float = 15.0,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.data_dir = Path(
@@ -441,6 +444,9 @@ class WorkerScheduler:
         self.status_path = self.paper_dir / "hl_worker_status.json"
         self.jobs = jobs if jobs is not None else build_job_specs()
         self.max_workers = max(1, int(max_workers))
+        self.readonly_retries = max(0, int(readonly_retries))
+        self.readonly_retry_delay_s = max(0.0, float(readonly_retry_delay_s))
+        self._thread_local = threading.local()
         has_tg_token = bool(
             os.environ.get("TELEGRAM_SIGNAL_BOT_TOKEN", "").strip()
             or os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
@@ -492,6 +498,7 @@ class WorkerScheduler:
                 "last_finished_at_utc": prev.get("last_finished_at_utc"),
                 "last_exit_code": prev.get("last_exit_code"),
                 "last_duration_s": prev.get("last_duration_s"),
+                "last_error": prev.get("last_error"),
                 "runs_ok": int(prev.get("runs_ok", 0)),
                 "runs_failed": int(prev.get("runs_failed", 0)),
                 "next_run_utc": job.next_run_utc(now).strftime("%Y-%m-%d %H:%M UTC"),
@@ -535,26 +542,33 @@ class WorkerScheduler:
                     pass
 
     def _subprocess_runner(self, cmd: list[str], env: dict[str, str], timeout_s: int) -> int:
+        self._thread_local.last_stderr = None
+        err_file = tempfile.TemporaryFile(mode="w+b")
         try:
-            proc = subprocess.Popen(cmd, env=env, start_new_session=True)
+            proc = subprocess.Popen(cmd, env=env, stderr=err_file, start_new_session=True)
         except Exception as exc:
+            err_file.close()
+            self._thread_local.last_stderr = f"spawn_failed: {exc}"[:240]
             print(f"[hl-worker] job failed to spawn: {exc}", flush=True)
             return 1
         with self._procs_lock:
             self._active_procs.add(proc)
+        rc_final = 1
         try:
             deadline = time.monotonic() + float(timeout_s)
             while True:
                 rc = proc.poll()
                 if rc is not None:
-                    return int(rc)
+                    rc_final = int(rc)
+                    break
                 if self._stop_event.is_set():
                     self._signal_process_group(proc, signal.SIGTERM)
                     try:
-                        return int(proc.wait(timeout=15.0))
+                        rc_final = int(proc.wait(timeout=15.0))
                     except subprocess.TimeoutExpired:
                         self._signal_process_group(proc, signal.SIGKILL)
-                        return int(proc.wait(timeout=2.0))
+                        rc_final = int(proc.wait(timeout=2.0))
+                    break
                 if time.monotonic() >= deadline:
                     print(f"[hl-worker] job timed out after {timeout_s}s: {' '.join(cmd[:3])}", flush=True)
                     self._signal_process_group(proc, signal.SIGTERM)
@@ -563,11 +577,26 @@ class WorkerScheduler:
                     except subprocess.TimeoutExpired:
                         self._signal_process_group(proc, signal.SIGKILL)
                         proc.wait(timeout=2.0)
-                    return 124
+                    rc_final = 124
+                    self._thread_local.last_stderr = f"timed out after {timeout_s}s"
+                    break
                 time.sleep(0.25)
         finally:
             with self._procs_lock:
                 self._active_procs.discard(proc)
+            try:
+                err_file.seek(0)
+                raw_err = err_file.read().decode("utf-8", errors="replace")
+                if raw_err:
+                    sys.stderr.write(raw_err)
+                    sys.stderr.flush()
+                    if rc_final != 0:
+                        lines = [ln.strip() for ln in raw_err.splitlines() if ln.strip()]
+                        if lines:
+                            self._thread_local.last_stderr = lines[-1][:240]
+            finally:
+                err_file.close()
+        return rc_final
 
     def publish_status(self, now_utc: datetime | None = None) -> dict[str, Any]:
         now = now_utc or datetime.now(tz=timezone.utc)
@@ -628,7 +657,22 @@ class WorkerScheduler:
             env["PYTHONUNBUFFERED"] = "1"
 
             print(f"[hl-worker] starting {job.name} ({job.cron_expr})", flush=True)
-            exit_code = self._runner(cmd, env, job.timeout_s)
+            max_attempts = (1 + self.readonly_retries) if job.readonly else 1
+            exit_code = 1
+            last_err: str | None = None
+            for attempt in range(1, max_attempts + 1):
+                self._thread_local.last_stderr = None
+                exit_code = self._runner(cmd, env, job.timeout_s)
+                last_err = getattr(self._thread_local, "last_stderr", None)
+                if exit_code == 0 or attempt >= max_attempts or self._stop_event.is_set():
+                    break
+                print(
+                    f"[hl-worker] readonly job {job.name} failed (rc={exit_code}); "
+                    f"retrying in {self.readonly_retry_delay_s:.0f}s (attempt {attempt + 1}/{max_attempts})",
+                    flush=True,
+                )
+                if self._stop_event.wait(timeout=self.readonly_retry_delay_s):
+                    break
             duration = round(time.monotonic() - t0, 2)
             end_dt = datetime.now(tz=timezone.utc)
 
@@ -638,6 +682,7 @@ class WorkerScheduler:
                 entry["last_finished_at_utc"] = end_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
                 entry["last_exit_code"] = exit_code
                 entry["last_duration_s"] = duration
+                entry["last_error"] = None if exit_code == 0 else (last_err or f"exit_code={exit_code}")
                 if exit_code == 0:
                     entry["runs_ok"] = int(entry["runs_ok"]) + 1
                 else:
