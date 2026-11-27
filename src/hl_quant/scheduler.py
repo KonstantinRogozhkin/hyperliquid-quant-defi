@@ -391,7 +391,7 @@ def build_job_specs() -> list[JobSpec]:
             cron_expr="34 5 * * *",
             minutes=(34,),
             hours=(5,),
-            timeout_s=300,
+            timeout_s=480,
             readonly=True,
             bootstrap_eligible=True,
             build_command=_settlement_study_cmd,
@@ -486,6 +486,18 @@ class WorkerScheduler:
         for job in self.jobs:
             enabled, reason = job.is_enabled()
             prev = existing.get(job.name, {})
+            prev_state = str(prev.get("state") or "")
+            prev_rc = prev.get("last_exit_code")
+            if not enabled:
+                restored_state = "disabled"
+            elif prev_state in {"ok", "failed"}:
+                restored_state = prev_state
+            elif prev_rc == 0:
+                restored_state = "ok"
+            elif prev_rc is not None:
+                restored_state = "failed"
+            else:
+                restored_state = "idle"
             self._state[job.name] = {
                 "name": job.name,
                 "description": job.description,
@@ -493,7 +505,7 @@ class WorkerScheduler:
                 "readonly": job.readonly,
                 "enabled": enabled,
                 "status_reason": reason,
-                "state": "idle" if enabled else "disabled",
+                "state": restored_state,
                 "last_started_at_utc": prev.get("last_started_at_utc"),
                 "last_finished_at_utc": prev.get("last_finished_at_utc"),
                 "last_exit_code": prev.get("last_exit_code"),

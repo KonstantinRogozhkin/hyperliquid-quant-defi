@@ -75,6 +75,7 @@ export interface TestnetAuditRecord {
   total_notional_usd: number;
   high_water_mark_usd: number;
   blocked_isolated_coins: string[];
+  skipped_unquoted_coins?: string[];
 }
 
 export interface CoinAttributionRow {

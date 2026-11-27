@@ -355,15 +355,45 @@ async def fetch_settlement_dataset(
         # end-of-window funding magnitude, which introduces lookahead selection bias.
         selected = sorted(candidates, key=lambda x: (-x["oi_usd"], -x["vol_usd"], x["coin"]))[:max_coins]
 
-        sem = asyncio.Semaphore(4)
+        # Hyperliquid IP budget is ~1,200 weight/min (weight 20 per candleSnapshot/fundingHistory
+        # call). Pace requests gently and coordinate backoff across workers on HTTP 429 so all
+        # requested coins collect cleanly instead of silently dropping half the universe.
+        sem = asyncio.Semaphore(2)
+        rate_lock = asyncio.Lock()
+        next_allowed_at = 0.0
+        min_request_interval_s = 0.25
 
-        async def _post_with_retry(payload: dict[str, Any]) -> Any:
-            for attempt in range(4):
-                r_p = await client.post(info_url, json=payload)
+        async def _wait_pacing_slot() -> None:
+            nonlocal next_allowed_at
+            async with rate_lock:
+                now_mono = time.monotonic()
+                wait_s = max(0.0, next_allowed_at - now_mono)
+                next_allowed_at = max(now_mono, next_allowed_at) + min_request_interval_s
+            if wait_s > 0:
+                await asyncio.sleep(wait_s)
+
+        async def _push_cooldown(delay_s: float) -> None:
+            nonlocal next_allowed_at
+            async with rate_lock:
+                next_allowed_at = max(next_allowed_at, time.monotonic() + delay_s)
+
+        async def _post_with_retry(payload: dict[str, Any], *, max_attempts: int = 6) -> Any:
+            for attempt in range(max_attempts):
+                await _wait_pacing_slot()
+                try:
+                    r_p = await client.post(info_url, json=payload)
+                except httpx.HTTPError:
+                    delay = min(15.0, 1.5 * (2**attempt))
+                    await _push_cooldown(delay)
+                    await asyncio.sleep(delay)
+                    continue
                 if r_p.status_code == 200:
                     return r_p.json() or []
-                if r_p.status_code == 429:
-                    await asyncio.sleep(0.6 * (attempt + 1))
+                if r_p.status_code in (429, 500, 502, 503, 504):
+                    retry_after = _f(r_p.headers.get("Retry-After"), 0.0)
+                    delay = max(retry_after, min(20.0, 1.5 * (2**attempt)))
+                    await _push_cooldown(delay)
+                    await asyncio.sleep(delay)
                     continue
                 return []
             return []
@@ -384,10 +414,9 @@ async def fetch_settlement_dataset(
                 if last_t <= cursor:
                     break
                 cursor = last_t + 1
-                await asyncio.sleep(0.05)
             return all_rows
 
-        async def _collect_one(item: dict[str, Any]) -> pd.DataFrame:
+        async def _collect_one(item: dict[str, Any]) -> tuple[str, pd.DataFrame]:
             coin = item["coin"]
             async with sem:
                 try:
@@ -395,24 +424,24 @@ async def fetch_settlement_dataset(
                         {"type": "candleSnapshot", "req": {"coin": coin, "interval": iv, "startTime": start_ms, "endTime": now_ms}}
                     )
                     if not candles:
-                        return pd.DataFrame()
-                    await asyncio.sleep(0.06)
+                        return coin, pd.DataFrame()
                     c_start = int(candles[0]["t"]) - 2 * HOUR_MS
                     f_hist = await _fetch_paginated_funding(coin, c_start)
                     if not f_hist:
-                        return pd.DataFrame()
+                        return coin, pd.DataFrame()
                     if iv == "15m":
-                        return build_coin_settlement_events_15m(
+                        return coin, build_coin_settlement_events_15m(
                             coin, candles, f_hist, day_vol_usd=item["vol_usd"], oi_usd=item["oi_usd"]
                         )
-                    return build_coin_settlement_events(
+                    return coin, build_coin_settlement_events(
                         coin, candles, f_hist, day_vol_usd=item["vol_usd"], oi_usd=item["oi_usd"]
                     )
                 except Exception:
-                    return pd.DataFrame()
+                    return coin, pd.DataFrame()
 
-        frames = await asyncio.gather(*[_collect_one(it) for it in selected])
-        valid = [df for df in frames if not df.empty]
+        results = await asyncio.gather(*[_collect_one(it) for it in selected])
+        valid = [df for _coin, df in results if not df.empty]
+        coins_failed = [coin for coin, df in results if df.empty]
         combined = pd.concat(valid, ignore_index=True) if valid else pd.DataFrame()
 
     span_days = (
@@ -425,6 +454,7 @@ async def fetch_settlement_dataset(
         "bar_interval": iv,
         "coins_requested": len(selected),
         "coins_collected": int(combined["coin"].nunique()) if not combined.empty else 0,
+        "coins_failed": coins_failed,
         "total_settlement_events": int(len(combined)),
         "span_days": span_days,
     }

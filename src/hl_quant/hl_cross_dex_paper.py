@@ -49,7 +49,8 @@ class CrossDexPaperConfig:
     enable_extended: bool = True  # scan Extended alongside Lighter
     enable_basis_carry_combo: bool = True  # H1: immediate entry on favorable basis + positive carry
     combo_min_exec_basis_bps: float = 8.0
-    combo_min_apr_pct: float = 8.0
+    combo_min_apr_pct: float = 12.0  # avoid low-carry majors that churn fees if structural basis never converges
+    combo_max_hold_hours: float = 48.0  # time-stop if basis never converges once carry decays below exit_apr_pct
 
     def other_fee_bps(self, dex: str) -> float:
         return self.lighter_fee_bps if dex == "lighter" else self.extended_fee_bps
@@ -195,12 +196,17 @@ def run_cross_dex_paper_tick(
             pos["missing_quote_ticks"] = 0
             live_dir_apr = float(pos.get("live_spread_apr_pct", 0.0))
             live_basis = float(pos.get("live_mark_basis_bps", 0.0))
+            hours_held = float(pos.get("hours_held", 0.0))
             is_combo = pos.get("entry_type") == "basis_carry_combo"
-            should_exit = (
-                (live_dir_apr < cfg.exit_apr_pct and live_basis <= 1.0)
-                if is_combo
-                else (live_dir_apr < cfg.exit_apr_pct)
-            )
+            if is_combo:
+                # Never hold a combo position bleeding negative funding, and cap waiting for
+                # persistent cross-DEX mark-basis convergence once carry decays below exit_apr_pct.
+                should_exit = (live_dir_apr < 0.0) or (
+                    live_dir_apr < cfg.exit_apr_pct
+                    and (live_basis <= 1.0 or hours_held >= cfg.combo_max_hold_hours)
+                )
+            else:
+                should_exit = live_dir_apr < cfg.exit_apr_pct
         live_dir_apr = float(pos.get("live_spread_apr_pct", 0.0))
         if should_exit:
             notional = float(pos["leg_notional_usd"])
@@ -315,10 +321,13 @@ def run_cross_dex_paper_tick(
                 gated_stats["skipped_l2_slip"] += 1
                 continue
 
+            oth_fee = cfg.other_fee_bps(other_dex)
+            venue_rt_fee_bps = 2.0 * (cfg.hl_fee_bps + oth_fee) + cfg.bridge_drag_bps
+            combo_basis_floor = max(cfg.combo_min_exec_basis_bps, venue_rt_fee_bps)
             is_h1_combo = (
                 cfg.enable_basis_carry_combo
                 and spread_apr >= cfg.combo_min_apr_pct
-                and exec_basis >= cfg.combo_min_exec_basis_bps
+                and exec_basis >= combo_basis_floor
             )
             if not is_h1_combo:
                 if not passes_persist:
@@ -328,10 +337,11 @@ def run_cross_dex_paper_tick(
                     gated_stats["skipped_basis"] += 1
                     continue
 
-            oth_fee = cfg.other_fee_bps(other_dex)
             entry_cost_bps = cfg.hl_fee_bps + oth_fee + cfg.bridge_drag_bps + l2_slip
-            # exec_basis already incorporates entry VWAP slippage; add 1x l2_slip for estimated exit slippage.
-            est_rt_cost_bps = max(0.0, 2.0 * (cfg.hl_fee_bps + oth_fee) + l2_slip + cfg.bridge_drag_bps - exec_basis)
+            # Credit only conservative 50% convergence for positive cross-DEX basis (persistent
+            # venue oracle/mark offsets do not guarantee 100% reversion at exit); charge full adverse basis.
+            basis_credit_bps = (0.5 * exec_basis) if exec_basis > 0 else exec_basis
+            est_rt_cost_bps = max(0.0, venue_rt_fee_bps + l2_slip - basis_credit_bps)
             hourly_bps = spread_apr / (cds.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
             if be_hours > cfg.max_breakeven_hours:

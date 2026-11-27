@@ -59,12 +59,20 @@ def main(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     if not events_df.empty:
-        events_df.to_parquet(output_dir / "events.parquet", index=False)
+        tmp_ev = output_dir / "events.tmp.parquet"
+        events_df.to_parquet(tmp_ev, index=False)
+        tmp_ev.replace(output_dir / "events.parquet")
     if not stats_df.empty:
-        stats_df.to_parquet(output_dir / "stats.parquet", index=False)
-    (output_dir / "meta.json").write_text(json.dumps(meta, indent=2))
+        tmp_st = output_dir / "stats.tmp.parquet"
+        stats_df.to_parquet(tmp_st, index=False)
+        tmp_st.replace(output_dir / "stats.parquet")
+    tmp_meta = output_dir / "meta.tmp.json"
+    tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    tmp_meta.replace(output_dir / "meta.json")
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(md)
+    tmp_rep = report_path.with_suffix(".tmp.md")
+    tmp_rep.write_text(md, encoding="utf-8")
+    tmp_rep.replace(report_path)
 
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(

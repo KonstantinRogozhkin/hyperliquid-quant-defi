@@ -90,3 +90,75 @@ def test_15m_settlement_events_and_ex_top1_coin_audit():
     assert row["top1_coin"] == "OUTLIER"
     assert row["mean_gross_bps"] > 30.0  # inflated by OUTLIER
     assert row["ex_top1_gross_bps"] == pytest.approx(2.0, abs=0.2)  # Ex-Top1 reveals STEADY is only +2 bps!
+
+
+def test_fetch_settlement_dataset_retries_429_and_tracks_failed_coins(monkeypatch):
+    import asyncio
+    import json
+
+    import httpx
+
+    hour = fss.HOUR_MS
+    m15 = fss.FIFTEEN_MIN_MS
+    base = 1_795_000_000_000 - (1_795_000_000_000 % hour)
+    candles_ok = [
+        {"t": base + h * hour + off, "o": "100.0", "c": "100.0"}
+        for h in range(4)
+        for off in (-m15, 0, m15)
+    ]
+    fund_ok = [{"time": base + h * hour, "fundingRate": "0.0001"} for h in range(4)]
+
+    calls: dict[str, int] = {}
+
+    async def fake_sleep(_s: float) -> None:
+        return None
+
+    monkeypatch.setattr(fss.asyncio, "sleep", fake_sleep)
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        rtype = body.get("type")
+        if rtype == "metaAndAssetCtxs":
+            return httpx.Response(
+                200,
+                json=[
+                    {"universe": [{"name": "BTC"}, {"name": "ETH"}]},
+                    [
+                        {"markPx": "60000", "openInterest": "1000", "dayNtlVlm": "50000000", "funding": "0.0001"},
+                        {"markPx": "2000", "openInterest": "10000", "dayNtlVlm": "20000000", "funding": "0.0001"},
+                    ],
+                ],
+            )
+        if rtype == "candleSnapshot":
+            coin = body["req"]["coin"]
+            key = f"candle:{coin}"
+            calls[key] = calls.get(key, 0) + 1
+            if coin == "BTC" and calls[key] <= 2:
+                return httpx.Response(429, headers={"Retry-After": "0.1"}, json={"error": "rate_limit"})
+            if coin == "ETH":
+                return httpx.Response(400, json={"error": "bad_coin"})
+            return httpx.Response(200, json=candles_ok)
+        if rtype == "fundingHistory":
+            coin = body["coin"]
+            key = f"fund:{coin}"
+            calls[key] = calls.get(key, 0) + 1
+            if calls[key] == 1:
+                return httpx.Response(429, json={"error": "rate_limit"})
+            return httpx.Response(200, json=fund_ok)
+        return httpx.Response(404)
+
+    real_async_client = httpx.AsyncClient
+
+    def _patched_client(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(fss.httpx, "AsyncClient", _patched_client)
+
+    df, meta = asyncio.run(fss.fetch_settlement_dataset(bar_interval="15m", max_coins=2))
+    assert not df.empty
+    assert meta["coins_requested"] == 2
+    assert meta["coins_collected"] == 1
+    assert meta["coins_failed"] == ["ETH"]
+    assert calls["candle:BTC"] == 3
+    assert calls["fund:BTC"] == 2

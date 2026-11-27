@@ -231,3 +231,36 @@ def test_h6_separates_crowded_funding_basis_from_crash_and_hlp_pnl_ignores_lp_de
     assert mm_res["pnl_source"] == "vault_pnlHistory_deposit_clean"
     assert mm_res["hlp_pnl_delta_usd"] == pytest.approx(12_000.0)
     assert mm_res["mm_pnl_regime"] == "CALM"
+
+
+def test_fetch_hlp_vault_telemetry_retries_transient_429_without_dropping_children(monkeypatch):
+    import json
+
+    import httpx
+
+    monkeypatch.setattr(oea.time, "sleep", lambda _s: None)
+    calls: dict[str, int] = {}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = json.loads(req.content)
+        key = f"{body.get('type')}:{body.get('user') or body.get('vaultAddress')}"
+        calls[key] = calls.get(key, 0) + 1
+        if calls[key] == 1:
+            return httpx.Response(429, json={"error": "rate_limited"})
+        if body.get("type") == "vaultDetails":
+            return httpx.Response(
+                200,
+                json={
+                    "portfolio": [["allTime", {"accountValueHistory": [[1, "150000000.0"]], "pnlHistory": [[1, "141000000.0"]]}]],
+                    "relationship": {"data": {"childAddresses": ["0xchild1"]}},
+                },
+            )
+        return httpx.Response(200, json={"marginSummary": {"accountValue": "40000000.0"}, "assetPositions": []})
+
+    with httpx.Client(transport=httpx.MockTransport(handler)) as client:
+        states, tvl, cum_pnl = oea.fetch_hlp_vault_telemetry(client, vault_address="0xhlp")
+    assert tvl == pytest.approx(150_000_000.0)
+    assert cum_pnl == pytest.approx(141_000_000.0)
+    assert len(states) == 1
+    assert calls["vaultDetails:0xhlp"] == 2
+    assert calls["clearinghouseState:0xchild1"] == 2

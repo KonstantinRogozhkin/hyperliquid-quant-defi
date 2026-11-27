@@ -455,6 +455,33 @@ def grade_forward_outcomes(
     return updated
 
 
+def _post_json_with_retry(
+    client: httpx.Client,
+    url: str,
+    payload: dict[str, Any],
+    *,
+    max_attempts: int = 3,
+    base_delay_s: float = 0.8,
+) -> httpx.Response:
+    """POST JSON to Hyperliquid with bounded retry on HTTP 429/5xx or transient transport errors."""
+    last_exc: Exception | None = None
+    last_resp: httpx.Response | None = None
+    for attempt in range(max_attempts):
+        try:
+            resp = client.post(url, json=payload)
+            last_resp = resp
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                return resp
+        except httpx.HTTPError as exc:
+            last_exc = exc
+        if attempt + 1 < max_attempts:
+            time.sleep(base_delay_s * (attempt + 1))
+    if last_resp is not None:
+        return last_resp
+    assert last_exc is not None
+    raise last_exc
+
+
 def fetch_hlp_vault_telemetry(
     client: httpx.Client,
     *,
@@ -462,7 +489,7 @@ def fetch_hlp_vault_telemetry(
     info_url: str = evm.HYPERCORE_INFO_URL,
 ) -> tuple[list[dict[str, Any]], float, float | None]:
     """Fetch HLP child clearinghouse states, TVL, and deposit-clean ``allTime.pnlHistory`` latest PnL."""
-    r = client.post(info_url, json={"type": "vaultDetails", "vaultAddress": vault_address})
+    r = _post_json_with_retry(client, info_url, {"type": "vaultDetails", "vaultAddress": vault_address})
     r.raise_for_status()
     vd = r.json() or {}
     tvl = 0.0
@@ -481,7 +508,7 @@ def fetch_hlp_vault_telemetry(
     states: list[dict[str, Any]] = []
     for addr in addrs:
         try:
-            cr = client.post(info_url, json={"type": "clearinghouseState", "user": addr})
+            cr = _post_json_with_retry(client, info_url, {"type": "clearinghouseState", "user": addr})
             if cr.status_code == 200 and isinstance(cr.json(), dict):
                 states.append(cr.json())
         except Exception:
