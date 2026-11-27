@@ -19,6 +19,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 import pandas as pd
 
+from hl_quant.hl_analytics_risk import build_desk_analytics_payload
 from hl_quant.hl_portfolio_dashboard import collect_dashboard_payload
 from hl_quant.metrics import PROMETHEUS_CONTENT_TYPE, render_prometheus_metrics
 
@@ -327,6 +328,11 @@ def create_app(
                 "rebalances": _read_parquet_tail(resolved_data_root / "hl_autopilot" / "rebalances.parquet", limit=100),
             }
         )
+
+    @app.get("/api/v1/analytics")
+    def analytics_risk(response: Response) -> dict[str, Any]:
+        _no_store(response)
+        return sanitize_json(build_desk_analytics_payload(resolved_data_root))
 
     @app.get("/api/v1/events/latest")
     def events_latest(response: Response) -> dict[str, Any]:

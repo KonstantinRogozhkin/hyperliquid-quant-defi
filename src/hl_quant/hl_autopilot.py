@@ -126,18 +126,18 @@ class AutopilotConfig:
 # --------------------------------------------------------------------------- Crisis-Alpha CTA Sleeve
 
 
-def fetch_hypercore_daily_closes(
+def fetch_hypercore_daily_closes_with_dates(
     client: httpx.Client,
     coins: tuple[str, ...] = CTA_UNIVERSE,
     *,
-    lookback_days: int = 60,
+    lookback_days: int = 90,
     now_ms: int | None = None,
     info_url: str = HL_INFO_URL,
-) -> dict[str, list[float]]:
-    """Fetch strictly completed daily closes (up to ``lookback_days``) from HyperCore ``candleSnapshot``."""
+) -> dict[str, list[dict[str, Any]]]:
+    """Fetch daily ``[{date, close}]`` bars from HyperCore ``candleSnapshot`` for CTA & benchmarks."""
     end_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     start_ms = end_ms - (lookback_days + 5) * 86_400_000
-    out: dict[str, list[float]] = {}
+    out: dict[str, list[dict[str, Any]]] = {}
     for coin in coins:
         try:
             r = client.post(
@@ -152,12 +152,35 @@ def fetch_hypercore_daily_closes(
             bars = r.json() or []
             if not isinstance(bars, list):
                 continue
-            closes = [_f(b.get("c")) for b in bars if isinstance(b, dict) and _f(b.get("c")) > 0]
-            if closes:
-                out[coin] = closes[-lookback_days:]
+            pts: list[dict[str, Any]] = []
+            for b in bars:
+                if not isinstance(b, dict):
+                    continue
+                c_px = _f(b.get("c"))
+                t_ms = int(_f(b.get("T") or b.get("t")))
+                if c_px > 0 and t_ms > 0:
+                    d_str = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+                    pts.append({"date": d_str, "close": c_px})
+            if pts:
+                out[coin] = pts[-lookback_days:]
         except Exception:
             continue
     return out
+
+
+def fetch_hypercore_daily_closes(
+    client: httpx.Client,
+    coins: tuple[str, ...] = CTA_UNIVERSE,
+    *,
+    lookback_days: int = 60,
+    now_ms: int | None = None,
+    info_url: str = HL_INFO_URL,
+) -> dict[str, list[float]]:
+    """Fetch strictly completed daily closes (up to ``lookback_days``) from HyperCore ``candleSnapshot``."""
+    dated = fetch_hypercore_daily_closes_with_dates(
+        client, coins, lookback_days=lookback_days, now_ms=now_ms, info_url=info_url
+    )
+    return {c: [float(p["close"]) for p in pts] for c, pts in dated.items() if pts}
 
 
 def compute_tsmom_signal(closes: list[float]) -> tuple[float, float]:
@@ -549,7 +572,15 @@ def run_autopilot_tick(
     try:
         if daily_closes is None:
             assert http_client is not None
-            closes_map = fetch_hypercore_daily_closes(http_client, CTA_UNIVERSE, now_ms=ts_ms, info_url=info_url)
+            dated_bars = fetch_hypercore_daily_closes_with_dates(
+                http_client, CTA_UNIVERSE, lookback_days=90, now_ms=ts_ms, info_url=info_url
+            )
+            if dated_bars:
+                _write_json_atomic(
+                    data_root / "hl_benchmarks" / "daily_closes.json",
+                    {"updated_at_utc": obs_utc, "benchmarks": dated_bars},
+                )
+            closes_map = {c: [float(p["close"]) for p in pts[-60:]] for c, pts in dated_bars.items() if pts}
         else:
             closes_map = dict(daily_closes)
     finally:

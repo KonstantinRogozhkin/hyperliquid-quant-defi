@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
+import { AnalyticsRiskTab } from "./components/AnalyticsRiskTab";
 import { EquityCurveChart, KappaCalibrationChart } from "./components/Charts";
-import type { BuildInfo, CoinAttributionRow, OverviewPayload } from "./types";
+import type { AnalyticsPayload, BuildInfo, CoinAttributionRow, OverviewPayload } from "./types";
 
-type TabId = "overview" | "frontier" | "crossdex" | "onchain" | "execution" | "ops";
+type TabId = "overview" | "analytics" | "frontier" | "crossdex" | "onchain" | "execution" | "ops";
 
 const TABS: Array<{ id: TabId; label: string }> = [
   { id: "overview", label: "Overview & Metamodel" },
+  { id: "analytics", label: "Analytics & Risk" },
   { id: "frontier", label: "HIP-3 · Boros · Yield" },
   { id: "crossdex", label: "5-DEX & Paper" },
   { id: "onchain", label: "On-Chain Alpha" },
@@ -45,6 +47,7 @@ function shortSha(sha?: string | null): string {
 export default function App() {
   const [tab, setTab] = useState<TabId>("overview");
   const [data, setData] = useState<OverviewPayload | null>(null);
+  const [analytics, setAnalytics] = useState<AnalyticsPayload | null>(null);
   const [feBuild, setFeBuild] = useState<BuildInfo | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -61,15 +64,19 @@ export default function App() {
   const loadAll = useCallback(async () => {
     try {
       setError(null);
-      const [ovRes, feRes] = await Promise.all([
+      const [ovRes, feRes, anRes] = await Promise.all([
         fetch("/api/v1/overview", { cache: "no-store" }),
         fetch("/build-info.json", { cache: "no-store" }).catch(() => null),
+        fetch("/api/v1/analytics", { cache: "no-store" }).catch(() => null),
       ]);
       if (!ovRes.ok) {
         throw new Error(`Backend /api/v1/overview returned HTTP ${ovRes.status}`);
       }
       const ovJson = (await ovRes.json()) as OverviewPayload;
       setData(ovJson);
+      if (anRes && anRes.ok) {
+        setAnalytics((await anRes.json()) as AnalyticsPayload);
+      }
       if (feRes && feRes.ok) {
         setFeBuild((await feRes.json()) as BuildInfo);
       } else {
@@ -193,6 +200,8 @@ export default function App() {
         <div className="card muted">Loading Hyperliquid live desk telemetry...</div>
       ) : (
         <>
+          {tab === "analytics" && <AnalyticsRiskTab analytics={analytics} overview={data} />}
+
           {tab === "overview" && (
             <div className="stack">
               <section className="kpi-grid">

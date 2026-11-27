@@ -324,4 +324,239 @@ export interface OverviewPayload {
     vaults?: Array<Record<string, unknown>>;
   } | null;
   mm_calibration?: Record<string, CoinCalibration> | null;
+  spot_perp_paper?: SpotPerpPaperState | null;
+  spot_perp_scan?: SpotPerpScanSnapshot | null;
+  autopilot?: AutopilotState | null;
+}
+
+export interface SpotPerpOpportunity {
+  base_symbol: string;
+  spot_pair: string;
+  spot_token: string;
+  asset_tier: string;
+  is_proxy_hedge: boolean;
+  spot_day_vol_usd: number;
+  funding_apr_pct: number;
+  net_deposit_apr_pct: number;
+  exec_basis_bps: number | null;
+  mark_basis_bps: number;
+  entry_l2_slip_bps: number | null;
+  payback_hours: number | null;
+  boros_fixed_apr_pct: number | null;
+  eligible: boolean;
+  reject_reason: string;
+}
+
+export interface SpotPerpScanSnapshot {
+  observed_at_utc: string;
+  hlp_apr_pct: number;
+  hlp_tvl_usd: number;
+  clip_usd: number;
+  opportunities: SpotPerpOpportunity[];
+}
+
+export interface SpotPerpPosition {
+  base_symbol: string;
+  spot_pair: string;
+  spot_token: string;
+  asset_tier: string;
+  spot_notional_usd: number;
+  perp_notional_usd: number;
+  effective_perp_leverage: number;
+  perp_liq_distance_pct: number;
+  live_funding_apr_pct: number;
+  cum_funding_usd: number;
+  net_pnl_usd: number;
+  hours_held: number;
+}
+
+export interface SpotPerpPaperState {
+  starting_capital_usd: number;
+  equity_usd: number;
+  share_price: number;
+  return_pct: number;
+  hlp_reserve_usd: number;
+  hlp_reserve_share_pct: number;
+  hlp_apr_pct: number;
+  free_cash_usd: number;
+  blended_portfolio_apr_pct: number;
+  cum_funding_usd: number;
+  cum_hlp_yield_usd: number;
+  cum_basis_mtm_usd: number;
+  cum_costs_usd: number;
+  observed_at_utc?: string;
+  positions: Record<string, SpotPerpPosition>;
+  risk_telemetry?: {
+    gross_leverage: number;
+    leverage_30d_avg: number;
+    leverage_30d_max: number;
+    active_assets: number;
+    net_delta_pct: number;
+    min_perp_liq_distance_pct: number;
+    venue_breakdown_usd?: Record<string, number>;
+    asset_tier_breakdown_usd?: Record<string, number>;
+    nav_guard_triggered?: boolean;
+  };
+}
+
+export interface AutopilotSleeveRow {
+  name: string;
+  category: string;
+  target_weight_pct: number;
+  actual_weight_pct: number;
+  drift_pct: number;
+  allocation_usd: number;
+  tick_pnl_usd: number;
+}
+
+export interface AutopilotCtaAsset {
+  coin: string;
+  last_close: number;
+  tsmom_signal: number;
+  ann_vol_pct: number;
+  weight: number;
+  target_weight: number;
+}
+
+export interface AutopilotState {
+  starting_capital_usd: number;
+  gross_equity_usd: number;
+  net_equity_usd: number;
+  gross_share_price: number;
+  net_share_price: number;
+  hwm_net_share_price: number;
+  gross_return_pct: number;
+  net_return_pct: number;
+  cum_mgmt_fee_usd: number;
+  cum_perf_fee_usd: number;
+  cum_rebalance_cost_usd: number;
+  observed_at_utc?: string;
+  sleeves: AutopilotSleeveRow[];
+  cta_state?: {
+    gross_leverage?: number;
+    net_exposure?: number;
+    cum_pnl_usd?: number;
+    assets?: Record<string, AutopilotCtaAsset>;
+  };
+  risk_telemetry?: {
+    gross_leverage: number;
+    leverage_30d_avg: number;
+    leverage_30d_max: number;
+    net_directional_exposure_pct: number;
+    directional_sleeve_pct: number;
+    reserve_sleeve_pct: number;
+    max_weight_drift_pct: number;
+    rebalanced_this_tick: boolean;
+    nav_guard_triggered?: boolean;
+  };
+}
+
+export interface HorizonMetrics {
+  "7d": number | null;
+  "30d": number | null;
+  ytd: number | null;
+  all_time: number | null;
+}
+
+export interface MonthlyReturnRow {
+  year: number;
+  months: Record<string, number>;
+  ytd: number | null;
+}
+
+export interface LeaderboardRow {
+  id: string;
+  name: string;
+  category: string;
+  is_benchmark: boolean;
+  fee_schedule: string;
+  equity_usd: number | null;
+  share_price_gross: number | null;
+  share_price_net: number | null;
+  spot_price_usd?: number | null;
+  days_tracked: number;
+  gross_returns: HorizonMetrics;
+  gross_apy: HorizonMetrics;
+  net_returns: HorizonMetrics;
+  net_apy: HorizonMetrics;
+  sharpe_gross: number | null;
+  sortino_gross: number | null;
+  sharpe_net: number | null;
+  sortino_net: number | null;
+  max_dd_gross_pct: number;
+  max_dd_net_pct: number;
+  dd_recovery_days: number;
+  positive_days_pct: number | null;
+  longest_win_streak: number;
+  longest_loss_streak: number;
+  monthly_gross: MonthlyReturnRow[];
+  monthly_net: MonthlyReturnRow[];
+}
+
+export interface AnalyticsCurve {
+  id: string;
+  name: string;
+  category: string;
+  is_benchmark: boolean;
+  dates: string[];
+  gross_shares: number[];
+  net_shares: number[];
+}
+
+export interface OlsScatterPoint {
+  date: string;
+  factor_ret_pct: number;
+  strat_ret_pct: number;
+}
+
+export interface OlsExposureRow {
+  id: string;
+  name: string;
+  beta: number | null;
+  r2_pct: number | null;
+  alpha_ann_pct: number | null;
+  days: number;
+  scatter: OlsScatterPoint[];
+}
+
+export interface RiskConcentrationRow {
+  label: string;
+  usd: number;
+  share_pct: number;
+}
+
+export interface StrategyLeverageRow {
+  strategy: string;
+  current_leverage: number;
+  leverage_30d_avg: number;
+  leverage_30d_max: number;
+  net_exposure_pct: number;
+  nav_guard_triggers: number;
+}
+
+export interface AnalyticsPayload {
+  generated_at_utc: string;
+  methodology?: Record<string, unknown>;
+  leaderboard: LeaderboardRow[];
+  curves: Record<string, AnalyticsCurve>;
+  correlation: {
+    ids: string[];
+    labels?: Record<string, string>;
+    matrix: Array<Array<number | null>>;
+    overlap_days: number;
+  };
+  market_exposure: Record<
+    string,
+    {
+      factor: string;
+      factor_days: number;
+      rows: OlsExposureRow[];
+    }
+  >;
+  risk_exposure: {
+    leverage_by_strategy: StrategyLeverageRow[];
+    venue_concentration: RiskConcentrationRow[];
+    asset_tier_concentration: RiskConcentrationRow[];
+    total_nav_guard_triggers: number;
+  };
 }

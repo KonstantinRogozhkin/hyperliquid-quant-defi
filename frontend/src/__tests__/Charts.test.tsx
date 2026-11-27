@@ -1,6 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
-import { EquityCurveChart, KappaCalibrationChart } from "../components/Charts";
+import { EquityCurveChart, KappaCalibrationChart, MultiSeriesChart, OlsScatterChart } from "../components/Charts";
 import type { CoinCalibration } from "../types";
 
 describe("Charts", () => {
@@ -52,5 +52,37 @@ describe("Charts", () => {
     expect(screen.getByRole("img", { name: "BTC kappa curve" })).toBeInTheDocument();
     expect(container.querySelectorAll("circle")).toHaveLength(3);
     expect(screen.getByText("5.0 bps")).toBeInTheDocument();
+  });
+
+  it("renders MultiSeriesChart with multiple polylines", () => {
+    const { container } = render(
+      <MultiSeriesChart
+        dates={["2026-10-01", "2026-10-02", "2026-10-03"]}
+        series={[
+          { id: "ap", name: "Autopilot", color: "#10b981", values: [0, 0.5, 1.2] },
+          { id: "btc", name: "BTC", color: "#f59e0b", values: [0, -2.0, -4.5] },
+        ]}
+      />,
+    );
+    expect(screen.getByRole("img", { name: /Multi-strategy cumulative performance chart/i })).toBeInTheDocument();
+    expect(container.querySelectorAll("polyline")).toHaveLength(2);
+  });
+
+  it("renders OlsScatterChart with scatter points and fitted regression line", () => {
+    const { container } = render(
+      <OlsScatterChart
+        factorName="BTC"
+        strategyName="Spot+Perp"
+        beta={0.002}
+        alphaAnnPct={9.5}
+        points={[
+          { date: "2026-10-01", factor_ret_pct: -2.1, strat_ret_pct: 0.03 },
+          { date: "2026-10-02", factor_ret_pct: 1.5, strat_ret_pct: 0.04 },
+          { date: "2026-10-03", factor_ret_pct: -0.8, strat_ret_pct: 0.02 },
+        ]}
+      />,
+    );
+    expect(screen.getByRole("img", { name: /OLS regression scatter Spot\+Perp vs BTC/i })).toBeInTheDocument();
+    expect(container.querySelectorAll("circle")).toHaveLength(3);
   });
 });

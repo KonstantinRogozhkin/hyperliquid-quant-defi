@@ -643,4 +643,190 @@ describe("App", () => {
     });
     expect(screen.getByText("● Calm Regime")).toBeInTheDocument();
   });
+
+  it("renders Neutral-style Analytics & Risk tab with Gross/Net, Correlation, OLS, Monthly, and Risk Telemetry", async () => {
+    const overview = makeOverview({
+      autopilot: {
+        starting_capital_usd: 250000,
+        gross_equity_usd: 254200,
+        net_equity_usd: 253600,
+        gross_share_price: 1.0168,
+        net_share_price: 1.0144,
+        hwm_net_share_price: 1.0144,
+        gross_return_pct: 1.68,
+        net_return_pct: 1.44,
+        cum_mgmt_fee_usd: 120,
+        cum_perf_fee_usd: 480,
+        cum_rebalance_cost_usd: 15,
+        sleeves: [
+          {
+            name: "spot_perp_paper",
+            category: "Market Neutral",
+            target_weight_pct: 35,
+            actual_weight_pct: 35.8,
+            drift_pct: 0.8,
+            allocation_usd: 91000,
+            tick_pnl_usd: 45,
+          },
+        ],
+        risk_telemetry: {
+          gross_leverage: 1.28,
+          leverage_30d_avg: 1.25,
+          leverage_30d_max: 1.41,
+          net_directional_exposure_pct: -0.6,
+          directional_sleeve_pct: 5.0,
+          reserve_sleeve_pct: 15.0,
+          max_weight_drift_pct: 0.8,
+          rebalanced_this_tick: false,
+        },
+      },
+      spot_perp_paper: {
+        starting_capital_usd: 100000,
+        equity_usd: 101850,
+        share_price: 1.0185,
+        return_pct: 1.85,
+        hlp_reserve_usd: 10185,
+        hlp_reserve_share_pct: 10.0,
+        hlp_apr_pct: 14.37,
+        free_cash_usd: 8000,
+        blended_portfolio_apr_pct: 8.65,
+        cum_funding_usd: 1650,
+        cum_hlp_yield_usd: 240,
+        cum_basis_mtm_usd: 10,
+        cum_costs_usd: 50,
+        positions: {},
+        risk_telemetry: {
+          gross_leverage: 1.31,
+          leverage_30d_avg: 1.34,
+          leverage_30d_max: 1.52,
+          active_assets: 5,
+          net_delta_pct: 0.012,
+          min_perp_liq_distance_pct: 44.5,
+        },
+      },
+    });
+    const analyticsPayload = {
+      generated_at_utc: "2026-11-27 14:30 UTC",
+      leaderboard: [
+        {
+          id: "spot_perp",
+          name: "HyperCore Spot+Perp (+10% HLP)",
+          category: "Market Neutral",
+          is_benchmark: false,
+          fee_schedule: "1% mgmt / 20% HWM",
+          equity_usd: 101850,
+          share_price_gross: 1.0185,
+          share_price_net: 1.0145,
+          days_tracked: 45,
+          gross_returns: { "7d": 0.25, "30d": 1.12, ytd: 1.85, all_time: 1.85 },
+          gross_apy: { "7d": 13.9, "30d": 14.5, ytd: 15.1, all_time: 15.1 },
+          net_returns: { "7d": 0.19, "30d": 0.88, ytd: 1.45, all_time: 1.45 },
+          net_apy: { "7d": 10.4, "30d": 11.2, ytd: 11.8, all_time: 11.8 },
+          sharpe_gross: 5.9,
+          sortino_gross: 7.4,
+          sharpe_net: 5.1,
+          sortino_net: 6.5,
+          max_dd_gross_pct: 0.21,
+          max_dd_net_pct: 0.24,
+          dd_recovery_days: 3,
+          positive_days_pct: 82.0,
+          longest_win_streak: 14,
+          longest_loss_streak: 2,
+          monthly_gross: [{ year: 2026, months: { "10": 0.95, "11": 0.89 }, ytd: 1.85 }],
+          monthly_net: [{ year: 2026, months: { "10": 0.74, "11": 0.70 }, ytd: 1.45 }],
+        },
+      ],
+      curves: {
+        spot_perp: {
+          id: "spot_perp",
+          name: "HyperCore Spot+Perp (+10% HLP)",
+          category: "Market Neutral",
+          is_benchmark: false,
+          dates: ["2026-10-01", "2026-10-15", "2026-11-01"],
+          gross_shares: [1.0, 1.009, 1.0185],
+          net_shares: [1.0, 1.007, 1.0145],
+        },
+      },
+      correlation: {
+        ids: ["spot_perp"],
+        labels: { spot_perp: "HyperCore Spot+Perp (+10% HLP)" },
+        matrix: [[1.0]],
+        overlap_days: 45,
+      },
+      market_exposure: {
+        BTC: {
+          factor: "BTC",
+          factor_days: 45,
+          rows: [
+            {
+              id: "spot_perp",
+              name: "HyperCore Spot+Perp (+10% HLP)",
+              beta: 0.001,
+              r2_pct: 0.1,
+              alpha_ann_pct: 9.8,
+              days: 45,
+              scatter: [
+                { date: "2026-10-01", factor_ret_pct: -2.5, strat_ret_pct: 0.04 },
+                { date: "2026-10-02", factor_ret_pct: 1.8, strat_ret_pct: 0.03 },
+                { date: "2026-10-03", factor_ret_pct: -1.1, strat_ret_pct: 0.05 },
+              ],
+            },
+          ],
+        },
+      },
+      risk_exposure: {
+        leverage_by_strategy: [
+          {
+            strategy: "HyperCore Spot+Perp (+10% HLP)",
+            current_leverage: 1.31,
+            leverage_30d_avg: 1.34,
+            leverage_30d_max: 1.52,
+            net_exposure_pct: 0.012,
+            nav_guard_triggers: 0,
+          },
+        ],
+        venue_concentration: [{ label: "HyperCore Spot", usd: 55000, share_pct: 84.6 }],
+        asset_tier_concentration: [{ label: "Gold RWA", usd: 15000, share_pct: 20.0 }],
+        total_nav_guard_triggers: 0,
+      },
+    };
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/api/v1/analytics")) {
+        return new Response(JSON.stringify(analyticsPayload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/api/v1/overview")) {
+        return new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ service: "hl-frontend", sha: BASE_SHA, built_at: "" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    await user.click(screen.getByRole("button", { name: "Analytics & Risk" }));
+    expect(screen.getByText("Performance vs Buy & Hold Leaderboard")).toBeInTheDocument();
+    expect(screen.getByText("Correlation Between Strategies (Pearson ρ)")).toBeInTheDocument();
+    expect(screen.getByText("Market Exposure (OLS Regression)")).toBeInTheDocument();
+    expect(screen.getByText("Gold RWA")).toBeInTheDocument();
+    expect(screen.getByText("spot_perp_paper")).toBeInTheDocument();
+
+    // Toggle Gross vs Net & APY vs Returns & Methodology drawer
+    await user.click(screen.getByRole("button", { name: "Gross" }));
+    await user.click(screen.getByRole("button", { name: "APY" }));
+    expect(screen.getAllByText("+15.10%").length).toBeGreaterThanOrEqual(1);
+    await user.click(screen.getByRole("button", { name: "How calculated" }));
+    expect(screen.getByText(/Methodology \(Neutral Trade Standard\)/i)).toBeInTheDocument();
+  });
 });
