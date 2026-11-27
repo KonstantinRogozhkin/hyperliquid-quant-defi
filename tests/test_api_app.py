@@ -152,3 +152,5 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert sched_body["worker_status"]["service"] == "hl-worker"
     assert sched_body["artifact_freshness"]["frontier_history"]["exists"] is True
     assert sched_body["artifact_freshness"]["testnet_audit"]["exists"] is True
+    for expected_key in ("liq_funding_alpha", "mm_calibration", "settlement_study"):
+        assert expected_key in sched_body["artifact_freshness"]

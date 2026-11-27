@@ -1,12 +1,12 @@
 """Container-native UTC job scheduler replacing local macOS crons for Docker / Dokploy.
 
-Runs the 7 scheduled Hyperliquid research/paper/testnet jobs plus 2 read-only dashboard scanners
-in isolated subprocesses with:
+Runs the 7 core Hyperliquid research/paper/testnet jobs plus 5 read-only dashboard/analytics
+scanners (12 UTC jobs total) in isolated subprocesses with:
 - Catch-up slot evaluation + per-job non-overlapping worker threads (so a slow job at :05 never
   skips another job scheduled at :10)
 - Atomic ``hl_worker_status.json`` telemetry
 - Strict opt-in gating (``HL_ENABLE_TESTNET_EXECUTION=true`` + both key and address required)
-- All state/HWM/attribution paths anchored under ``HL_DATA_DIR``
+- All state/HWM/attribution/report paths anchored under ``HL_DATA_DIR``
 - Graceful ``SIGTERM`` propagation to active child process groups on container shutdown
 """
 
@@ -194,6 +194,49 @@ def build_job_specs() -> list[JobSpec]:
             str(data_dir / "paper/hl_hyperevm_defi"),
         ]
 
+    def _liq_funding_cmd(root: Path, data_dir: Path, _tg: bool) -> list[str]:
+        return [
+            py,
+            str(root / "scripts/analytics/run_hl_liquidation_and_funding_alpha.py"),
+            "--top-whales",
+            os.environ.get("HL_LIQ_TOP_WHALES", "45"),
+            "--top-funding-coins",
+            os.environ.get("HL_LIQ_TOP_FUNDING_COINS", "8"),
+            "--lookback-hours",
+            "6",
+            "--output-dir",
+            str(data_dir / "paper/hl_liq_funding_alpha"),
+        ]
+
+    def _mm_calibration_cmd(root: Path, data_dir: Path, _tg: bool) -> list[str]:
+        return [
+            py,
+            str(root / "scripts/analytics/run_hl_mm_calibration.py"),
+            "--coins",
+            os.environ.get("HL_MM_CALIBRATION_COINS", "BTC,ETH"),
+            "--duration-sec",
+            os.environ.get("HL_MM_CALIBRATION_SEC", "45"),
+            "--ws-network",
+            "mainnet",
+            "--capture-dir",
+            str(data_dir / "paper/hl_mm_calibration"),
+        ]
+
+    def _settlement_study_cmd(root: Path, data_dir: Path, _tg: bool) -> list[str]:
+        out_dir = data_dir / "paper/hl_funding_settlement_study"
+        return [
+            py,
+            str(root / "scripts/analytics/run_hl_funding_settlement_study.py"),
+            "--interval",
+            os.environ.get("HL_SETTLEMENT_INTERVAL", "15m"),
+            "--max-coins",
+            os.environ.get("HL_SETTLEMENT_MAX_COINS", "35"),
+            "--output-dir",
+            str(out_dir),
+            "--report-path",
+            str(out_dir / "report.md"),
+        ]
+
     def _attribution_cmd(root: Path, data_dir: Path, tg: bool) -> list[str]:
         cmd = [
             py,
@@ -312,6 +355,45 @@ def build_job_specs() -> list[JobSpec]:
             readonly=True,
             bootstrap_eligible=True,
             build_command=_hyperevm_cmd,
+            is_enabled=_default_enabled,
+            has_required_credentials=_default_enabled,
+        ),
+        JobSpec(
+            name="liq_funding_alpha",
+            description="H2 Whale Liquidation Clusters & :00 Funding Microstructure (4h :35)",
+            cron_expr="35 */4 * * *",
+            minutes=(35,),
+            hours=four_hour,
+            timeout_s=240,
+            readonly=True,
+            bootstrap_eligible=True,
+            build_command=_liq_funding_cmd,
+            is_enabled=_default_enabled,
+            has_required_credentials=_default_enabled,
+        ),
+        JobSpec(
+            name="mm_calibration",
+            description="Avellaneda-Stoikov Empirical Kappa WS Calibration (daily 05:15 UTC)",
+            cron_expr="15 5 * * *",
+            minutes=(15,),
+            hours=(5,),
+            timeout_s=240,
+            readonly=True,
+            bootstrap_eligible=True,
+            build_command=_mm_calibration_cmd,
+            is_enabled=_default_enabled,
+            has_required_credentials=_default_enabled,
+        ),
+        JobSpec(
+            name="settlement_study",
+            description=":00 Hourly Funding Settlement OOS Study Refresh (daily 05:30 UTC)",
+            cron_expr="30 5 * * *",
+            minutes=(30,),
+            hours=(5,),
+            timeout_s=300,
+            readonly=True,
+            bootstrap_eligible=True,
+            build_command=_settlement_study_cmd,
             is_enabled=_default_enabled,
             has_required_credentials=_default_enabled,
         ),
@@ -572,8 +654,11 @@ class WorkerScheduler:
             "metamodel_paper": self.paper_dir / "hl_metamodel" / "state.json",
             "cross_dex_paper": self.paper_dir / "hl_cross_dex_paper" / "state.json",
             "frontier_persistence": self.paper_dir / "hl_frontier_history" / "latest_summary.json",
-            "cross_dex_scan": self.paper_dir / "hl_cross_dex_v2" / "snapshot.json",
+            "cross_dex_scan": self.paper_dir / "hl_cross_dex_v2" / "opportunities.parquet",
             "hyperevm_defi_scan": self.paper_dir / "hl_hyperevm_defi" / "snapshot.json",
+            "liq_funding_alpha": self.paper_dir / "hl_liq_funding_alpha" / "snapshot.json",
+            "mm_calibration": self.paper_dir / "hl_mm_calibration" / "calibration.json",
+            "settlement_study": self.paper_dir / "hl_funding_settlement_study" / "stats.parquet",
             "testnet_attribution": self.paper_dir / "hl_testnet_attribution" / "attribution.json",
         }
         return sentinels.get(job_name)
@@ -646,8 +731,14 @@ class WorkerScheduler:
         signal.signal(signal.SIGINT, _handle_stop)
 
         self.publish_status()
+        bootstrap_thread: threading.Thread | None = None
         if bootstrap:
-            self.run_bootstrap_readonly()
+            bootstrap_thread = threading.Thread(
+                target=self.run_bootstrap_readonly,
+                name="hl-bootstrap",
+                daemon=True,
+            )
+            bootstrap_thread.start()
 
         print(
             f"[hl-worker] scheduler active (data_dir={self.data_dir}, jobs={len(self.jobs)}, workers={self.max_workers})",
@@ -668,6 +759,8 @@ class WorkerScheduler:
                     self._stop_event.wait(timeout=poll_seconds)
             finally:
                 self.terminate_active_children(grace_sec=15.0)
+                if bootstrap_thread is not None and bootstrap_thread.is_alive():
+                    bootstrap_thread.join(timeout=5.0)
                 for fut in futures:
                     try:
                         fut.result(timeout=5.0)

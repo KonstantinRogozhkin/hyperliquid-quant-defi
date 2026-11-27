@@ -10,7 +10,7 @@
 |---|---|---|---|
 | **`frontend`** | `ghcr.io/konstantinrogozhkin/hl-frontend:sha-<SHA>` | `expose: 80` (через Dokploy Traefik HTTPS) | Nginx `1.27-alpine` + React/Vite/TS SPA, `/build-info.json`, `/nginx-health`, динамический Docker DNS `resolver 127.0.0.11` для прокси `/api/* → http://backend:8000`. Секретов не получает. |
 | **`backend`** | `ghcr.io/konstantinrogozhkin/hl-backend:sha-<SHA>` | `hl-data:/app/data:ro`, internal `:8000` | Read-only `FastAPI` + `uvicorn` (`hl_quant.api.app`). Эндпоинты `/healthz`, `/build-info.json`, `/api/v1/overview`, `/api/v1/metamodel/positions`, `/api/v1/hip3/persistence`, `/api/v1/events/latest`, `/api/v1/attribution`, `/api/v1/scheduler/status`. Ключи кошелька и Telegram **не** прокидываются. |
-| **`worker`** | `ghcr.io/konstantinrogozhkin/hl-worker:sha-<SHA>` | `hl-data:/app/data:rw`, без портов | Контейнерный UTC-планировщик `hl_quant.scheduler` (9 задач с catch-up пропущенных минут, per-job lock'ами, `SIGTERM`-пробросом в группы дочерних процессов и атомарным heartbeat `hl_worker_status.json`). `HL_ENABLE_TESTNET_EXECUTION=false` по умолчанию. |
+| **`worker`** | `ghcr.io/konstantinrogozhkin/hl-worker:sha-<SHA>` | `hl-data:/app/data:rw`, без портов | Контейнерный UTC-планировщик `hl_quant.scheduler` (12 UTC-задач: 7 основных + 5 read-only сканеров дашборда `cross_dex_scan`, `hyperevm_defi_scan`, `liq_funding_alpha`, `mm_calibration`, `settlement_study`; фоновый per-artifact bootstrap, catch-up пропущенных минут, per-job lock'и, `SIGTERM`-проброс, унифицированные `TELEGRAM_*`/`TELEGRAM_SIGNAL_*` + `THREAD_ID` и атомарный heartbeat `hl_worker_status.json`). `HL_ENABLE_TESTNET_EXECUTION=false` по умолчанию. |
 
 ---
 
@@ -20,7 +20,7 @@
 - **Быстрый path-skip внутри джоб (`ci.yml`):** при docs/backend-only PR `frontend` завершается за ~4s (не подвешивая required checks); при frontend-only PR аналогично быстро завершается `tests`.
 - **Авторелиз при мерже в `main` (`release.yml`):**
   1. `gate`: проверяет, что `HEAD == main` (не деплоит устаревший SHA при серии мержей).
-  2. `build-and-push`: собирает `hl-backend`, `hl-worker`, `hl-frontend` с `BUILD_SHA=$GITHUB_SHA`, прогоняет **pre-push container smoke tests** (`/healthz`, `/build-info.json`, worker SDK & 9 jobs, standalone Nginx `/nginx-health`) и пушит immutable `:sha-<GITHUB_SHA>` + `:latest` в публичный GHCR (`ghcr.io`).
+  2. `build-and-push`: собирает `hl-backend`, `hl-worker`, `hl-frontend` с `BUILD_SHA=$GITHUB_SHA`, прогоняет **pre-push container smoke tests** (`/healthz`, `/build-info.json`, worker SDK & 12 jobs, standalone Nginx `/nginx-health`) и пушит immutable `:sha-<GITHUB_SHA>` + `:latest` в публичный GHCR (`ghcr.io`).
   3. `deploy-dokploy` (при `vars.DOKPLOY_DEPLOY_ENABLED == 'true'`): вызывает `scripts/ops/deploy_dokploy.py`, обновляет `DEPLOY_SHA` через Dokploy API (`compose.update`), запускает `compose.deploy`, дожидается `status == done` и проверяет совпадение `sha` на живых `/build-info.json` и `/api/v1/build-info.json`.
 
 ---
