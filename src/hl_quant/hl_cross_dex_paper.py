@@ -154,15 +154,23 @@ def run_cross_dex_paper_tick(
 
         prev_hl = float(pos["last_hl_px"])
         prev_oth = float(pos.get("last_other_px", pos.get("last_lt_px", oth.mark_px)))
-        hl_ret = (h.mark_px - prev_hl) / prev_hl if prev_hl > 0 else 0.0
-        oth_ret = (oth.mark_px - prev_oth) / prev_oth if prev_oth > 0 else 0.0
-        basis_pnl = notional * (hl_sgn * hl_ret + oth_sgn * oth_ret)
+        entry_hl = float(pos.get("entry_hl_px") or prev_hl)
+        entry_oth = float(pos.get("entry_other_px") or pos.get("entry_lt_px") or prev_oth)
+        hl_qty = float(pos.get("hl_qty") or (notional / entry_hl if entry_hl > 0 else 0.0))
+        oth_qty = float(pos.get("other_qty") or (notional / entry_oth if entry_oth > 0 else 0.0))
+        basis_pnl = hl_sgn * hl_qty * (h.mark_px - prev_hl) + oth_sgn * oth_qty * (oth.mark_px - prev_oth)
 
-        hl_fund_pnl = notional * (-hl_sgn) * h.funding_rate_h * dt_hours
-        oth_fund_pnl = notional * (-oth_sgn) * oth.funding_rate_h * dt_hours
+        hl_notional = hl_qty * h.mark_px
+        oth_notional = oth_qty * oth.mark_px
+        hl_fund_pnl = hl_notional * (-hl_sgn) * h.funding_rate_h * dt_hours
+        oth_fund_pnl = oth_notional * (-oth_sgn) * oth.funding_rate_h * dt_hours
         fund_pnl = hl_fund_pnl + oth_fund_pnl
 
         pos["other_dex"] = other_dex
+        pos["hl_qty"] = round(hl_qty, 8)
+        pos["other_qty"] = round(oth_qty, 8)
+        pos["hl_notional_usd"] = round(hl_notional, 2)
+        pos["other_notional_usd"] = round(oth_notional, 2)
         pos["last_hl_px"] = h.mark_px
         pos["last_lt_px"] = oth.mark_px
         pos["last_other_px"] = oth.mark_px
@@ -215,18 +223,25 @@ def run_cross_dex_paper_tick(
         live_dir_apr = float(pos.get("live_spread_apr_pct", 0.0))
         if should_exit:
             notional = float(pos["leg_notional_usd"])
+            hl_qty = float(pos.get("hl_qty") or 0.0)
+            oth_qty = float(pos.get("other_qty") or 0.0)
+            exit_notional = (
+                0.5 * (hl_qty * h.mark_px + oth_qty * oth.mark_px)
+                if (h and oth and hl_qty > 0 and oth_qty > 0)
+                else notional
+            )
             short_hl_exit = float(pos["hl_sign"]) > 0
             l2_slip = 2.0
             if h and oth:
                 hb, ha = get_book("hyperliquid", h.raw_symbol)
                 ob, oa = get_book(other_dex, oth.raw_symbol)
                 _, sl, _ = cds.compute_executable_cross_dex_entry_bps(
-                    hb, ha, ob, oa, short_hl=short_hl_exit, clip_usd=notional
+                    hb, ha, ob, oa, short_hl=short_hl_exit, clip_usd=exit_notional
                 )
                 if sl is not None:
                     l2_slip = sl
             exit_cost_bps = cfg.hl_fee_bps + cfg.other_fee_bps(other_dex) + l2_slip
-            exit_cost_usd = notional * exit_cost_bps * 1e-4
+            exit_cost_usd = exit_notional * exit_cost_bps * 1e-4
             tick_costs_usd += exit_cost_usd
             pos["cum_cost_usd"] = round(float(pos.get("cum_cost_usd", 0.0)) + exit_cost_usd, 4)
             final_net = round(pos["cum_funding_usd"] + pos["cum_basis_mtm_usd"] - pos["cum_cost_usd"], 4)
@@ -381,6 +396,10 @@ def run_cross_dex_paper_tick(
                 "direction": direction,
                 "hl_sign": -1.0 if short_hl else 1.0,
                 "leg_notional_usd": cfg.slot_notional_usd,
+                "hl_qty": round(cfg.slot_notional_usd / h.mark_px, 8) if h.mark_px > 0 else 0.0,
+                "other_qty": round(cfg.slot_notional_usd / oth.mark_px, 8) if oth.mark_px > 0 else 0.0,
+                "hl_notional_usd": round(cfg.slot_notional_usd, 2),
+                "other_notional_usd": round(cfg.slot_notional_usd, 2),
                 "opened_ms": ts_ms,
                 "hours_held": 0.0,
                 "entry_hl_px": h.mark_px,

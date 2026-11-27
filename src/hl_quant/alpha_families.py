@@ -652,8 +652,10 @@ def build_ml_walkforward_weights(
     vol = market.hl_close.pct_change().shift(1).rolling(72, min_periods=24).std().replace(0.0, np.nan)
 
     # Forward total return (price + funding) over (h_t, h_{t+horizon_h}]
+    # Close of bar opening at h_t is price at h_{t+1}, so price at h_t is hl_close.shift(1)
+    # and price at h_{t+horizon_h} is hl_close.shift(-(horizon_h - 1)).
     # Note: we purge the last `horizon_h` hours of every train window so the target NEVER touches test!
-    fwd_px = np.log(market.hl_close.shift(-horizon_h) / market.hl_close)
+    fwd_px = np.log(market.hl_close.shift(-(horizon_h - 1)) / market.hl_close.shift(1))
     fwd_fund = -market.hl_fund_next.rolling(horizon_h).sum().shift(-(horizon_h - 1))
     fwd_total = fwd_px + fwd_fund
     # Cross-sectional demeaned target
