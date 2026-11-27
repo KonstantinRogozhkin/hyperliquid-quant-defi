@@ -1,0 +1,585 @@
+"""Read-only HIP-3 Cross-Builder Paper Tracker with Split-Margin & Oracle-Divergence Guardrails.
+
+Zero orders placed. Tracks live dual-leg HIP-3 builder-perp arbitrage (`xyz` × `io` × `para`)
+on HyperCore L1 with realistic execution accounting:
+- **Zero-Bridge, Builder-Specific Fees:** uses live per-builder `est_taker_fee_bps` (or maker)
+  derived from `growthMode` and `deployerFeeScale` (e.g. `1.8 bps` entry / `3.6 bps` RT taker
+  when both legs are in Growth Mode).
+- **Split-Margin Accounting:** each HIP-3 builder DEX clears and margins independently (no
+  cross-DEX netting), so each pair locks `2 * leg_notional / per_leg_leverage` margin.
+- **Oracle-Divergence & Persistence Guards:** refuses entries with `oracle_risk_warning` or
+  `oracle_divergence_bps > max_oracle_div_bps`, requires `clean_streak >= min_clean_streak`
+  (unchanged legs, no gaps), and emergency-exits if deployer oracles decouple beyond
+  `exit_oracle_div_bps`.
+- **Isolated-Market Sizing Discipline:** halves notional (`isolated_slot_scale = 0.5`) on
+  `onlyIsolated` builder legs (or skips them entirely when `allow_only_isolated=False`).
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+import html
+import json
+from pathlib import Path
+import time
+from typing import Any
+
+import httpx
+import pandas as pd
+
+from hl_quant import cross_dex_scanner as cds
+from hl_quant import hl_hip3_builder_arb as hip3
+
+
+@dataclass(frozen=True, slots=True)
+class Hip3PaperConfig:
+    starting_capital_usd: float = 50_000.0
+    max_slots: int = 5
+    slot_notional_usd: float = 5_000.0  # per leg on Cross markets -> $10k gross pair
+    isolated_slot_scale: float = 0.5  # half clip ($2.5k/leg) on onlyIsolated builder legs
+    per_leg_leverage: float = 2.0  # independent HIP-3 DEX margin: $2.5k/DEX = $5k total margin per $5k/leg pair
+    max_margin_utilization: float = 0.80  # keep >= 20% free equity buffer
+    min_leg_vol_usd: float = 200_000.0
+    entry_apr_pct: float = 20.0  # matches frontier_persistence clean streak bar
+    exit_apr_pct: float = 6.0  # hysteresis exit when directional carry decays below 6%
+    min_clean_streak: int = 2  # consecutive clean same-direction ticks required to open
+    max_oracle_div_bps: float = 15.0  # reject pairs with builder oracle divergence > 15 bps
+    exit_oracle_div_bps: float = 35.0  # emergency exit if oracles diverge > 35 bps while held
+    max_l2_slip_bps: float = 6.0  # reject thin builder books with > 6 bps L2 VWAP slip
+    min_exec_basis_bps: float = -5.0  # refuse entries starting deep underwater on L2 basis
+    max_payback_hours: float = 24.0  # reject slow-payback pairs (> 1 day)
+    use_taker_fees: bool = True  # conservative atomic two-leg crossing assumption
+    allow_only_isolated: bool = True  # track both Cross and half-sized Isolated pairs in paper
+    max_missing_ticks: int = 3  # tolerate transient missing market before force-closing
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def _load_or_init_state(state_path: Path, cfg: Hip3PaperConfig) -> dict[str, Any]:
+    if state_path.is_file():
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st.setdefault("clean_streaks", {})
+        st.setdefault("positions", {})
+        st.setdefault("closed_pairs_count", 0)
+        st.setdefault("payback_achieved_count", 0)
+        return st
+    return {
+        "starting_capital_usd": cfg.starting_capital_usd,
+        "equity_usd": cfg.starting_capital_usd,
+        "return_pct": 0.0,
+        "margin_locked_usd": 0.0,
+        "margin_utilization_pct": 0.0,
+        "cum_funding_usd": 0.0,
+        "cum_basis_mtm_usd": 0.0,
+        "cum_costs_usd": 0.0,
+        "last_tick_ms": 0,
+        "ny_session": "",
+        "positions": {},  # base_symbol -> position dict
+        "clean_streaks": {},  # "BASE:short_sym->long_sym" -> consecutive clean ticks
+        "closed_pairs_count": 0,
+        "payback_achieved_count": 0,
+    }
+
+
+def _append_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    new_df = pd.DataFrame(rows)
+    if path.is_file():
+        old = pd.read_parquet(path)
+        combined = pd.concat([old, new_df], ignore_index=True)
+    else:
+        combined = new_df
+    tmp = path.with_suffix(".tmp.parquet")
+    combined.to_parquet(tmp, index=False)
+    tmp.replace(path)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp.json")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _load_external_clean_streaks(frontier_summary_path: Path | None) -> dict[str, int]:
+    """Read verified zero-flip active clean streaks from ``hl_frontier_history/latest_summary.json``."""
+    if frontier_summary_path is None or not frontier_summary_path.is_file():
+        return {}
+    try:
+        raw = json.loads(frontier_summary_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    out: dict[str, int] = {}
+    for row in raw.get("hip3_persistence") or []:
+        if not isinstance(row, dict):
+            continue
+        if row.get("active_in_latest_tick") is False:
+            continue
+        if int(row.get("direction_flips", 0) or 0) > 0:
+            continue
+        base = str(row.get("base_symbol") or "").upper()
+        short_sym = str(row.get("short_symbol") or "")
+        long_sym = str(row.get("long_symbol") or "")
+        streak = int(row.get("clean_streak", 0) or 0)
+        if base and short_sym and long_sym and streak > 0:
+            out[f"{base}:{short_sym}->{long_sym}"] = streak
+    return out
+
+
+def _leg_fee_bps(mkt: hip3.Hip3BuilderMarket, *, use_taker: bool) -> float:
+    return float(mkt.est_taker_fee_bps if use_taker else mkt.est_maker_fee_bps)
+
+
+def run_hip3_paper_tick(
+    client: httpx.Client | None = None,
+    *,
+    state_dir: Path,
+    cfg: Hip3PaperConfig = Hip3PaperConfig(),
+    now_ms: int | None = None,
+    markets: list[hip3.Hip3BuilderMarket] | None = None,
+    book_fetcher: Any = None,
+    frontier_summary_path: Path | None = None,
+    info_url: str = hip3.HL_INFO_URL,
+) -> dict[str, Any]:
+    """Run one idempotent HIP-3 cross-builder L2 paper tick and update the split-margin ledger."""
+    ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    ny_session = hip3.classify_ny_tradfi_session(ts_ms)
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state_path = state_dir / "state.json"
+    state = _load_or_init_state(state_path, cfg)
+
+    own_client = client is None and (markets is None or book_fetcher is None)
+    http_client = client or (httpx.Client(timeout=20.0) if own_client else None)
+    try:
+        if markets is None:
+            assert http_client is not None
+            _, live_markets = hip3.fetch_hip3_builders_and_markets(http_client, info_url=info_url, min_day_vol_usd=0.0)
+        else:
+            live_markets = list(markets)
+
+        def _default_book(sym: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+            assert http_client is not None
+            return cds.fetch_dex_l2_book(http_client, "hyperliquid", sym)
+
+        get_book = book_fetcher or _default_book
+        by_symbol: dict[str, hip3.Hip3BuilderMarket] = {m.full_symbol: m for m in live_markets}
+
+        prev_ms = int(state.get("last_tick_ms", 0))
+        dt_hours = max(0.0, min(24.0, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
+
+        positions: dict[str, dict[str, Any]] = state.get("positions") or {}
+        tick_funding_usd = 0.0
+        tick_basis_mtm_usd = 0.0
+        tick_costs_usd = 0.0
+        trade_rows: list[dict[str, Any]] = []
+
+        # 1. Mark-to-market & accrue hourly funding on open dual-builder pairs
+        for base, pos in list(positions.items()):
+            s_mkt = by_symbol.get(str(pos["short_symbol"]))
+            l_mkt = by_symbol.get(str(pos["long_symbol"]))
+            if not (s_mkt and l_mkt):
+                continue
+            notional = float(pos["leg_notional_usd"])
+            prev_s = float(pos["last_short_px"])
+            prev_l = float(pos["last_long_px"])
+            s_ret = (s_mkt.mark_px - prev_s) / prev_s if prev_s > 0 else 0.0
+            l_ret = (l_mkt.mark_px - prev_l) / prev_l if prev_l > 0 else 0.0
+            # Short leg profits when price drops (-s_ret); long leg profits when price rises (+l_ret).
+            basis_pnl = notional * (-s_ret + l_ret)
+            # Short receives positive funding (+s_mkt.funding_rate_h); long pays positive funding (-l_mkt.funding_rate_h).
+            fund_pnl = notional * (s_mkt.funding_rate_h - l_mkt.funding_rate_h) * dt_hours
+
+            live_spread_apr = round(s_mkt.funding_apr_pct - l_mkt.funding_apr_pct, 2)
+            live_mark_basis = round((s_mkt.mark_px - l_mkt.mark_px) / l_mkt.mark_px * 1e4, 2) if l_mkt.mark_px > 0 else 0.0
+            live_ora_div = (
+                round(abs(s_mkt.oracle_px - l_mkt.oracle_px) / l_mkt.oracle_px * 1e4, 2)
+                if l_mkt.oracle_px > 0
+                else 0.0
+            )
+
+            pos["last_short_px"] = s_mkt.mark_px
+            pos["last_long_px"] = l_mkt.mark_px
+            pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + dt_hours, 2)
+            pos["cum_funding_usd"] = round(float(pos.get("cum_funding_usd", 0.0)) + fund_pnl, 4)
+            pos["cum_basis_mtm_usd"] = round(float(pos.get("cum_basis_mtm_usd", 0.0)) + basis_pnl, 4)
+            pos["live_spread_apr_pct"] = live_spread_apr
+            pos["live_mark_basis_bps"] = live_mark_basis
+            pos["live_oracle_div_bps"] = live_ora_div
+            pos["both_growth_mode"] = bool(s_mkt.growth_mode and l_mkt.growth_mode)
+            pos["net_pnl_usd"] = round(
+                pos["cum_funding_usd"] + pos["cum_basis_mtm_usd"] - float(pos.get("cum_cost_usd", 0.0)),
+                4,
+            )
+            pos["payback_achieved"] = bool(pos["cum_funding_usd"] >= float(pos.get("entry_cost_usd", 0.0)))
+
+            tick_funding_usd += fund_pnl
+            tick_basis_mtm_usd += basis_pnl
+
+        # 2. Evaluate exits: carry decay, oracle divergence spike, or delisted/missing legs
+        hip3_online = bool(by_symbol)
+        for base in list(positions.keys()):
+            pos = positions[base]
+            s_mkt = by_symbol.get(str(pos["short_symbol"]))
+            l_mkt = by_symbol.get(str(pos["long_symbol"]))
+            exit_reason = ""
+            if not (s_mkt and l_mkt):
+                if not hip3_online:
+                    continue
+                miss = int(pos.get("missing_quote_ticks", 0)) + 1
+                pos["missing_quote_ticks"] = miss
+                if miss >= cfg.max_missing_ticks:
+                    exit_reason = "delisted_or_missing"
+            else:
+                pos["missing_quote_ticks"] = 0
+                live_apr = float(pos.get("live_spread_apr_pct", 0.0))
+                live_ora = float(pos.get("live_oracle_div_bps", 0.0))
+                if live_ora > cfg.exit_oracle_div_bps:
+                    exit_reason = "oracle_divergence"
+                elif live_apr < cfg.exit_apr_pct:
+                    exit_reason = "apr_decay"
+
+            if exit_reason:
+                notional = float(pos["leg_notional_usd"])
+                l2_slip = 2.0
+                if s_mkt and l_mkt:
+                    sb, sa = get_book(s_mkt.full_symbol)
+                    lb, la = get_book(l_mkt.full_symbol)
+                    # Closing reverses legs: buy back short_symbol (ask) & sell long_symbol (bid) -> short_hl=False
+                    _, sl, _ = cds.compute_executable_cross_dex_entry_bps(
+                        sb, sa, lb, la, short_hl=False, clip_usd=notional
+                    )
+                    if sl is not None:
+                        l2_slip = sl
+                    exit_fee_bps = _leg_fee_bps(s_mkt, use_taker=cfg.use_taker_fees) + _leg_fee_bps(
+                        l_mkt, use_taker=cfg.use_taker_fees
+                    )
+                else:
+                    exit_fee_bps = float(pos.get("entry_fee_bps", 1.8))
+                exit_cost_bps = exit_fee_bps + l2_slip
+                exit_cost_usd = notional * exit_cost_bps * 1e-4
+                tick_costs_usd += exit_cost_usd
+                pos["cum_cost_usd"] = round(float(pos.get("cum_cost_usd", 0.0)) + exit_cost_usd, 4)
+                final_net = round(pos["cum_funding_usd"] + pos["cum_basis_mtm_usd"] - pos["cum_cost_usd"], 4)
+                state["closed_pairs_count"] = int(state.get("closed_pairs_count", 0)) + 1
+                if (pos["cum_funding_usd"] + max(0.0, pos["cum_basis_mtm_usd"])) >= pos["cum_cost_usd"]:
+                    state["payback_achieved_count"] = int(state.get("payback_achieved_count", 0)) + 1
+                trade_rows.append(
+                    {
+                        "ts_ms": ts_ms,
+                        "action": "CLOSE",
+                        "exit_reason": exit_reason,
+                        "base_symbol": base,
+                        "short_symbol": pos["short_symbol"],
+                        "long_symbol": pos["long_symbol"],
+                        "any_only_isolated": bool(pos.get("any_only_isolated", False)),
+                        "both_growth_mode": bool(pos.get("both_growth_mode", False)),
+                        "leg_notional_usd": notional,
+                        "margin_locked_usd": float(pos.get("margin_locked_usd", 0.0)),
+                        "spread_apr_pct": float(pos.get("live_spread_apr_pct", 0.0)),
+                        "oracle_div_bps": float(pos.get("live_oracle_div_bps", 0.0)),
+                        "l2_slip_bps": round(l2_slip, 2),
+                        "cost_usd": round(exit_cost_usd, 4),
+                        "hours_held": float(pos.get("hours_held", 0.0)),
+                        "final_net_pnl_usd": final_net,
+                    }
+                )
+                positions.pop(base, None)
+
+        # 3. Scan cross-builder candidates and update local clean streaks
+        opps = hip3.scan_hip3_cross_builder_arb(
+            live_markets,
+            min_leg_vol_usd=cfg.min_leg_vol_usd,
+            min_spread_apr_pct=cfg.entry_apr_pct,
+            book_fetcher=None,  # L2 books fetched below only for streak-qualified candidates
+        )
+        prev_streaks: dict[str, int] = dict(state.get("clean_streaks") or {})
+        new_streaks: dict[str, int] = {}
+        for opp in opps:
+            key = f"{opp.base_symbol}:{opp.short_symbol}->{opp.long_symbol}"
+            if (
+                opp.spread_apr_pct >= cfg.entry_apr_pct
+                and not opp.oracle_risk_warning
+                and opp.oracle_divergence_bps <= cfg.max_oracle_div_bps
+            ):
+                new_streaks[key] = int(prev_streaks.get(key, 0)) + 1
+        state["clean_streaks"] = new_streaks
+        external_streaks = _load_external_clean_streaks(frontier_summary_path)
+
+        # 4. Open qualified new pairs within slot & split-margin limits
+        opened_symbols: list[str] = []
+        gated_stats = {
+            "skipped_oracle": 0,
+            "skipped_isolated": 0,
+            "skipped_streak": 0,
+            "skipped_l2_slip": 0,
+            "skipped_basis": 0,
+            "skipped_payback": 0,
+            "skipped_margin": 0,
+        }
+        est_equity = float(state["equity_usd"]) + tick_funding_usd + tick_basis_mtm_usd - tick_costs_usd
+        used_margin = sum(float(p.get("margin_locked_usd", 0.0)) for p in positions.values())
+        max_margin_usd = max(0.0, est_equity * cfg.max_margin_utilization)
+
+        for opp in opps:
+            if len(positions) >= cfg.max_slots:
+                break
+            if opp.base_symbol in positions:
+                continue
+            if opp.oracle_risk_warning or opp.oracle_divergence_bps > cfg.max_oracle_div_bps:
+                gated_stats["skipped_oracle"] += 1
+                continue
+            if opp.any_only_isolated and not cfg.allow_only_isolated:
+                gated_stats["skipped_isolated"] += 1
+                continue
+
+            key = f"{opp.base_symbol}:{opp.short_symbol}->{opp.long_symbol}"
+            eff_streak = max(int(new_streaks.get(key, 0)), int(external_streaks.get(key, 0)))
+            if eff_streak < cfg.min_clean_streak:
+                gated_stats["skipped_streak"] += 1
+                continue
+
+            leg_notional = round(
+                cfg.slot_notional_usd * (cfg.isolated_slot_scale if opp.any_only_isolated else 1.0), 2
+            )
+            pair_margin = round((2.0 * leg_notional) / max(cfg.per_leg_leverage, 1.0), 2)
+            if used_margin + pair_margin > max_margin_usd + 1e-6:
+                gated_stats["skipped_margin"] += 1
+                continue
+
+            s_mkt = by_symbol.get(opp.short_symbol)
+            l_mkt = by_symbol.get(opp.long_symbol)
+            if not (s_mkt and l_mkt):
+                continue
+
+            sb, sa = get_book(opp.short_symbol)
+            lb, la = get_book(opp.long_symbol)
+            exec_basis, l2_slip, full_ok = cds.compute_executable_cross_dex_entry_bps(
+                sb, sa, lb, la, short_hl=True, clip_usd=leg_notional
+            )
+            if not full_ok or l2_slip is None or exec_basis is None or l2_slip > cfg.max_l2_slip_bps:
+                gated_stats["skipped_l2_slip"] += 1
+                continue
+            if exec_basis < cfg.min_exec_basis_bps:
+                gated_stats["skipped_basis"] += 1
+                continue
+
+            entry_fee_bps = _leg_fee_bps(s_mkt, use_taker=cfg.use_taker_fees) + _leg_fee_bps(
+                l_mkt, use_taker=cfg.use_taker_fees
+            )
+            rt_fee_bps = 2.0 * entry_fee_bps
+            # Conservative 50% credit on positive entry basis (same policy as cross_dex_paper)
+            basis_credit = (0.5 * exec_basis) if exec_basis > 0 else exec_basis
+            est_rt_cost_bps = max(0.0, rt_fee_bps + l2_slip - basis_credit)
+            hourly_bps = opp.spread_apr_pct / (hip3.HOURS_PER_YEAR * 100.0) * 1e4
+            be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
+            if be_hours > cfg.max_payback_hours:
+                gated_stats["skipped_payback"] += 1
+                continue
+
+            entry_cost_bps = entry_fee_bps + l2_slip
+            entry_cost_usd = leg_notional * entry_cost_bps * 1e-4
+            tick_costs_usd += entry_cost_usd
+            used_margin += pair_margin
+
+            positions[opp.base_symbol] = {
+                "base_symbol": opp.base_symbol,
+                "short_symbol": opp.short_symbol,
+                "long_symbol": opp.long_symbol,
+                "short_dex": opp.short_dex,
+                "long_dex": opp.long_dex,
+                "both_growth_mode": bool(opp.both_growth_mode),
+                "any_only_isolated": bool(opp.any_only_isolated),
+                "margin_mode": "isolated" if opp.any_only_isolated else "cross",
+                "leg_notional_usd": leg_notional,
+                "margin_locked_usd": pair_margin,
+                "per_leg_leverage": cfg.per_leg_leverage,
+                "opened_ms": ts_ms,
+                "hours_held": 0.0,
+                "entry_short_px": s_mkt.mark_px,
+                "entry_long_px": l_mkt.mark_px,
+                "last_short_px": s_mkt.mark_px,
+                "last_long_px": l_mkt.mark_px,
+                "entry_spread_apr_pct": opp.spread_apr_pct,
+                "live_spread_apr_pct": opp.spread_apr_pct,
+                "net_apr_split_margin_pct": round(opp.spread_apr_pct * (cfg.per_leg_leverage / 2.0) * 0.5, 2)
+                if cfg.per_leg_leverage != 2.0
+                else round(opp.spread_apr_pct * 0.5, 2),
+                "entry_oracle_div_bps": opp.oracle_divergence_bps,
+                "live_oracle_div_bps": opp.oracle_divergence_bps,
+                "entry_fee_bps": round(entry_fee_bps, 2),
+                "entry_l2_slip_bps": round(l2_slip, 2),
+                "entry_exec_basis_bps": round(exec_basis, 2),
+                "live_mark_basis_bps": opp.mark_basis_bps,
+                "entry_payback_hours": round(be_hours, 1),
+                "entry_cost_usd": round(entry_cost_usd, 4),
+                "cum_cost_usd": round(entry_cost_usd, 4),
+                "cum_funding_usd": 0.0,
+                "cum_basis_mtm_usd": 0.0,
+                "net_pnl_usd": round(-entry_cost_usd, 4),
+                "payback_achieved": False,
+                "clean_streak": eff_streak,
+                "missing_quote_ticks": 0,
+            }
+            opened_symbols.append(opp.base_symbol)
+            trade_rows.append(
+                {
+                    "ts_ms": ts_ms,
+                    "action": "OPEN",
+                    "exit_reason": "",
+                    "base_symbol": opp.base_symbol,
+                    "short_symbol": opp.short_symbol,
+                    "long_symbol": opp.long_symbol,
+                    "any_only_isolated": bool(opp.any_only_isolated),
+                    "both_growth_mode": bool(opp.both_growth_mode),
+                    "leg_notional_usd": leg_notional,
+                    "margin_locked_usd": pair_margin,
+                    "spread_apr_pct": opp.spread_apr_pct,
+                    "oracle_div_bps": opp.oracle_divergence_bps,
+                    "l2_slip_bps": round(l2_slip, 2),
+                    "cost_usd": round(entry_cost_usd, 4),
+                    "hours_held": 0.0,
+                    "final_net_pnl_usd": round(-entry_cost_usd, 4),
+                }
+            )
+
+        # 5. Update portfolio equity, split-margin utilization, and persist atomically
+        tick_net_pnl = tick_funding_usd + tick_basis_mtm_usd - tick_costs_usd
+        new_equity = round(float(state["equity_usd"]) + tick_net_pnl, 4)
+        start_cap = float(state["starting_capital_usd"])
+        margin_locked = round(sum(float(p.get("margin_locked_usd", 0.0)) for p in positions.values()), 2)
+        margin_util = round((margin_locked / new_equity) * 100.0, 2) if new_equity > 0 else 0.0
+
+        state["equity_usd"] = new_equity
+        state["return_pct"] = round(((new_equity / start_cap) - 1.0) * 100.0, 4) if start_cap > 0 else 0.0
+        state["margin_locked_usd"] = margin_locked
+        state["margin_utilization_pct"] = margin_util
+        state["cum_funding_usd"] = round(float(state["cum_funding_usd"]) + tick_funding_usd, 4)
+        state["cum_basis_mtm_usd"] = round(float(state["cum_basis_mtm_usd"]) + tick_basis_mtm_usd, 4)
+        state["cum_costs_usd"] = round(float(state["cum_costs_usd"]) + tick_costs_usd, 4)
+        state["last_tick_ms"] = ts_ms
+        state["observed_at_utc"] = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        state["ny_session"] = ny_session
+        state["positions"] = positions
+
+        _write_json_atomic(state_path, state)
+
+        tick_row = {
+            "ts_ms": ts_ms,
+            "ny_session": ny_session,
+            "dt_hours": round(dt_hours, 3),
+            "equity_usd": new_equity,
+            "active_pairs": len(positions),
+            "gross_notional_usd": round(sum(float(p["leg_notional_usd"]) * 2.0 for p in positions.values()), 2),
+            "margin_locked_usd": margin_locked,
+            "margin_utilization_pct": margin_util,
+            "tick_funding_usd": round(tick_funding_usd, 4),
+            "tick_basis_mtm_usd": round(tick_basis_mtm_usd, 4),
+            "tick_costs_usd": round(tick_costs_usd, 4),
+            "tick_net_pnl_usd": round(tick_net_pnl, 4),
+            "opened_count": len(opened_symbols),
+            "closed_count": sum(1 for t in trade_rows if t["action"] == "CLOSE"),
+        }
+        _append_parquet(state_dir / "ticks.parquet", [tick_row])
+        _append_parquet(state_dir / "trades.parquet", trade_rows)
+
+        return {
+            "status": "ok",
+            "tick": tick_row,
+            "state": state,
+            "trades": trade_rows,
+            "gated_stats": gated_stats,
+            "markets_scanned": len(live_markets),
+            "opps_evaluated": len(opps),
+        }
+    finally:
+        if own_client and http_client is not None:
+            http_client.close()
+
+
+# --------------------------------------------------------------------------- Reporting
+
+
+def format_hip3_paper_markdown(result: dict[str, Any]) -> str:
+    st = result["state"]
+    tk = result["tick"]
+    gs = result.get("gated_stats") or {}
+    ts = st.get("observed_at_utc") or datetime.fromtimestamp(tk["ts_ms"] / 1000, tz=timezone.utc).strftime(
+        "%Y-%m-%d %H:%M UTC"
+    )
+    lines = [
+        f"# HIP-3 Cross-Builder Split-Margin Paper Tracker ({ts})",
+        "",
+        f"- **Баланс Paper:** **${st['equity_usd']:,.2f}** (`{st['return_pct']:+.3f}%` от ${st['starting_capital_usd']:,.0f}) · сессия NY `{st.get('ny_session', '')}`",
+        f"- **Split-маржа (независимые DEX):** залочено `${st['margin_locked_usd']:,.0f}` (`{st['margin_utilization_pct']:.1f}%`) · активных пар: **{tk['active_pairs']}** (gross `${tk['gross_notional_usd']:,.0f}`)",
+        f"- **Накопленный PnL:** Funding `{st['cum_funding_usd']:+.2f}$` + Basis MTM `{st['cum_basis_mtm_usd']:+.2f}$` − L2/Fees `{st['cum_costs_usd']:.2f}$`",
+        f"- **Фильтры на тике:** oracle `{gs.get('skipped_oracle', 0)}`, streak `{gs.get('skipped_streak', 0)}`, L2 slip `{gs.get('skipped_l2_slip', 0)}`, payback `{gs.get('skipped_payback', 0)}` · закрыто пар `{st['closed_pairs_count']}`, окупивших вход `{st['payback_achieved_count']}`",
+        "",
+        "## Активные HIP-3 пары (Zero-Bridge Split-Margin)",
+        "",
+        "| Тикер | Ноги | Режим | Номинал/ногу | Live APR | Oracle Div | L2 Slip | Часов | Funding | Basis MTM | Net PnL |",
+        "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for p in sorted(st["positions"].values(), key=lambda x: -float(x["live_spread_apr_pct"])):
+        mode_tag = ("⚡GM" if p.get("both_growth_mode") else "Std") + (
+            " · Iso" if p.get("any_only_isolated") else " · Cross"
+        )
+        lines.append(
+            f"| **{p['base_symbol']}** | `S {p['short_symbol']} / L {p['long_symbol']}` | {mode_tag} | "
+            f"${p['leg_notional_usd']:,.0f} | **{p['live_spread_apr_pct']:+.1f}%** | "
+            f"{p['live_oracle_div_bps']:.1f} б.п. | {p['entry_l2_slip_bps']:.1f} б.п. | {p['hours_held']:.1f}ч | "
+            f"{p['cum_funding_usd']:+.2f}$ | {p['cum_basis_mtm_usd']:+.2f}$ | **{p['net_pnl_usd']:+.2f}$** |"
+        )
+    if not st["positions"]:
+        lines.append("| — | Нет активных пар (ожидание clean_streak ≥ 2) | — | — | — | — | — | — | — | — | — |")
+    return "\n".join(lines) + "\n"
+
+
+def format_hip3_paper_telegram_rich_html(result: dict[str, Any]) -> str:
+    st = result["state"]
+    tk = result["tick"]
+    dt = datetime.fromtimestamp(tk["ts_ms"] / 1000, tz=timezone.utc)
+    date_str = dt.strftime("%d.%m.%Y")
+    time_str = dt.strftime("%H:%M UTC")
+    ret_pct = float(st.get("return_pct", 0.0))
+    dot = "🟢" if ret_pct >= 0 else "🔴"
+
+    parts = [
+        f"<h1>🏛️ HIP-3 Split-Margin Paper · {html.escape(date_str)}</h1>",
+        (
+            f"<p>{dot} <b>Депозит ({html.escape(time_str)}):</b> ${st['equity_usd']:,.2f} ({ret_pct:+.3f}%) · "
+            f"<b>Маржа:</b> ${st['margin_locked_usd']:,.0f} ({st['margin_utilization_pct']:.1f}%)<br>"
+            f"<b>Пар:</b> {tk['active_pairs']} · Funding {st['cum_funding_usd']:+.2f}$ · "
+            f"Basis {st['cum_basis_mtm_usd']:+.2f}$ · L2/Fees −{st['cum_costs_usd']:.2f}$</p>"
+        ),
+    ]
+    if st["positions"]:
+        rows = [
+            "<tr>"
+            '<th align="left">Тикер / Ноги</th>'
+            '<th align="left">Режим</th>'
+            '<th align="right">Live APR</th>'
+            '<th align="right">Oracle</th>'
+            '<th align="right">Net PnL</th>'
+            "</tr>"
+        ]
+        for p in sorted(st["positions"].values(), key=lambda x: -float(x["live_spread_apr_pct"])):
+            mode = ("⚡GM/" if p.get("both_growth_mode") else "Std/") + (
+                "Iso" if p.get("any_only_isolated") else "Cross"
+            )
+            p_dot = "🟢" if float(p["net_pnl_usd"]) >= 0 else "🔴"
+            rows.append(
+                "<tr>"
+                f'<td align="left"><b>{html.escape(str(p["base_symbol"]))}</b> ({html.escape(str(p["short_dex"]))}/{html.escape(str(p["long_dex"]))})</td>'
+                f'<td align="left">{html.escape(mode)}</td>'
+                f'<td align="right"><b>{p["live_spread_apr_pct"]:+.1f}%</b></td>'
+                f'<td align="right">{p["live_oracle_div_bps"]:.1f} б.п.</td>'
+                f'<td align="right">{p_dot} {p["net_pnl_usd"]:+.2f}$</td>'
+                "</tr>"
+            )
+        parts.append('<table bordered striped>' + "".join(rows) + "</table>")
+
+    parts.append("<footer>Read-only HIP-3 L2 Paper: Zero-Bridge Growth Mode · Split-Margin · Oracle Div ≤ 15 б.п.</footer>")
+    return "".join(parts)

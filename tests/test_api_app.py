@@ -121,6 +121,25 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
         ),
         encoding="utf-8",
     )
+    (tmp_path / "hl_hip3_paper").mkdir(parents=True)
+    (tmp_path / "hl_hip3_paper" / "state.json").write_text(
+        json.dumps(
+            {
+                "starting_capital_usd": 50000.0,
+                "equity_usd": 50012.5,
+                "return_pct": 0.025,
+                "margin_locked_usd": 5000.0,
+                "margin_utilization_pct": 10.0,
+                "cum_funding_usd": 15.0,
+                "cum_basis_mtm_usd": 0.0,
+                "cum_costs_usd": 2.5,
+                "positions": {},
+                "closed_pairs_count": 0,
+                "payback_achieved_count": 0,
+            }
+        ),
+        encoding="utf-8",
+    )
     (tmp_path / "hl_testnet_audit.jsonl").write_text(
         json.dumps({"ts_ms": 1_795_734_634_563, "status": "ok", "violations": [], "cancelled_count": 1, "placed_count": 7, "total_notional_usd": 380.34, "high_water_mark_usd": 999.0, "skipped_unquoted_coins": ["JUP", "PONS"]}) + "\n",
         encoding="utf-8",
@@ -130,6 +149,7 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert r_hip3.status_code == 200
     hip3_body = r_hip3.json()
     assert hip3_body["frontier_history"]["hip3_persistence"][0]["base_symbol"] == "AAPL"
+    assert hip3_body["hip3_paper"]["equity_usd"] == 50012.5
     assert hip3_body["history_tail"][0]["spread_apr_pct"] is None
 
     r_events = client.get("/api/v1/events/latest")
@@ -153,5 +173,5 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert sched_body["worker_status"]["service"] == "hl-worker"
     assert sched_body["artifact_freshness"]["frontier_history"]["exists"] is True
     assert sched_body["artifact_freshness"]["testnet_audit"]["exists"] is True
-    for expected_key in ("liq_funding_alpha", "mm_calibration", "settlement_study"):
+    for expected_key in ("hip3_paper", "liq_funding_alpha", "mm_calibration", "settlement_study"):
         assert expected_key in sched_body["artifact_freshness"]

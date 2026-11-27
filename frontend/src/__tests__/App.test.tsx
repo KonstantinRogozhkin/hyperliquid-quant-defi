@@ -485,13 +485,60 @@ describe("App", () => {
   });
 
   it("filters HIP-3 persistence rows by Active only, Only steady (0 flips), and ticker search", async () => {
-    mockFetch(makeOverview());
+    mockFetch(
+      makeOverview({
+        hip3_paper: {
+          starting_capital_usd: 50000,
+          equity_usd: 50042.5,
+          return_pct: 0.085,
+          margin_locked_usd: 7500,
+          margin_utilization_pct: 15.0,
+          cum_funding_usd: 48.2,
+          cum_basis_mtm_usd: 1.8,
+          cum_costs_usd: 7.5,
+          observed_at_utc: "2026-11-27 12:22 UTC",
+          ny_session: "US_PREMARKET",
+          closed_pairs_count: 1,
+          payback_achieved_count: 1,
+          positions: {
+            MU: {
+              base_symbol: "MU",
+              short_symbol: "io:MU",
+              long_symbol: "xyz:MU",
+              short_dex: "io",
+              long_dex: "xyz",
+              both_growth_mode: true,
+              any_only_isolated: true,
+              margin_mode: "isolated",
+              leg_notional_usd: 2500,
+              margin_locked_usd: 2500,
+              hours_held: 8.0,
+              entry_spread_apr_pct: 80.0,
+              live_spread_apr_pct: 106.5,
+              live_oracle_div_bps: 4.2,
+              entry_l2_slip_bps: 3.1,
+              entry_exec_basis_bps: 12.4,
+              cum_funding_usd: 4.5,
+              cum_basis_mtm_usd: 1.2,
+              cum_cost_usd: 1.2,
+              net_pnl_usd: 4.5,
+              clean_streak: 4,
+            },
+          },
+        },
+      })
+    );
     const user = userEvent.setup();
 
     render(<App />);
     await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
 
     await user.click(screen.getByRole("button", { name: "HIP-3 · Boros · Yield" }));
+
+    const hip3PaperSection = screen.getByText("HIP-3 Split-Margin Paper Ledger").closest("section")!;
+    expect(within(hip3PaperSection).getByText("$50,042.50")).toBeInTheDocument();
+    expect(within(hip3PaperSection).getByText("MU")).toBeInTheDocument();
+    expect(within(hip3PaperSection).getByText("Isolated")).toHaveClass("badge-warn");
 
     const hip3Section = screen.getByText("HIP-3 Cross-Builder Spread Persistence").closest("section")!;
     // Active only is checked by default: AAPL and NVDA shown, stale TSLA hidden
