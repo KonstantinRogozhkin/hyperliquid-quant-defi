@@ -98,12 +98,6 @@ def main(
             for c, w in target_weights.items()
             if c in meta and (allow_only_isolated or not meta[c].only_isolated)
         }
-        if neutralize_net and targets is None:
-            valid_targets = ex.neutralize_target_weights(
-                valid_targets,
-                max_gross=min(0.90, limits.max_gross_leverage),
-                max_single_coin_weight=limits.max_single_coin_weight,
-            )
         if account_addr:
             account = ex.fetch_testnet_account(client, account_addr)
         else:
@@ -116,6 +110,19 @@ def main(
             )
         coins_to_quote = sorted(set(valid_targets.keys()) | set(account.positions_sz.keys()))
         bbo = ex.fetch_testnet_bbo(client, coins_to_quote)
+        skipped_unquoted: list[str] = []
+        if targets is None:
+            valid_targets, skipped_unquoted = ex.filter_unquoted_targets(
+                valid_targets,
+                bbo,
+                max_missing_fraction=limits.max_unquoted_coin_fraction,
+            )
+            if neutralize_net:
+                valid_targets = ex.neutralize_target_weights(
+                    valid_targets,
+                    max_gross=min(0.90, limits.max_gross_leverage),
+                    max_single_coin_weight=limits.max_single_coin_weight,
+                )
         funding_apr_by_coin = ex.fetch_testnet_funding_apr(client)
 
     adapter: ex.ExchangeAdapter
@@ -139,6 +146,7 @@ def main(
         high_water_mark_usd=hwm,
         audit_log_path=audit_log,
         funding_apr_by_coin=funding_apr_by_coin,
+        skipped_unquoted_coins=skipped_unquoted,
     )
     if account_addr:
         ex.save_high_water_mark(hwm_state, hwm)

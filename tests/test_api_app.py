@@ -122,7 +122,7 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
         encoding="utf-8",
     )
     (tmp_path / "hl_testnet_audit.jsonl").write_text(
-        json.dumps({"ts_ms": 1_795_734_634_563, "status": "ok", "violations": [], "cancelled_count": 1, "placed_count": 7, "total_notional_usd": 380.34, "high_water_mark_usd": 999.0}) + "\n",
+        json.dumps({"ts_ms": 1_795_734_634_563, "status": "ok", "violations": [], "cancelled_count": 1, "placed_count": 7, "total_notional_usd": 380.34, "high_water_mark_usd": 999.0, "skipped_unquoted_coins": ["JUP", "PONS"]}) + "\n",
         encoding="utf-8",
     )
 
@@ -140,6 +140,7 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert r_attr.status_code == 200
     assert r_attr.json()["attribution"]["total_fills"] == 14
     assert r_attr.json()["testnet_audit_recent"][0]["placed_count"] == 7
+    assert r_attr.json()["testnet_audit_recent"][0]["skipped_unquoted_coins"] == ["JUP", "PONS"]
 
     r_pos = client.get("/api/v1/metamodel/positions")
     assert r_pos.status_code == 200

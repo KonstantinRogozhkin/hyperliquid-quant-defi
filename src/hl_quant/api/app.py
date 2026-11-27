@@ -158,6 +158,7 @@ def _read_testnet_audit_tail(data_root: Path, limit: int = 15) -> list[dict[str,
                 "total_notional_usd": float(rec.get("total_notional_usd", 0.0) or 0.0),
                 "high_water_mark_usd": float(rec.get("high_water_mark_usd", 0.0) or 0.0),
                 "blocked_isolated_coins": list(rec.get("blocked_isolated_coins") or []),
+                "skipped_unquoted_coins": list(rec.get("skipped_unquoted_coins") or []),
             }
         )
     return records

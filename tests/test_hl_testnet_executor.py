@@ -282,3 +282,74 @@ def test_pre_settlement_negative_funding_guard_defers_naive_long_entries():
     acct_short = ex.AccountSnapshot(equity_usd=1_000.0, free_margin_usd=1_000.0, positions_sz={"GRAM": -100.0}, open_orders=[], observed_at_ms=t_5700)
     ords_close = ex.plan_rebalance_orders(acct_short, {"GRAM": 0.0}, meta, bbo_57, limits, funding_apr_by_coin={"GRAM": -60.0}, now_ms=t_5700)
     assert len(ords_close) == 1 and ords_close[0].reduce_only is True
+
+
+def test_filter_unquoted_targets_skips_thin_testnet_books_and_fails_closed_on_outage(tmp_path: Path):
+    now = 1_700_000_000_000
+    raw_targets = {"BTC": 0.12, "ETH": 0.08, "SOL": -0.06, "INIT": -0.07, "JUP": 0.05, "PONS": -0.12}
+    # 2/6 coins (33.3% <= 35%) lack a two-sided Testnet book (like JUP/PONS empty ask/book)
+    bbo = {
+        "BTC": (60_000.0, 60_002.0, now),
+        "ETH": (2_500.0, 2_501.0, now),
+        "SOL": (100.0, 100.1, now),
+        "INIT": (0.12, 0.121, now),
+    }
+    filtered, skipped = ex.filter_unquoted_targets(raw_targets, bbo, max_missing_fraction=0.35)
+    assert skipped == ["JUP", "PONS"]
+    assert set(filtered.keys()) == {"BTC", "ETH", "SOL", "INIT"}
+
+    # Re-neutralizing after dropping unquoted coins restores dollar-neutrality
+    neut = ex.neutralize_target_weights(filtered, max_gross=0.90)
+    assert abs(sum(neut.values())) < 1e-4
+
+    # Rebalance cycle proceeds on the 4 quoted coins, cancels stale resting order on skipped JUP,
+    # leaves unmanaged MM order on HYPE untouched, and logs + formats skipped_unquoted_coins.
+    meta = {
+        "BTC": ex.AssetSpec("BTC", sz_decimals=5, max_leverage=40),
+        "ETH": ex.AssetSpec("ETH", sz_decimals=4, max_leverage=25),
+        "SOL": ex.AssetSpec("SOL", sz_decimals=2, max_leverage=20),
+        "INIT": ex.AssetSpec("INIT", sz_decimals=0, max_leverage=5),
+    }
+    acct = ex.AccountSnapshot(
+        equity_usd=10_000.0,
+        free_margin_usd=10_000.0,
+        positions_sz={},
+        open_orders=[{"coin": "JUP", "oid": 77}, {"coin": "HYPE", "oid": 88}],
+        observed_at_ms=now,
+    )
+    adapter = ex.DryRunAdapter()
+    audit_path = tmp_path / "audit.jsonl"
+    res = ex.execute_rebalance_cycle(
+        acct,
+        neut,
+        meta,
+        bbo,
+        adapter,
+        audit_log_path=audit_path,
+        now_ms=now,
+        skipped_unquoted_coins=skipped,
+    )
+    assert res["status"] == "ok"
+    assert res["skipped_unquoted_coins"] == ["JUP", "PONS"]
+    assert res["cancelled_count"] == 1
+    assert [c["coin"] for c in adapter.cancelled] == ["JUP"]
+    assert {o["coin"] for o in adapter.placed} == {"BTC", "ETH", "SOL", "INIT"}
+    audit_lines = [line for line in audit_path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert '"skipped_unquoted_coins": ["JUP", "PONS"]' in audit_lines[-1]
+    tg_html = ex.format_testnet_telegram_rich_html(acct, res, bbo, hwm_usd=10_000.0)
+    assert "JUP, PONS" in tg_html
+
+    # Fail-closed safeguard: if >35% of the basket is unquoted (e.g. 3/6 = 50% systemic outage),
+    # filter_unquoted_targets refuses to drop coins so check_kill_switch halts the cycle.
+    bbo_outage = {"BTC": (60_000.0, 60_002.0, now), "ETH": (2_500.0, 2_501.0, now), "SOL": (100.0, 100.1, now)}
+    outage_targets, outage_skipped = ex.filter_unquoted_targets(raw_targets, bbo_outage, max_missing_fraction=0.35)
+    assert outage_skipped == []
+    assert outage_targets == raw_targets
+    res_outage = ex.execute_rebalance_cycle(acct, outage_targets, meta, bbo_outage, ex.DryRunAdapter(), now_ms=now)
+    assert res_outage["status"] == "kill_switch_triggered"
+    assert sorted(res_outage["violations"]) == ["missing_quote:INIT", "missing_quote:JUP", "missing_quote:PONS"]
+
+    # Also fail-closed when a 2-coin basket loses 1 coin (leaving <2 quoted coins)
+    pair_targets, pair_skipped = ex.filter_unquoted_targets({"BTC": 0.1, "ETH": -0.1}, {"BTC": (60_000.0, 60_002.0, now)}, max_missing_fraction=0.6)
+    assert pair_skipped == []
+    assert pair_targets == {"BTC": 0.1, "ETH": -0.1}
