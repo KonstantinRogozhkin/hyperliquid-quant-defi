@@ -286,3 +286,152 @@ def test_cross_dex_long_hl_book_and_mark_basis_share_denominator() -> None:
     mark = (103.0 - 100.0) / 100.0 * 1e4
     assert book == pytest.approx(mark, abs=0.01)
 
+
+def test_autopilot_nav_guard_does_not_poison_sleeve_or_cta_baselines(tmp_path: Path) -> None:
+    from hl_quant import hl_autopilot as ap
+
+    sp = tmp_path / "hl_spot_perp_paper"
+    sp.mkdir()
+    (sp / "state.json").write_text(
+        json.dumps({"equity_usd": 100_000.0, "starting_capital_usd": 100_000.0, "positions": {}})
+    )
+    closes = {c: [100.0] * 50 for c in ap.CTA_UNIVERSE}
+    cfg = ap.AutopilotConfig(max_tick_nav_jump_pct=3.0)
+    t0 = 1_795_700_000_000
+    r1 = ap.run_autopilot_tick(data_root=tmp_path, cfg=cfg, now_ms=t0, daily_closes=closes)
+    base_eq = r1["state"]["gross_equity_usd"]
+
+    # Anomalous +50% upstream spike should trip NAV guard and NOT overwrite last_sleeve_equities or cta last_closes
+    (sp / "state.json").write_text(
+        json.dumps({"equity_usd": 150_000.0, "starting_capital_usd": 100_000.0, "positions": {}})
+    )
+    spike_closes = {c: [100.0] * 49 + [200.0] for c in ap.CTA_UNIVERSE}
+    r2 = ap.run_autopilot_tick(data_root=tmp_path, cfg=cfg, now_ms=t0 + 4 * 3_600_000, daily_closes=spike_closes)
+    assert r2["state"]["risk_telemetry"]["nav_guard_triggered"] is True
+    assert r2["state"]["last_sleeve_equities"]["spot_perp_paper"] == pytest.approx(100_000.0)
+    assert r2["state"]["cta_state"]["last_closes"]["BTC"] == pytest.approx(100.0)
+
+    # Next tick when upstream feed returns to normal should NOT book a phantom crash
+    (sp / "state.json").write_text(
+        json.dumps({"equity_usd": 100_100.0, "starting_capital_usd": 100_000.0, "positions": {}})
+    )
+    r3 = ap.run_autopilot_tick(data_root=tmp_path, cfg=cfg, now_ms=t0 + 8 * 3_600_000, daily_closes=closes)
+    assert r3["state"]["risk_telemetry"]["nav_guard_triggered"] is False
+    assert r3["state"]["gross_equity_usd"] >= base_eq
+
+
+def test_spot_perp_nav_guard_reverts_mutated_position_equity(tmp_path: Path) -> None:
+    from hl_quant import hl_spot_perp_arb as spa
+
+    markets = [
+        {
+            "base_symbol": "HYPE",
+            "spot_pair": "@107",
+            "spot_token": "HYPE",
+            "quote_token": "USDC",
+            "is_proxy_hedge": False,
+            "spot_mid_px": 35.0,
+            "spot_day_vol_usd": 10_000_000.0,
+            "perp_mark_px": 20.0,
+            "perp_oracle_px": 20.0,
+            "funding_rate_h": 0.0002,
+            "perp_day_vol_usd": 50_000_000.0,
+            "perp_oi_usd": 20_000_000.0,
+            "only_isolated": False,
+            "max_leverage": 5,
+        }
+    ]
+
+    def fake_book(coin_key: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        px = 35.0 if coin_key == "@107" else 20.0
+        return [(px * 0.9999, 10_000.0)], [(px * 1.0001, 10_000.0)]
+
+    state_dir = tmp_path / "sp"
+    state_dir.mkdir()
+    seed_state = {
+        "starting_capital_usd": 100_000.0,
+        "equity_usd": 100_000.0,
+        "hlp_reserve_usd": 10_000.0,
+        "free_cash_usd": 60_000.0,
+        "hlp_apr_pct": 12.0,
+        "last_tick_ms": 1_795_700_000_000,
+        "ticks_count": 1,
+        "positions": {
+            "HYPE": {
+                "base_symbol": "HYPE",
+                "spot_pair": "@107",
+                "qty": 1000.0,
+                "entry_spot_px": 20.0,
+                "entry_perp_px": 20.0,
+                "last_spot_px": 20.0,
+                "last_perp_px": 20.0,
+                "spot_notional_usd": 20_000.0,
+                "perp_notional_usd": 20_000.0,
+                "perp_margin_usd": 10_000.0,
+                "entry_cost_usd": 6.0,
+                "cum_cost_usd": 6.0,
+                "cum_funding_usd": 0.0,
+                "cum_basis_mtm_usd": 0.0,
+                "hours_held": 4.0,
+            }
+        },
+    }
+    (state_dir / "state.json").write_text(json.dumps(seed_state))
+
+    # Corrupt spot price spike (20 -> 35 while perp stays 20 => +$15k / +15% basis jump > 3% guard)
+    cfg = spa.SpotPerpPaperConfig(max_tick_nav_jump_pct=3.0)
+    res = spa.run_spot_perp_paper_tick(
+        state_dir=state_dir,
+        cfg=cfg,
+        now_ms=1_795_700_000_000 + 4 * 3_600_000,
+        markets=markets,
+        book_fetcher=fake_book,
+        hlp_summary=(12.0, 250_000_000.0),
+    )
+    st = res["state"]
+    assert st["risk_telemetry"]["nav_guard_triggered"] is True
+    assert st["equity_usd"] == pytest.approx(100_000.0, abs=1.0)
+    assert st["positions"]["HYPE"]["last_spot_px"] == pytest.approx(20.0)
+
+
+def test_execution_stress_short_series_and_initial_dd() -> None:
+    import pandas as pd
+
+    from hl_quant import execution_stress as es
+
+    idx = pd.Index([1, 2, 3], name="hour_ms")
+    ret_df = pd.DataFrame({"BTC": [-0.10, -0.05, 0.02]}, index=idx)
+    w_df = pd.DataFrame({"BTC": [1.0, 1.0, 1.0]}, index=idx)
+    rows = es.margin_buffer_audit(ret_df, w_df, leverages=(1.0,))
+    assert math.isfinite(rows[0]["worst_72h_single_leg_pct"])
+    assert rows[0]["max_single_leg_dd_pct"] == pytest.approx(-15.0, abs=0.01)
+
+    empty_mc = es.run_execution_monte_carlo(
+        pd.Series(dtype=float),
+        pd.Series(dtype=float),
+        pd.Series(dtype=float),
+        n_paths=8,
+    )
+    assert len(empty_mc) == len(es.DEFAULT_SCENARIOS)
+
+
+def test_dashboard_and_tear_sheet_tolerate_null_fields() -> None:
+    from hl_quant import hl_portfolio_dashboard as dash
+    from hl_quant import hl_tear_sheet as ts
+
+    payload = {
+        "generated_at_utc": "2026-11-27 12:00 UTC",
+        "attribution": {"equity_usd": None, "maker_volume_share_pct": None, "effective_fee_bps": None},
+        "mm_session": {"summary": None},
+        "mm_calibration": {"BTC": {"kappa_per_bp": None, "r2_fit": None}, "meta": "skip"},
+        "boros": {"markets": [{"market_id": "1", "name": "HYPE", "best_bid_apr_pct": None, "best_ask_apr_pct": None}]},
+        "paper_ticks": [{"equity_usd": None}, {"equity_usd": float("nan")}, {"equity_usd": 100_000.0}],
+        "hyperevm": {"vaults": [{"tvl_usd": None, "apr_pct": None}]},
+        "latency_bench": {"p50_us": None, "throughput_ticks_per_sec": None},
+    }
+    html_out = dash.render_portfolio_dashboard_html(payload)
+    assert "nan,nan" not in html_out.lower()
+    tg_out = ts.format_tear_sheet_telegram_rich_html(payload)
+    assert "Maker 100%" in tg_out
+    md_out = ts.format_tear_sheet_markdown(payload)
+    assert "κ=0.000" in md_out

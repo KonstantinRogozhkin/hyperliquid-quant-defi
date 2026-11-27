@@ -88,8 +88,16 @@ export function AnalyticsRiskTab({
       const subShares = rawShares.slice(rawShares.length - sliceCount);
       const subDates = c.dates.slice(c.dates.length - sliceCount);
       if (subDates.length > longestDates.length) longestDates = subDates;
-      const base = rebaseWindow ? (subShares[0] || 1) : 1;
-      const pctVals = subShares.map((s) => (base > 0 ? (s / base - 1) * 100 : 0));
+      const cleanShares: number[] = [];
+      let lastValid = 1;
+      for (const raw of subShares) {
+        if (typeof raw === "number" && Number.isFinite(raw) && raw > 0) {
+          lastValid = raw;
+        }
+        cleanShares.push(lastValid);
+      }
+      const base = rebaseWindow ? (cleanShares[0] || 1) : 1;
+      const pctVals = cleanShares.map((s) => (base > 0 ? (s / base - 1) * 100 : 0));
       lines.push({
         id,
         name: c.name,
@@ -108,6 +116,19 @@ export function AnalyticsRiskTab({
     return showMode === "returns" ? r.net_returns : r.net_apy;
   };
 
+  const csvCell = (val: unknown): string => {
+    if (val === null || val === undefined) return "";
+    if (typeof val === "number") return Number.isFinite(val) ? String(val) : "";
+    let s = String(val);
+    if (/^[=+\t\r@]/.test(s) || (s.startsWith("-") && Number.isNaN(Number(s)))) {
+      s = `'${s}`;
+    }
+    if (/[",\n\r]/.test(s)) {
+      return `"${s.replace(/"/g, '""')}"`;
+    }
+    return s;
+  };
+
   const exportCsv = () => {
     const header = ["Strategy", "Category", "7D", "30D", "YTD", "All-Time", "Sharpe90D", "Sortino90D", "MaxDD%", "PosDays%", "SharePrice"];
     const lines = filteredLeaderboard.map((r) => {
@@ -117,7 +138,7 @@ export function AnalyticsRiskTab({
       const dd = feeMode === "gross" ? r.max_dd_gross_pct : r.max_dd_net_pct;
       const sp = feeMode === "gross" ? r.share_price_gross : r.share_price_net;
       return [r.name, r.category, h["7d"], h["30d"], h.ytd, h.all_time, sh, so, dd, r.positive_days_pct, sp]
-        .map((x) => (x === null || x === undefined ? "" : String(x)))
+        .map(csvCell)
         .join(",");
     });
     const csv = [header.join(","), ...lines].join("\n");
@@ -127,7 +148,7 @@ export function AnalyticsRiskTab({
     a.href = url;
     a.download = `hl_quant_analytics_${feeMode}_${showMode}.csv`;
     a.click();
-    URL.revokeObjectURL(url);
+    window.setTimeout(() => URL.revokeObjectURL(url), 0);
   };
 
   const autopilot = overview?.autopilot;

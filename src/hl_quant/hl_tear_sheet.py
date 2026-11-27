@@ -113,28 +113,29 @@ def format_tear_sheet_markdown(d: dict[str, Any]) -> str:
 
     if d.get("attribution"):
         a = d["attribution"]
-        fr = f"{a['real_alo_fill_rate_pct']:.1f}% ({a['audit_orders_filled']}/{a['audit_orders_placed']})" if a.get("real_alo_fill_rate_pct") is not None else "—"
-        mk = f"{a['vw_markout_bps']:+.2f} б.п." if a.get("vw_markout_bps") is not None else "—"
+        fr = f"{float(a['real_alo_fill_rate_pct']):.1f}% ({a.get('audit_orders_filled', 0)}/{a.get('audit_orders_placed', 0)})" if a.get("real_alo_fill_rate_pct") is not None else "—"
+        mk = f"{float(a['vw_markout_bps']):+.2f} б.п." if a.get("vw_markout_bps") is not None else "—"
         lines.append(
             f"| **Live Testnet ALO Execution & Attribution** | ✅ Cron 4h + Daily 09:00 UTC | "
-            f"Баланс **${a['equity_usd']:,.2f}**, сделок {a['total_fills']}, оборот ${a['total_volume_usd']:,.1f}, "
-            f"**Maker {a['maker_volume_share_pct']:.1f}%**, fee **{a['effective_fee_bps']:.2f} б.п.**, ALO Fill **{fr}**, Markout {mk}, Liq warnings: `{len(a.get('liq_warnings') or [])}` |"
+            f"Баланс **${float(a.get('equity_usd') or 0):,.2f}**, сделок {int(a.get('total_fills') or 0)}, оборот ${float(a.get('total_volume_usd') or 0):,.1f}, "
+            f"**Maker {float(a.get('maker_volume_share_pct') if a.get('maker_volume_share_pct') is not None else 100):.1f}%**, fee **{float(a.get('effective_fee_bps') or 0):.2f} б.п.**, ALO Fill **{fr}**, Markout {mk}, Liq warnings: `{len(a.get('liq_warnings') or [])}` |"
         )
 
     if d.get("paper"):
         p = d["paper"]
         lines.append(
             f"| **Live Paper L2 Shadow Tracker** (HL × Bybit/Binance/OKX) | ✅ Cron 4h | "
-            f"Тиков: {p['ticks']}, активных позиций: {p['active_positions']}, Equity `${p['equity_usd']:,.2f}` (`{p['return_pct']:+.3f}%`), динамический ALO-throttle |"
+            f"Тиков: {int(p.get('ticks') or 0)}, активных позиций: {int(p.get('active_positions') or 0)}, Equity `${float(p.get('equity_usd') or 0):,.2f}` (`{float(p.get('return_pct') or 0):+.3f}%`), динамический ALO-throttle |"
         )
 
     if d.get("mm_session"):
-        sums = d["mm_session"].get("summaries") or ({d["mm_session"]["summary"]["coin"]: d["mm_session"]["summary"]} if "summary" in d["mm_session"] else {})
-        tot_fills = sum(int(s.get("fills_count", 0)) for s in sums.values())
-        tot_vol = sum(float(s.get("volume_usd", 0.0)) for s in sums.values())
-        tot_pnl = sum(float(s.get("net_pnl_usd", 0.0)) for s in sums.values())
-        tot_bbo = sum(int(s.get("bbo_ticks_observed", 0)) for s in sums.values())
-        tot_mod = sum(int(s.get("quotes_modified", 0)) for s in sums.values())
+        mm_single = d["mm_session"].get("summary")
+        sums = d["mm_session"].get("summaries") or ({mm_single["coin"]: mm_single} if isinstance(mm_single, dict) and "coin" in mm_single else {})
+        tot_fills = sum(int(s.get("fills_count") or 0) for s in sums.values() if isinstance(s, dict))
+        tot_vol = sum(float(s.get("volume_usd") or 0.0) for s in sums.values() if isinstance(s, dict))
+        tot_pnl = sum(float(s.get("net_pnl_usd") or 0.0) for s in sums.values() if isinstance(s, dict))
+        tot_bbo = sum(int(s.get("bbo_ticks_observed") or 0) for s in sums.values() if isinstance(s, dict))
+        tot_mod = sum(int(s.get("quotes_modified") or 0) for s in sums.values() if isinstance(s, dict))
         coins_txt = ", ".join(sums.keys())
         lines.append(
             f"| **Avellaneda–Stoikov MM v2** (WS `bbo+l2Book`, Lead-Lag, `batchModify`, `scheduleCancel`) | ✅ Live Testnet | "
@@ -142,35 +143,39 @@ def format_tear_sheet_markdown(d: dict[str, Any]) -> str:
         )
 
     if d.get("mm_calibration"):
-        cal_parts = [f"{c}: κ={v['kappa_per_bp']:.3f} (R²={v['r2_fit']:.2f})" for c, v in d["mm_calibration"].items()]
+        cal_parts = [
+            f"{c}: κ={float(v.get('kappa_per_bp') or 0):.3f} (R²={float(v.get('r2_fit') or 0):.2f})"
+            for c, v in d["mm_calibration"].items()
+            if isinstance(v, dict)
+        ]
         lines.append(f"| **Эмпирическая калибровка λ(δ)=Ae^(−κδ)** (Mainnet WS) | ✅ Verified | {', '.join(cal_parts)} |")
 
     if d.get("hyperevm"):
         ev = d["hyperevm"]
         ch = ev.get("chain") or {}
-        hlp = (ev.get("vaults") or [{}])[0]
-        exec_cnt = sum(1 for x in (ev.get("evm_arb") or []) if x.get("executable"))
+        hlp = (ev.get("vaults") or [{}])[0] or {}
+        exec_cnt = sum(1 for x in (ev.get("evm_arb") or []) if isinstance(x, dict) and x.get("executable"))
         l1_cnt = len(ev.get("l1_read_oracles") or [])
         lines.append(
             f"| **HyperEVM Chain 999 DeFi & `L1Read` Precompiles** | ✅ Live On-Chain | "
-            f"Блок `#{ch.get('block_number', 0):,}`, L1 `#{ch.get('l1_block_number', 0):,}`, пег USDT0 `{ch.get('usdt0_peg_discount_bps', 0):+.1f} б.п.`, "
-            f"`L1Read` оракулов: {l1_cnt}, чистых peg-adj арб: {exec_cnt}, HLP TVL **${float(hlp.get('tvl_usd', 0))/1e6:,.1f}M** (`{float(hlp.get('apr_pct', 0)):+.2f}% APR`) |"
+            f"Блок `#{int(ch.get('block_number') or 0):,}`, L1 `#{int(ch.get('l1_block_number') or 0):,}`, пег USDT0 `{float(ch.get('usdt0_peg_discount_bps') or 0):+.1f} б.п.`, "
+            f"`L1Read` оракулов: {l1_cnt}, чистых peg-adj арб: {exec_cnt}, HLP TVL **${float(hlp.get('tvl_usd') or 0)/1e6:,.1f}M** (`{float(hlp.get('apr_pct') or 0):+.2f}% APR`) |"
         )
 
     if d.get("liq_funding"):
         lf = d["liq_funding"]
         top_c = (lf.get("clusters") or [None])[0]
-        top_txt = f"лидер {top_c['coin']} (${top_c['total_0_10_usd']/1e6:,.2f}M в 0–10%)" if top_c else "—"
+        top_txt = f"лидер {top_c.get('coin', '?')} (${float(top_c.get('total_0_10_usd') or 0)/1e6:,.2f}M в 0–10%)" if isinstance(top_c, dict) else "—"
         lines.append(
             f"| **L1 Liquidation Heatmap & Hourly `:00` Funding Alpha** | ✅ Live Mainnet | "
-            f"Китов: {lf.get('whales_scanned', 0)}, зон ликвидации: {lf.get('liq_positions_count', 0)} ({top_txt}), 1m-микроструктура расчёта `:00` |"
+            f"Китов: {int(lf.get('whales_scanned') or 0)}, зон ликвидации: {int(lf.get('liq_positions_count') or 0)} ({top_txt}), 1m-микроструктура расчёта `:00` |"
         )
 
     if d.get("cross_dex_top"):
         top_cd = d["cross_dex_top"][0]
         lines.append(
             f"| **5-DEX Cross-DEX Arbitrage v2** (HL × Lighter × Extended × dYdX × Paradex) | ✅ Live L2 Depth | "
-            f"Лидер **{top_cd['coin']}** ({top_cd['direction']}): спред **{top_cd['spread_apr_pct']:.1f}% APR**, L2 slip $10k `{top_cd.get('l2_slip_10k_bps', '—')} б.п.` |"
+            f"Лидер **{top_cd.get('coin', '?')}** ({top_cd.get('direction', '')}): спред **{float(top_cd.get('spread_apr_pct') or 0):.1f}% APR**, L2 slip $10k `{top_cd.get('l2_slip_10k_bps', '—')} б.п.` |"
         )
 
     lat = d.get("latency_bench") or {}
@@ -178,9 +183,9 @@ def format_tear_sheet_markdown(d: dict[str, Any]) -> str:
         "",
         "## 2. Бенчмарк горячего пути котирования (`tick-to-quote`)",
         "",
-        f"- Прогон `{int(lat.get('iterations', 0)):,}` тиков (`parse_bbo -> EWMA -> LeadLag -> compute_as_quotes`, pure Python): "
-        f"**p50 = `{lat.get('p50_us', 0):.2f} мкс`**, **p95 = `{lat.get('p95_us', 0):.2f} мкс`**, **p99 = `{lat.get('p99_us', 0):.2f} мкс`**, "
-        f"пропускная способность **`{int(lat.get('throughput_ticks_per_sec', 0)):,}` тиков/сек**.",
+        f"- Прогон `{int(lat.get('iterations') or 0):,}` тиков (`parse_bbo -> EWMA -> LeadLag -> compute_as_quotes`, pure Python): "
+        f"**p50 = `{float(lat.get('p50_us') or 0):.2f} мкс`**, **p95 = `{float(lat.get('p95_us') or 0):.2f} мкс`**, **p99 = `{float(lat.get('p99_us') or 0):.2f} мкс`**, "
+        f"пропускная способность **`{int(lat.get('throughput_ticks_per_sec') or 0):,}` тиков/сек**.",
         "",
         "## 3. Архитектурные гарантии и риск-контроль",
         "",
@@ -200,9 +205,9 @@ def format_tear_sheet_telegram_rich_html(d: dict[str, Any]) -> str:
     rows = [
         '<tr><th align="left">Контур</th><th align="right">Подтверждённый статус</th></tr>',
         '<tr><td align="left">Метамодель (PR #16–#19)</td><td align="right"><b>5.0 б.п. BBO audit</b> · Ex-INIT −0.37% (Obs-Only)</td></tr>',
-        f'<tr><td align="left">Testnet ALO экзекутор</td><td align="right"><b>Maker {attr.get("maker_volume_share_pct", 100):.0f}%</b> · {attr.get("effective_fee_bps", 1.5):.2f} б.п. · ${attr.get("equity_usd", 0):,.2f}</td></tr>',
-        f'<tr><td align="left">A–S MM v2 (bbo + Lead-Lag)</td><td align="right">p50 <b>{lat.get("p50_us", 0):.1f} мкс</b> · {int(lat.get("throughput_ticks_per_sec", 0)):,} тик/с</td></tr>',
-        f'<tr><td align="left">HyperEVM Chain 999 &amp; HLP</td><td align="right">HLP <b>${float(hlp.get("tvl_usd", 0))/1e6:,.1f}M</b> ({float(hlp.get("apr_pct", 0)):+.1f}% APR) · L1Read OK</td></tr>',
+        f'<tr><td align="left">Testnet ALO экзекутор</td><td align="right"><b>Maker {float(attr.get("maker_volume_share_pct") if attr.get("maker_volume_share_pct") is not None else 100):.0f}%</b> · {float(attr.get("effective_fee_bps") if attr.get("effective_fee_bps") is not None else 1.5):.2f} б.п. · ${float(attr.get("equity_usd") or 0):,.2f}</td></tr>',
+        f'<tr><td align="left">A–S MM v2 (bbo + Lead-Lag)</td><td align="right">p50 <b>{float(lat.get("p50_us") or 0):.1f} мкс</b> · {int(lat.get("throughput_ticks_per_sec") or 0):,} тик/с</td></tr>',
+        f'<tr><td align="left">HyperEVM Chain 999 &amp; HLP</td><td align="right">HLP <b>${float(hlp.get("tvl_usd") or 0)/1e6:,.1f}M</b> ({float(hlp.get("apr_pct") or 0):+.1f}% APR) · L1Read OK</td></tr>',
     ]
     return (
         f"<h1>🏆 Hyperliquid Trading Tear-Sheet · {html.escape(d['generated_at_utc'])}</h1>"

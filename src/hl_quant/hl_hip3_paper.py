@@ -179,7 +179,7 @@ def run_hip3_paper_tick(
         trade_rows: list[dict[str, Any]] = []
 
         # 1. Mark-to-market & accrue hourly funding on open dual-builder pairs
-        for base, pos in list(positions.items()):
+        for _base, pos in list(positions.items()):
             s_mkt = by_symbol.get(str(pos["short_symbol"]))
             l_mkt = by_symbol.get(str(pos["long_symbol"]))
             if not (s_mkt and l_mkt):

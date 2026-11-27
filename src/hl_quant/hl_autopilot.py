@@ -671,6 +671,7 @@ def run_autopilot_tick(
         # Accrue sleeve-level returns onto existing allocations
         raw_pnl_total = 0.0
         provisional_alloc = dict(alloc_usd)
+        provisional_last_eq_map = dict(last_eq_map)
         for name, cur_alloc in alloc_usd.items():
             if cur_alloc <= 0:
                 sleeve_tick_pnl[name] = 0.0
@@ -685,7 +686,7 @@ def run_autopilot_tick(
                 cur_eq = float(sleeves[name]["equity_usd"])
                 prev_s_eq = _f(last_eq_map.get(name), cur_eq)
                 r = (cur_eq - prev_s_eq) / prev_s_eq if prev_s_eq > 0 else 0.0
-                last_eq_map[name] = cur_eq
+                provisional_last_eq_map[name] = cur_eq
             pnl = cur_alloc * r
             sleeve_tick_pnl[name] = round(pnl, 4)
             provisional_alloc[name] = max(0.0, cur_alloc + pnl)
@@ -695,7 +696,7 @@ def run_autopilot_tick(
         # into them does not credit Autopilot with returns earned before it held the sleeve.
         for name in ("spot_perp_paper", "cross_dex_paper", "hip3_paper", "metamodel_paper"):
             if name in sleeves and _f(alloc_usd.get(name)) <= 0:
-                last_eq_map[name] = float(sleeves[name]["equity_usd"])
+                provisional_last_eq_map[name] = float(sleeves[name]["equity_usd"])
         # Bounded NAV Sanity Guard
         if prev_gross > 0 and abs(raw_pnl_total) / prev_gross * 100.0 > cfg.max_tick_nav_jump_pct:
             nav_guard_triggered = True
@@ -707,6 +708,7 @@ def run_autopilot_tick(
             sleeve_tick_pnl = {k: 0.0 for k in alloc_usd}
         else:
             alloc_usd = provisional_alloc
+            last_eq_map = provisional_last_eq_map
             cta_alloc_prev = float(state.get("sleeve_allocations_usd", {}).get("crisis_cta", 0.0))
             cta_state["cum_pnl_usd"] = round(float(cta_state.get("cum_pnl_usd", 0.0)) + cta_alloc_prev * cta_tick_ret, 4)
             cta_state["cum_cost_usd"] = round(float(cta_state.get("cum_cost_usd", 0.0)) + cta_alloc_prev * cta_cost_ret, 4)
@@ -812,11 +814,12 @@ def run_autopilot_tick(
     lev_30d_avg, lev_30d_max = spa._compute_30d_leverage_stats(ticks_path, weighted_lev, ts_ms)
     net_dir_pct = round(actual_weights.get("crisis_cta", 0.0) * float(cta_snap["net_exposure"]) * 100.0, 3)
 
-    cta_state["weights"] = cta_snap["weights"]
-    cta_state["last_closes"] = new_last_closes
-    cta_state["gross_leverage"] = cta_snap["gross_leverage"]
-    cta_state["net_exposure"] = cta_snap["net_exposure"]
-    cta_state["assets"] = cta_snap["assets"]
+    if not nav_guard_triggered:
+        cta_state["weights"] = cta_snap["weights"]
+        cta_state["last_closes"] = new_last_closes
+        cta_state["gross_leverage"] = cta_snap["gross_leverage"]
+        cta_state["net_exposure"] = cta_snap["net_exposure"]
+        cta_state["assets"] = cta_snap["assets"]
 
     sleeve_summary = []
     for k in target_weights:

@@ -108,9 +108,12 @@ def run_execution_monte_carlo(
         delayed = (rng.random((n_paths, n)) < sc.unhedged_leg_delay_prob) & (dx > 1e-8)
         leg_shock = -np.abs(rng.normal(0.0, 1.0, size=(n_paths, n))) * (dx[None, :] * lv[None, :]) * delayed
 
+        if n == 0:
+            results.append(StressSummary(sc.name, n_paths, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0))
+            continue
         paths_r = r_base[None, :] + extra_cost + leg_shock
         aprs = paths_r.mean(axis=1) * af.HOURS_PER_YEAR
-        stds = paths_r.std(axis=1, ddof=1)
+        stds = paths_r.std(axis=1, ddof=1) if n >= 2 else np.zeros(n_paths, dtype=float)
         sharpes = np.where(stds > 0, paths_r.mean(axis=1) / stds * math.sqrt(af.HOURS_PER_YEAR), 0.0)
         eq = np.cumsum(paths_r, axis=1)
         peak = np.maximum.accumulate(np.hstack([np.zeros((n_paths, 1)), eq]), axis=1)[:, 1:]
@@ -144,10 +147,14 @@ def margin_buffer_audit(
     w = hl_weights.reindex_like(hl_ret_next).fillna(0.0)
     hl_only_ret = (w * hl_ret_next).sum(axis=1)
     # 24h and 72h worst single-leg cumulative drop (before collateral can be rebalanced)
-    w24 = float(hl_only_ret.rolling(24).sum().min())
-    w72 = float(hl_only_ret.rolling(72).sum().min())
-    eq = hl_only_ret.cumsum()
-    max_single_leg_dd = float((eq - eq.cummax()).min())
+    if hl_only_ret.empty:
+        w24 = w72 = max_single_leg_dd = 0.0
+    else:
+        w24 = float(hl_only_ret.rolling(24, min_periods=1).sum().min())
+        w72 = float(hl_only_ret.rolling(72, min_periods=1).sum().min())
+        eq = hl_only_ret.cumsum()
+        peak = np.maximum(0.0, eq.cummax())
+        max_single_leg_dd = float(min(0.0, (eq - peak).min()))
 
     rows = []
     for lev in leverages:

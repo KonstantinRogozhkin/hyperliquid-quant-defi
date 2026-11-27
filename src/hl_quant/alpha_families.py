@@ -181,8 +181,13 @@ def simulate_cross_venue(
     leg opened). Each leg is charged half of ``one_way_cost_bps``.
     """
     w = weights.reindex(index=market.hours, columns=market.coins).fillna(0.0).to_numpy(dtype=float, copy=True)
-    if len(w) > 0:
-        w[-1, :] = 0.0
+    if len(w) == 0:
+        return pd.DataFrame(
+            columns=["position", "turnover", "cex_turnover", "funding_pnl", "basis_pnl", "cost_pnl", "ret"],
+            index=market.hours,
+            dtype=float,
+        )
+    w[-1, :] = 0.0
     prev = np.vstack([np.zeros((1, w.shape[1])), w[:-1, :]])
     dw = np.abs(w - prev)
 
@@ -192,7 +197,7 @@ def simulate_cross_venue(
     by_r = market.bybit_ret_next.to_numpy(dtype=float)
     dw_cex = dw
 
-    if venue_choice is not None:
+    if venue_choice is not None and len(market.coins) > 0:
         vc = venue_choice.reindex(index=market.hours, columns=market.coins)
         bn_f = market.binance_fund_next.to_numpy(dtype=float)
         bn_r = market.binance_ret_next.to_numpy(dtype=float)
@@ -247,8 +252,13 @@ def simulate_hl_single_venue(
     Capital at 1x gross leverage = ``sum(|w|) <= 1.0`` -> ``scale = 1.0``.
     """
     w = weights.reindex(index=market.hours, columns=market.coins).fillna(0.0).to_numpy(dtype=float, copy=True)
-    if len(w) > 0:
-        w[-1, :] = 0.0
+    if len(w) == 0:
+        return pd.DataFrame(
+            columns=["position", "turnover", "price_pnl", "funding_pnl", "cost_pnl", "ret"],
+            index=market.hours,
+            dtype=float,
+        )
+    w[-1, :] = 0.0
     prev = np.vstack([np.zeros((1, w.shape[1])), w[:-1, :]])
     dw = np.abs(w - prev)
 

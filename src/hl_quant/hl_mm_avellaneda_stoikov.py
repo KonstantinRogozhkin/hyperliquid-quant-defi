@@ -2092,7 +2092,10 @@ async def run_multi_coin_mm_ws_session(
                     cancel_all.append({"coin": c_name, "oid": o.get("oid")})
                     stats[c_name]["cleanup_cancelled"] += 1
         if cancel_all:
-            await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_all)
+            try:
+                await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_all)
+            except Exception:
+                pass
 
         # 2. Optional flatten-on-exit per coin
         if flatten_on_exit:
@@ -2116,10 +2119,13 @@ async def run_multi_coin_mm_ws_session(
                         tif="Ioc",
                         reduce_only=True,
                     )
-                    await asyncio.to_thread(adapter.place_ioc_order, flat_ord)
-                    stats[c_name]["flattened_exit_sz"] = unwind_sz
-                    if not execute_live:
-                        ledgers[c_name].on_fill(unwind_side, mid, unwind_sz, fee_usd=unwind_sz * mid * 4.5e-4)
+                    try:
+                        await asyncio.to_thread(adapter.place_ioc_order, flat_ord)
+                        stats[c_name]["flattened_exit_sz"] = unwind_sz
+                        if not execute_live:
+                            ledgers[c_name].on_fill(unwind_side, mid, unwind_sz, fee_usd=unwind_sz * mid * 4.5e-4)
+                    except Exception:
+                        pass
 
         # 3. Disarm Dead Man's Switch so it never consumes a daily trigger on clean shutdown
         if dead_man_armed and hasattr(adapter, "schedule_cancel"):

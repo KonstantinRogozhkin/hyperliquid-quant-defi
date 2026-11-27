@@ -68,6 +68,23 @@ describe("Charts", () => {
     expect(container.querySelectorAll("polyline")).toHaveLength(2);
   });
 
+  it("right-aligns shorter series to the end of MultiSeriesChart date window", () => {
+    const { container } = render(
+      <MultiSeriesChart
+        dates={["2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04"]}
+        series={[
+          { id: "long", name: "Long", color: "#10b981", values: [0, 1, 2, 3] },
+          { id: "short", name: "Short", color: "#f59e0b", values: [0, 1] },
+        ]}
+      />,
+    );
+    const lines = container.querySelectorAll("polyline");
+    expect(lines).toHaveLength(2);
+    const longFirstX = Number(lines[0].getAttribute("points")!.split(" ")[0].split(",")[0]);
+    const shortFirstX = Number(lines[1].getAttribute("points")!.split(" ")[0].split(",")[0]);
+    expect(shortFirstX).toBeGreaterThan(longFirstX);
+  });
+
   it("renders OlsScatterChart with scatter points and fitted regression line", () => {
     const { container } = render(
       <OlsScatterChart

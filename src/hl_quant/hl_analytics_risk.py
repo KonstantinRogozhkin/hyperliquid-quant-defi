@@ -409,7 +409,7 @@ def compute_monthly_returns(
         rows_by_year[yr]["months"][str(mo)] = r_pct
 
     # Compute YTD compound per year
-    for yr, entry in rows_by_year.items():
+    for _yr, entry in rows_by_year.items():
         comp = 1.0
         for v in entry["months"].values():
             comp *= 1.0 + v / 100.0

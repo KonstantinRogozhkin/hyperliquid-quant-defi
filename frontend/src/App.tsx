@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnalyticsRiskTab } from "./components/AnalyticsRiskTab";
 import { EquityCurveChart, KappaCalibrationChart } from "./components/Charts";
 import type { AnalyticsPayload, BuildInfo, CoinAttributionRow, OverviewPayload } from "./types";
@@ -65,8 +65,10 @@ export default function App() {
   const [posQuery, setPosQuery] = useState<string>("");
   const [crossDexMinApr, setCrossDexMinApr] = useState<number>(0);
   const [settlementSplit, setSettlementSplit] = useState<string>("OOS");
+  const reqSeqRef = useRef<number>(0);
 
   const loadAll = useCallback(async () => {
+    const seq = ++reqSeqRef.current;
     try {
       setError(null);
       const [ovRes, feRes, anRes] = await Promise.all([
@@ -78,12 +80,15 @@ export default function App() {
         throw new Error(`Backend /api/v1/overview returned HTTP ${ovRes.status}`);
       }
       const ovJson = (await ovRes.json()) as OverviewPayload;
+      const anJson = anRes && anRes.ok ? ((await anRes.json()) as AnalyticsPayload) : null;
+      const feJson = feRes && feRes.ok ? ((await feRes.json()) as BuildInfo) : null;
+      if (seq !== reqSeqRef.current) return;
       setData(ovJson);
-      if (anRes && anRes.ok) {
-        setAnalytics((await anRes.json()) as AnalyticsPayload);
+      if (anJson) {
+        setAnalytics(anJson);
       }
-      if (feRes && feRes.ok) {
-        setFeBuild((await feRes.json()) as BuildInfo);
+      if (feJson) {
+        setFeBuild(feJson);
       } else {
         setFeBuild({
           service: "hl-frontend",
@@ -92,9 +97,12 @@ export default function App() {
         });
       }
     } catch (err) {
+      if (seq !== reqSeqRef.current) return;
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      setLoading(false);
+      if (seq === reqSeqRef.current) {
+        setLoading(false);
+      }
     }
   }, []);
 

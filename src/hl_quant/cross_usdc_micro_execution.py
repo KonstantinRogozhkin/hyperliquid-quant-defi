@@ -894,7 +894,17 @@ class MicroExecutionRunner:
             binance_available_usdc = _binance_free_balance(binance_account, "USDC")
             bybit_permissions = responses["bybit_api"].get("result", {}).get("permissions") or []
             expected_agent = self.hyperliquid.api_wallet_address.lower()
-            agent_authorized = expected_agent in json.dumps(responses["hyperliquid_agents"], sort_keys=True).lower()
+            now_ms = int(time.time() * 1000)
+            agents_raw = responses["hyperliquid_agents"]
+            if isinstance(agents_raw, list) and any(isinstance(item, Mapping) and "address" in item for item in agents_raw):
+                agent_authorized = any(
+                    isinstance(item, Mapping)
+                    and str(item.get("address") or "").lower() == expected_agent
+                    and (item.get("validUntil") in (None, 0) or int(item["validUntil"]) > now_ms)
+                    for item in agents_raw
+                )
+            else:
+                agent_authorized = expected_agent in json.dumps(agents_raw, sort_keys=True).lower()
             hyperliquid_account_mode = str(responses["hyperliquid_account_mode"])
             checks: list[dict[str, Any]] = [
                 {"name": "private_auth_and_ip_access", "passed": private_span_ms <= self.contract.max_snapshot_sync_span_ms * 2},
@@ -1062,7 +1072,11 @@ class MicroExecutionRunner:
         deadline = time.monotonic() + 2.0
         while True:
             query_end_ms = max(end_ms, int(time.time() * 1000))
-            rows, _ = _run_parallel({"binance": lambda: self.binance.fills(symbol=symbol, start_ms=start_ms, end_ms=query_end_ms), "bybit": lambda: self.bybit.fills(symbol=perp, start_ms=start_ms, end_ms=query_end_ms), "hyperliquid": lambda: self.hyperliquid.fills(start_ms=start_ms, end_ms=query_end_ms)})
+            rows, _ = _run_parallel({
+                "binance": lambda q_end=query_end_ms: self.binance.fills(symbol=symbol, start_ms=start_ms, end_ms=q_end),
+                "bybit": lambda q_end=query_end_ms: self.bybit.fills(symbol=perp, start_ms=start_ms, end_ms=q_end),
+                "hyperliquid": lambda q_end=query_end_ms: self.hyperliquid.fills(start_ms=start_ms, end_ms=q_end),
+            })
             if all(rows.get(venue) for venue in expected_venues) or time.monotonic() >= deadline:
                 return rows
             time.sleep(0.25)
@@ -1274,7 +1288,7 @@ class MicroExecutionRunner:
             if binance_exit_qty < b_min or binance_exit_qty * binance_exit_bid < b_min_notional:
                 unwound = self._safe_unwind(asset, filled={"binance": binance_position_qty, "bybit": y_filled, "hyperliquid": h_filled}, books=exit_books, client_tag=tag)
                 return {"asset": asset, "status": "failed_safe_unwind" if unwound else "failed_manual_intervention", "entry_span_ms": exit_start - start_ms, "delta_mismatch_fraction": float(delta_mismatch), "entry_snapshot": entry_snapshot, "safe_unwind_attempted": True}
-            _run_parallel({
+            exit_orders, _ = _run_parallel({
                 "binance": lambda: self.binance.create_ioc(symbol=symbol, side="SELL", quantity=binance_exit_qty, price=protected_limit(binance_exit_bid, side="sell", adverse_bps=self.contract.max_adverse_execution_bps, tick=b_tick), client_id=f"{tag}-bo"),
                 "bybit": lambda: self.bybit.create_ioc(symbol=perp, side="Buy", quantity=y_filled, price=protected_limit(_best_price(exit_books["bybit"], venue="bybit", side="buy"), side="buy", adverse_bps=self.contract.max_adverse_execution_bps, tick=y_tick), client_id=f"{tag}-yo", reduce_only=True),
                 "hyperliquid": lambda: self.hyperliquid.create_ioc(
@@ -1292,7 +1306,9 @@ class MicroExecutionRunner:
                 ),
             })
             exit_fills = self._wait_fills(asset, start_ms=exit_start, end_ms=int(time.time() * 1000), expected_venues=("binance", "bybit", "hyperliquid"))
-            exit_qty = {"binance": _aggregate_fills(exit_fills["binance"], venue="binance", side="sell", symbol=symbol)[0], "bybit": _aggregate_fills(exit_fills["bybit"], venue="bybit", side="buy", symbol=perp)[0], "hyperliquid": _aggregate_fills(exit_fills["hyperliquid"], venue="hyperliquid", side="buy", symbol=asset)[0]}
+            h_exit_indexed = _aggregate_fills(exit_fills["hyperliquid"], venue="hyperliquid", side="buy", symbol=asset)[0]
+            h_exit_filled = h_exit_indexed or _hyperliquid_ioc_filled_quantity(exit_orders["hyperliquid"])
+            exit_qty = {"binance": _aggregate_fills(exit_fills["binance"], venue="binance", side="sell", symbol=symbol)[0], "bybit": _aggregate_fills(exit_fills["bybit"], venue="bybit", side="buy", symbol=perp)[0], "hyperliquid": h_exit_filled}
             exit_ok = exit_qty == {"binance": binance_exit_qty, "bybit": y_filled, "hyperliquid": h_filled}
             exit_snapshot = self._account_snapshot(asset)
             binance_remaining = _binance_asset_balance(self.binance.account(), asset)

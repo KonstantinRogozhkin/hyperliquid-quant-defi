@@ -640,7 +640,9 @@ def run_spot_perp_paper_tick(
 
         # 1. Accrue HLP 10% reserve yield
         hlp_apr = scan.hlp_apr_pct if scan.hlp_apr_pct != 0.0 else float(state.get("hlp_apr_pct", cfg.default_hlp_apr_pct))
-        hlp_usd = float(state.get("hlp_reserve_usd", 0.0))
+        hlp_usd_prev = float(state.get("hlp_reserve_usd", 0.0))
+        positions_backup = {k: dict(v) for k, v in positions.items()}
+        hlp_usd = hlp_usd_prev
         tick_hlp_usd = hlp_usd * (hlp_apr / 100.0 / HOURS_PER_YEAR) * dt_hours if dt_hours > 0 else 0.0
         hlp_usd = round(hlp_usd + tick_hlp_usd, 4)
 
@@ -699,7 +701,11 @@ def run_spot_perp_paper_tick(
             )
             state["nav_guard_triggers"] = int(state.get("nav_guard_triggers", 0)) + 1
             # Revert anomalous tick MTM to protect equity ledger integrity
+            positions = positions_backup
+            hlp_usd = hlp_usd_prev
+            tick_funding_usd = 0.0
             tick_basis_mtm_usd = 0.0
+            tick_hlp_usd = 0.0
 
         # 3. Auto-rebalance perp margin if a sharp rally erodes short-perp margin beyond max_perp_leverage
         free_cash = float(state.get("free_cash_usd", 0.0))

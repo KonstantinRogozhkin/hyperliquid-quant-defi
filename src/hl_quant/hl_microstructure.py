@@ -405,6 +405,8 @@ def analyze_recording(
     trades_path = recording_dir / "trades.parquet"
     trades_df = pd.read_parquet(trades_path) if trades_path.exists() else pd.DataFrame()
     reports: list[CoinMicrostructureReport] = []
+    if l2_df.empty or "coin" not in l2_df.columns:
+        return reports
     for coin in sorted(l2_df["coin"].unique().tolist()):
         l2_c = l2_df[l2_df["coin"] == coin]
         if "source" in l2_c.columns and (l2_c["source"] == "bbo").any():
@@ -415,7 +417,8 @@ def analyze_recording(
         if not tr_c.empty and "trade_time_ms" in tr_c.columns:
             # The trades subscription replays recent history stamped with the subscribe-time recv_ms;
             # those prints happened before the recording and must not count as fills.
-            tr_c = tr_c[tr_c["trade_time_ms"] >= int(l2_c["recv_ms"].min()) - 1_000]
+            ts_ref_col = "book_time_ms" if "book_time_ms" in l2_c.columns else "recv_ms"
+            tr_c = tr_c[tr_c["trade_time_ms"] >= int(l2_c[ts_ref_col].min()) - 1_000]
         reports.append(
             simulate_passive_alo_coin(
                 l2_c,

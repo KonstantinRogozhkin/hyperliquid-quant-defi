@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import html
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -150,6 +151,25 @@ def _svg_calibration_curve(cal: dict[str, Any], *, width: int = 380, height: int
     )
 
 
+def _nf(v: Any, default: float = 0.0) -> float:
+    if v is None:
+        return default
+    try:
+        out = float(v)
+        return out if math.isfinite(out) else default
+    except (TypeError, ValueError):
+        return default
+
+
+def _ni(v: Any, default: int = 0) -> int:
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return default
+
+
 def _e(val: object) -> str:
     return html.escape(str(val))
 
@@ -164,12 +184,13 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     cd_paper = d.get("cross_dex_paper") or {}
     mm_cal = d.get("mm_calibration") or {}
     mm_raw = d.get("mm_session") or {}
+    mm_single = mm_raw.get("summary")
     mm_sums: dict[str, Any] = mm_raw.get("summaries") or (
-        {mm_raw["summary"]["coin"]: mm_raw["summary"]} if "summary" in mm_raw else {}
+        {mm_single["coin"]: mm_single} if isinstance(mm_single, dict) and "coin" in mm_single else {}
     )
 
     # Top KPI computations
-    tn_eq = float(attr.get("equity_usd", 0.0))
+    tn_eq = float(attr.get("equity_usd") or 0.0)
     tn_fill = attr.get("real_alo_fill_rate_pct")
     tn_fill_txt = f"{tn_fill:.1f}%" if tn_fill is not None else "—"
     tn_liq_warns = len(attr.get("liq_warnings") or [])
@@ -178,12 +199,12 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     tn_api_ratio = attr.get("api_reqs_per_usd_vol")
     tn_api_txt = f"{tn_api_health} ({float(tn_api_ratio):.3f} req/$)" if tn_api_ratio is not None else tn_api_health
 
-    mm_vol = sum(float(s.get("volume_usd", 0.0)) for s in mm_sums.values())
-    mm_pnl = sum(float(s.get("net_pnl_usd", 0.0)) for s in mm_sums.values())
+    mm_vol = sum(_nf(s.get("volume_usd"), 0.0) for s in mm_sums.values())
+    mm_pnl = sum(_nf(s.get("net_pnl_usd"), 0.0) for s in mm_sums.values())
 
     cd_positions = list((cd_paper.get("positions") or {}).values())
     cd_avg_apr = (
-        sum(float(p.get("live_spread_apr_pct", 0.0)) for p in cd_positions) / len(cd_positions)
+        sum(_nf(p.get("live_spread_apr_pct"), 0.0) for p in cd_positions) / len(cd_positions)
         if cd_positions
         else 0.0
     )
@@ -195,9 +216,9 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     # Tab 1: Testnet Per-Coin Attribution rows + Paper Sparkline
     per_coin_rows = ""
     for c in attr.get("per_coin") or []:
-        sz = float(c.get("position_sz", 0.0))
+        sz = _nf(c.get("position_sz"), 0.0)
         side_badge = '<span class="pill green">Лонг</span>' if sz > 0 else ('<span class="pill red">Шорт</span>' if sz < 0 else '<span class="pill gray">Закрыта</span>')
-        pnl = float(c.get("net_pnl_usd", 0.0))
+        pnl = _nf(c.get("net_pnl_usd"), 0.0)
         pnl_cls = "pos" if pnl >= 0 else "neg"
         mk = f"{float(c['vw_markout_bps']):+.1f} б.п." if c.get("vw_markout_bps") is not None else "—"
         lq = f"{float(c['liq_distance_pct']):.1f}%" if c.get("liq_distance_pct") is not None else "—"
@@ -205,10 +226,10 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
         per_coin_rows += (
             "<tr>"
             f"<td><b>{_e(c.get('coin'))}</b></td>"
-            f"<td>{side_badge} ${float(c.get('position_usd', 0)):,.1f}</td>"
+            f"<td>{side_badge} ${_nf(c.get('position_usd'), 0):,.1f}</td>"
             f"<td><code>{_e(c.get('leverage_mode'))}</code></td>"
-            f"<td class='num'>{int(c.get('fills_count', 0))}</td>"
-            f"<td class='num'>{float(c.get('maker_share_pct', 0)):.0f}%</td>"
+            f"<td class='num'>{_ni(c.get('fills_count'), 0)}</td>"
+            f"<td class='num'>{_nf(c.get('maker_share_pct'), 0):.0f}%</td>"
             f"<td class='num {pnl_cls}'>{pnl:+.2f}$</td>"
             f"<td class='num'>{_e(mk)}</td>"
             f"<td class='num'>{_e(lq)}</td>"
@@ -218,22 +239,26 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     if not per_coin_rows:
         per_coin_rows = '<tr><td colspan="9" class="muted">Нет данных атрибуции Testnet</td></tr>'
 
-    paper_eq_vals = [float(t["equity_usd"]) for t in (d.get("paper_ticks") or []) if "equity_usd" in t]
+    paper_eq_vals = [
+        float(t["equity_usd"])
+        for t in (d.get("paper_ticks") or [])
+        if isinstance(t, dict) and t.get("equity_usd") is not None and math.isfinite(float(t["equity_usd"]))
+    ]
     paper_spark = _svg_sparkline(paper_eq_vals, stroke="#38bdf8")
 
     # Tab 2: MM v2 summaries + calibration SVGs
     mm_rows = ""
     for c_name, s in mm_sums.items():
         mk5 = f"{float(s['vw_markout_5s_bps']):+.2f} б.п." if s.get("vw_markout_5s_bps") is not None else "—"
-        pnl_v = float(s.get("net_pnl_usd", 0.0))
+        pnl_v = _nf(s.get("net_pnl_usd"), 0.0)
         mm_rows += (
             "<tr>"
             f"<td><b>{_e(c_name)}</b></td>"
-            f"<td class='num'>{int(s.get('ticks_observed', 0))} ({int(s.get('bbo_ticks_observed', 0))} bbo)</td>"
-            f"<td class='num'>{int(s.get('quotes_modified', 0))} / {int(s.get('lead_pulls', 0))}</td>"
-            f"<td class='num'>{float(s.get('avg_half_spread_bps', 0)):.2f} б.п.</td>"
-            f"<td class='num'>{int(s.get('fills_count', 0))} ({int(s.get('buy_fills', 0))}B/{int(s.get('sell_fills', 0))}S)</td>"
-            f"<td class='num'>${float(s.get('volume_usd', 0)):,.2f} · {float(s.get('maker_share_pct', 0)):.0f}%</td>"
+            f"<td class='num'>{_ni(s.get('ticks_observed'), 0)} ({_ni(s.get('bbo_ticks_observed'), 0)} bbo)</td>"
+            f"<td class='num'>{_ni(s.get('quotes_modified'), 0)} / {_ni(s.get('lead_pulls'), 0)}</td>"
+            f"<td class='num'>{_nf(s.get('avg_half_spread_bps'), 0):.2f} б.п.</td>"
+            f"<td class='num'>{_ni(s.get('fills_count'), 0)} ({_ni(s.get('buy_fills'), 0)}B/{_ni(s.get('sell_fills'), 0)}S)</td>"
+            f"<td class='num'>${_nf(s.get('volume_usd'), 0):,.2f} · {_nf(s.get('maker_share_pct'), 0):.0f}%</td>"
             f"<td class='num {'pos' if pnl_v >= 0 else 'neg'}'>{pnl_v:+.4f}$</td>"
             f"<td class='num pos'>{_e(mk5)}</td>"
             "</tr>"
@@ -243,34 +268,36 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
 
     cal_cards = ""
     for c_name, cal in mm_cal.items():
+        if not isinstance(cal, dict):
+            continue
         cal_cards += (
             '<div class="card">'
             f'<h4>Калибровка λ(δ)=Ae<sup>−κδ</sup> · {_e(c_name)}</h4>'
-            f'<div class="meta-line">κ = <b>{float(cal.get("kappa_per_bp", 0)):.3f} 1/б.п.</b> · '
-            f'A = {float(cal.get("arrival_a_per_sec", 0)):.3f} 1/с · '
-            f'R² = <b>{float(cal.get("r2_fit", 0)):.2f}</b> · '
-            f'σ<sub>30s</sub> = {float(cal.get("empirical_sigma_tau_bps", 0)):.1f} б.п.</div>'
+            f'<div class="meta-line">κ = <b>{_nf(cal.get("kappa_per_bp"), 0):.3f} 1/б.п.</b> · '
+            f'A = {_nf(cal.get("arrival_a_per_sec"), 0):.3f} 1/с · '
+            f'R² = <b>{_nf(cal.get("r2_fit"), 0):.2f}</b> · '
+            f'σ<sub>30s</sub> = {_nf(cal.get("empirical_sigma_tau_bps"), 0):.1f} б.п.</div>'
             f'{_svg_calibration_curve(cal)}'
             "</div>"
         )
 
     # Tab 3: HL x Lighter x Extended Paper + 5-DEX v2 Opportunities
     cdp_rows = ""
-    for p in sorted(cd_positions, key=lambda x: -float(x.get("live_spread_apr_pct", 0.0))):
-        net_p = float(p.get("net_pnl_usd", 0.0))
+    for p in sorted(cd_positions, key=lambda x: -_nf(x.get("live_spread_apr_pct"), 0.0)):
+        net_p = _nf(p.get("net_pnl_usd"), 0.0)
         venue = str(p.get("other_dex") or "lighter")
-        mode_lbl = "H1-Combo" if float(p.get("entry_exec_basis_bps", 0.0)) >= 8.0 else "Carry"
+        mode_lbl = "H1-Combo" if _nf(p.get("entry_exec_basis_bps"), 0.0) >= 8.0 else "Carry"
         pill_cls = "green" if mode_lbl == "H1-Combo" else "gray"
         cdp_rows += (
             "<tr>"
             f"<td><b>{_e(p.get('coin'))}</b></td>"
             f"<td><code>{_e(venue)}</code> <span class='pill {pill_cls}'>{mode_lbl}</span></td>"
             f"<td>{_e(p.get('direction'))}</td>"
-            f"<td class='num'>${float(p.get('leg_notional_usd', 0)):,.0f}</td>"
-            f"<td class='num pos'><b>{float(p.get('live_spread_apr_pct', 0)):+.1f}%</b></td>"
-            f"<td class='num'>{float(p.get('entry_l2_slip_bps', 0)):.1f} б.п.</td>"
-            f"<td class='num'>{float(p.get('entry_breakeven_hours', 0)):.0f}ч</td>"
-            f"<td class='num'>{float(p.get('hours_held', 0)):.1f}ч</td>"
+            f"<td class='num'>${_nf(p.get('leg_notional_usd'), 0):,.0f}</td>"
+            f"<td class='num pos'><b>{_nf(p.get('live_spread_apr_pct'), 0):+.1f}%</b></td>"
+            f"<td class='num'>{_nf(p.get('entry_l2_slip_bps'), 0):.1f} б.п.</td>"
+            f"<td class='num'>{_nf(p.get('entry_breakeven_hours'), 0):.0f}ч</td>"
+            f"<td class='num'>{_nf(p.get('hours_held'), 0):.1f}ч</td>"
             f"<td class='num {'pos' if net_p >= 0 else 'neg'}'>{net_p:+.2f}$</td>"
             "</tr>"
         )
@@ -287,11 +314,11 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
             "<tr>"
             f"<td><b>{_e(r.get('coin'))}</b></td>"
             f"<td>{_e(r.get('direction'))}</td>"
-            f"<td class='num pos'><b>{float(r.get('spread_apr_pct', 0)):.1f}%</b></td>"
+            f"<td class='num pos'><b>{_nf(r.get('spread_apr_pct'), 0):.1f}%</b></td>"
             f"<td class='num'>{_e(eb)}</td>"
             f"<td class='num'>{_e(s10)} / {_e(s50)} б.п.</td>"
             f"<td>{ok50}</td>"
-            f"<td class='num'>${float(r.get('hl_vol_m', 0)):,.1f}M / ${float(r.get('other_vol_m', 0)):,.1f}M</td>"
+            f"<td class='num'>${_nf(r.get('hl_vol_m'), 0):,.1f}M / ${_nf(r.get('other_vol_m'), 0):,.1f}M</td>"
             "</tr>"
         )
 
@@ -301,11 +328,11 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
         l1_rows += (
             "<tr>"
             f"<td><b>{_e(o.get('coin'))}</b></td>"
-            f"<td class='num'>{int(o.get('asset_index', 0))}</td>"
-            f"<td class='num'>{float(o.get('l1read_mark_px', 0)):,.5g}</td>"
-            f"<td class='num'>{float(o.get('l1read_oracle_px', 0)):,.5g}</td>"
-            f"<td class='num'>{float(o.get('rest_mark_px', 0)):,.5g}</td>"
-            f"<td class='num pos'>{float(o.get('drift_bps', 0)):+.2f} б.п.</td>"
+            f"<td class='num'>{_ni(o.get('asset_index'), 0)}</td>"
+            f"<td class='num'>{_nf(o.get('l1read_mark_px'), 0):,.5g}</td>"
+            f"<td class='num'>{_nf(o.get('l1read_oracle_px'), 0):,.5g}</td>"
+            f"<td class='num'>{_nf(o.get('rest_mark_px'), 0):,.5g}</td>"
+            f"<td class='num pos'>{_nf(o.get('drift_bps'), 0):+.2f} б.п.</td>"
             "</tr>"
         )
     evm_rows = ""
@@ -315,24 +342,24 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
             "<tr>"
             f"<td>{_e(a.get('dex'))}</td>"
             f"<td><b>{_e(a.get('label'))}</b></td>"
-            f"<td class='num'>{float(a.get('gross_spread_bps', 0)):+.1f} б.п.</td>"
-            f"<td class='num'>{float(a.get('peg_adjusted_spread_bps', 0)):+.1f} б.п.</td>"
-            f"<td class='num'>{badge} {float(a.get('net_arb_bps', 0)):+.1f} б.п.</td>"
-            f"<td class='num'>${float(a.get('virtual_depth_usd', 0))/1e6:,.2f}M</td>"
-            f"<td class='num'>{float(a.get('slippage_25k_bps', 0)):.1f} б.п.</td>"
+            f"<td class='num'>{_nf(a.get('gross_spread_bps'), 0):+.1f} б.п.</td>"
+            f"<td class='num'>{_nf(a.get('peg_adjusted_spread_bps'), 0):+.1f} б.п.</td>"
+            f"<td class='num'>{badge} {_nf(a.get('net_arb_bps'), 0):+.1f} б.п.</td>"
+            f"<td class='num'>${_nf(a.get('virtual_depth_usd'), 0)/1e6:,.2f}M</td>"
+            f"<td class='num'>{_nf(a.get('slippage_25k_bps'), 0):.1f} б.п.</td>"
             "</tr>"
         )
     vault_rows = ""
     for v in evm.get("vaults") or []:
-        apr = float(v.get("apr_pct", 0.0))
+        apr = _nf(v.get("apr_pct"), 0.0)
         vault_rows += (
             "<tr>"
             f"<td><b>{_e(v.get('name'))}</b></td>"
-            f"<td class='num'>${float(v.get('tvl_usd', 0))/1e6:,.2f}M</td>"
+            f"<td class='num'>${_nf(v.get('tvl_usd'), 0)/1e6:,.2f}M</td>"
             f"<td class='num {'pos' if apr >= 0 else 'neg'}'><b>{apr:+.2f}%</b></td>"
-            f"<td class='num'>{int(v.get('open_positions_count', 0))}</td>"
-            f"<td class='num'>${float(v.get('total_notional_usd', 0))/1e6:,.2f}M</td>"
-            f"<td class='num'>{float(v.get('margin_utilization_pct', 0)):.1f}%</td>"
+            f"<td class='num'>{_ni(v.get('open_positions_count'), 0)}</td>"
+            f"<td class='num'>${_nf(v.get('total_notional_usd'), 0)/1e6:,.2f}M</td>"
+            f"<td class='num'>{_nf(v.get('margin_utilization_pct'), 0):.1f}%</td>"
             "</tr>"
         )
 
@@ -351,10 +378,10 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
         h6_rows += (
             "<tr>"
             f"<td><b>{_e(r.get('coin'))}</b></td>"
-            f"<td class='num'>{float(r.get('mid_vs_mark_bps', 0)):+.2f} б.п.</td>"
-            f"<td class='num'><b>{float(r.get('mark_vs_oracle_bps', 0)):+.2f} б.п.</b></td>"
+            f"<td class='num'>{_nf(r.get('mid_vs_mark_bps'), 0):+.2f} б.п.</td>"
+            f"<td class='num'><b>{_nf(r.get('mark_vs_oracle_bps'), 0):+.2f} б.п.</b></td>"
             f"<td><code>{_e(r.get('stress_type'))}</code></td>"
-            f"<td class='num'>${float(r.get('day_vol_usd', 0))/1e6:,.1f}M</td>"
+            f"<td class='num'>${_nf(r.get('day_vol_usd'), 0)/1e6:,.1f}M</td>"
             f"<td>{al_pill}</td>"
             "</tr>"
         )
@@ -369,9 +396,9 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
             liq_rows += (
                 "<tr>"
                 f"<td><b>{_e(r.get('coin'))}</b></td>"
-                f"<td class='num'>{float(r.get('mark_px', 0)):,.5g}</td>"
-                f"<td class='num'>{int(r.get('whales_count', 0))}</td>"
-                f"<td class='num'><b>${float(r.get('total_0_10_usd', 0))/1e6:,.2f}M</b></td>"
+                f"<td class='num'>{_nf(r.get('mark_px'), 0):,.5g}</td>"
+                f"<td class='num'>{_ni(r.get('whales_count'), 0)}</td>"
+                f"<td class='num'><b>${_nf(r.get('total_0_10_usd'), 0)/1e6:,.2f}M</b></td>"
                 f"<td class='num'>{_e(wall)}</td>"
                 f"<td>{_e(r.get('cascade_bias'))}</td>"
                 "</tr>"
@@ -381,9 +408,9 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
             liq_rows += (
                 "<tr>"
                 f"<td><b>{_e(c.get('coin'))}</b></td>"
-                f"<td class='num'>{float(c.get('mark_px', 0)):,.5g}</td>"
-                f"<td class='num'>{int(c.get('whales_count', 0))}</td>"
-                f"<td class='num'>${float(c.get('total_0_10_usd', 0))/1e6:,.2f}M</td>"
+                f"<td class='num'>{_nf(c.get('mark_px'), 0):,.5g}</td>"
+                f"<td class='num'>{_ni(c.get('whales_count'), 0)}</td>"
+                f"<td class='num'>${_nf(c.get('total_0_10_usd'), 0)/1e6:,.2f}M</td>"
                 f"<td class='num'>L −{_e(c.get('nearest_long_dist_pct', '—'))}% / S +{_e(c.get('nearest_short_dist_pct', '—'))}%</td>"
                 f"<td>{_e(c.get('cascade_bias'))}</td>"
                 "</tr>"
@@ -396,7 +423,9 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     if st_list:
         sdf = pd.DataFrame(st_list)
         dev_m = sdf[sdf["split"] == "dev"].set_index(["bucket", "strategy"])
+        dev_m = dev_m[~dev_m.index.duplicated(keep="last")]
         hld_m = sdf[sdf["split"] == "holdout"].set_index(["bucket", "strategy"])
+        hld_m = hld_m[~hld_m.index.duplicated(keep="last")]
         for key in dev_m.index:
             if key not in hld_m.index:
                 continue
@@ -446,7 +475,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
             "<tr>"
             f"<td><b>{_e(o.get('base_symbol'))}</b></td>"
             f"<td><code>S {_e(o.get('short_symbol'))}</code> / <code>L {_e(o.get('long_symbol'))}</code></td>"
-            f"<td class='num pos'><b>+{float(o.get('spread_apr_pct', 0)):.1f}%</b></td>"
+            f"<td class='num pos'><b>+{_nf(o.get('spread_apr_pct'), 0):.1f}%</b></td>"
             f"<td>{gm}</td>"
             f"<td class='num'>{odiv_html}</td>"
             f"<td class='num'>{_e(eb5)}</td>"
@@ -465,10 +494,10 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
             "<tr>"
             f"<td><code>{_e(m.get('market_id'))}</code></td>"
             f"<td><b>{_e(m.get('name'))}</b>{spr}</td>"
-            f"<td class='num'>{float(m.get('days_to_maturity', 0)):.1f}д</td>"
-            f"<td class='num pos'><b>{float(m.get('best_bid_apr_pct', 0)):+.2f}%</b> / {float(m.get('best_ask_apr_pct', 0)):+.2f}%</td>"
-            f"<td class='num'>{float(m.get('floating_apr_pct', 0)):+.2f}%</td>"
-            f"<td class='num'>{float(m.get('fixed_minus_float_bid_pct', 0)):+.2f}%</td>"
+            f"<td class='num'>{float(m.get('days_to_maturity') or 0):.1f}д</td>"
+            f"<td class='num pos'><b>{float(m.get('best_bid_apr_pct') or 0):+.2f}%</b> / {float(m.get('best_ask_apr_pct') or 0):+.2f}%</td>"
+            f"<td class='num'>{float(m.get('floating_apr_pct') or 0):+.2f}%</td>"
+            f"<td class='num'>{float(m.get('fixed_minus_float_bid_pct') or 0):+.2f}%</td>"
             f"<td>{_e(m.get('recommended_action'))}</td>"
             "</tr>"
         )
@@ -483,10 +512,10 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
             "<tr>"
             f"<td><b>{_e(s.get('name'))}</b></td>"
             f"<td>{rt_pill}</td>"
-            f"<td class='num'>{float(s.get('gross_stacked_apr_pct', 0)):+.2f}%</td>"
-            f"<td class='num'>{float(s.get('capital_efficiency_pct', 0)):.0f}%</td>"
-            f"<td class='num pos'><b>{float(s.get('net_deposit_apr_pct', 0)):+.2f}%</b></td>"
-            f"<td class='num'>{float(s.get('liq_buffer_pct', 0)):.0f}%</td>"
+            f"<td class='num'>{_nf(s.get('gross_stacked_apr_pct'), 0):+.2f}%</td>"
+            f"<td class='num'>{_nf(s.get('capital_efficiency_pct'), 0):.0f}%</td>"
+            f"<td class='num pos'><b>{_nf(s.get('net_deposit_apr_pct'), 0):+.2f}%</b></td>"
+            f"<td class='num'>{_nf(s.get('liq_buffer_pct'), 0):.0f}%</td>"
             f"<td class='muted'>{_e(s.get('key_risks'))}</td>"
             "</tr>"
         )
@@ -574,22 +603,22 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     <div class="kpi">
       <div class="lbl">3. Маркет-мейкер (живой тест)</div>
       <div class="val {'pos' if mm_pnl >= 0 else 'neg'}">{mm_pnl:+.4f}$</div>
-      <div class="sub">Оборот ${mm_vol:,.1f} · 100% Maker · скорость <b>{float(lat.get('p50_us', 0)):.1f} мкс</b></div>
+      <div class="sub">Оборот ${mm_vol:,.1f} · 100% Maker · скорость <b>{_nf(lat.get('p50_us'), 0):.1f} мкс</b></div>
     </div>
     <div class="kpi">
       <div class="lbl">4. Арбитраж HL × Lighter</div>
       <div class="val pos">{cd_avg_apr:+.1f}% APR</div>
-      <div class="sub">Открыто {len(cd_positions)} пар · Баланс ${float(cd_paper.get('equity_usd', 50000)):,.2f}</div>
+      <div class="sub">Открыто {len(cd_positions)} пар · Баланс ${_nf(cd_paper.get('equity_usd'), 50000):,.2f}</div>
     </div>
     <div class="kpi">
-      <div class="lbl">5. HyperEVM (Chain {int(evm_chain.get('chain_id', 999))}) и HLP</div>
-      <div class="val pos">${float(hlp_vault.get('tvl_usd', 0))/1e6:,.1f}M</div>
-      <div class="sub">Доходность HLP {float(hlp_vault.get('apr_pct', 0)):+.2f}% · Пег USDT0 {float(evm_chain.get('usdt0_peg_discount_bps', 0)):+.1f} б.п.</div>
+      <div class="lbl">5. HyperEVM (Chain {_ni(evm_chain.get('chain_id'), 999)}) и HLP</div>
+      <div class="val pos">${_nf(hlp_vault.get('tvl_usd'), 0)/1e6:,.1f}M</div>
+      <div class="sub">Доходность HLP {_nf(hlp_vault.get('apr_pct'), 0):+.2f}% · Пег USDT0 {_nf(evm_chain.get('usdt0_peg_discount_bps'), 0):+.1f} б.п.</div>
     </div>
     <div class="kpi">
       <div class="lbl">6. Аудит фандинга в :00</div>
-      <div class="val">{int(s_meta.get('total_settlement_events', 0)):,}</div>
-      <div class="sub">{int(s_meta.get('coins_collected', 0))} монет · {float(s_meta.get('span_days', 0)):.1f} дн. · Фильтр в проде</div>
+      <div class="val">{_ni(s_meta.get('total_settlement_events'), 0):,}</div>
+      <div class="sub">{_ni(s_meta.get('coins_collected'), 0)} монет · {_nf(s_meta.get('span_days'), 0):.1f} дн. · Фильтр в проде</div>
     </div>
   </section>
 
@@ -614,12 +643,12 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     <div class="grid-2">
       <div class="card">
         <h3>Paper L2 Shadow Tracker (HL × Bybit/Binance/OKX)</h3>
-        <div class="meta-line">Тиков: <b>{int(paper.get('ticks', 0))}</b> · Позиций: <b>{int(paper.get('active_positions', 0))}</b> · Equity: <b>${float(paper.get('equity_usd', 100000)):,.2f}</b> ({float(paper.get('return_pct', 0)):+.3f}%) · HL fee <code>5.0 б.п.</code> (PR #19) · Obs-Only</div>
+        <div class="meta-line">Тиков: <b>{_ni(paper.get('ticks'), 0)}</b> · Позиций: <b>{_ni(paper.get('active_positions'), 0)}</b> · Equity: <b>${_nf(paper.get('equity_usd'), 100000):,.2f}</b> ({_nf(paper.get('return_pct'), 0):+.3f}%) · HL fee <code>5.0 б.п.</code> (PR #19) · Obs-Only</div>
         {paper_spark}
       </div>
       <div class="card">
         <h3>Пост-трейд атрибуция Hyperliquid Testnet</h3>
-        <div class="meta-line">Адрес: <code>{_e(attr.get('account_address', '—'))}</code> · Сделок: <b>{int(attr.get('total_fills', 0))}</b> · Оборот: <b>${float(attr.get('total_volume_usd', 0)):,.1f}</b> · Maker: <b>{float(attr.get('maker_volume_share_pct', 0)):.1f}%</b> · Fee: <b>{float(attr.get('effective_fee_bps', 0)):.2f} б.п.</b></div>
+        <div class="meta-line">Адрес: <code>{_e(attr.get('account_address', '—'))}</code> · Сделок: <b>{_ni(attr.get('total_fills'), 0)}</b> · Оборот: <b>${_nf(attr.get('total_volume_usd'), 0):,.1f}</b> · Maker: <b>{_nf(attr.get('maker_volume_share_pct'), 0):.1f}%</b> · Fee: <b>{_nf(attr.get('effective_fee_bps'), 0):.2f} б.п.</b></div>
         <div class="meta-line">Риски: <b>{tn_liq_warns}</b> ликв. · <b>{tn_adl_warns}</b> ADL-алертов · API Quota: <code>{_e(tn_api_txt)}</code> · защита <code>onlyIsolated</code> + <code>cross:3x</code> + <code>:55–:59</code>.</div>
       </div>
     </div>
@@ -638,12 +667,12 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
       <div class="guide-grid">
         <div class="guide-item"><b>Идея:</b> робот одновременно ставит заявку на покупку и продажу в стакане и зарабатывает спред, автоматически сдвигая цены при накоплении позиции.</div>
         <div class="guide-item"><b>Как читать цифры:</b> <code>Markout +5s &gt; 0</code> — нас не «переезжают» быстрые игроки; <code>LeadPull</code> — сколько раз бот успел убрать ордер по сигналу Binance; графики внизу показывают, как часто исполняются ордера в глубине стакана.</div>
-        <div class="guide-item"><b>Статус сейчас:</b> 🟢 Живой тест на BTC+ETH закрыт в плюс (<b>{mm_pnl:+.4f}$</b>, 100% Maker, скорость расчёта <b>{float(lat.get('p50_us', 0)):.2f} мкс</b>).</div>
+        <div class="guide-item"><b>Статус сейчас:</b> 🟢 Живой тест на BTC+ETH закрыт в плюс (<b>{mm_pnl:+.4f}$</b>, 100% Maker, скорость расчёта <b>{_nf(lat.get('p50_us'), 0):.2f} мкс</b>).</div>
       </div>
     </div>
     <div class="card">
       <h3>Живая мульти-монетная сессия Avellaneda–Stoikov MM v2 (WS bbo+l2Book + Binance Lead-Lag + batchModify + scheduleCancel)</h3>
-      <div class="meta-line">Бенчмарк горячего пути (<code>3 000</code> тиков): <b>p50 = {float(lat.get('p50_us', 0)):.2f} мкс</b> · <b>p95 = {float(lat.get('p95_us', 0)):.2f} мкс</b> · <b>p99 = {float(lat.get('p99_us', 0)):.2f} мкс</b> · <b>{int(lat.get('throughput_ticks_per_sec', 0)):,}</b> тик/с · <code>:59→:05</code> funding overlay встроен.</div>
+      <div class="meta-line">Бенчмарк горячего пути (<code>3 000</code> тиков): <b>p50 = {_nf(lat.get('p50_us'), 0):.2f} мкс</b> · <b>p95 = {_nf(lat.get('p95_us'), 0):.2f} мкс</b> · <b>p99 = {_nf(lat.get('p99_us'), 0):.2f} мкс</b> · <b>{_ni(lat.get('throughput_ticks_per_sec'), 0):,}</b> тик/с · <code>:59→:05</code> funding overlay встроен.</div>
       <table>
         <thead><tr><th>Монета</th><th class="num">Тики (bbo)</th><th class="num">batchMod / LeadPull</th><th class="num">Полуспред</th><th class="num">Сделки</th><th class="num">Оборот · Maker</th><th class="num">Net PnL</th><th class="num">Markout +5s</th></tr></thead>
         <tbody>{mm_rows}</tbody>
@@ -663,7 +692,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     </div>
     <div class="card">
       <h3>Двуногий Paper-трекер v2: Hyperliquid × Lighter × Extended (Persistence + Slip ≤ 5 б.п. + H1 Basis+Carry)</h3>
-      <div class="meta-line">Баланс: <b>${float(cd_paper.get('equity_usd', 50000)):,.2f}</b> · Persistence ≥ 2 тика, L2 slip ≤ 5 б.п., Basis ≥ −3 б.п., H1-Combo (Basis ≥ +8 б.п.) · Funding {float(cd_paper.get('cum_funding_usd', 0)):+.2f}$ · Costs −{float(cd_paper.get('cum_costs_usd', 0)):.2f}$</div>
+      <div class="meta-line">Баланс: <b>${_nf(cd_paper.get('equity_usd'), 50000):,.2f}</b> · Persistence ≥ 2 тика, L2 slip ≤ 5 б.п., Basis ≥ −3 б.п., H1-Combo (Basis ≥ +8 б.п.) · Funding {_nf(cd_paper.get('cum_funding_usd'), 0):+.2f}$ · Costs −{_nf(cd_paper.get('cum_costs_usd'), 0):.2f}$</div>
       <table>
         <thead><tr><th>Монета</th><th>Площадка / Тип</th><th>Направление</th><th class="num">Нога ($)</th><th class="num">Live APR</th><th class="num">L2 Slip</th><th class="num">Окуп.</th><th class="num">Часов</th><th class="num">Net PnL</th></tr></thead>
         <tbody>{cdp_rows}</tbody>
@@ -684,13 +713,13 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
       <div class="guide-grid">
         <div class="guide-item"><b>Идея:</b> проверяем разницу цен между спотовыми DEX-пулами внутри блокчейна HyperEVM и фьючерсами Hyperliquid, а также следим за главным пулом ликвидности биржи (HLP).</div>
         <div class="guide-item"><b>Как читать цифры:</b> <code>Дрейф 0.00 б.п.</code> значит, что ончейн-оракул <code>L1Read</code> абсолютно точен. <code>Peg-Adj</code> убирает ложный арбитраж из-за того, что USDT0 торгуется с дисконтом к USDC.</div>
-        <div class="guide-item"><b>Статус сейчас:</b> 🟢 Ложные арбитражи отфильтрованы, HLP держит <b>${float(hlp_vault.get('tvl_usd', 0))/1e6:,.1f}M</b> под <b>{float(hlp_vault.get('apr_pct', 0)):+.2f}% APR</b>.</div>
+        <div class="guide-item"><b>Статус сейчас:</b> 🟢 Ложные арбитражи отфильтрованы, HLP держит <b>${_nf(hlp_vault.get('tvl_usd'), 0)/1e6:,.1f}M</b> под <b>{_nf(hlp_vault.get('apr_pct'), 0):+.2f}% APR</b>.</div>
       </div>
     </div>
     <div class="grid-2">
       <div class="card">
         <h3>Нативные прекомпилы HyperEVM <code>L1Read</code> (0x0806 / 0x0807 / 0x0809)</h3>
-        <div class="meta-line">EVM блок <code>#{int(evm_chain.get('block_number', 0)):,}</code> · L1 блок <code>#{int(evm_chain.get('l1_block_number', 0)):,}</code> · Газ <code>{float(evm_chain.get('gas_price_gwei', 0)):.3f} Gwei</code></div>
+        <div class="meta-line">EVM блок <code>#{_ni(evm_chain.get('block_number'), 0):,}</code> · L1 блок <code>#{_ni(evm_chain.get('l1_block_number'), 0):,}</code> · Газ <code>{_nf(evm_chain.get('gas_price_gwei'), 0):.3f} Gwei</code></div>
         <table>
           <thead><tr><th>Монета</th><th class="num">Idx</th><th class="num">L1Read Mark</th><th class="num">L1Read Oracle</th><th class="num">REST Mark</th><th class="num">Дрейф</th></tr></thead>
           <tbody>{l1_rows}</tbody>
@@ -706,7 +735,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     </div>
     <div class="card">
       <h3>Истинный (Peg-Adjusted) Арбитраж HyperCore ↔ HyperEVM + V3-глубина</h3>
-      <div class="meta-line">Пег <code>{_e(evm_chain.get('stable_peg_source', '—'))}</code>: <code>1 USDC = {float(evm_chain.get('usdt0_per_usdc', 1.0)):.6f} USDT0</code> ({float(evm_chain.get('usdt0_peg_discount_bps', 0)):+.2f} б.п.)</div>
+      <div class="meta-line">Пег <code>{_e(evm_chain.get('stable_peg_source', '—'))}</code>: <code>1 USDC = {_nf(evm_chain.get('usdt0_per_usdc'), 1.0):.6f} USDT0</code> ({_nf(evm_chain.get('usdt0_peg_discount_bps'), 0):+.2f} б.п.)</div>
       <table>
         <thead><tr><th>DEX</th><th>Пул</th><th class="num">Сырой</th><th class="num">Peg-Adj</th><th class="num">Net (0-clip)</th><th class="num">Вирт. глубина</th><th class="num">Slip $25k</th></tr></thead>
         <tbody>{evm_rows}</tbody>
@@ -718,7 +747,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     <div class="guide-box">
       <div class="guide-title">💡 Простыми словами: что показывают «Ликвидации китов и аудит фандинга :00»</div>
       <div class="guide-grid">
-        <div class="guide-item"><b>Идея:</b> на Hyperliquid видны точные цены ликвидации крупных трейдеров и фандинг платится каждый час ровно в <code>:00</code>. Мы проверили <b>{int(s_meta.get('total_settlement_events', 0)):,}</b> таких расчётов, чтобы отделить реальный доход от мифов.</div>
+        <div class="guide-item"><b>Идея:</b> на Hyperliquid видны точные цены ликвидации крупных трейдеров и фандинг платится каждый час ровно в <code>:00</code>. Мы проверили <b>{_ni(s_meta.get('total_settlement_events'), 0):,}</b> таких расчётов, чтобы отделить реальный доход от мифов.</div>
         <div class="guide-item"><b>Как читать вердикты:</b> <code>NO-GO</code> — стратегия теряет деньги после комиссий (не торгуем); <code>MM Overlay</code> — сигнал статистически реален (<code>+2.3…+3.8 б.п.</code>), поэтому мы вшили его бесплатно в сдвиг котировок маркет-мейкера и фильтр экзекутора.</div>
         <div class="guide-item"><b>Статус сейчас:</b> 🟢 Оба вывода уже работают в коде: экзекутор не лезет в ловушку в <code>:55–:59</code>, а MM сдвигает котировки в <code>:59–:05</code>.</div>
       </div>
@@ -734,7 +763,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
       </div>
       <div class="card">
         <h3>H6 Стресс BookMid ↔ Mark ↔ Oracle &amp; HLP MM PnL Inversion</h3>
-        <div class="meta-line">Режим MM PnL: {mm_regime_pill} · HLP Child Equity: <b>${float(mm_pnl_box.get('hlp_child_account_value_usd', 0))/1e6:,.2f}M</b> · Cooldown алертов: <code>4ч</code></div>
+        <div class="meta-line">Режим MM PnL: {mm_regime_pill} · HLP Child Equity: <b>${_nf(mm_pnl_box.get('hlp_child_account_value_usd'), 0)/1e6:,.2f}M</b> · Cooldown алертов: <code>4ч</code></div>
         <table>
           <thead><tr><th>Монета</th><th class="num">Mid vs Mark</th><th class="num">Mark vs Oracle</th><th>Тип</th><th class="num">Объём 24ч</th><th>Статус</th></tr></thead>
           <tbody>{h6_rows}</tbody>
@@ -742,8 +771,8 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
       </div>
     </div>
     <div class="card">
-      <h3>Каузальное {float(s_meta.get('span_days', 0)):.0f}-дневное OOS-исследование расчётов фандинга :00 (Dev 65% vs Holdout 35%)</h3>
-      <div class="meta-line">Монет: <b>{int(s_meta.get('coins_collected', 0))}</b> · Часовых расчётов: <b>{int(s_meta.get('total_settlement_events', 0)):,}</b> · Нулевой lookahead (<code>f(T0-1h)</code>) · Maker RT 3.0 б.п.</div>
+      <h3>Каузальное {_nf(s_meta.get('span_days'), 0):.0f}-дневное OOS-исследование расчётов фандинга :00 (Dev 65% vs Holdout 35%)</h3>
+      <div class="meta-line">Монет: <b>{_ni(s_meta.get('coins_collected'), 0)}</b> · Часовых расчётов: <b>{_ni(s_meta.get('total_settlement_events'), 0):,}</b> · Нулевой lookahead (<code>f(T0-1h)</code>) · Maker RT 3.0 б.п.</div>
       <table>
         <thead><tr><th>Бакет</th><th>Стратегия</th><th class="num">Dev N · Gross (t)</th><th class="num">Holdout N · Gross (t)</th><th class="num">Holdout Net Maker</th><th>Вердикт</th></tr></thead>
         <tbody>{s_rows}</tbody>
@@ -762,7 +791,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     </div>
     <div class="card">
       <h3>HIP-3 Кросс-билдер арбитраж на HyperCore L1 (нулевой риск моста · Growth Mode &amp; Oracle Guard)</h3>
-      <div class="meta-line">Билдеров: <b>{int(hip3.get('builders_discovered', 0))}</b> · Рынков: <b>{int(hip3.get('active_markets_count', 0))}</b> · Оборот 24ч: <b>${float(hip3.get('total_hip3_day_vol_usd', 0))/1e9:,.2f}B</b> · Сессия NY: <code>{_e(hip3.get('ny_session', '—'))}</code></div>
+      <div class="meta-line">Билдеров: <b>{_ni(hip3.get('builders_discovered'), 0)}</b> · Рынков: <b>{_ni(hip3.get('active_markets_count'), 0)}</b> · Оборот 24ч: <b>${_nf(hip3.get('total_hip3_day_vol_usd'), 0)/1e9:,.2f}B</b> · Сессия NY: <code>{_e(hip3.get('ny_session', '—'))}</code></div>
       <table>
         <thead><tr><th>Тикер</th><th>Ноги (Short / Long)</th><th class="num">Спред APR</th><th>Growth</th><th class="num">Oracle Div</th><th class="num">Exec Basis $5k</th><th class="num">Slip $5k / $25k</th><th class="num">Окуп. M/T</th><th>Режим</th></tr></thead>
         <tbody>{hip3_rows}</tbody>
@@ -770,7 +799,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     </div>
     <div class="card">
       <h3>Pendle Boros — Фиксация ставок фандинга Hyperliquid и Spread Markets</h3>
-      <div class="meta-line">Просканировано рынков Boros: <b>{int(boros.get('total_markets_scanned', 0))}</b> · Активных: <b>{int(boros.get('active_markets_count', 0))}</b> · Hyperliquid / Spread: <b>{int(boros.get('hl_and_spread_count', 0))}</b></div>
+      <div class="meta-line">Просканировано рынков Boros: <b>{_ni(boros.get('total_markets_scanned'), 0)}</b> · Активных: <b>{_ni(boros.get('active_markets_count'), 0)}</b> · Hyperliquid / Spread: <b>{_ni(boros.get('hl_and_spread_count'), 0)}</b></div>
       <table>
         <thead><tr><th>ID</th><th>Рынок Boros</th><th class="num">Срок</th><th class="num">Fixed Bid / Ask</th><th class="num">Float</th><th class="num">Bid − Float</th><th>Идея</th></tr></thead>
         <tbody>{boros_rows}</tbody>
@@ -778,7 +807,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     </div>
     <div class="card">
       <h3>HyperEVM Composable Delta-Neutral Yield Stack (kHYPE / stHYPE + Short HYPE + Boros vs HLP)</h3>
-      <div class="meta-line">HYPE Funding: <b>{float(ys_inp.get('hype_funding_apr_pct', 0)):+.2f}%</b> · kHYPE: <b>{float(ys_inp.get('khype_apy_pct', 0)):.2f}%</b> (${float(ys_inp.get('khype_tvl_usd', 0))/1e6:,.0f}M) · Boros Fix: <b>{float(ys_inp.get('boros_hype_fixed_bid_apr_pct') or 0):+.2f}%</b> · HLP: <b>{float(ys_inp.get('hlp_apr_pct', 0)):.2f}%</b></div>
+      <div class="meta-line">HYPE Funding: <b>{_nf(ys_inp.get('hype_funding_apr_pct'), 0):+.2f}%</b> · kHYPE: <b>{_nf(ys_inp.get('khype_apy_pct'), 0):.2f}%</b> (${_nf(ys_inp.get('khype_tvl_usd'), 0)/1e6:,.0f}M) · Boros Fix: <b>{float(ys_inp.get('boros_hype_fixed_bid_apr_pct') or 0):+.2f}%</b> · HLP: <b>{_nf(ys_inp.get('hlp_apr_pct'), 0):.2f}%</b></div>
       <table>
         <thead><tr><th>Связка</th><th>Тип</th><th class="num">Gross</th><th class="num">Эфф. кап.</th><th class="num">Net на депозит</th><th class="num">Буфер</th><th>Риски</th></tr></thead>
         <tbody>{ys_rows}</tbody>

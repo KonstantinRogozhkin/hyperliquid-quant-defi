@@ -19,8 +19,10 @@ TEMP_DIR="${ROOT_DIR}/.neira/temp"
 mkdir -p "${TEMP_DIR}"
 BACKUP_PATH="${TEMP_DIR}/hl_onchain_events_crontab_backup_${RUN_DATE}_${RUN_TIME}.txt"
 CRON_PATH="${TEMP_DIR}/hl_onchain_events_crontab_install_${RUN_DATE}_${RUN_TIME}.txt"
-BEGIN_MARKER="# BEGIN Spy2Money BackTester hl onchain event alpha schedule"
-END_MARKER="# END Spy2Money BackTester hl onchain event alpha schedule"
+LEGACY_BEGIN_MARKER="# BEGIN Spy2Money BackTester hl onchain event alpha schedule"
+LEGACY_END_MARKER="# END hyperliquid-quant-defi onchain event alpha schedule"
+BEGIN_MARKER="# BEGIN hyperliquid-quant-defi onchain event alpha schedule"
+END_MARKER="# END hyperliquid-quant-defi onchain event alpha schedule"
 TICK_PATH="${ROOT_DIR}/scripts/ops/run_hl_onchain_event_tick.sh"
 HL_ONCHAIN_CRON_SCHEDULE="${HL_ONCHAIN_CRON_SCHEDULE:-*/15 * * * *}"
 
@@ -29,9 +31,9 @@ printf "%s\n" "${EXISTING_CRONTAB}" > "${BACKUP_PATH}"
 
 {
   if [[ -n "${EXISTING_CRONTAB}" ]]; then
-    printf "%s\n" "${EXISTING_CRONTAB}" | awk -v begin="${BEGIN_MARKER}" -v end="${END_MARKER}" '
-      $0 == begin {skip=1; next}
-      $0 == end {skip=0; next}
+    printf "%s\n" "${EXISTING_CRONTAB}" | awk -v begin="${BEGIN_MARKER}" -v end="${END_MARKER}" -v lbegin="${LEGACY_BEGIN_MARKER}" -v lend="${LEGACY_END_MARKER}" '
+      $0 == begin || $0 == lbegin {skip=1; next}
+      $0 == end || $0 == lend {skip=0; next}
       skip == 0 {print}
     '
   fi
