@@ -201,12 +201,41 @@ def _window_return(
     return (end_val / start_val - 1.0) * 100.0, span
 
 
-def _daily_closes(dates_dt: list[datetime], shares: list[float]) -> list[float]:
-    """Resample an (possibly intraday) share series to one UTC calendar-day close per day."""
+def _daily_close_series(dates_dt: list[datetime], shares: list[float]) -> pd.Series:
+    """Resample an (possibly intraday) share series to one UTC calendar-day close per ``YYYY-MM-DD``."""
     by_day: dict[str, float] = {}
     for d, v in zip(dates_dt, shares, strict=False):
         by_day[d.astimezone(timezone.utc).strftime("%Y-%m-%d")] = float(v)
-    return [by_day[k] for k in sorted(by_day)]
+    if not by_day:
+        return pd.Series(dtype=float)
+    keys = sorted(by_day)
+    return pd.Series([by_day[k] for k in keys], index=keys, dtype=float)
+
+
+def _daily_closes(dates_dt: list[datetime], shares: list[float]) -> list[float]:
+    """Resample an (possibly intraday) share series to one UTC calendar-day close per day."""
+    return _daily_close_series(dates_dt, shares).tolist()
+
+
+def _consecutive_daily_log_returns(series: pd.Series) -> pd.Series:
+    """Compute daily log returns strictly across consecutive 1-calendar-day intervals.
+
+    Multi-day gaps (e.g. a 3-day worker outage) are masked out rather than treated as a single
+    1-day return, preventing distorted Sharpe/Sortino variance and misaligned OLS beta regressions.
+    """
+    if series is None or series.empty:
+        return pd.Series(dtype=float)
+    clean = pd.to_numeric(series, errors="coerce")
+    clean = clean[clean > 0].dropna().sort_index()
+    if len(clean) < 2:
+        return pd.Series(dtype=float)
+    lr = np.log(clean.astype(float)).diff()
+    idx_dt = pd.to_datetime(clean.index, utc=True, errors="coerce")
+    if idx_dt.isna().any():
+        return lr.dropna()
+    day_steps = pd.Series(idx_dt, index=clean.index).diff().dt.total_seconds() / 86_400.0
+    valid = day_steps.between(0.95, 1.05)
+    return lr[valid].dropna()
 
 
 def _compute_drawdown_stats(
@@ -336,21 +365,28 @@ def compute_series_performance(
     win_streak = loss_streak = 0
     unique_cal_days = len({d.astimezone(timezone.utc).strftime("%Y-%m-%d") for d in dates_dt})
 
+    def _with_daily_inception(daily_ser: pd.Series) -> pd.Series:
+        if daily_ser.empty or inception_share is None or inception_share <= 0:
+            return daily_ser
+        first_dt = pd.to_datetime(str(daily_ser.index[0]), utc=True, errors="coerce")
+        if pd.isna(first_dt):
+            return daily_ser
+        prev_day = (first_dt - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+        anchor = pd.Series([float(inception_share)], index=[prev_day], dtype=float)
+        return pd.concat([anchor, daily_ser])
+
     def _ratios(series: list[float]) -> tuple[float | None, float | None]:
         if unique_cal_days < 5 or len(series) < 5:
             return None, None
-        # Always resample to UTC calendar-day closes (never raw 4h intraday ticks) and prepend
-        # `inception_share` when inside the trailing 90d window so Day-1 entry costs are included.
-        daily_vals = _daily_closes(dates_dt, series)
-        if inception_share is not None and inception_share > 0 and len(daily_vals) <= 90:
-            daily_vals = [float(inception_share), *daily_vals]
+        # Always resample to UTC calendar-day closes (never raw 4h intraday ticks), prepend
+        # `inception_share` when inside the trailing 90d window, and drop non-consecutive day gaps.
+        daily_ser = _daily_close_series(dates_dt, series)
+        if inception_share is not None and inception_share > 0 and len(daily_ser) <= 90:
+            daily_ser = _with_daily_inception(daily_ser)
         else:
-            daily_vals = daily_vals[-91:]
-        sub = np.asarray(daily_vals, dtype=float)
-        sub = sub[sub > 0]
-        if len(sub) < 3:
-            return None, None
-        lr = np.diff(np.log(sub))
+            daily_ser = daily_ser.iloc[-91:]
+        lr_ser = _consecutive_daily_log_returns(daily_ser)
+        lr = lr_ser.to_numpy(dtype=float)
         if len(lr) < 2:
             return None, None
         mean_d = float(np.mean(lr))
@@ -365,16 +401,13 @@ def compute_series_performance(
             so = None
         return sh, so
 
-    # Positive-days % and win/loss streaks are computed on UTC calendar-day closes (never on raw
-    # intraday ticks) and only once >= 2 calendar days exist.
+    # Positive-days % and win/loss streaks are computed on consecutive UTC calendar-day closes
+    # (never on raw intraday ticks or multi-day outage jumps) and only once >= 2 calendar days exist.
     if unique_cal_days >= 2:
-        daily = _daily_closes(dates_dt, gross_shares)
-        if inception_share is not None and inception_share > 0:
-            daily = [inception_share, *daily]
-        arr_g = np.asarray(daily, dtype=float)
-        arr_g = arr_g[arr_g > 0]
-        if len(arr_g) >= 2:
-            pos_days_pct, win_streak, loss_streak = _compute_streaks(np.diff(np.log(arr_g)))
+        daily_g = _with_daily_inception(_daily_close_series(dates_dt, gross_shares))
+        lr_g = _consecutive_daily_log_returns(daily_g).to_numpy(dtype=float)
+        if len(lr_g) >= 1:
+            pos_days_pct, win_streak, loss_streak = _compute_streaks(lr_g)
     if len(gross_shares) >= 2:
         sharpe_g, sortino_g = _ratios(gross_shares)
         sharpe_n, sortino_n = _ratios(net_s)
@@ -478,8 +511,9 @@ def compute_correlation_matrix(
     if not ids:
         return {"ids": [], "matrix": [], "overlap_days": 0}
 
-    df = pd.DataFrame(series_map).sort_index()
-    log_rets = np.log(df.where(df > 0)).diff()
+    log_rets = pd.DataFrame(
+        {sid: _consecutive_daily_log_returns(ser) for sid, ser in series_map.items()}
+    ).sort_index()
 
     matrix: list[list[float | None]] = []
     max_overlap = 0
@@ -518,11 +552,11 @@ def compute_ols_market_exposure(
     max_scatter: int = 120,
 ) -> dict[str, Any]:
     """OLS regression of strategy daily log returns against a market benchmark factor."""
-    f_clean = np.log(factor_series.where(factor_series > 0)).diff().dropna()
+    f_clean = _consecutive_daily_log_returns(factor_series)
     rows: list[dict[str, Any]] = []
 
     for sid, (sname, s_ser) in strategy_series.items():
-        s_ret = np.log(s_ser.where(s_ser > 0)).diff().dropna()
+        s_ret = _consecutive_daily_log_returns(s_ser)
         aligned = pd.concat([f_clean.rename("x"), s_ret.rename("y")], axis=1).dropna()
         n = len(aligned)
         if n < min_overlap:
@@ -686,6 +720,7 @@ _CANONICAL_TIER = {
     "Cash / HLP (Spot+Perp sleeve)": TIER_CASH,
     "Cash (CTA sleeve)": TIER_CASH,
     "Cash (Cross-DEX sleeve)": TIER_CASH,
+    "Cash (Metamodel sleeve)": TIER_CASH,
 }
 _GOLD_COINS = {"PAXG", "XAUT", "XAUT0"}
 
@@ -704,7 +739,11 @@ _SLEEVE_TIER_LABEL = {
 
 
 def _autopilot_look_through_tiers(
-    ap: dict[str, Any], sp: dict[str, Any] | None, h3: dict[str, Any] | None
+    ap: dict[str, Any],
+    sp: dict[str, Any] | None,
+    h3: dict[str, Any] | None,
+    cd: dict[str, Any] | None = None,
+    mm: dict[str, Any] | None = None,
 ) -> dict[str, float]:
     """Asset-tier USD breakdown of the Autopilot NAV (sums to its sleeve allocations)."""
     out: dict[str, float] = {}
@@ -738,6 +777,31 @@ def _autopilot_look_through_tiers(
                 _add(_SLEEVE_TIER_LABEL["hip3_paper"], alloc * frac)
                 _add("Cash (HIP-3 sleeve)", alloc * (1.0 - frac))
                 continue
+        if sleeve == "cross_dex_paper" and cd:
+            cd_eq = _f(cd.get("equity_usd"))
+            locked_cd = sum(
+                _f(p.get("margin_locked_usd"))
+                if p.get("margin_locked_usd") is not None
+                else (2.0 * _f(p.get("leg_notional_usd"))) / max(_f(p.get("per_leg_leverage"), 2.0), 1.0)
+                for p in (cd.get("positions") or {}).values()
+                if isinstance(p, dict)
+            )
+            if cd_eq > 0:
+                frac = min(1.0, max(0.0, locked_cd / cd_eq))
+                _add(_SLEEVE_TIER_LABEL["cross_dex_paper"], alloc * frac)
+                _add("Cash (Cross-DEX sleeve)", alloc * (1.0 - frac))
+                continue
+        if sleeve == "metamodel_paper" and mm:
+            mm_gross = sum(
+                metamodel_position_gross(p)
+                for p in (mm.get("positions") or {}).values()
+                if isinstance(p, dict)
+            )
+            # Each 2-leg neutral unit (HL + CEX) at 2x per-leg margin locks ~50% of gross notional as cash margin.
+            frac = min(1.0, max(0.0, mm_gross / 2.0))
+            _add(_SLEEVE_TIER_LABEL["metamodel_paper"], alloc * frac)
+            _add("Cash (Metamodel sleeve)", alloc * (1.0 - frac))
+            continue
         if sleeve == "crisis_cta":
             # Look through CTA weights (fractions of the CTA allocation): gold shorts are not crypto,
             # and the unlevered remainder of the sleeve is idle cash, not directional exposure.
@@ -905,6 +969,8 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
             venue_usd["HIP-3 Builders"] = round(venue_usd.get("HIP-3 Builders", 0.0) + h3_eq, 2)
 
     if mm:
+        mm_nav_guards = int(mm.get("nav_guard_triggers", 0) or 0)
+        total_nav_guard_triggers += mm_nav_guards
         mm_pos = mm.get("positions") or {}
         mm_eq = max(_f(mm.get("equity_usd"), 100_000.0), 1.0)
         mm_lev = round(sum(metamodel_position_gross(p) for p in mm_pos.values() if isinstance(p, dict)), 3)
@@ -917,7 +983,7 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
                 "leverage_30d_avg": mm_avg,
                 "leverage_30d_max": mm_max,
                 "net_exposure_pct": round(mm_net * 100.0, 3),
-                "nav_guard_triggers": int(mm.get("nav_guard_triggers", 0) or 0),
+                "nav_guard_triggers": mm_nav_guards,
             }
         )
         if not ap:
@@ -927,7 +993,7 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
     # Autopilot master vault exists, both are derived from its sleeve allocations (look-through into
     # each sleeve's own tier mix, scaled to the USD the Autopilot actually allocates to it).
     if ap and ap.get("sleeve_allocations_usd"):
-        tier_usd = _autopilot_look_through_tiers(ap, sp, h3)
+        tier_usd = _autopilot_look_through_tiers(ap, sp, h3, cd, mm)
 
     def _to_pct_rows(raw_map: dict[str, float]) -> list[dict[str, Any]]:
         tot = sum(v for v in raw_map.values() if v > 0)

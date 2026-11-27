@@ -26,9 +26,9 @@ def test_decode_uniswap_v3_sqrt_price_x96_and_depth_slippage():
     liq_raw = int(target_x_human * (10**18) * sqrt_p)
     v_depth, slips = defi.compute_v3_virtual_depth_and_slippage(liq_raw, sqrt_x96, dec0=18, token0_usd=60.0)
     assert v_depth == pytest.approx(10_000_000.0, rel=1e-3)
-    assert slips[5_000.0] == pytest.approx(5.0, abs=0.1)
-    assert slips[25_000.0] == pytest.approx(25.0, abs=0.2)
-    assert slips[100_000.0] == pytest.approx(100.0, abs=0.5)
+    assert slips[5_000.0] == pytest.approx(5_000.0 / 10_005_000.0 * 1e4, abs=0.05)
+    assert slips[25_000.0] == pytest.approx(25_000.0 / 10_025_000.0 * 1e4, abs=0.05)
+    assert slips[100_000.0] == pytest.approx(100_000.0 / 10_100_000.0 * 1e4, abs=0.05)
 
 
 def test_hyperevm_v2_peg_adjustment_eliminates_fake_usdt0_arb_and_reads_l1read():

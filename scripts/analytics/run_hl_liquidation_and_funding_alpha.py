@@ -37,7 +37,7 @@ def _load_dotenv(path: Path) -> None:
 
 @app.command()
 def main(
-    top_whales: int = typer.Option(45, help="Number of active top leaderboard whales to scan"),
+    top_whales: int = typer.Option(lfa.DEFAULT_TOP_WHALES, help="Number of active top leaderboard whales to scan"),
     top_funding_coins: int = typer.Option(8, help="Number of extreme-funding coins for :00 microstructure"),
     lookback_hours: int = typer.Option(6, help="Hours of 1m candles for hourly settlement measurement"),
     output_dir: Path = typer.Option(ROOT / "data/paper/hl_liq_funding_alpha", help="Directory for output artifacts"),
@@ -45,11 +45,13 @@ def main(
     telegram: bool = typer.Option(False, help="Send Rich HTML summary to Telegram"),
 ) -> None:
     _load_dotenv(ROOT / ".env")
+    shared_whale_cache = output_dir.parent / "whales_cache.json"
     snap = asyncio.run(
         lfa.run_liquidation_and_funding_alpha_scan(
             top_whales=top_whales,
             top_funding_coins=top_funding_coins,
             lookback_hours=lookback_hours,
+            whale_cache_path=shared_whale_cache,
         )
     )
     md = lfa.format_liq_funding_markdown(snap)

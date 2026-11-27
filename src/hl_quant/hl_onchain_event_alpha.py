@@ -585,11 +585,12 @@ def run_onchain_event_tick(
             cum_pnl_val = hlp_cum_pnl_usd
 
     if liq_snap is None:
+        shared_cache = (state_dir.parent / "whales_cache.json") if state_dir.parent.exists() else (state_dir / "whales_cache.json")
         liq_snap = asyncio.run(
             liq.run_liquidation_and_funding_alpha_scan(
                 top_whales=cfg.top_whales,
                 top_funding_coins=1,
-                whale_cache_path=state_dir / "whales_cache.json",
+                whale_cache_path=shared_cache,
                 whale_cache_ttl_sec=cfg.whale_cache_ttl_sec,
             )
         )

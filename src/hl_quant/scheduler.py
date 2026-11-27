@@ -238,7 +238,7 @@ def build_job_specs() -> list[JobSpec]:
             py,
             str(root / "scripts/analytics/run_hl_liquidation_and_funding_alpha.py"),
             "--top-whales",
-            os.environ.get("HL_LIQ_TOP_WHALES", "45"),
+            os.environ.get("HL_LIQ_TOP_WHALES", "60"),
             "--top-funding-coins",
             os.environ.get("HL_LIQ_TOP_FUNDING_COINS", "8"),
             "--lookback-hours",

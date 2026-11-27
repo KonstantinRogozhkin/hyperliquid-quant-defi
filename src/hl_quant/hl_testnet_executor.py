@@ -741,7 +741,7 @@ def execute_rebalance_cycle(
             target_lev = max(1, min(spec.max_leverage, limits.default_cross_leverage if is_cross else limits.default_isolated_leverage))
             cur_mode, cur_lev = account.position_leverage.get(o.coin, ("", 0))
             expected_mode = "cross" if is_cross else "isolated"
-            if cur_mode == expected_mode and 0 < cur_lev <= target_lev:
+            if cur_mode == expected_mode and cur_lev == target_lev:
                 continue
             try:
                 upd = adapter.set_leverage(o.coin, target_lev, is_cross=is_cross)
