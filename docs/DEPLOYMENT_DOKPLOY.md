@@ -104,8 +104,14 @@ python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl.ex
 python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl.example.com --expect-testnet-worker --apply
 
 # 2b. Or cut over the 6 data/paper/alert schedules while keeping local testnet_executor active
+#     (only allowed while the Dokploy worker is read-only, HL_ENABLE_TESTNET_EXECUTION=false)
 python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl.example.com --keep-local-testnet --apply
 
 # 3. Instant rollback from backup if ever needed
 python3 scripts/ops/cutover_local_crons_to_dokploy.py --restore data/crontab_backups/crontab_<timestamp>.txt --apply
 ```
+
+Single-executor guard: the script exits with code 2 and leaves the crontab untouched when the cutover would leave **two** Testnet executors or **none**:
+
+- `--keep-local-testnet` while the Dokploy worker has `HL_ENABLE_TESTNET_EXECUTION=true` (both would rebalance the same account at `:10 */4`), or while the worker state cannot be checked (`--skip-remote-check`). Override: `--force-dual-executor`.
+- Disabling the local executor while the Dokploy worker is read-only, which would stop execution silently. Override: `--allow-no-testnet-executor`.

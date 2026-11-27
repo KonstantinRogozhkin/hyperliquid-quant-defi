@@ -52,6 +52,37 @@ class RiskLimits:
     neg_funding_apr_threshold: float = -25.0
     pre_settlement_window_min: int = 5
     max_unquoted_coin_fraction: float = 0.35
+    # Kill-switch de-risking: on account-risk violations (drawdown, margin, gross, coin cap) keep
+    # submitting reduce-only orders instead of freezing the book; on a drawdown breach flatten all.
+    derisk_on_kill_switch: bool = True
+    flatten_on_drawdown: bool = True
+    # Close positions on coins without a two-sided Testnet book with reduce-only ALO orders priced
+    # off the oracle (or the surviving book side) instead of leaving them unmanaged forever.
+    unwind_unquoted_orphans: bool = True
+
+
+# Kill-switch reasons caused by untrustworthy inputs: no BBO-based rebalancing on them (fail-closed).
+DATA_INTEGRITY_VIOLATIONS = ("non_finite", "zero_or_negative_equity", "stale_feed", "missing_quote")
+# Subset that makes the account snapshot itself untrustworthy: nothing at all is submitted. A pure
+# ``missing_quote`` feed gap still allows reduce-only oracle-priced unwinds of orphan positions.
+HARD_DATA_VIOLATIONS = ("non_finite", "zero_or_negative_equity", "stale_feed")
+# Kill-switch reasons describing account risk: block new exposure but keep reducing it.
+ACCOUNT_RISK_VIOLATIONS = ("drawdown_limit", "low_free_margin", "gross_leverage", "coin_cap")
+
+
+def safe_int(raw: Any) -> int | None:
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def classify_violations(violations: list[str]) -> tuple[bool, bool, bool]:
+    """Return ``(data_integrity, account_risk, drawdown)`` flags for kill-switch reasons."""
+    data_integrity = any(v.startswith(DATA_INTEGRITY_VIOLATIONS) for v in violations)
+    account_risk = any(v.startswith(ACCOUNT_RISK_VIOLATIONS) for v in violations)
+    drawdown = any(v.startswith("drawdown_limit") for v in violations)
+    return data_integrity, account_risk, drawdown
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,24 +180,49 @@ def fetch_testnet_meta(client: httpx.Client) -> dict[str, AssetSpec]:
     return out
 
 
-def fetch_testnet_bbo(client: httpx.Client, coins: list[str]) -> dict[str, tuple[float, float, int]]:
-    """Return ``{coin: (best_bid, best_ask, observed_ms)}`` from Hyperliquid Testnet ``l2Book``."""
-    out: dict[str, tuple[float, float, int]] = {}
+BookTop = tuple[float | None, float | None, int]
+
+
+def _level_px(side: Any) -> float | None:
+    if not (isinstance(side, list) and side and isinstance(side[0], dict)):
+        return None
+    try:
+        px = float(side[0].get("px"))
+    except (TypeError, ValueError):
+        return None
+    return px if math.isfinite(px) and px > 0 else None
+
+
+def fetch_testnet_book_tops(client: httpx.Client, coins: list[str]) -> dict[str, BookTop]:
+    """Return ``{coin: (best_bid | None, best_ask | None, observed_ms)}`` including one-sided books."""
+    out: dict[str, BookTop] = {}
     for coin in sorted(set(coins)):
         resp = client.post(TESTNET_INFO_URL, json={"type": "l2Book", "coin": coin})
         resp.raise_for_status()
         book = resp.json()
         levels = book.get("levels") if isinstance(book, dict) else None
-        if not (isinstance(levels, list) and len(levels) == 2 and levels[0] and levels[1]):
+        if not (isinstance(levels, list) and len(levels) == 2):
+            out[coin] = (None, None, int(time.time() * 1000))
             continue
-        bid = float(levels[0][0]["px"])
-        ask = float(levels[1][0]["px"])
         # Exchange-side book time, so the stale-feed gate measures real quote age.
         book_ms = book.get("time")
         observed_ms = int(book_ms) if isinstance(book_ms, (int, float)) and book_ms > 0 else int(time.time() * 1000)
-        if bid > 0 and ask >= bid:
-            out[coin] = (bid, ask, observed_ms)
+        out[coin] = (_level_px(levels[0]), _level_px(levels[1]), observed_ms)
     return out
+
+
+def two_sided_bbo(tops: dict[str, BookTop]) -> dict[str, tuple[float, float, int]]:
+    """Keep only coins with a valid two-sided book: ``{coin: (bid, ask, observed_ms)}``."""
+    out: dict[str, tuple[float, float, int]] = {}
+    for coin, (bid, ask, ms) in tops.items():
+        if bid is not None and ask is not None and ask >= bid > 0:
+            out[coin] = (bid, ask, ms)
+    return out
+
+
+def fetch_testnet_bbo(client: httpx.Client, coins: list[str]) -> dict[str, tuple[float, float, int]]:
+    """Return ``{coin: (best_bid, best_ask, observed_ms)}`` from Hyperliquid Testnet ``l2Book``."""
+    return two_sided_bbo(fetch_testnet_book_tops(client, coins))
 
 
 def fetch_testnet_account(client: httpx.Client, account_address: str) -> AccountSnapshot:
@@ -300,8 +356,14 @@ def check_kill_switch(
     *,
     high_water_mark_usd: float,
     now_ms: int | None = None,
+    retained_coins: set[str] | None = None,
 ) -> list[str]:
-    """Return list of risk violations; non-empty list halts new entries and cancels open orders."""
+    """Return list of risk violations; non-empty list halts new entries and cancels open orders.
+
+    ``retained_coins`` are held non-target coins the planner will *not* close (another engine's
+    inventory), so their notional counts toward gross leverage even when quoted.
+    """
+    retained = set(retained_coins or ())
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     reasons: list[str] = []
 
@@ -329,7 +391,7 @@ def check_kill_switch(
     for c, sz in account.positions_sz.items():
         if abs(sz) <= 1e-12 or c in target_weights:
             continue
-        if c in bbo:
+        if c in bbo and c not in retained:
             # Quoted non-target positions will be closed by plan_rebalance_orders this cycle.
             continue
         ntl = abs(float(account.position_notional_usd.get(c, 0.0) or 0.0))
@@ -397,9 +459,15 @@ def plan_rebalance_orders(
     *,
     funding_apr_by_coin: dict[str, float] | None = None,
     now_ms: int | None = None,
+    exclude_coins: set[str] | None = None,
 ) -> list[PlannedOrder]:
-    """Reconcile live Testnet positions vs target weights and emit sliced post-only ``ALO`` child orders."""
-    all_coins = sorted(set(account.positions_sz.keys()) | set(target_weights.keys()))
+    """Reconcile live Testnet positions vs target weights and emit sliced post-only ``ALO`` child orders.
+
+    ``exclude_coins`` are non-target coins owned by another engine on the shared address (e.g. MM
+    inventory); their positions are left untouched instead of being closed to zero.
+    """
+    excluded = set(exclude_coins or ()) - set(target_weights.keys())
+    all_coins = sorted((set(account.positions_sz.keys()) - excluded) | set(target_weights.keys()))
     planned: list[PlannedOrder] = []
     ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     fund_map = funding_apr_by_coin or {}
@@ -459,6 +527,194 @@ def plan_rebalance_orders(
                 )
             )
     return planned
+
+
+ORPHAN_MIN_CLOSE_USD = 0.50
+
+
+def _orphan_close_px(side: str, bid: float | None, ask: float | None, ref_px: float | None, sz_decimals: int) -> float | None:
+    """Passive (post-only) closing price for a position whose book is one-sided or empty.
+
+    Sells never rest at/below the best bid and buys never at/above the best ask, so the ALO order
+    cannot cross. Within that bound the order prices at the oracle reference, improving (not
+    crossing) the surviving opposite quote when the oracle is beyond it.
+    """
+    tick_frac = 1e-4
+    if side == "sell":
+        preferred = ref_px
+        if ask is not None:
+            preferred = min(preferred, ask) if preferred is not None else ask
+        if preferred is None:
+            preferred = bid * (1.0 + tick_frac) if bid is not None else None
+        if preferred is None:
+            return None
+        px = round_hl_price(preferred, sz_decimals, side="sell")
+        if bid is not None and px <= bid:
+            px = round_hl_price(bid * (1.0 + tick_frac), sz_decimals, side="sell")
+            if px <= bid:
+                return None
+        return px
+    preferred = ref_px
+    if bid is not None:
+        preferred = max(preferred, bid) if preferred is not None else bid
+    if preferred is None:
+        preferred = ask * (1.0 - tick_frac) if ask is not None else None
+    if preferred is None or preferred <= 0:
+        return None
+    px = round_hl_price(preferred, sz_decimals, side="buy")
+    if ask is not None and px >= ask:
+        px = round_hl_price(ask * (1.0 - tick_frac), sz_decimals, side="buy")
+        if px >= ask:
+            return None
+    return px
+
+
+def plan_orphan_unwind_orders(
+    account: AccountSnapshot,
+    meta: dict[str, AssetSpec],
+    bbo: dict[str, tuple[float, float, int]],
+    book_tops: dict[str, BookTop] | None,
+    reference_px: dict[str, float] | None,
+    *,
+    exclude_coins: set[str] | None = None,
+    target_weights: dict[str, float] | None = None,
+) -> list[PlannedOrder]:
+    """Reduce-only ALO orders unwinding positions on coins that lack a two-sided Testnet book.
+
+    The regular planner skips such coins, so without this they would never be reduced (orphans
+    keep accruing funding and mark risk). ``target_weights`` holds the strategy's desired weight
+    for such coins (if any): a holding of the same sign and within the desired size (valued at the
+    oracle) is kept; only the excess is unwound, and opposite-sign / untargeted holdings are closed.
+    """
+    tops = book_tops or {}
+    refs = reference_px or {}
+    targets = target_weights or {}
+    excluded = set(exclude_coins or ())
+    planned: list[PlannedOrder] = []
+    for coin in sorted(account.positions_sz):
+        cur_sz = float(account.positions_sz.get(coin, 0.0) or 0.0)
+        if abs(cur_sz) <= 1e-12 or coin in bbo or coin in excluded or coin not in meta:
+            continue
+        spec = meta[coin]
+        bid, ask, _ = tops.get(coin, (None, None, 0))
+        ref = refs.get(coin)
+        ref_px = float(ref) if ref is not None and math.isfinite(float(ref)) and float(ref) > 0 else None
+        desired_w = float(targets.get(coin, 0.0) or 0.0)
+        if abs(desired_w) > 1e-12 and ref_px is None:
+            continue  # cannot size the excess of a still-targeted coin without a reference price
+        desired_sz = (account.equity_usd * desired_w / ref_px) if (ref_px and abs(desired_w) > 1e-12) else 0.0
+        if desired_sz * cur_sz > 0:
+            excess = abs(cur_sz) - abs(desired_sz)
+            if excess <= 0:
+                continue
+        else:
+            excess = abs(cur_sz)
+        side = "sell" if cur_sz > 0 else "buy"
+        limit_px = _orphan_close_px(side, bid, ask, ref_px, spec.sz_decimals)
+        if limit_px is None:
+            continue
+        sz = round_hl_size(excess, spec.sz_decimals)
+        if sz <= 0 or sz * limit_px < ORPHAN_MIN_CLOSE_USD:
+            continue
+        planned.append(
+            PlannedOrder(
+                coin=coin,
+                side=side,
+                limit_px=limit_px,
+                sz=sz,
+                notional_usd=round(sz * limit_px, 2),
+                tif="Alo",
+                reduce_only=True,
+            )
+        )
+    return planned
+
+
+def orphan_residual_notional_usd(
+    account: AccountSnapshot,
+    meta: dict[str, AssetSpec],
+    bbo: dict[str, tuple[float, float, int]],
+    book_tops: dict[str, BookTop] | None,
+    reference_px: dict[str, float] | None,
+    *,
+    exclude_coins: set[str] | None = None,
+    target_weights: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Signed USD notional each unquoted position is intended to keep after this cycle's unwinds.
+
+    Mirrors :func:`plan_orphan_unwind_orders`, so dollar-neutralization of the quoted book offsets
+    the *residual* orphan exposure instead of exposure that is being closed in the same cycle.
+    """
+    planned = {
+        o.coin: o.sz
+        for o in plan_orphan_unwind_orders(
+            account, meta, bbo, book_tops, reference_px, exclude_coins=exclude_coins, target_weights=target_weights
+        )
+    }
+    out: dict[str, float] = {}
+    for coin, cur_sz in account.positions_sz.items():
+        cur = float(cur_sz or 0.0)
+        if abs(cur) <= 1e-12 or coin in bbo:
+            continue
+        ntl = float(account.position_notional_usd.get(coin, 0.0) or 0.0)
+        keep_frac = max(0.0, 1.0 - planned.get(coin, 0.0) / abs(cur))
+        out[coin] = ntl * keep_frac
+    return out
+
+
+def load_logged_order_oids(audit_log_path: Path | None) -> set[int]:
+    """Collect every order id recorded in a JSONL audit log (MM ``mm_audit.jsonl`` or executor log).
+
+    Handles both executor records (``orders[].response`` / ``orders[].oid``) and flat MM records
+    (top-level ``oid``); dry-run records are skipped because their ids are simulated.
+    """
+    oids: set[int] = set()
+    if audit_log_path is None or not audit_log_path.is_file():
+        return oids
+
+    def _add(raw: Any) -> None:
+        try:
+            oid = int(raw)
+        except (TypeError, ValueError):
+            return
+        if oid > 0:
+            oids.add(oid)
+
+    for line in audit_log_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("mode") == "dry_run":
+            continue
+        if rec.get("oid") is not None:
+            _add(rec.get("oid"))
+        for ord_rec in rec.get("orders") or []:
+            if not isinstance(ord_rec, dict) or ord_rec.get("mode") == "dry_run":
+                continue
+            if ord_rec.get("oid") is not None:
+                _add(ord_rec.get("oid"))
+            statuses, err_msg = extract_hl_order_statuses(ord_rec.get("response") or {})
+            if err_msg is not None:
+                continue
+            for st in statuses:
+                if not isinstance(st, dict):
+                    continue
+                for key in ("resting", "filled"):
+                    if isinstance(st.get(key), dict):
+                        _add(st[key].get("oid"))
+    return oids
+
+
+def leverage_update_ok(upd: Any) -> bool:
+    """True when a ``set_leverage`` adapter result reports success (top-level or SDK ``response``)."""
+    if not isinstance(upd, dict) or upd.get("error"):
+        return False
+    resp = upd.get("response")
+    return upd.get("status") == "ok" or (isinstance(resp, dict) and resp.get("status") == "ok")
 
 
 # --------------------------------------------------------------------------- Adapters & Orchestrator
@@ -703,13 +959,38 @@ def execute_rebalance_cycle(
     funding_apr_by_coin: dict[str, float] | None = None,
     cancel_unmanaged_orders: bool = False,
     skipped_unquoted_coins: list[str] | None = None,
+    book_tops: dict[str, BookTop] | None = None,
+    reference_px: dict[str, float] | None = None,
+    foreign_order_oids: set[int] | None = None,
+    foreign_coins: set[str] | None = None,
+    orphan_target_weights: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     """Run one complete Testnet rebalance cycle: kill-switch -> cancel stale -> place sliced ALO orders.
 
     ``high_water_mark_usd`` must be the peak equity persisted across cycles; without it the
     drawdown gate only compares equity with itself and can never fire.
+
+    Shared-address isolation: ``foreign_order_oids`` (e.g. ids logged by the MM in
+    ``mm_audit.jsonl``) are never cancelled except on an account-risk kill-switch, and positions on
+    ``foreign_coins`` that are not rebalance targets are left to their owning engine.
+
+    Kill-switch behaviour (``summary["derisk_mode"]``):
+
+    * hard data violations (non-finite snapshot, non-positive equity, stale feed) submit nothing;
+    * a ``missing_quote`` feed gap halts BBO rebalancing but still unwinds orphan positions
+      (reduce-only, oracle-priced) — ``orphan_unwind_only``;
+    * account-risk violations (drawdown, free margin, gross, coin cap) cancel every open order and
+      keep submitting reduce-only orders toward targets (``reduce_only``); a drawdown breach
+      flattens every position instead (``flatten``, ``limits.flatten_on_drawdown``).
     """
     hwm = max(float(high_water_mark_usd or 0.0), 0.0) or account.equity_usd
+    foreign_oids = {int(o) for o in (foreign_order_oids or set())}
+    foreign_order_coins = {
+        str(o.get("coin") or "")
+        for o in account.open_orders
+        if o.get("oid") is not None and safe_int(o.get("oid")) in foreign_oids
+    }
+    foreign = (set(foreign_coins or ()) | foreign_order_coins) - set(target_weights.keys())
     skipped_unquoted = sorted(set(skipped_unquoted_coins or []))
     # Open positions on coins we cannot quote (whether dropped from targets or already target=0)
     # are unmanaged: neither rebalanced nor closable by the ALO planner. Surface all of them.
@@ -719,7 +1000,9 @@ def execute_rebalance_cycle(
         for c in sorted(unquoted_open_coins)
         if abs(float(account.positions_sz.get(c, 0.0) or 0.0)) > 1e-12
     }
-    violations = check_kill_switch(account, target_weights, bbo, limits, high_water_mark_usd=hwm, now_ms=now_ms)
+    violations = check_kill_switch(
+        account, target_weights, bbo, limits, high_water_mark_usd=hwm, now_ms=now_ms, retained_coins=foreign
+    )
     # Persist the account view the kill-switch evaluated, so the audit trail (and /metrics) show
     # equity, drawdown and orphan exposure even on cycles where nothing trips.
     orphan_notional_usd = sum(abs(float(account.position_notional_usd.get(c, 0.0) or 0.0)) for c in orphan_positions)
@@ -730,25 +1013,91 @@ def execute_rebalance_cycle(
         "orphan_notional_usd": round(orphan_notional_usd, 4),
     }
 
-    # On kill-switch emergency, cancel ALL open orders; during normal rebalance, cancel only
-    # orders belonging to the rebalance coin scope so concurrent MM quotes on other coins survive.
-    if violations or cancel_unmanaged_orders:
+    _, account_risk, drawdown_breach = classify_violations(violations)
+    hard_data = any(v.startswith(HARD_DATA_VIOLATIONS) for v in violations)
+    # Reduce-only de-risking is allowed unless the account snapshot itself is untrustworthy; a
+    # missing-quote feed gap only removes the affected coins from the BBO planner.
+    derisk_allowed = bool(violations) and limits.derisk_on_kill_switch and not hard_data
+    flatten = derisk_allowed and account_risk and drawdown_breach and limits.flatten_on_drawdown
+
+    # Account-risk emergency (or explicit opt-in) cancels ALL open orders on the address. Otherwise
+    # (normal cycle or a data-integrity halt) only orders in the rebalance scope are cancelled and
+    # orders positively identified as another engine's (MM) are preserved.
+    if (violations and account_risk) or cancel_unmanaged_orders:
         orders_to_cancel = list(account.open_orders)
     else:
-        managed_coins = set(target_weights.keys()) | set(account.positions_sz.keys()) | set(skipped_unquoted)
-        orders_to_cancel = [o for o in account.open_orders if str(o.get("coin") or "") in managed_coins]
+        managed_coins = (set(target_weights.keys()) | set(account.positions_sz.keys()) | set(skipped_unquoted)) - foreign
+        orders_to_cancel = [
+            o
+            for o in account.open_orders
+            if str(o.get("coin") or "") in managed_coins and safe_int(o.get("oid")) not in foreign_oids
+        ]
     cancelled = adapter.cancel_all_open_orders(orders_to_cancel) if orders_to_cancel else []
+
+    orphan_unwinds: list[PlannedOrder] = []
+    if limits.unwind_unquoted_orphans and not hard_data:
+        orphan_unwinds = plan_orphan_unwind_orders(
+            account,
+            meta,
+            bbo,
+            book_tops,
+            reference_px,
+            exclude_coins=set() if flatten else foreign,
+            # Keep strategy-intended holdings on unquoted coins, except when flattening everything.
+            target_weights={} if flatten else (orphan_target_weights if orphan_target_weights is not None else target_weights),
+        )
+
     if violations:
+        derisk_mode = "none"
+        derisk_orders: list[PlannedOrder] = []
+        if not derisk_allowed:
+            orphan_unwinds = []
+        elif not account_risk and orphan_unwinds:
+            # Feed gap (missing quotes) halts BBO rebalancing, but oracle-priced reduce-only
+            # unwinds of orphans only shrink exposure and remain allowed.
+            derisk_mode = "orphan_unwind_only"
+            derisk_orders = list(orphan_unwinds)
+        if derisk_allowed and account_risk:
+            derisk_mode = "flatten" if flatten else "reduce_only"
+            if flatten:
+                plan_targets = {c: 0.0 for c in target_weights}
+            else:
+                # A reversal target (opposite sign to the held position) would plan one non-reduce-only
+                # order through zero and be filtered out entirely; clamp it to 0 so the closing part
+                # still executes without opening the new side.
+                plan_targets = {
+                    c: (0.0 if float(account.positions_sz.get(c, 0.0) or 0.0) * float(w) < 0 else float(w))
+                    for c, w in target_weights.items()
+                }
+            derisk_orders = [
+                o
+                for o in plan_rebalance_orders(
+                    account,
+                    plan_targets,
+                    meta,
+                    bbo,
+                    limits,
+                    funding_apr_by_coin=funding_apr_by_coin,
+                    now_ms=now_ms,
+                    exclude_coins=set() if flatten else foreign,
+                )
+                if o.reduce_only
+            ] + orphan_unwinds
+        placed = [adapter.place_alo_order(o) for o in derisk_orders]
         summary = {
             "status": "kill_switch_triggered",
             "violations": violations,
+            "derisk_mode": derisk_mode,
             "cancelled_count": len(cancelled),
-            "placed_count": 0,
+            "placed_count": len(placed),
+            "total_notional_usd": round(sum(o.notional_usd for o in derisk_orders), 2),
+            "orphan_unwind_count": len(orphan_unwinds),
             "high_water_mark_usd": hwm,
             "skipped_unquoted_coins": skipped_unquoted,
             "orphan_positions": orphan_positions,
+            "foreign_coins": sorted(foreign),
             **account_fields,
-            "orders": [],
+            "orders": placed,
         }
     else:
         planned = plan_rebalance_orders(
@@ -759,9 +1108,11 @@ def execute_rebalance_cycle(
             limits,
             funding_apr_by_coin=funding_apr_by_coin,
             now_ms=now_ms,
+            exclude_coins=foreign,
         )
         leverage_updates: list[dict[str, Any]] = []
         blocked_isolated_coins: set[str] = set()
+        blocked_leverage_coins: set[str] = set()
         seen_lev_coins: set[str] = set()
         for o in planned:
             if o.reduce_only or o.coin in seen_lev_coins or o.coin not in meta:
@@ -776,17 +1127,15 @@ def execute_rebalance_cycle(
                 continue
             try:
                 upd = adapter.set_leverage(o.coin, target_lev, is_cross=is_cross)
-                leverage_updates.append(upd)
-                resp = upd.get("response") if isinstance(upd, dict) else None
-                ok = (upd.get("status") == "ok") or (isinstance(resp, dict) and resp.get("status") == "ok")
-                if spec.only_isolated and not ok:
-                    blocked_isolated_coins.add(o.coin)
             except Exception as exc:
-                leverage_updates.append({"coin": o.coin, "leverage": target_lev, "is_cross": is_cross, "error": str(exc)})
-                if spec.only_isolated:
-                    blocked_isolated_coins.add(o.coin)
+                upd = {"coin": o.coin, "leverage": target_lev, "is_cross": is_cross, "error": str(exc)}
+            leverage_updates.append(upd)
+            if not leverage_update_ok(upd):
+                # Never open exposure at an unknown (exchange default / max) leverage.
+                (blocked_isolated_coins if spec.only_isolated else blocked_leverage_coins).add(o.coin)
 
-        executable = [o for o in planned if o.reduce_only or o.coin not in blocked_isolated_coins]
+        blocked = blocked_isolated_coins | blocked_leverage_coins
+        executable = [o for o in planned if o.reduce_only or o.coin not in blocked] + orphan_unwinds
         placed = [adapter.place_alo_order(o) for o in executable]
         summary = {
             "status": "ok",
@@ -794,11 +1143,14 @@ def execute_rebalance_cycle(
             "cancelled_count": len(cancelled),
             "placed_count": len(placed),
             "total_notional_usd": round(sum(o.notional_usd for o in executable), 2),
+            "orphan_unwind_count": len(orphan_unwinds),
             "high_water_mark_usd": hwm,
             "leverage_updates": leverage_updates,
             "blocked_isolated_coins": sorted(blocked_isolated_coins),
+            "blocked_leverage_coins": sorted(blocked_leverage_coins),
             "skipped_unquoted_coins": skipped_unquoted,
             "orphan_positions": orphan_positions,
+            "foreign_coins": sorted(foreign),
             **account_fields,
             "orders": placed,
         }
@@ -906,6 +1258,13 @@ def format_testnet_telegram_rich_html(
     ]
     if result.get("violations"):
         parts.append(f"<p><b>⚠️ Kill-switch:</b> {html.escape(', '.join(result['violations']))}</p>")
+        derisk_txt = {
+            "flatten": "закрытие всех позиций (reduce-only)",
+            "reduce_only": "только сокращение позиций (reduce-only)",
+            "orphan_unwind_only": "закрытие позиций без стакана по oracle (reduce-only)",
+        }.get(str(result.get("derisk_mode") or ""))
+        if derisk_txt:
+            parts.append(f"<p><b>🛡 Снижение риска:</b> {html.escape(derisk_txt)}</p>")
     if result.get("skipped_unquoted_coins"):
         parts.append(
             f"<p><b>ℹ️ Пропущены (пустой стакан Testnet):</b> "

@@ -247,6 +247,16 @@ def _cex_frames(market: af.WideMarket, venue: str) -> tuple[pd.DataFrame, pd.Dat
     return market.bybit_close, market.bybit_fund_next
 
 
+def funding_interval_hours(hours: np.ndarray, prev_hour_ms: int, tick_hour_ms: int) -> np.ndarray:
+    """Grid hours whose ``*_fund_next`` settlements were earned by positions held since the last tick.
+
+    Both arguments are the OPEN of the last closed hourly bar at each tick (a 20:05 run has
+    ``tick_hour_ms`` = 19:00), and ``*_fund_next[h]`` is the settlement paid at ``h + 1h``. Positions
+    held from the previous tick to now therefore earned indices ``(prev_hour_ms, tick_hour_ms]``.
+    """
+    return hours[(hours > int(prev_hour_ms)) & (hours <= int(tick_hour_ms))]
+
+
 def run_paper_tick(
     market: af.WideMarket,
     quotes: dict[str, L2Quote],
@@ -315,10 +325,14 @@ def run_paper_tick(
     fund_pnl_usd = 0.0
     coin_tick_pnl: dict[str, float] = {}
     if prev_hour_ms is not None and prev_pos:
-        # Event settling at h + 1h is stored in *_fund_next at index h, so funding
-        # accrued over (prev_hour_ms, tick_hour_ms] lives at [prev_hour_ms, tick_hour_ms).
-        interval_mask = (market.hours >= int(prev_hour_ms)) & (market.hours < tick_hour_ms)
-        interval_hours = market.hours[interval_mask]
+        # ``tick_hour_ms`` is the OPEN of the last closed hourly bar: a tick running at 20:05 has
+        # tick_hour_ms = 19:00, and the previous one (16:05) had 15:00. Positions set at 16:05 were
+        # held through the settlements at 17:00, 18:00, 19:00 and 20:00 (the wrapper fetches funding
+        # up to the current ``:00``). The settlement at h + 1h is stored in *_fund_next at index h,
+        # so the held settlements live at indices (prev_hour_ms, tick_hour_ms]. Using
+        # [prev, tick) instead credited the 16:00 payment (before entry) and dropped 20:00 — for
+        # 8-hourly CEX funding that moved a whole settlement to the wrong portfolio.
+        interval_hours = funding_interval_hours(market.hours, int(prev_hour_ms), tick_hour_ms)
         for coin, p in prev_pos.items():
             hw = float(p.get("hl_weight", 0.0))
             prev_hl_px = float(p.get("last_hl_px", 0.0))
@@ -347,16 +361,31 @@ def run_paper_tick(
             fund_pnl_usd += c_fn_pnl
             coin_tick_pnl[coin] = c_px_pnl + c_fn_pnl
 
-    # 1b. Bounded NAV Sanity Guard: clamp anomalous single-tick MTM jumps and freeze positions
+    # 1b. Bounded NAV Sanity Guard: clamp an anomalous single-tick MTM jump and freeze positions,
+    # but only until the next tick hour confirms it. A clamped tick does not advance
+    # ``last_tick_hour_ms``, so the confirming tick re-measures price AND funding over the whole
+    # interval — nothing is dropped, and a genuine move cannot freeze the ledger forever.
     nav_guard_triggered = False
     nav_guard_reason = ""
+    pending_raw = state.get("nav_guard_pending_tick_hour_ms")
+    nav_guard_pending: int | None = int(pending_raw) if pending_raw is not None else None
     raw_mtm_pnl = price_pnl_usd + fund_pnl_usd
-    if (
+    jump_exceeded = (
         prev_hour_ms is not None
         and equity > 0
         and max_tick_nav_jump_pct > 0.0
         and abs(raw_mtm_pnl) / equity * 100.0 > max_tick_nav_jump_pct
-    ):
+    )
+    if jump_exceeded and nav_guard_pending is not None and tick_hour_ms > nav_guard_pending:
+        nav_guard_reason = (
+            f"Tick MTM jump {raw_mtm_pnl / equity * 100.0:+.2f}% persisted since the clamped tick; "
+            "accepted as genuine"
+        )
+        nav_guard_pending = None
+    elif not jump_exceeded:
+        nav_guard_pending = None
+    if jump_exceeded and nav_guard_reason == "":
+        nav_guard_pending = nav_guard_pending if nav_guard_pending is not None else tick_hour_ms
         nav_guard_triggered = True
         nav_guard_triggers += 1
         nav_guard_reason = (
@@ -496,10 +525,12 @@ def run_paper_tick(
     state_out = {
         "starting_capital_usd": float(state["starting_capital_usd"]),
         "equity_usd": new_equity,
-        "last_tick_hour_ms": tick_hour_ms,
+        # A clamped tick keeps the previous clock so the confirming tick covers the full interval.
+        "last_tick_hour_ms": prev_hour_ms if nav_guard_triggered else tick_hour_ms,
         "tick_count": int(state.get("tick_count", 0)) + 1,
         "nav_guard_triggers": nav_guard_triggers,
         "nav_guard_reason": nav_guard_reason,
+        "nav_guard_pending_tick_hour_ms": nav_guard_pending,
         "positions": new_positions,
         "sleeves": [{"name": s.spec.name, "weight": s.weight} for s in active_sleeves],
     }

@@ -72,6 +72,8 @@ class CutoverPlan:
     changed_count: int
     affected_labels: list[str]
     preserved_testnet_local: bool
+    # True when an actual testnet-executor schedule (managed block or stray command) was disabled.
+    disabled_testnet_executor: bool = False
 
 
 def _parse_iso_utc(raw: str) -> datetime:
@@ -223,6 +225,7 @@ def transform_crontab(
     changed_count = 0
     affected_labels: list[str] = []
     preserved_testnet_local = False
+    disabled_testnet_executor = False
 
     def _record_label(label: str) -> None:
         if label not in affected_labels:
@@ -243,6 +246,8 @@ def transform_crontab(
             else:
                 changed_count += 1
                 _record_label(current_label)
+                if TESTNET_MARKER_RE.search(current_label):
+                    disabled_testnet_executor = True
             continue
 
         if in_hl_block:
@@ -260,6 +265,8 @@ def transform_crontab(
                 continue
 
             if mode == "remove":
+                if stripped and not stripped.startswith("#") and TESTNET_MARKER_RE.search(stripped):
+                    disabled_testnet_executor = True
                 continue
 
             # mode == "comment": comment out active non-empty, non-comment lines idempotently
@@ -267,6 +274,8 @@ def transform_crontab(
                 out.append(f"{disable_prefix}{line}")
                 changed_count += 1
                 _record_label(current_label or "hyperliquid-quant-defi")
+                if TESTNET_MARKER_RE.search(current_label) or TESTNET_MARKER_RE.search(stripped):
+                    disabled_testnet_executor = True
             else:
                 out.append(line)
             continue
@@ -279,6 +288,8 @@ def transform_crontab(
                 continue
             changed_count += 1
             _record_label("stray hyperliquid-quant-defi cron")
+            if TESTNET_MARKER_RE.search(stripped):
+                disabled_testnet_executor = True
             if mode == "comment":
                 out.append(f"{disable_prefix}{line}")
             continue
@@ -296,6 +307,7 @@ def transform_crontab(
         changed_count=changed_count,
         affected_labels=affected_labels,
         preserved_testnet_local=preserved_testnet_local,
+        disabled_testnet_executor=disabled_testnet_executor,
     )
 
 
@@ -397,6 +409,19 @@ def build_parser() -> argparse.ArgumentParser:
         help="Keep the local testnet executor cron active while disabling the other 6 schedules.",
     )
     parser.add_argument(
+        "--force-dual-executor",
+        action="store_true",
+        help=(
+            "DANGEROUS: allow --keep-local-testnet even when the Dokploy worker also executes on Testnet "
+            "(or when that cannot be verified). Both would rebalance the same account at :10 */4."
+        ),
+    )
+    parser.add_argument(
+        "--allow-no-testnet-executor",
+        action="store_true",
+        help="Allow disabling the local testnet executor while the Dokploy worker is read-only (executor stops).",
+    )
+    parser.add_argument(
         "--backup-dir",
         type=Path,
         default=DEFAULT_BACKUP_DIR,
@@ -449,6 +474,7 @@ def main(
         print(f"[cutover] Restored crontab from {backup_path} (previous snapshot saved to {pre_restore_backup}).")
         return 0
 
+    remote_testnet_enabled: bool | None = None
     if not args.skip_remote_check:
         if not args.public_url:
             print(
@@ -478,6 +504,25 @@ def main(
         )
         for warn in check.warnings:
             print(f"[cutover] WARNING: {warn}")
+        remote_testnet_enabled = check.testnet_execution_enabled
+
+    if args.keep_local_testnet and not args.force_dual_executor:
+        if remote_testnet_enabled is None:
+            print(
+                "[cutover] REFUSED: --keep-local-testnet with --skip-remote-check cannot verify that the Dokploy "
+                "worker is not also executing on Testnet. Pass --force-dual-executor to override.",
+                file=sys.stderr,
+            )
+            return 2
+        if remote_testnet_enabled:
+            print(
+                "[cutover] REFUSED: --keep-local-testnet while the Dokploy worker has "
+                "HL_ENABLE_TESTNET_EXECUTION=true would run two executors on the same Testnet account "
+                "(double cancels/orders, HWM races). Drop --keep-local-testnet, disable execution in Dokploy, "
+                "or pass --force-dual-executor.",
+                file=sys.stderr,
+            )
+            return 2
 
     current_text = crontab_reader()
     plan = transform_crontab(
@@ -489,6 +534,15 @@ def main(
     if plan.changed_count == 0:
         print("[cutover] No active local hyperliquid-quant-defi cron entries to change.")
         return 0
+
+    if plan.disabled_testnet_executor and remote_testnet_enabled is False and not args.allow_no_testnet_executor:
+        print(
+            "[cutover] REFUSED: this would disable the local testnet executor while the Dokploy worker is "
+            "read-only, leaving NO executor (and no alert for it). Pass --keep-local-testnet, enable "
+            "HL_ENABLE_TESTNET_EXECUTION in Dokploy, or --allow-no-testnet-executor.",
+            file=sys.stderr,
+        )
+        return 2
 
     diff = "".join(
         difflib.unified_diff(

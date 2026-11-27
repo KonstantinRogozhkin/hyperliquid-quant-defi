@@ -31,6 +31,8 @@ from hl_quant.persistence_clock import advance_streak, streak_count, update_stre
 
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 HOURS_PER_YEAR = 8760.0
+# A NAV-guard clamp is confirmed (accepted) by a tick at least this much later.
+NAV_GUARD_CONFIRM_MS = 3_600_000
 
 # Canonical HyperCore spot token -> HyperCore perpetual symbol aliases.
 # Unit bridge tokens (UBTC, UETH, USOL, ...) represent 1:1 native assets on HyperCore.
@@ -761,9 +763,25 @@ def run_spot_perp_paper_tick(
             tick_funding_usd += fund_pnl
             tick_basis_mtm_usd += basis_pnl
 
-        # 2b. Bounded NAV Sanity Guard (Neutral Trade circuit breaker)
+        # 2b. Bounded NAV Sanity Guard (Neutral Trade circuit breaker). A jump is clamped once; if
+        # it persists on a tick >= NAV_GUARD_CONFIRM_MS later it is accepted as genuine. A clamped
+        # tick keeps ``last_tick_ms`` so the confirming tick re-accrues funding/HLP/basis over the
+        # whole interval (nothing is lost and the ledger cannot freeze forever).
         raw_tick_pnl = tick_funding_usd + tick_basis_mtm_usd + tick_hlp_usd
-        if prev_equity > 0 and abs(raw_tick_pnl) / prev_equity * 100.0 > cfg.max_tick_nav_jump_pct:
+        pending_raw = state.get("nav_guard_pending_ms")
+        nav_guard_pending: int | None = int(pending_raw) if pending_raw else None
+        jump_exceeded = prev_equity > 0 and abs(raw_tick_pnl) / prev_equity * 100.0 > cfg.max_tick_nav_jump_pct
+        if jump_exceeded and nav_guard_pending is not None and ts_ms - nav_guard_pending >= NAV_GUARD_CONFIRM_MS:
+            nav_guard_reason = (
+                f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% persisted since the clamped tick; "
+                "accepted as genuine"
+            )
+            nav_guard_pending = None
+            jump_exceeded = False
+        elif not jump_exceeded:
+            nav_guard_pending = None
+        if jump_exceeded:
+            nav_guard_pending = nav_guard_pending if nav_guard_pending is not None else ts_ms
             nav_guard_triggered = True
             nav_guard_reason = (
                 f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% exceeded "
@@ -1071,7 +1089,8 @@ def run_spot_perp_paper_tick(
                 "cum_hlp_yield_usd": round(float(state.get("cum_hlp_yield_usd", 0.0)) + tick_hlp_usd, 4),
                 "cum_basis_mtm_usd": round(float(state.get("cum_basis_mtm_usd", 0.0)) + tick_basis_mtm_usd, 4),
                 "cum_costs_usd": round(float(state.get("cum_costs_usd", 0.0)) + tick_costs_usd, 4),
-                "last_tick_ms": ts_ms,
+                "last_tick_ms": prev_ms if nav_guard_triggered else ts_ms,
+                "nav_guard_pending_ms": nav_guard_pending,
                 "observed_at_utc": obs_utc,
                 "positions": positions,
                 "clean_streaks": clean_streaks,
