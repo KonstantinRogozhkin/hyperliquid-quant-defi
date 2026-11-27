@@ -11,8 +11,9 @@ from typer.testing import CliRunner
 from hl_quant.scheduler import WorkerScheduler, app, build_job_specs
 
 
-def test_job_schedule_matching():
+def test_job_schedule_matching(tmp_path: Path):
     jobs = {j.name: j for j in build_job_specs()}
+    assert len(jobs) == 12
 
     assert jobs["onchain_events"].should_run_at(datetime(2026, 11, 26, 14, 15, tzinfo=timezone.utc))
     assert not jobs["onchain_events"].should_run_at(datetime(2026, 11, 26, 14, 16, tzinfo=timezone.utc))
@@ -23,8 +24,22 @@ def test_job_schedule_matching():
     assert jobs["frontier_persistence"].should_run_at(datetime(2026, 11, 26, 8, 20, tzinfo=timezone.utc))
     assert not jobs["frontier_persistence"].should_run_at(datetime(2026, 11, 26, 9, 20, tzinfo=timezone.utc))
 
+    assert jobs["liq_funding_alpha"].should_run_at(datetime(2026, 11, 26, 8, 35, tzinfo=timezone.utc))
+    assert not jobs["liq_funding_alpha"].should_run_at(datetime(2026, 11, 26, 9, 35, tzinfo=timezone.utc))
+
+    assert jobs["mm_calibration"].should_run_at(datetime(2026, 11, 26, 5, 15, tzinfo=timezone.utc))
+    assert not jobs["mm_calibration"].should_run_at(datetime(2026, 11, 26, 17, 15, tzinfo=timezone.utc))
+
+    assert jobs["settlement_study"].should_run_at(datetime(2026, 11, 26, 5, 30, tzinfo=timezone.utc))
+    assert not jobs["settlement_study"].should_run_at(datetime(2026, 11, 26, 17, 30, tzinfo=timezone.utc))
+
     assert jobs["testnet_attribution"].should_run_at(datetime(2026, 11, 26, 6, 0, tzinfo=timezone.utc))
     assert not jobs["testnet_attribution"].should_run_at(datetime(2026, 11, 26, 18, 0, tzinfo=timezone.utc))
+
+    # Settlement study must write report under writable data_dir (never read-only /app/docs)
+    settle_cmd = jobs["settlement_study"].build_command(Path("/app"), tmp_path, False)
+    assert "--report-path" in settle_cmd
+    assert str(tmp_path / "paper/hl_funding_settlement_study/report.md") in settle_cmd
 
 
 def test_testnet_execution_disabled_by_default(monkeypatch):
@@ -203,5 +218,8 @@ def test_bootstrap_seeds_only_missing_readonly_artifacts(tmp_path: Path, monkeyp
     sched.run_bootstrap_readonly()
     assert "run_hl_frontier_persistence_tick.py" not in executed
     assert "run_hl_metamodel_paper_tick.py" in executed
+    assert "run_hl_liquidation_and_funding_alpha.py" in executed
+    assert "run_hl_mm_calibration.py" in executed
+    assert "run_hl_funding_settlement_study.py" in executed
     assert "run_hl_testnet_attribution.py" not in executed  # disabled without address
     assert "run_hl_testnet_executor.py" not in executed

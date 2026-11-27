@@ -4,7 +4,7 @@ This repository ships as a three-container Docker Compose stack behind Dokploy T
 
 - **`frontend`** (`nginx:1.27-alpine` + React/Vite/TS SPA): serves the live quant desk UI, `/build-info.json`, and proxies `/api/*` → `http://backend:8000` (single public domain, zero CORS setup).
 - **`backend`** (`python:3.11-slim` + `FastAPI`/`uvicorn`): read-only telemetry API mounted on `/app/data:ro`, never receives wallet private keys or Telegram tokens.
-- **`worker`** (`python:3.11-slim` + `hl_quant.scheduler` + `--extra testnet`): replaces all 7 local macOS crons plus 2 dashboard scanners, writes atomically to shared volume `hl-data:/app/data:rw`.
+- **`worker`** (`python:3.11-slim` + `hl_quant.scheduler` + `--extra testnet`): runs all 12 UTC jobs (the 7 core schedules plus 5 read-only dashboard scanners: `cross_dex_scan`, `hyperevm_defi_scan`, `liq_funding_alpha`, `mm_calibration`, and `settlement_study`), writes atomically to shared volume `hl-data:/app/data:rw`, and seeds any missing read-only tab in the background on startup.
 
 ---
 
@@ -40,10 +40,11 @@ DEPLOY_SHA=<initial-40-char-sha-from-main>
 # Worker behavior (read-only bootstrap populates all tabs within ~60s on first start)
 HL_WORKER_BOOTSTRAP_READONLY=true
 
-# Optional Telegram alerts (worker only)
+# Optional Telegram alerts (worker only; accepts TELEGRAM_* or TELEGRAM_SIGNAL_*)
 HL_TELEGRAM_ENABLED=true
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
+TELEGRAM_THREAD_ID=
 
 # Optional Hyperliquid Testnet execution (strictly OFF by default)
 HL_ENABLE_TESTNET_EXECUTION=false

@@ -24,6 +24,7 @@ import os
 import re
 import subprocess
 import sys
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -301,10 +302,32 @@ def read_local_crontab() -> str:
     raise RuntimeError(f"crontab -l failed (exit {proc.returncode}): {proc.stderr.strip()}")
 
 
-def write_local_crontab(text: str) -> None:
-    proc = subprocess.run(["crontab", "-"], input=text, capture_output=True, text=True, check=False)
-    if proc.returncode != 0:
-        raise RuntimeError(f"crontab - failed (exit {proc.returncode}): {proc.stderr.strip()}")
+def write_local_crontab(text: str, *, timeout_s: float = 15.0) -> None:
+    """Install crontab via a short ``/tmp`` path to avoid macOS BSD 99-char and stdin hangs."""
+    tmp_dir = "/tmp" if os.path.isdir("/tmp") else None
+    fd, tmp_path = tempfile.mkstemp(dir=tmp_dir, prefix="hlcron_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        try:
+            proc = subprocess.run(
+                ["crontab", tmp_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout_s,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(
+                f"crontab install timed out after {timeout_s:.0f}s — on macOS this usually means "
+                "a TCC permission prompt is waiting or the calling app is not authorized to edit crontab. "
+                "Re-run this command directly from your interactive Terminal."
+            ) from exc
+        if proc.returncode != 0:
+            raise RuntimeError(f"crontab install failed (exit {proc.returncode}): {proc.stderr.strip()}")
+    finally:
+        if os.path.exists(tmp_path):
+            os.unlink(tmp_path)
 
 
 def save_crontab_backup(text: str, backup_dir: Path = DEFAULT_BACKUP_DIR) -> Path:

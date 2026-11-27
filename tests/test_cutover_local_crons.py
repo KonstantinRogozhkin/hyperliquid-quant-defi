@@ -212,3 +212,28 @@ def test_cli_dry_run_apply_and_restore_roundtrip(tmp_path: Path) -> None:
     )
     assert rc == 0
     assert state["crontab"] == SAMPLE_CRONTAB
+
+
+def test_write_local_crontab_uses_temp_file_and_handles_tcc_timeout(monkeypatch) -> None:
+    import subprocess
+
+    seen_paths: list[Path] = []
+
+    def fake_run(cmd, **_kwargs):
+        p = Path(cmd[1])
+        seen_paths.append(p)
+        assert p.is_file()
+        assert p.read_text(encoding="utf-8") == "0 * * * * echo hi\n"
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    monkeypatch.setattr(cutover.subprocess, "run", fake_run)
+    cutover.write_local_crontab("0 * * * * echo hi\n", timeout_s=5.0)
+    assert len(seen_paths) == 1
+    assert not seen_paths[0].exists()  # temp file cleaned up
+
+    def fake_timeout(cmd, **_kwargs):
+        raise subprocess.TimeoutExpired(cmd, 5.0)
+
+    monkeypatch.setattr(cutover.subprocess, "run", fake_timeout)
+    with pytest.raises(RuntimeError, match="TCC"):
+        cutover.write_local_crontab("0 * * * * echo hi\n", timeout_s=5.0)
