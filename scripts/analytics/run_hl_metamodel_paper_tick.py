@@ -52,7 +52,12 @@ def main(
     telegram: bool = typer.Option(False, help="Send HTML summary to Telegram on new tick"),
 ) -> None:
     now = hl.current_time_ms()
-    end_ms = now - now % fa.HOUR_MS - 1
+    floor_hour_ms = now - now % fa.HOUR_MS
+    end_ms = floor_hour_ms - 1
+    # Funding settlements occur ON the `:00:00.000` boundary (`floor_hour_ms`), whereas `end_ms` is
+    # `XX:59:59.999` for completed candle opens; pass `floor_hour_ms` to funding collectors so the
+    # just-settled `:00` rate is populated into `*_fund_next` of the latest completed hour bar.
+    fund_end_ms = floor_hour_ms
     start_ms = end_ms + 1 - lookback_days * 24 * fa.HOUR_MS
 
     frames: list[pd.DataFrame] = []
@@ -78,9 +83,9 @@ def main(
         for cand in cands:
             c, sym = cand.coin, cand.cex_symbol
             try:
-                hl_f = hl.collect_funding(hl_client, c, start_ms, end_ms, now_ms=now).rows
+                hl_f = hl.collect_funding(hl_client, c, start_ms, fund_end_ms, now_ms=now).rows
                 hl_b = hl.collect_candles(hl_client, c, "1h", start_ms, end_ms, now_ms=now).rows
-                by_f = cex.collect_funding(by_client, "bybit", sym, start_ms, end_ms, now_ms=now).rows
+                by_f = cex.collect_funding(by_client, "bybit", sym, start_ms, fund_end_ms, now_ms=now).rows
                 by_b = cex.collect_klines_1h(by_client, "bybit", sym, start_ms, end_ms, now_ms=now).rows
                 if any(df.empty for df in (hl_f, hl_b, by_f, by_b)):
                     continue
@@ -96,7 +101,7 @@ def main(
                     }
                 )
                 if sym in bn_syms:
-                    bn_f = cex.collect_funding(bn_client, "binance", sym, start_ms, end_ms, now_ms=now).rows
+                    bn_f = cex.collect_funding(bn_client, "binance", sym, start_ms, fund_end_ms, now_ms=now).rows
                     bn_b = cex.collect_klines_1h(bn_client, "binance", sym, start_ms, end_ms, now_ms=now).rows
                     if not bn_f.empty and not bn_b.empty:
                         p_bn = fa.build_panel(hl_f, bn_f, hl_b, bn_b)[
@@ -114,7 +119,7 @@ def main(
                         panel = panel.join(p_bn, how="left")
                 try:
                     okx_sym = cex.okx_symbol(c)
-                    okx_f = cex.collect_funding(okx_client, "okx", okx_sym, start_ms, end_ms, now_ms=now).rows
+                    okx_f = cex.collect_funding(okx_client, "okx", okx_sym, start_ms, fund_end_ms, now_ms=now).rows
                     okx_b = cex.collect_klines_1h(okx_client, "okx", okx_sym, start_ms, end_ms, now_ms=now).rows
                     if not okx_f.empty and not okx_b.empty:
                         p_okx = fa.build_panel(hl_f, okx_f, hl_b, okx_b)[
@@ -174,7 +179,7 @@ def main(
         ticks_path = state_dir / "ticks.parquet"
         ticks_df = pd.read_parquet(ticks_path) if ticks_path.exists() else None
         token, chat_id, thread_id = pt.load_telegram_credentials(
-            (ROOT / ".env", ROOT.parent / "ResearchLAB" / "system" / ".env")
+            (ROOT / ".env",)
         )
         if token and chat_id:
             rich_html = pt.format_telegram_rich_html(result, state, ticks_df=ticks_df)

@@ -110,7 +110,7 @@ groups:
     interval: 60s
     rules:
       - alert: HLArtifactStale
-        expr: hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_attribution|testnet_audit"} > 360
+        expr: hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_audit"} > 360
         for: 15m
         labels:
           severity: warning
@@ -118,6 +118,16 @@ groups:
         annotations:
           summary: "Telemetry artifact stale (> 6h): {{ $labels.artifact }}"
           description: "Artifact {{ $labels.artifact }} has not refreshed for {{ $value | humanize }} minutes."
+
+      - alert: HLSettlementStudyDegraded
+        expr: hl_settlement_study_degraded == 1
+        for: 15m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Settlement study collection degraded (< 80% coins collected)"
+          description: "Latest :00 funding settlement study collected <80% of requested coins (likely HTTP 429); retained previous stats.parquet."
 
       - alert: HLTestnetALOFillRateLow
         expr: hl_testnet_alo_fill_rate_pct < 65

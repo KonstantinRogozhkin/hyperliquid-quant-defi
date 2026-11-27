@@ -638,8 +638,15 @@ def format_settlement_study_telegram_rich_html(stats_df: pd.DataFrame, meta: dic
                 "</tr>"
             )
     iv = meta.get("bar_interval", "5m")
+    deg_note = (
+        f"<p>⚠️ <b>DEGRADED ({meta.get('coins_collected')}/{meta.get('coins_requested')} монет):</b> "
+        "неполный сбор из-за лимитов API; предыдущий stats.parquet сохранён.</p>"
+        if meta.get("degraded")
+        else ""
+    )
     return (
         f"<h1>🔬 OOS-аудит фандинга :00 ({meta['span_days']:.0f}д · {html.escape(str(iv))}, Hyperliquid)</h1>"
+        f"{deg_note}"
         f"<p><b>Выборка:</b> {meta['coins_collected']} монет · <b>{meta['total_settlement_events']:,}</b> расчётов (Dev 65% vs Holdout 35%, Ex-Top1-Coin).</p>"
         f'<table bordered striped>{"".join(rows)}</table>'
         f"<footer>Hyperliquid Mainnet {html.escape(str(iv))} candles + paginated fundingHistory</footer>"

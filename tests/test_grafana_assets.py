@@ -79,6 +79,7 @@ def _sample_full_metrics_names() -> set[str]:
         },
         "cross_dex_all": [{"coin": "BTC", "spread_apr_pct": 35.0}],
         "paper": {"starting_capital_usd": 100000.0, "equity_usd": 99500.0, "return_pct": -0.5, "active_positions": 12, "ticks": 4},
+        "settlement_meta": {"degraded": False, "collection_ratio": 1.0},
         "onchain_events": {
             "hlp_tvl_usd": 152e6,
             "hlp_mm_pnl": {"hlp_cum_pnl_usd": 141e6, "hlp_pnl_delta_usd": 200.0},
@@ -194,3 +195,17 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
         assert "bool(" not in expr, f"Invalid PromQL bool(...) function in '{rule['title']}'; use '< bool' / '> bool'"
         for m in metric_re.findall(expr):
             assert m in emitted, f"Grafana alert '{rule['title']}' references unknown metric '{m}'"
+
+
+def test_grafana_dashboard_json_is_in_sync_with_builder():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "build_grafana_dashboard", ROOT / "scripts" / "ops" / "build_grafana_dashboard.py"
+    )
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    expected = mod.build_dashboard()
+    actual = json.loads(DASH_PATH.read_text(encoding="utf-8"))
+    assert actual == expected, "Run `python3 scripts/ops/build_grafana_dashboard.py` to sync dashboard JSON"

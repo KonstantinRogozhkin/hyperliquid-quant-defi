@@ -31,14 +31,26 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-def _read_parquet_records(path: Path, limit: int | None = None) -> list[dict[str, Any]]:
+_PARQUET_CACHE: dict[str, tuple[int, int, int | None, list[dict[str, Any]]]] = {}
+
+
+def _read_parquet_records(path: Path, limit: int | None = None, *, head: bool = False) -> list[dict[str, Any]]:
     if not path.is_file():
         return []
     try:
+        st = path.stat()
+        cache_key = f"{path.resolve()}::{head}"
+        cached = _PARQUET_CACHE.get(cache_key)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size and cached[2] == limit:
+            return list(cached[3])
         df = pd.read_parquet(path)
         if limit is not None:
-            df = df.head(limit)
-        return df.to_dict(orient="records")
+            df = df.head(limit) if head else df.tail(limit)
+        records = df.to_dict(orient="records")
+        if len(_PARQUET_CACHE) > 64:
+            _PARQUET_CACHE.clear()
+        _PARQUET_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, limit, records)
+        return list(records)
     except Exception:
         return []
 
@@ -47,7 +59,7 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
     """Collect all live JSON/Parquet outputs under ``data_root`` for dashboard rendering."""
     base = ts.collect_tear_sheet_data(data_root)
     cross_paper_state = _read_json(data_root / "hl_cross_dex_paper" / "state.json")
-    paper_ticks = _read_parquet_records(data_root / "hl_metamodel" / "ticks.parquet")
+    paper_ticks = _read_parquet_records(data_root / "hl_metamodel" / "ticks.parquet", limit=720)
     mm_quotes = _read_parquet_records(data_root / "hl_mm_testnet" / "quotes.parquet", limit=200)
     # Prefer the expanded 52-day (60k-event) :00 funding study when present, else fallback to 17-day
     study_dir = (
@@ -57,18 +69,19 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
     )
     settlement_stats = _read_parquet_records(study_dir / "stats.parquet")
     settlement_meta = _read_json(study_dir / "meta.json")
+    settlement_last_attempt = _read_json(study_dir / "last_attempt.json")
     onchain_events = _read_json(data_root / "hl_onchain_events" / "latest_snapshot.json")
-    cross_dex_all = _read_parquet_records(data_root / "hl_cross_dex_v2" / "opportunities.parquet", limit=15)
+    cross_dex_all = _read_parquet_records(data_root / "hl_cross_dex_v2" / "opportunities.parquet", limit=15, head=True)
     hip3_snap = _read_json(data_root / "hl_hip3_arb" / "snapshot.json")
     hip3_paper = _read_json(data_root / "hl_hip3_paper" / "state.json")
-    hip3_paper_ticks = _read_parquet_records(data_root / "hl_hip3_paper" / "ticks.parquet")
+    hip3_paper_ticks = _read_parquet_records(data_root / "hl_hip3_paper" / "ticks.parquet", limit=720)
     spot_perp_paper = _read_json(data_root / "hl_spot_perp_paper" / "state.json")
-    spot_perp_paper_ticks = _read_parquet_records(data_root / "hl_spot_perp_paper" / "ticks.parquet")
+    spot_perp_paper_ticks = _read_parquet_records(data_root / "hl_spot_perp_paper" / "ticks.parquet", limit=720)
     spot_perp_scan = _read_json(data_root / "hl_spot_perp_paper" / "snapshot.json") or _read_json(
         data_root / "hl_spot_perp_arb" / "snapshot.json"
     )
     autopilot = _read_json(data_root / "hl_autopilot" / "state.json")
-    autopilot_ticks = _read_parquet_records(data_root / "hl_autopilot" / "ticks.parquet")
+    autopilot_ticks = _read_parquet_records(data_root / "hl_autopilot" / "ticks.parquet", limit=720)
     boros_snap = _read_json(data_root / "hl_boros" / "snapshot.json")
     yield_snap = _read_json(data_root / "hl_hyperevm_yield_stack" / "snapshot.json")
     frontier_hist = _read_json(data_root / "hl_frontier_history" / "latest_summary.json")
@@ -81,6 +94,7 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
         "mm_quotes": mm_quotes,
         "settlement_stats": settlement_stats,
         "settlement_meta": settlement_meta,
+        "settlement_last_attempt": settlement_last_attempt,
         "onchain_events": onchain_events,
         "cross_dex_all": cross_dex_all,
         "hip3": hip3_snap,

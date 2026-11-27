@@ -84,10 +84,8 @@ def main(
     tmp_rep.write_text(md, encoding="utf-8")
     tmp_rep.replace(report_path)
 
-    if telegram:
-        token, chat_id, thread_id = pt.load_telegram_credentials(
-            (ROOT / ".env", ROOT.parent / "ResearchLAB" / "system" / ".env")
-        )
+    if telegram and not degraded:
+        token, chat_id, thread_id = pt.load_telegram_credentials((ROOT / ".env",))
         if token and chat_id:
             try:
                 rich = fss.format_settlement_study_telegram_rich_html(stats_df, meta)

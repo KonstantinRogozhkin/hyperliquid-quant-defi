@@ -364,3 +364,215 @@ def test_degraded_settlement_run_keeps_published_meta(tmp_path: Path, monkeypatc
     assert json.loads((out / "meta.json").read_text()) == published
     assert json.loads((out / "last_attempt.json").read_text())["coins_collected"] == 5
     assert (out / "stats.parquet").is_file()
+
+
+def test_degraded_settlement_run_suppresses_corrupted_telegram_push(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import importlib.util
+
+    from typer.testing import CliRunner
+
+    spec = importlib.util.spec_from_file_location(
+        "run_settlement_study_tg", Path(__file__).resolve().parents[1] / "scripts/analytics/run_hl_funding_settlement_study.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec is not None and spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    sent: list[str] = []
+    monkeypatch.setattr(mod.pt, "load_telegram_credentials", lambda *_a, **_kw: ("tok", "chat", None))
+    monkeypatch.setattr(mod.pt, "send_telegram_rich_message", lambda html, **_kw: sent.append(html) or {"ok": True})
+
+    async def fake_fetch(**_kw):
+        return pd.DataFrame(), {
+            "observed_at_ms": 1_796_000_000_000,
+            "bar_interval": "15m",
+            "coins_requested": 35,
+            "coins_collected": 15,
+            "coins_failed": ["X"],
+            "total_settlement_events": 1000,
+            "span_days": 52.0,
+            "collection_ratio": 15 / 35,
+            "degraded": True,
+        }
+
+    monkeypatch.setattr(mod.fss, "fetch_settlement_dataset", fake_fetch)
+    res = CliRunner().invoke(
+        mod.app,
+        ["--output-dir", str(tmp_path / "s"), "--report-path", str(tmp_path / "r.md"), "--telegram"],
+        catch_exceptions=False,
+    )
+    assert res.exit_code == 2
+    assert sent == []  # never broadcast unrepresentative degraded stats to Telegram
+
+
+def test_testnet_orphan_neutralization_killswitch_and_sub10_reduce_only_close():
+    from hl_quant import hl_testnet_executor as ex
+    from hl_quant.api.app import _audit_record
+
+    # 1. Dollar neutralization offsets signed orphan exposure (+0.07 net long orphan -> quoted sum == -0.07)
+    neut = ex.neutralize_target_weights({"BTC": 0.20, "ETH": -0.10, "SOL": -0.05}, max_gross=0.80, fixed_net_weight=0.07)
+    assert sum(neut.values()) + 0.07 == pytest.approx(0.0, abs=1e-4)
+
+    # 2. Unquoted orphan notional counts toward gross leverage kill-switch
+    now = 1_796_000_000_000
+    acct = ex.AccountSnapshot(
+        equity_usd=1_000.0,
+        free_margin_usd=800.0,
+        positions_sz={"VVV": 1.7, "JUP": 30.0},
+        open_orders=[],
+        observed_at_ms=now,
+        position_notional_usd={"VVV": 700.0, "JUP": 7.5},
+    )
+    bbo = {"BTC": (60_000.0, 60_002.0, now), "JUP": (0.249, 0.251, now)}  # VVV unquoted!
+    violations = ex.check_kill_switch(
+        acct, {"BTC": 0.90}, bbo, ex.RiskLimits(max_gross_leverage=1.50), high_water_mark_usd=1_000.0, now_ms=now
+    )
+    assert any(v.startswith("gross_leverage:") for v in violations)  # 0.90 + 0.70 = 1.60x > 1.50x
+
+    # 3. Sub-$10 dust position (`JUP` $7.50) with target_w == 0 is closed via reduce_only=True,
+    #    and unquoted held `VVV` (target_w == 0) is surfaced in `orphan_positions` + preserved by API `_audit_record`.
+    meta = {
+        "BTC": ex.AssetSpec("BTC", sz_decimals=5, max_leverage=40),
+        "JUP": ex.AssetSpec("JUP", sz_decimals=0, max_leverage=10),
+        "VVV": ex.AssetSpec("VVV", sz_decimals=2, max_leverage=5),
+    }
+    adapter = ex.DryRunAdapter()
+    cyc = ex.execute_rebalance_cycle(acct, {"BTC": 0.10}, meta, bbo, adapter, now_ms=now)
+    assert cyc["status"] == "ok"
+    assert cyc["orphan_positions"] == {"VVV": 1.7}
+    jup_orders = [o for o in adapter.placed if o["coin"] == "JUP"]
+    assert len(jup_orders) == 1 and jup_orders[0]["reduce_only"] is True and jup_orders[0]["side"] == "sell"
+    api_rec = _audit_record({"ts_ms": now, **cyc})
+    assert api_rec["orphan_positions"] == {"VVV": 1.7}
+
+
+def test_autopilot_drops_unclosed_intraday_daily_candle():
+    from hl_quant import hl_autopilot as ap
+
+    now = 1_796_040_000_000
+    bars = [
+        {"t": now - 2 * 86_400_000, "T": now - 86_400_000 - 1, "c": "60000"},
+        {"t": now - 86_400_000, "T": now - 1, "c": "61000"},
+        {"t": now, "T": now + 40_000_000, "c": "99999"},  # still-forming intraday 1d candle!
+    ]
+    transport = httpx.MockTransport(lambda _req: httpx.Response(200, json=bars))
+    with httpx.Client(transport=transport) as client:
+        out = ap.fetch_hypercore_daily_closes_with_dates(client, ("BTC",), lookback_days=10, now_ms=now)
+    assert [r["close"] for r in out["BTC"]] == [60000.0, 61000.0]
+
+
+def test_analytics_daily_resample_ratios_single_down_sortino_and_net_dd():
+    # 6 calendar days x 6 intraday 4h ticks = 36 points, with exactly 1 losing day
+    base = datetime(2026, 11, 1, 0, 0, tzinfo=timezone.utc)
+    dates: list[str] = []
+    shares: list[float] = []
+    day_closes = [1.002, 1.004, 1.003, 1.006, 1.009, 1.008]  # day 3 dips, day 6 slightly below day 5 peak
+    for d_idx, dc in enumerate(day_closes):
+        for h in (0, 4, 8, 12, 16, 20):
+            dates.append((base + timedelta(days=d_idx, hours=h)).strftime("%Y-%m-%dT%H:%M:%SZ"))
+            shares.append(dc)
+    row = ar.compute_series_performance(
+        strategy_id="sp",
+        name="Spot+Perp",
+        category="Market Neutral",
+        dates=dates,
+        gross_shares=shares,
+        mgmt_fee_pct=2.0,
+        perf_fee_pct=20.0,
+        inception_share=1.0,
+    )
+    assert row["sortino_gross"] is not None and row["sortino_gross"] != 99.0
+    assert row["current_underwater_net_days"] is not None
+    # Day-1 management fee is charged on the inception -> first tick interval
+    net_series = ar.simulate_net_series_from_inception(
+        ["2026-11-01", "2026-11-02"], [1.0, 1.0], inception_share=1.0, mgmt_fee_annual_pct=3.65, perf_fee_pct=0.0
+    )
+    assert net_series[0] < 1.0
+
+
+def test_dashboard_parquet_reader_returns_latest_tail_and_invalidates_cache(tmp_path: Path):
+    from hl_quant import hl_portfolio_dashboard as pdash
+
+    p = tmp_path / "quotes.parquet"
+    pd.DataFrame({"seq": [1, 2, 3, 4, 5]}).to_parquet(p, index=False)
+    tail2 = pdash._read_parquet_records(p, limit=2)
+    assert [r["seq"] for r in tail2] == [4, 5]
+    head2 = pdash._read_parquet_records(p, limit=2, head=True)
+    assert [r["seq"] for r in head2] == [1, 2]
+
+    pd.DataFrame({"seq": [1, 2, 3, 4, 5, 6]}).to_parquet(p, index=False)
+    tail2_updated = pdash._read_parquet_records(p, limit=2)
+    assert [r["seq"] for r in tail2_updated] == [5, 6]
+
+
+def test_metrics_autopilot_weighted_apr_hlp_zero_ret_and_scheduler_restart_guard(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    from hl_quant.metrics import render_prometheus_metrics
+    from hl_quant.scheduler import WorkerScheduler
+
+    overview = {
+        "frontier_history": {"hlp_apr_pct": 14.36},
+        "onchain_events": {"hlp_tvl_usd": 152_000_000.0},
+        "spot_perp_paper": {"equity_usd": 100_000.0, "starting_capital_usd": 100_000.0, "blended_portfolio_apr_pct": 4.0},
+        "cross_dex_paper": {
+            "equity_usd": 50_000.0,
+            "starting_capital_usd": 50_000.0,
+            "positions": {"A": {"leg_notional_usd": 25_000.0, "live_spread_apr_pct": 42.12}},  # 21.06% on $50k
+        },
+        "hip3_paper": {
+            "equity_usd": 50_000.0,
+            "starting_capital_usd": 50_000.0,
+            "positions": {"NVDA": {"leg_notional_usd": 25_000.0, "live_spread_apr_pct": 48.68}},  # 24.34% on $50k
+        },
+        "autopilot": {
+            "gross_equity_usd": 250_000.0,
+            "net_equity_usd": 250_000.0,
+            "starting_capital_usd": 250_000.0,
+            "sleeves": [
+                {"name": "spot_perp_paper", "category": "MN", "actual_weight_pct": 35.0, "allocation_usd": 87_500.0},
+                {"name": "cross_dex_paper", "category": "MN", "actual_weight_pct": 25.0, "allocation_usd": 62_500.0},
+                {"name": "hip3_paper", "category": "MN", "actual_weight_pct": 20.0, "allocation_usd": 50_000.0},
+                {"name": "hlp_savings_reserve", "category": "Res", "actual_weight_pct": 15.0, "allocation_usd": 37_500.0},
+                {"name": "crisis_cta", "category": "CTA", "actual_weight_pct": 5.0, "allocation_usd": 12_500.0},
+            ],
+        },
+    }
+    txt = render_prometheus_metrics(overview)
+    # 0.35*4.0 + 0.25*21.06 + 0.20*24.34 + 0.15*14.36 = 13.687 -> 13.69% (never 4.0%!)
+    assert 'hl_strategy_live_apr_pct{strategy="neutral_autopilot",category="Master Vault",mode="paper"} 13.69' in txt
+    assert 'hl_strategy_return_pct{strategy="hlp_benchmark",category="Benchmark",mode="mainnet"} 0' in txt
+
+    # Worker restart within the same UTC minute (`08:20:45` after starting at `08:20:05`) must not re-fire the job
+    monkeypatch.delenv("HL_ENABLE_TESTNET_EXECUTION", raising=False)
+    status_path = tmp_path / "paper" / "hl_worker_status.json"
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(
+        json.dumps(
+            {
+                "service": "hl-worker",
+                "jobs": [
+                    {
+                        "name": "frontier_persistence",
+                        "state": "ok",
+                        "last_started_at_utc": "2026-11-26 08:20:05 UTC",
+                        "last_exit_code": 0,
+                        "runs_ok": 1,
+                        "runs_failed": 0,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    ran: list[list[str]] = []
+    sched = WorkerScheduler(data_dir=tmp_path, telegram_enabled=False, runner=lambda c, _e, _t: ran.append(c) or 0)
+    assert sched.tick_minute(datetime(2026, 11, 26, 8, 20, 45, tzinfo=timezone.utc)) == []
+    assert ran == []
+
+
+def test_zero_external_monorepo_env_paths_in_src_and_analytics_scripts():
+    repo_root = Path(__file__).resolve().parents[1]
+    for folder in (repo_root / "src", repo_root / "scripts" / "analytics"):
+        for py in folder.rglob("*.py"):
+            content = py.read_text(encoding="utf-8")
+            assert "ResearchLAB" not in content, f"Forbidden ResearchLAB dependency in {py}"
+            assert "BackTesterv2" not in content, f"Forbidden BackTesterv2 dependency in {py}"

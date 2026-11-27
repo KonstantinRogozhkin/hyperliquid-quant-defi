@@ -174,6 +174,7 @@ def _audit_record(rec: dict[str, Any]) -> dict[str, Any]:
         "high_water_mark_usd": float(rec.get("high_water_mark_usd", 0.0) or 0.0),
         "blocked_isolated_coins": list(rec.get("blocked_isolated_coins") or []),
         "skipped_unquoted_coins": list(rec.get("skipped_unquoted_coins") or []),
+        "orphan_positions": dict(rec.get("orphan_positions") or {}),
     }
 
 

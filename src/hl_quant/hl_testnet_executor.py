@@ -62,6 +62,9 @@ class AccountSnapshot:
     open_orders: list[dict[str, Any]]
     observed_at_ms: int
     position_leverage: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # Signed USD mark value per held coin (+long, -short) from clearinghouseState, so unquoted
+    # orphan positions are still counted in gross leverage and dollar-neutrality checks.
+    position_notional_usd: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -176,12 +179,18 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
 
     positions_sz: dict[str, float] = {}
     position_leverage: dict[str, tuple[str, int]] = {}
+    position_notional_usd: dict[str, float] = {}
     for entry in st.get("assetPositions") or []:
         pos = entry.get("position") or {}
         coin = str(pos.get("coin") or "").strip()
         szi = float(pos.get("szi", 0.0))
         if coin and abs(szi) > 1e-12:
             positions_sz[coin] = szi
+            pos_val = abs(float(pos.get("positionValue", 0.0) or 0.0))
+            if pos_val <= 0.0:
+                pos_val = abs(szi) * abs(float(pos.get("entryPx", 0.0) or 0.0))
+            if pos_val > 0.0:
+                position_notional_usd[coin] = math.copysign(pos_val, szi)
             lev = pos.get("leverage") if isinstance(pos.get("leverage"), dict) else {}
             if lev:
                 position_leverage[coin] = (str(lev.get("type", "cross")), int(float(lev.get("value", 1))))
@@ -227,6 +236,7 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
         open_orders=open_orders if isinstance(open_orders, list) else [],
         observed_at_ms=int(time.time() * 1000),
         position_leverage=position_leverage,
+        position_notional_usd=position_notional_usd,
     )
 
 
@@ -294,7 +304,17 @@ def check_kill_switch(
     if free_pct < limits.min_free_margin_pct:
         reasons.append(f"low_free_margin:{free_pct:.1f}%<{limits.min_free_margin_pct:.1f}%")
 
-    gross = sum(abs(w) for w in target_weights.values())
+    orphan_gross_w = 0.0
+    for c, sz in account.positions_sz.items():
+        if abs(sz) <= 1e-12 or c in target_weights:
+            continue
+        if c in bbo:
+            # Quoted non-target positions will be closed by plan_rebalance_orders this cycle.
+            continue
+        ntl = abs(float(account.position_notional_usd.get(c, 0.0) or 0.0))
+        orphan_gross_w += ntl / account.equity_usd
+
+    gross = sum(abs(w) for w in target_weights.values()) + orphan_gross_w
     if gross > limits.max_gross_leverage + 1e-9:
         reasons.append(f"gross_leverage:{gross:.2f}x>{limits.max_gross_leverage:.2f}x")
 
@@ -380,12 +400,14 @@ def plan_rebalance_orders(
         target_sz = (account.equity_usd * target_w) / mid
         delta_sz = target_sz - cur_sz
         delta_usd = abs(delta_sz) * mid
-        min_notional = 10.5 if (target_w == 0.0 and abs(cur_sz) > 1e-12) else limits.min_order_usd
+        side = "buy" if delta_sz > 0 else "sell"
+        reduce_only = (cur_sz > 0 and side == "sell" and target_sz >= 0) or (cur_sz < 0 and side == "buy" and target_sz <= 0)
+        # Hyperliquid enforces ~$10 min notional only on exposure-increasing orders; full reduce-only
+        # unwinds (`target_w == 0`) are permitted on sub-$10 dust (e.g. $7.37 JUP / $2.45 BTC).
+        min_notional = 0.50 if (reduce_only and abs(target_w) <= 1e-12 and abs(cur_sz) > 1e-12) else limits.min_order_usd
         if delta_usd < min_notional:
             continue
 
-        side = "buy" if delta_sz > 0 else "sell"
-        reduce_only = (cur_sz > 0 and side == "sell" and target_sz >= 0) or (cur_sz < 0 and side == "buy" and target_sz <= 0)
         if side == "buy" and not reduce_only and is_pre_settlement_neg_funding_trap(ts_ms, fund_map.get(coin, 0.0), limits):
             # Defer naive pre-:00 long entry on extreme negative funding until after :00 unwind
             continue
@@ -668,11 +690,12 @@ def execute_rebalance_cycle(
     """
     hwm = max(float(high_water_mark_usd or 0.0), 0.0) or account.equity_usd
     skipped_unquoted = sorted(set(skipped_unquoted_coins or []))
-    # Open positions on coins we cannot quote are unmanaged: neither rebalanced nor closable by the
-    # ALO planner. Surface them on every cycle (not only on the tick that tripped the kill-switch).
+    # Open positions on coins we cannot quote (whether dropped from targets or already target=0)
+    # are unmanaged: neither rebalanced nor closable by the ALO planner. Surface all of them.
+    unquoted_open_coins = set(skipped_unquoted) | {c for c in account.positions_sz if c not in bbo}
     orphan_positions = {
         c: account.positions_sz[c]
-        for c in skipped_unquoted
+        for c in sorted(unquoted_open_coins)
         if abs(float(account.positions_sz.get(c, 0.0) or 0.0)) > 1e-12
     }
     violations = check_kill_switch(account, target_weights, bbo, limits, high_water_mark_usd=hwm, now_ms=now_ms)
@@ -761,8 +784,13 @@ def neutralize_target_weights(
     *,
     max_gross: float = 0.90,
     max_single_coin_weight: float = 0.25,
+    fixed_net_weight: float = 0.0,
 ) -> dict[str, float]:
-    """Re-center signed weights to dollar-neutral (``sum(w) == 0``) while honoring gross & single-coin caps."""
+    """Re-center signed weights so ``sum(w) + fixed_net_weight == 0`` while honoring gross & single-coin caps.
+
+    ``fixed_net_weight`` represents signed exposure locked in unquoted orphan positions that cannot
+    be traded this cycle, keeping the *total* account dollar-neutral.
+    """
     clean = {c: float(w) for c, w in weights.items() if math.isfinite(w) and abs(w) >= 1e-4}
     if len(clean) < 2:
         if len(clean) == 1 and max_single_coin_weight > 0:
@@ -770,7 +798,8 @@ def neutralize_target_weights(
             if abs(w) > max_single_coin_weight:
                 return {c: round(math.copysign(max_single_coin_weight, w), 6)}
         return clean
-    mean_w = sum(clean.values()) / len(clean)
+    eff_fixed = float(fixed_net_weight) if math.isfinite(fixed_net_weight) else 0.0
+    mean_w = (sum(clean.values()) + eff_fixed) / len(clean)
     centered = {c: w - mean_w for c, w in clean.items()}
     gross = sum(abs(w) for w in centered.values())
     max_abs = max((abs(w) for w in centered.values()), default=0.0)
@@ -781,6 +810,15 @@ def neutralize_target_weights(
         scale = min(scale, max_single_coin_weight / max_abs)
     if scale < 1.0:
         centered = {c: w * scale for c, w in centered.items()}
+        # Re-adjust mean if scaled down while offsetting a non-zero fixed_net_weight
+        if abs(eff_fixed) > 1e-6 and len(centered) >= 2:
+            rem_shift = (sum(centered.values()) + eff_fixed) / len(centered)
+            shifted = {c: w - rem_shift for c, w in centered.items()}
+            if (
+                sum(abs(w) for w in shifted.values()) <= max_gross + 1e-6
+                and max((abs(w) for w in shifted.values()), default=0.0) <= (max_single_coin_weight or 1e9) + 1e-6
+            ):
+                centered = shifted
     out = {c: round(w, 6) for c, w in centered.items() if abs(w) >= 1e-4}
     if max_single_coin_weight > 0:
         out = {

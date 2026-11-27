@@ -80,13 +80,48 @@ export function AnalyticsRiskTab({
     const lines: SeriesLine[] = [];
     let longestDates: string[] = [];
 
+    const parseMs = (raw: string): number | null => {
+      if (!raw) return null;
+      const ms = Date.parse(raw.includes("T") ? raw : `${raw}T00:00:00Z`);
+      return Number.isFinite(ms) ? ms : null;
+    };
+
+    let globalMaxMs: number | null = null;
+    if (periodDays > 0) {
+      for (const id of keys) {
+        if (hiddenSeries[id]) continue;
+        const ds = curvesMap[id]?.dates ?? [];
+        if (ds.length > 0) {
+          const ms = parseMs(ds[ds.length - 1]);
+          if (ms !== null && (globalMaxMs === null || ms > globalMaxMs)) {
+            globalMaxMs = ms;
+          }
+        }
+      }
+    }
+    const cutoffMs = periodDays > 0 && globalMaxMs !== null ? globalMaxMs - periodDays * 86_400_000 : null;
+
     keys.forEach((id, idx) => {
       if (hiddenSeries[id]) return;
       const c = curvesMap[id];
       const rawShares = feeMode === "gross" ? c.gross_shares : c.net_shares;
-      const sliceCount = periodDays > 0 ? Math.min(rawShares.length, periodDays) : rawShares.length;
-      const subShares = rawShares.slice(rawShares.length - sliceCount);
-      const subDates = c.dates.slice(c.dates.length - sliceCount);
+      let startIdx = 0;
+      if (cutoffMs !== null && c.dates.length === rawShares.length && c.dates.length > 0) {
+        const found = c.dates.findIndex((d) => {
+          const ms = parseMs(d);
+          return ms !== null && ms >= cutoffMs;
+        });
+        if (found === -1) {
+          startIdx = Math.max(0, rawShares.length - 2);
+        } else {
+          // Include one anchor point at/just before cutoff when available so window rebasing is exact
+          startIdx = found > 0 && (parseMs(c.dates[found]) ?? 0) > cutoffMs ? found - 1 : found;
+        }
+      } else if (periodDays > 0) {
+        startIdx = Math.max(0, rawShares.length - periodDays);
+      }
+      const subShares = rawShares.slice(startIdx);
+      const subDates = c.dates.slice(startIdx);
       if (subDates.length > longestDates.length) longestDates = subDates;
       const cleanShares: number[] = [];
       let lastValid = 1;
@@ -103,6 +138,7 @@ export function AnalyticsRiskTab({
         name: c.name,
         color: SERIES_COLORS[idx % SERIES_COLORS.length],
         values: pctVals,
+        dates: subDates,
       });
     });
 
@@ -271,8 +307,9 @@ export function AnalyticsRiskTab({
           <div className="alert-banner">
             <strong>Methodology (Neutral Trade Standard):</strong> Sharpe &amp; Sortino use trailing 90-day daily log
             returns (365d annualization). Net figures apply continuous annual management fee + High-Water Mark (HWM)
-            performance fee strictly above peak net NAV. Under APY view, negative returns are never annualized. Positive
-            days, win/loss streaks, and drawdown recovery days use daily NAV closes.
+            performance fee strictly above peak net NAV. Under APY view, negative period returns are shown as &ldquo;—&rdquo;
+            (never annualized; switch to Returns for period losses). Positive days, win/loss streaks, and drawdown
+            recovery days use daily NAV closes.
           </div>
         )}
 
@@ -301,6 +338,14 @@ export function AnalyticsRiskTab({
                 const sh = feeMode === "gross" ? r.sharpe_gross : r.sharpe_net;
                 const so = feeMode === "gross" ? r.sortino_gross : r.sortino_net;
                 const dd = feeMode === "gross" ? r.max_dd_gross_pct : r.max_dd_net_pct;
+                const ddRec =
+                  feeMode === "gross"
+                    ? r.dd_recovery_days
+                    : (r.dd_recovery_net_days !== undefined ? r.dd_recovery_net_days : r.dd_recovery_days);
+                const ddUnder =
+                  feeMode === "gross"
+                    ? (r.current_underwater_days ?? 0)
+                    : (r.current_underwater_net_days ?? r.current_underwater_days ?? 0);
                 const sp = r.is_benchmark ? r.spot_price_usd : feeMode === "gross" ? r.share_price_gross : r.share_price_net;
                 return (
                   <tr key={r.id}>
@@ -324,9 +369,9 @@ export function AnalyticsRiskTab({
                     <td className="num">{fmtNum(so, 2)}</td>
                     <td className={`num ${dd > 5 ? "neg" : ""}`}>{fmtNum(dd, 2, "%")}</td>
                     <td className="num">
-                      {r.dd_recovery_days !== null && r.dd_recovery_days !== undefined ? `${fmtNum(r.dd_recovery_days, 1)}d` : "—"}
-                      {(r.current_underwater_days ?? 0) > 0 ? (
-                        <div className="section-sub neg">под водой {fmtNum(r.current_underwater_days, 1)}d</div>
+                      {ddRec !== null && ddRec !== undefined ? `${fmtNum(ddRec, 1)}d` : "—"}
+                      {ddUnder > 0 ? (
+                        <div className="section-sub neg">под водой {fmtNum(ddUnder, 1)}d</div>
                       ) : null}
                     </td>
                     <td className="num">{fmtNum(r.positive_days_pct, 1, "%")}</td>

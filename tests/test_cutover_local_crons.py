@@ -51,7 +51,7 @@ def _make_fetcher(
     hb = (now - timedelta(seconds=heartbeat_age_sec)).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     jobs = []
-    for name in ("market_snapshot", "metamodel_paper", "frontier_persistence", "onchain_events"):
+    for name in cutover.DEFAULT_REQUIRED_JOBS:
         jobs.append(
             {
                 "name": name,

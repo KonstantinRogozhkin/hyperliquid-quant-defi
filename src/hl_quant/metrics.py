@@ -193,7 +193,7 @@ def render_prometheus_metrics(
         jobs = [j for j in (ws.get("jobs") or []) if isinstance(j, dict) and j.get("name")]
         enabled_jobs = [j for j in jobs if bool(j.get("enabled"))]
         ok_jobs = [j for j in enabled_jobs if str(j.get("state") or "") == "ok"]
-        b.emit("hl_worker_jobs_total", len(jobs), help_text="Total scheduled worker jobs")
+        b.emit("hl_worker_jobs_configured", len(jobs), help_text="Configured scheduled worker jobs")
         if enabled_jobs:
             b.emit(
                 "hl_worker_jobs_healthy_ratio",
@@ -251,8 +251,10 @@ def render_prometheus_metrics(
         b.emit("hl_testnet_funding_pnl_usd", attr.get("funding_pnl_usd"), help_text="Cumulative Testnet funding PnL USD")
         b.emit("hl_testnet_fees_usd", attr.get("fees_usd"), help_text="Cumulative Testnet fees USD")
         b.emit("hl_testnet_open_positions", attr.get("open_positions_count"), help_text="Open Testnet perp positions")
-        b.emit("hl_testnet_total_fills", attr.get("total_fills"), metric_type="counter", help_text="Total Testnet fills")
-        b.emit("hl_testnet_volume_usd", attr.get("total_volume_usd"), metric_type="counter", help_text="Total Testnet fill volume USD")
+        # Hyperliquid `userFills` is a rolling <=2,000-fill window, so count/volume can decrease as old fills age out -> gauge.
+        b.emit("hl_testnet_total_fills", attr.get("total_fills"), help_text="Tracked Testnet fills in active userFills window")
+        b.emit("hl_testnet_volume_usd", attr.get("total_volume_usd"), help_text="Tracked Testnet fill volume USD in active userFills window")
+        b.emit("hl_testnet_perps_withdrawable_usd", attr.get("withdrawable_usd"), help_text="Testnet Perps withdrawable margin USD")
         b.emit("hl_testnet_maker_share_pct", attr.get("maker_volume_share_pct"), help_text="Maker volume share percentage")
         b.emit("hl_testnet_alo_fill_rate_pct", attr.get("real_alo_fill_rate_pct"), help_text="Real ALO post-only fill rate percentage")
         b.emit("hl_testnet_effective_fee_bps", attr.get("effective_fee_bps"), help_text="Effective fee in bps")
@@ -272,12 +274,14 @@ def render_prometheus_metrics(
             b.emit("hl_testnet_position_adl_rank", crow.get("adl_rank_score"), help_text="Testnet per-coin ADL rank score", labels=clbl)
             b.emit("hl_testnet_position_maker_share_pct", crow.get("maker_share_pct"), help_text="Testnet per-coin maker fill share %", labels=clbl)
 
+    testnet_hwm_val: float | None = None
     audit_recent = overview.get("testnet_audit_recent")
     if isinstance(audit_recent, list) and audit_recent:
         latest_audit = audit_recent[0]
         if isinstance(latest_audit, dict):
             testnet_last_ok = str(latest_audit.get("status")) == "ok"
-            b.emit("hl_testnet_hwm_usd", latest_audit.get("high_water_mark_usd"), help_text="Testnet equity high-water mark USD")
+            testnet_hwm_val = _num(latest_audit.get("high_water_mark_usd"))
+            b.emit("hl_testnet_hwm_usd", testnet_hwm_val, help_text="Testnet equity high-water mark USD")
             b.emit(
                 "hl_testnet_last_cycle_ok",
                 testnet_last_ok,
@@ -289,6 +293,13 @@ def render_prometheus_metrics(
                 len(latest_audit.get("skipped_unquoted_coins") or []),
                 help_text="Unquoted Testnet coins skipped in latest cycle",
             )
+            orphans = latest_audit.get("orphan_positions")
+            if isinstance(orphans, dict):
+                b.emit(
+                    "hl_testnet_orphan_positions",
+                    len(orphans),
+                    help_text="Open Testnet positions currently unquoted and unmanaged",
+                )
 
     # 4. HIP-3 Split-Margin Paper Ledger & Persistence
     hp = overview.get("hip3_paper")
@@ -504,7 +515,12 @@ def render_prometheus_metrics(
         b.emit("hl_spot_perp_hlp_yield_usd", sp.get("cum_hlp_yield_usd"), help_text="Spot+Perp cumulative HLP reserve yield USD")
         b.emit("hl_spot_perp_basis_mtm_usd", sp.get("cum_basis_mtm_usd"), help_text="Spot+Perp cumulative basis MTM USD")
         b.emit("hl_spot_perp_costs_usd", sp.get("cum_costs_usd"), help_text="Spot+Perp cumulative fees & slippage USD")
-        b.emit("hl_spot_perp_nav_guard_triggers", sp_nav_guards, metric_type="counter", help_text="Spot+Perp bounded NAV sanity guard triggers")
+        b.emit(
+            "hl_spot_perp_nav_guard_triggers_total",
+            sp_nav_guards,
+            metric_type="counter",
+            help_text="Spot+Perp bounded NAV sanity guard triggers",
+        )
         sp_pos = sp.get("positions") or {}
         if isinstance(sp_pos, dict):
             b.emit("hl_spot_perp_open_positions", len(sp_pos), help_text="Open HyperCore Spot+Perp pairs")
@@ -551,7 +567,12 @@ def render_prometheus_metrics(
         b.emit("hl_autopilot_cum_perf_fee_usd", ap_st.get("cum_perf_fee_usd"), help_text="Neutral Autopilot cumulative HWM perf fee USD")
         b.emit("hl_autopilot_cum_rebalance_cost_usd", ap_st.get("cum_rebalance_cost_usd"), help_text="Neutral Autopilot cumulative rebalance cost USD")
         b.emit("hl_autopilot_rebalances_total", ap_st.get("rebalances_count"), metric_type="counter", help_text="Neutral Autopilot deadband rebalances executed")
-        b.emit("hl_autopilot_nav_guard_triggers", ap_nav_guards, metric_type="counter", help_text="Neutral Autopilot bounded NAV guard triggers")
+        b.emit(
+            "hl_autopilot_nav_guard_triggers_total",
+            ap_nav_guards,
+            metric_type="counter",
+            help_text="Neutral Autopilot bounded NAV guard triggers",
+        )
         ap_rt = ap_st.get("risk_telemetry")
         if isinstance(ap_rt, dict):
             b.emit("hl_autopilot_gross_leverage", ap_rt.get("gross_leverage"), help_text="Neutral Autopilot weighted gross leverage")
@@ -614,6 +635,58 @@ def render_prometheus_metrics(
             beta,
         )
 
+    s_meta = overview.get("settlement_last_attempt") or overview.get("settlement_meta")
+    if isinstance(s_meta, dict) and "degraded" in s_meta:
+        b.emit(
+            "hl_settlement_study_degraded",
+            bool(s_meta.get("degraded")),
+            help_text="1 if latest settlement study run collected <80% of requested coins",
+        )
+
+    # Pre-compute per-sleeve live APRs so Neutral Autopilot reports its true allocation-weighted APR
+    sp_live_apr = (_num(sp.get("blended_portfolio_apr_pct")) or 0.0) if isinstance(sp, dict) else 0.0
+    cd_live_apr = 0.0
+    if isinstance(cdp, dict):
+        cd_eq_tmp = max(_num(cdp.get("equity_usd")) or 0.0, 1.0)
+        cpos_tmp = cdp.get("positions") or {}
+        if isinstance(cpos_tmp, dict):
+            cd_live_apr = round(
+                sum(
+                    (_num(p.get("leg_notional_usd")) or 0.0) * (_num(p.get("live_spread_apr_pct")) or 0.0)
+                    for p in cpos_tmp.values()
+                    if isinstance(p, dict)
+                )
+                / cd_eq_tmp,
+                2,
+            )
+    hp_live_apr = 0.0
+    if isinstance(hp, dict):
+        hp_eq_tmp = max(_num(hp.get("equity_usd")) or 0.0, 1.0)
+        hpos_tmp = hp.get("positions") or {}
+        if isinstance(hpos_tmp, dict):
+            hp_live_apr = round(
+                sum(
+                    (_num(p.get("leg_notional_usd")) or 0.0) * (_num(p.get("live_spread_apr_pct")) or 0.0)
+                    for p in hpos_tmp.values()
+                    if isinstance(p, dict)
+                )
+                / hp_eq_tmp,
+                2,
+            )
+    hlp_live_apr = (
+        hlp_apr_val
+        if hlp_apr_val is not None
+        else ((_num(sp.get("hlp_apr_pct")) or 0.0) if isinstance(sp, dict) else 0.0)
+    )
+    sleeve_apr_map = {
+        "spot_perp_paper": sp_live_apr,
+        "cross_dex_paper": cd_live_apr,
+        "hip3_paper": hp_live_apr,
+        "hlp_savings_reserve": hlp_live_apr,
+        "metamodel_paper": 0.0,
+        "crisis_cta": 0.0,
+    }
+
     if isinstance(ap_st, dict):
         eq = _num(ap_st.get("gross_equity_usd")) or 0.0
         sc = _num(ap_st.get("starting_capital_usd")) or 250_000.0
@@ -621,7 +694,19 @@ def render_prometheus_metrics(
         net_r_st = _num(ap_st.get("net_return_pct"))
         net_r, max_dd, sh90, beta = _lb_fields("autopilot", ret)
         ap_rt = ap_st.get("risk_telemetry") or {}
-        active_sleeves = sum(1 for s in (ap_st.get("sleeves") or []) if isinstance(s, dict) and (_num(s.get("allocation_usd")) or 0.0) > 1.0)
+        sleeves_list = [s for s in (ap_st.get("sleeves") or []) if isinstance(s, dict)]
+        active_sleeves = sum(1 for s in sleeves_list if (_num(s.get("allocation_usd")) or 0.0) > 1.0)
+        if sleeves_list:
+            ap_live_apr = round(
+                sum(
+                    ((_num(s.get("actual_weight_pct")) or 0.0) / 100.0)
+                    * sleeve_apr_map.get(str(s.get("name") or ""), 0.0)
+                    for s in sleeves_list
+                ),
+                2,
+            )
+        else:
+            ap_live_apr = sp_live_apr
         _emit_strategy_row(
             b,
             strategy="neutral_autopilot",
@@ -635,7 +720,7 @@ def render_prometheus_metrics(
             net_pnl_usd=round((_num(ap_st.get("net_equity_usd")) or eq) - sc, 2),
             funding_pnl_usd=0.0,
             costs_usd=_num(ap_st.get("cum_rebalance_cost_usd")) or 0.0,
-            live_apr_pct=_num(sp.get("blended_portfolio_apr_pct")) if isinstance(sp, dict) else 0.0,
+            live_apr_pct=ap_live_apr,
             open_positions=active_sleeves,
             leverage=_num(ap_rt.get("gross_leverage")) or 0.0,
             max_dd_pct=max_dd,
@@ -791,6 +876,11 @@ def render_prometheus_metrics(
         tot_notional = sum(abs(_num(c.get("position_usd")) or 0.0) for c in (attr.get("per_coin") or []) if isinstance(c, dict))
         liq_w = len(attr.get("liq_warnings") or [])
         adl_w = len(attr.get("adl_warnings") or [])
+        testnet_dd = (
+            round(max(0.0, (1.0 - eq / testnet_hwm_val) * 100.0), 4)
+            if (testnet_hwm_val is not None and testnet_hwm_val > 0 and eq > 0)
+            else 0.0
+        )
         total_open_pos += pos_cnt
         _emit_strategy_row(
             b,
@@ -808,7 +898,7 @@ def render_prometheus_metrics(
             live_apr_pct=0.0,
             open_positions=pos_cnt,
             leverage=round(tot_notional / max(eq, 1.0), 3),
-            max_dd_pct=0.0,
+            max_dd_pct=testnet_dd,
             share_price=round(eq / sc, 6) if sc > 0 else 1.0,
         )
 
@@ -821,8 +911,8 @@ def render_prometheus_metrics(
             status_ok=True,
             equity_usd=hlp_tvl_val or 0.0,
             starting_capital_usd=hlp_tvl_val or 0.0,
-            return_pct=hlp_apr_val or 0.0,
-            net_return_pct=hlp_apr_val or 0.0,
+            return_pct=0.0,
+            net_return_pct=0.0,
             net_pnl_usd=0.0,
             funding_pnl_usd=0.0,
             costs_usd=0.0,
@@ -833,11 +923,19 @@ def render_prometheus_metrics(
             share_price=1.0,
         )
 
-    b.emit("hl_desk_total_paper_equity_usd", round(total_paper_eq, 2), help_text="Sum of active paper strategy equities USD")
+    analytics_nav_guards = (
+        int(((analytics.get("risk_exposure") or {}).get("total_nav_guard_triggers") or 0))
+        if isinstance(analytics, dict)
+        else 0
+    )
+    mm_nav_guards = int(((overview.get("paper") or {}).get("nav_guard_triggers") or 0)) if isinstance(overview.get("paper"), dict) else 0
+    total_nav_guards = max(sp_nav_guards + ap_nav_guards + mm_nav_guards, analytics_nav_guards)
+
+    b.emit("hl_desk_total_paper_equity_usd", round(total_paper_eq, 2), help_text="Sum of standalone paper sleeve equities USD (excludes Master Vault wrapper)")
     b.emit("hl_desk_total_open_positions", total_open_pos, help_text="Total open positions across all active strategies")
     b.emit(
         "hl_desk_nav_guard_triggers_total",
-        sp_nav_guards + ap_nav_guards,
+        total_nav_guards,
         metric_type="counter",
         help_text="Total Bounded NAV Sanity Guard triggers across desk ledgers",
     )

@@ -159,7 +159,14 @@ export default function App() {
   const settlementFiltered = useMemo(() => {
     const rows = data?.settlement_stats ?? [];
     if (settlementSplit === "ALL") return rows.slice(0, 20);
-    return rows.filter((r) => String(r.split).toUpperCase() === settlementSplit).slice(0, 20);
+    return rows
+      .filter((r) => {
+        const sp = String(r.split ?? "").trim().toUpperCase();
+        if (settlementSplit === "OOS") return sp === "OOS" || sp === "HOLDOUT";
+        if (settlementSplit === "IS") return sp === "IS" || sp === "DEV";
+        return sp === settlementSplit;
+      })
+      .slice(0, 20);
   }, [data, settlementSplit]);
 
   const beSha = data?.build_info?.sha ?? "dev";
@@ -1084,6 +1091,9 @@ export default function App() {
                               rec.violations.length ? rec.violations.join(", ") : "",
                               rec.skipped_unquoted_coins?.length
                                 ? `skipped (no BBO): ${rec.skipped_unquoted_coins.join(", ")}`
+                                : "",
+                              rec.orphan_positions && Object.keys(rec.orphan_positions).length
+                                ? `orphans: ${Object.keys(rec.orphan_positions).join(", ")}`
                                 : "",
                             ]
                               .filter(Boolean)

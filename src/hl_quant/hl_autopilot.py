@@ -175,7 +175,12 @@ def fetch_hypercore_daily_closes_with_dates(
                 if not isinstance(b, dict):
                     continue
                 c_px = _f(b.get("c"))
-                t_ms = int(_f(b.get("T") or b.get("t")))
+                close_ms = int(_f(b.get("T"))) if b.get("T") is not None else 0
+                open_ms = int(_f(b.get("t")))
+                # Drop today's still-forming 1d candle (`T > end_ms`) so 20d vol & TSMOM use completed UTC days.
+                if close_ms > end_ms:
+                    continue
+                t_ms = close_ms or open_ms
                 if c_px > 0 and t_ms > 0:
                     d_str = datetime.fromtimestamp(t_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
                     pts.append({"date": d_str, "close": c_px})
@@ -607,11 +612,14 @@ def run_autopilot_tick(
 
     own_client = client is None and daily_closes is None
     http_client = client or (httpx.Client(timeout=20.0) if own_client else None)
+    live_marks: dict[str, float] = {}
     try:
         if daily_closes is None:
             assert http_client is not None
+            # Fetch >=370 completed UTC days so `hl_benchmarks/daily_closes.json` covers full YTD & 1Y,
+            # while CTA TSMOM slices the trailing 60 completed daily closes below.
             dated_bars = fetch_hypercore_daily_closes_with_dates(
-                http_client, CTA_UNIVERSE, lookback_days=90, now_ms=ts_ms, info_url=info_url
+                http_client, CTA_UNIVERSE, lookback_days=370, now_ms=ts_ms, info_url=info_url
             )
             if dated_bars:
                 _write_json_atomic(
@@ -619,6 +627,15 @@ def run_autopilot_tick(
                     {"updated_at_utc": obs_utc, "benchmarks": dated_bars},
                 )
             closes_map = {c: [float(p["close"]) for p in pts[-60:]] for c, pts in dated_bars.items() if pts}
+            try:
+                m_resp = http_client.post(info_url, json={"type": "allMids"})
+                if m_resp.status_code == 200 and isinstance(m_resp.json(), dict):
+                    for k, v in m_resp.json().items():
+                        px = _f(v)
+                        if px > 0:
+                            live_marks[str(k)] = px
+            except Exception:
+                pass
         else:
             closes_map = dict(daily_closes)
     finally:
@@ -636,13 +653,17 @@ def run_autopilot_tick(
     prev_cta_w: dict[str, float] = dict(cta_state.get("weights") or {})
     prev_cta_px: dict[str, float] = dict(cta_state.get("last_closes") or {})
 
+    cta_mark_map = {
+        c: float(live_marks.get(c) or vals[-1])
+        for c, vals in closes_map.items()
+        if vals
+    }
     cta_tick_ret = 0.0
     if prev_cta_w and prev_ms > 0:
         for coin, w in prev_cta_w.items():
-            c_list = closes_map.get(coin)
+            p1 = cta_mark_map.get(coin, 0.0)
             p0 = _f(prev_cta_px.get(coin))
-            if c_list and p0 > 0:
-                p1 = float(c_list[-1])
+            if p1 > 0 and p0 > 0:
                 cta_tick_ret += w * ((p1 - p0) / p0)
 
     cta_snap = compute_crisis_cta_weights(closes_map, prev_weights=prev_cta_w, cfg=cfg)
@@ -652,7 +673,7 @@ def run_autopilot_tick(
     cta_funding_ret = prev_cta_gross * (cfg.cta_funding_cost_apr_pct / 100.0 / HOURS_PER_YEAR) * dt_hours
     cta_cost_ret = cta_turnover_cost_ret + cta_funding_ret
     cta_net_ret = cta_tick_ret - cta_cost_ret
-    new_last_closes = {c: float(vals[-1]) for c, vals in closes_map.items() if vals}
+    new_last_closes = dict(cta_mark_map)
 
     # 2. Compute target master weights
     target_weights = compute_autopilot_target_weights(
@@ -748,11 +769,10 @@ def run_autopilot_tick(
     if should_rebalance:
         rebal_turnover = 0.5 * sum(abs(target_weights[k] - actual_weights.get(k, 0.0)) for k in target_weights)
         if is_initial:
-            # Bootstrap = 100% turnover into the trading sleeves. Attaching to a sleeve's NAV is
-            # not free: replicating its open book costs at least the reallocation cost. HLP is a
-            # vault deposit; the CTA entry cost was already charged above.
+            # Bootstrap = 100% turnover into the trading sleeves (sized off full initial gross capital).
+            # HLP is a vault deposit; the CTA entry cost was already charged above.
             fundable = sum(
-                gross_before_rebal * w
+                prev_gross * w
                 for k, w in target_weights.items()
                 if k not in ("hlp_savings_reserve", "crisis_cta")
             )

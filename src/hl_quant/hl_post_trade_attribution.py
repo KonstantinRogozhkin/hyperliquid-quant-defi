@@ -86,6 +86,7 @@ class PostTradeAttribution:
     audit_actions_count: int = 0  # placements (incl. rejected ALO) + cancels from the audit log
     audit_fill_volume_usd: float = 0.0  # volume of fills belonging to audited orders only
     mixed_account_warning: str = ""
+    withdrawable_usd: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -653,8 +654,10 @@ def compute_post_trade_attribution(
             f"{foreign_fill_vol / tot_vol * 100.0:.0f}% fill volume is not from audited executor orders "
             "(MM/manual fills share this address) — attribution is contaminated"
         )
-    if is_unified:
-        mixed_warning = (mixed_warning + "; " if mixed_warning else "") + "account is in Unified mode (Standard required)"
+    # Unified Account (`unifiedAccount` / `portfolioMargin`) is natively supported above (`total_eq = spot_usdc`);
+    # only warn if an undocumented non-standard abstraction mode appears.
+    if abstraction and abstraction not in {"disabled", "default", "standard", "unifiedAccount", "portfolioMargin"}:
+        mixed_warning = (mixed_warning + "; " if mixed_warning else "") + f"unrecognized userAbstraction={abstraction}"
 
     return PostTradeAttribution(
         account_address=str(snapshot.get("account_address", "")),
@@ -691,6 +694,7 @@ def compute_post_trade_attribution(
         audit_actions_count=audit_actions,
         audit_fill_volume_usd=round(audit_vol, 2),
         mixed_account_warning=mixed_warning,
+        withdrawable_usd=round(withdrawable, 4),
     )
 
 

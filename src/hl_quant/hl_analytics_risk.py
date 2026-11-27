@@ -91,6 +91,18 @@ def simulate_hwm_net_series(
     return net
 
 
+def _inception_anchor_date_str(first_date: str) -> str:
+    """Stamp inception anchor 4h before an intraday ISO tick or 1d before a daily YYYY-MM-DD bar."""
+    first = str(first_date)
+    try:
+        if "T" in first:
+            dt = datetime.fromisoformat(first.replace("Z", "+00:00")) - pd.Timedelta(hours=4)
+            return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+        return (datetime.fromisoformat(first) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        return first
+
+
 def simulate_net_series_from_inception(
     dates: list[str],
     gross_shares: list[float],
@@ -104,8 +116,9 @@ def simulate_net_series_from_inception(
         return simulate_hwm_net_series(
             dates, gross_shares, mgmt_fee_annual_pct=mgmt_fee_annual_pct, perf_fee_pct=perf_fee_pct
         )
+    anchor_dt = _inception_anchor_date_str(dates[0]) if dates else ""
     full = simulate_hwm_net_series(
-        [dates[0], *dates],
+        [anchor_dt, *dates] if dates else [],
         [float(inception_share), *gross_shares],
         mgmt_fee_annual_pct=mgmt_fee_annual_pct,
         perf_fee_pct=perf_fee_pct,
@@ -326,7 +339,14 @@ def compute_series_performance(
     def _ratios(series: list[float]) -> tuple[float | None, float | None]:
         if unique_cal_days < 5 or len(series) < 5:
             return None, None
-        sub = np.asarray(series[-91:], dtype=float)
+        # Always resample to UTC calendar-day closes (never raw 4h intraday ticks) and prepend
+        # `inception_share` when inside the trailing 90d window so Day-1 entry costs are included.
+        daily_vals = _daily_closes(dates_dt, series)
+        if inception_share is not None and inception_share > 0 and len(daily_vals) <= 90:
+            daily_vals = [float(inception_share), *daily_vals]
+        else:
+            daily_vals = daily_vals[-91:]
+        sub = np.asarray(daily_vals, dtype=float)
         sub = sub[sub > 0]
         if len(sub) < 3:
             return None, None
@@ -337,12 +357,10 @@ def compute_series_performance(
         std_d = float(np.std(lr, ddof=1))
         sh = round((mean_d / std_d) * math.sqrt(TRADING_DAYS_PER_YEAR), 2) if std_d > 1e-10 else None
         down = lr[lr < 0.0]
-        if len(down) >= 2:
-            # Downside deviation over ALL periods (standard Sortino target semi-deviation).
+        if len(down) >= 1:
+            # Target downside semi-deviation over ALL periods: sqrt((1/N) * sum(min(r_i, 0)^2)).
             d_std = float(np.sqrt(np.sum(down * down) / len(lr)))
             so = round((mean_d / d_std) * math.sqrt(TRADING_DAYS_PER_YEAR), 2) if d_std > 1e-10 else None
-        elif len(down) == 0 and mean_d > 0:
-            so = 99.0
         else:
             so = None
         return sh, so
@@ -364,7 +382,9 @@ def compute_series_performance(
     max_dd_g, dd_rec_days, underwater_days = _compute_drawdown_stats(
         dates_dt, gross_shares, inception_share=inception_share
     )
-    max_dd_n, _, _ = _compute_drawdown_stats(dates_dt, net_s, inception_share=inception_share)
+    max_dd_n, dd_rec_net_days, underwater_net_days = _compute_drawdown_stats(
+        dates_dt, net_s, inception_share=inception_share
+    )
     elapsed_days = max((dates_dt[-1] - dates_dt[0]).total_seconds() / 86_400.0, 0.0) if dates_dt else 0.0
 
     return {
@@ -392,6 +412,8 @@ def compute_series_performance(
         "max_dd_net_pct": max_dd_n,
         "dd_recovery_days": dd_rec_days,
         "current_underwater_days": underwater_days,
+        "dd_recovery_net_days": dd_rec_net_days,
+        "current_underwater_net_days": underwater_net_days,
         "positive_days_pct": pos_days_pct,
         "longest_win_streak": win_streak,
         "longest_loss_streak": loss_streak,
