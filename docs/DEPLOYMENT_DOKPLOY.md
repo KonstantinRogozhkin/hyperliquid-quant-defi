@@ -93,8 +93,18 @@ Under **GitHub → Settings → Secrets and variables → Actions**:
 
 ## 5. Cutting Over from Local macOS Crons
 
-Once the Dokploy `worker` tab under **Scheduler & Ops** reports fresh heartbeats and green jobs, remove the 7 local macOS crons so Telegram alerts and Testnet ticks are not duplicated:
+Once the Dokploy `worker` tab under **Scheduler & Ops** reports fresh heartbeats and green jobs, use the pre-flight cutover script (it checks live `/build-info.json`, `/api/v1/healthz`, and `/api/v1/scheduler/status`, saves a timestamped backup under `data/crontab_backups/`, and preserves all unrelated cron entries):
 
 ```bash
-crontab -l | awk '/# BEGIN hyperliquid-quant-defi /{s=1;next} /# END hyperliquid-quant-defi /{s=0;next} !s' | crontab -
+# 1. Dry-run (verifies Dokploy worker heartbeat + prints unified crontab diff)
+python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl.example.com
+
+# 2a. Cut over all 7 schedules (when Dokploy worker has HL_ENABLE_TESTNET_EXECUTION=true)
+python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl.example.com --expect-testnet-worker --apply
+
+# 2b. Or cut over the 6 data/paper/alert schedules while keeping local testnet_executor active
+python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl.example.com --keep-local-testnet --apply
+
+# 3. Instant rollback from backup if ever needed
+python3 scripts/ops/cutover_local_crons_to_dokploy.py --restore data/crontab_backups/crontab_<timestamp>.txt --apply
 ```

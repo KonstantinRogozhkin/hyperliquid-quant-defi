@@ -1,4 +1,4 @@
-.PHONY: lint test api frontend-dev frontend-build docker-up dashboard scan-hip3 scan-boros scan-evm bench-mm
+.PHONY: lint test api frontend-dev frontend-test frontend-build docker-up dashboard scan-hip3 scan-boros scan-evm bench-mm
 
 PYTHON := .venv/bin/python
 PYTEST := .venv/bin/pytest
@@ -16,6 +16,9 @@ api:
 
 frontend-dev:
 	cd frontend && npm run dev
+
+frontend-test:
+	cd frontend && npm test
 
 frontend-build:
 	cd frontend && npm run build
