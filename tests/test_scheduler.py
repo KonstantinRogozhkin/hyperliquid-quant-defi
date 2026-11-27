@@ -13,7 +13,7 @@ from hl_quant.scheduler import WorkerScheduler, app, build_job_specs
 
 def test_job_schedule_matching(tmp_path: Path):
     jobs = {j.name: j for j in build_job_specs()}
-    assert len(jobs) == 13
+    assert len(jobs) == 14
 
     assert jobs["onchain_events"].should_run_at(datetime(2026, 11, 26, 14, 15, tzinfo=timezone.utc))
     assert not jobs["onchain_events"].should_run_at(datetime(2026, 11, 26, 14, 16, tzinfo=timezone.utc))
@@ -26,6 +26,9 @@ def test_job_schedule_matching(tmp_path: Path):
 
     assert jobs["hip3_paper"].should_run_at(datetime(2026, 11, 26, 8, 22, tzinfo=timezone.utc))
     assert not jobs["hip3_paper"].should_run_at(datetime(2026, 11, 26, 9, 22, tzinfo=timezone.utc))
+
+    assert jobs["spot_perp_paper"].should_run_at(datetime(2026, 11, 26, 8, 27, tzinfo=timezone.utc))
+    assert not jobs["spot_perp_paper"].should_run_at(datetime(2026, 11, 26, 9, 27, tzinfo=timezone.utc))
 
     assert jobs["liq_funding_alpha"].should_run_at(datetime(2026, 11, 26, 8, 35, tzinfo=timezone.utc))
     assert not jobs["liq_funding_alpha"].should_run_at(datetime(2026, 11, 26, 9, 35, tzinfo=timezone.utc))

@@ -166,7 +166,7 @@ jobs:
           import hyperliquid
           from hl_quant.scheduler import build_job_specs
           jobs = build_job_specs()
-          assert len(jobs) == 13 and any(j.name == "hip3_paper" for j in jobs), [j.name for j in jobs]
+          assert len(jobs) == 14 and any(j.name == "hip3_paper" for j in jobs) and any(j.name == "spot_perp_paper" for j in jobs), [j.name for j in jobs]
           print("worker smoke OK:", len(jobs), "jobs")
           '
 

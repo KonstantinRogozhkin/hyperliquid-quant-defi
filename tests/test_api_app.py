@@ -152,6 +152,15 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert hip3_body["hip3_paper"]["equity_usd"] == 50012.5
     assert hip3_body["history_tail"][0]["spread_apr_pct"] is None
 
+    (tmp_path / "hl_spot_perp_paper").mkdir(parents=True)
+    (tmp_path / "hl_spot_perp_paper" / "state.json").write_text(
+        json.dumps({"equity_usd": 100125.0, "hlp_reserve_usd": 10012.5, "positions": {}}),
+        encoding="utf-8",
+    )
+    r_sp = client.get("/api/v1/spot-perp")
+    assert r_sp.status_code == 200
+    assert r_sp.json()["state"]["equity_usd"] == 100125.0
+
     r_events = client.get("/api/v1/events/latest")
     assert r_events.status_code == 200
     assert r_events.json()["onchain_events"]["alerts_count"] == 1

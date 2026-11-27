@@ -60,6 +60,11 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
     hip3_snap = _read_json(data_root / "hl_hip3_arb" / "snapshot.json")
     hip3_paper = _read_json(data_root / "hl_hip3_paper" / "state.json")
     hip3_paper_ticks = _read_parquet_records(data_root / "hl_hip3_paper" / "ticks.parquet")
+    spot_perp_paper = _read_json(data_root / "hl_spot_perp_paper" / "state.json")
+    spot_perp_paper_ticks = _read_parquet_records(data_root / "hl_spot_perp_paper" / "ticks.parquet")
+    spot_perp_scan = _read_json(data_root / "hl_spot_perp_paper" / "snapshot.json") or _read_json(
+        data_root / "hl_spot_perp_arb" / "snapshot.json"
+    )
     boros_snap = _read_json(data_root / "hl_boros" / "snapshot.json")
     yield_snap = _read_json(data_root / "hl_hyperevm_yield_stack" / "snapshot.json")
     frontier_hist = _read_json(data_root / "hl_frontier_history" / "latest_summary.json")
@@ -77,6 +82,9 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
         "hip3": hip3_snap,
         "hip3_paper": hip3_paper,
         "hip3_paper_ticks": hip3_paper_ticks,
+        "spot_perp_paper": spot_perp_paper,
+        "spot_perp_paper_ticks": spot_perp_paper_ticks,
+        "spot_perp_scan": spot_perp_scan,
         "boros": boros_snap,
         "yield_stack": yield_snap,
         "frontier_history": frontier_hist,
