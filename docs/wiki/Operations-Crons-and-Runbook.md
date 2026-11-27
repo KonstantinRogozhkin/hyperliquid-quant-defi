@@ -42,9 +42,10 @@ zsh scripts/ops/install_all_hl_crons.sh
 # Установка окружения
 uv sync --extra dev --extra testnet
 
-# Проверка линтера и всех 168+ unit-тестов (идентично GitHub Actions CI)
+# Проверка линтера и всех unit-тестов (идентично GitHub Actions CI)
 make lint
 make test
+make frontend-test
 make frontend-build
 make docker-up   # локальный запуск Nginx + React SPA + FastAPI на http://localhost:8080
 
