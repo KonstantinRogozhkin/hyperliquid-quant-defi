@@ -113,9 +113,17 @@ class AutopilotConfig:
     cta_max_leverage: float = 1.5
     cta_max_asset_weight: float = 0.45
     cta_weight_deadband: float = 0.10
+    # A flat asset opens once its vol-scaled target reaches this size even if it is inside the
+    # deadband (otherwise targets of 4-8% never trade from 0 and 3/5 assets stay dead forever);
+    # a sign flip always trades.
+    cta_min_open_weight: float = 0.02
+    cta_funding_cost_apr_pct: float = 10.0  # conservative perp carry charged on |CTA gross| exposure
     cta_turnover_cost_bps: float = 5.0
     mgmt_fee_annual_pct: float = 1.0  # Model Neutral Autopilot 1% annual management fee
     perf_fee_pct: float = 10.0  # Model performance fee above HWM
+    # Performance fee ACCRUES every tick (reversible liability in net NAV) and is CRYSTALLIZED
+    # (paid, HWM reset) only once per period: "quarter" or "month".
+    perf_fee_crystallization: str = "quarter"
     max_tick_nav_jump_pct: float = 4.0  # Bounded NAV sanity guard
     default_hlp_apr_pct: float = 12.0
 
@@ -258,15 +266,26 @@ def compute_crisis_cta_weights(
     turnover = 0.0
     for coin, tw in target_w.items():
         pw = float(prev.get(coin, 0.0))
-        if abs(tw - pw) < cfg.cta_weight_deadband:
+        opens_flat = abs(pw) < 1e-9 and abs(tw) >= cfg.cta_min_open_weight
+        flips_sign = pw * tw < 0.0
+        if abs(tw - pw) < cfg.cta_weight_deadband and not opens_flat and not flips_sign:
             fw = pw
         else:
             fw = tw
         fw = round(fw, 4)
         final_w[coin] = fw
+
+    # Deadband can keep stale (larger) weights alongside new ones; re-enforce the leverage cap.
+    gross_db = sum(abs(w) for w in final_w.values())
+    if gross_db > cfg.cta_max_leverage + 1e-9:
+        f = cfg.cta_max_leverage / gross_db
+        final_w = {c: round(w * f, 4) for c, w in final_w.items()}
+
+    for coin, fw in final_w.items():
+        pw = float(prev.get(coin, 0.0))
         turnover += abs(fw - pw)
         asset_details[coin]["weight"] = fw
-        asset_details[coin]["target_weight"] = round(tw, 4)
+        asset_details[coin]["target_weight"] = round(target_w[coin], 4)
 
     # Account for any previously held asset that vanished from feed
     for coin, pw in prev.items():
@@ -510,6 +529,13 @@ def compute_autopilot_target_weights(
 # --------------------------------------------------------------------------- Master Tick Engine
 
 
+def _fee_period_key(ts_ms: int, mode: str) -> str:
+    d = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+    if mode == "month":
+        return f"{d.year}-{d.month:02d}"
+    return f"{d.year}-Q{(d.month - 1) // 3 + 1}"
+
+
 def _load_or_init_autopilot_state(state_path: Path, cfg: AutopilotConfig) -> dict[str, Any]:
     if state_path.is_file():
         st = json.loads(state_path.read_text(encoding="utf-8"))
@@ -608,7 +634,11 @@ def run_autopilot_tick(
                 cta_tick_ret += w * ((p1 - p0) / p0)
 
     cta_snap = compute_crisis_cta_weights(closes_map, prev_weights=prev_cta_w, cfg=cfg)
-    cta_cost_ret = cta_snap["turnover"] * (cfg.cta_turnover_cost_bps / 1e4)
+    cta_turnover_cost_ret = cta_snap["turnover"] * (cfg.cta_turnover_cost_bps / 1e4)
+    # Perp carry on the exposure held over the elapsed interval (previous weights)
+    prev_cta_gross = sum(abs(float(w)) for w in prev_cta_w.values())
+    cta_funding_ret = prev_cta_gross * (cfg.cta_funding_cost_apr_pct / 100.0 / HOURS_PER_YEAR) * dt_hours
+    cta_cost_ret = cta_turnover_cost_ret + cta_funding_ret
     cta_net_ret = cta_tick_ret - cta_cost_ret
     new_last_closes = {c: float(vals[-1]) for c, vals in closes_map.items() if vals}
 
@@ -629,6 +659,11 @@ def run_autopilot_tick(
 
     if is_initial:
         alloc_usd = {k: round(prev_gross * w, 2) for k, w in target_weights.items()}
+        # Opening the CTA book is not free: charge its entry turnover cost on the bootstrap tick.
+        cta_entry_cost = round(alloc_usd.get("crisis_cta", 0.0) * cta_turnover_cost_ret, 4)
+        if cta_entry_cost > 0:
+            alloc_usd["crisis_cta"] = round(alloc_usd["crisis_cta"] - cta_entry_cost, 4)
+            cta_state["cum_cost_usd"] = round(float(cta_state.get("cum_cost_usd", 0.0)) + cta_entry_cost, 4)
         for name in ("spot_perp_paper", "cross_dex_paper", "hip3_paper", "metamodel_paper"):
             if name in sleeves:
                 last_eq_map[name] = float(sleeves[name]["equity_usd"])
@@ -636,6 +671,7 @@ def run_autopilot_tick(
         # Accrue sleeve-level returns onto existing allocations
         raw_pnl_total = 0.0
         provisional_alloc = dict(alloc_usd)
+        provisional_last_eq_map = dict(last_eq_map)
         for name, cur_alloc in alloc_usd.items():
             if cur_alloc <= 0:
                 sleeve_tick_pnl[name] = 0.0
@@ -650,12 +686,17 @@ def run_autopilot_tick(
                 cur_eq = float(sleeves[name]["equity_usd"])
                 prev_s_eq = _f(last_eq_map.get(name), cur_eq)
                 r = (cur_eq - prev_s_eq) / prev_s_eq if prev_s_eq > 0 else 0.0
-                last_eq_map[name] = cur_eq
+                provisional_last_eq_map[name] = cur_eq
             pnl = cur_alloc * r
             sleeve_tick_pnl[name] = round(pnl, 4)
             provisional_alloc[name] = max(0.0, cur_alloc + pnl)
             raw_pnl_total += pnl
 
+        # Keep equity baselines fresh for zero-allocated sleeves too, so a later allocation
+        # into them does not credit Autopilot with returns earned before it held the sleeve.
+        for name in ("spot_perp_paper", "cross_dex_paper", "hip3_paper", "metamodel_paper"):
+            if name in sleeves and _f(alloc_usd.get(name)) <= 0:
+                provisional_last_eq_map[name] = float(sleeves[name]["equity_usd"])
         # Bounded NAV Sanity Guard
         if prev_gross > 0 and abs(raw_pnl_total) / prev_gross * 100.0 > cfg.max_tick_nav_jump_pct:
             nav_guard_triggered = True
@@ -667,6 +708,7 @@ def run_autopilot_tick(
             sleeve_tick_pnl = {k: 0.0 for k in alloc_usd}
         else:
             alloc_usd = provisional_alloc
+            last_eq_map = provisional_last_eq_map
             cta_alloc_prev = float(state.get("sleeve_allocations_usd", {}).get("crisis_cta", 0.0))
             cta_state["cum_pnl_usd"] = round(float(cta_state.get("cum_pnl_usd", 0.0)) + cta_alloc_prev * cta_tick_ret, 4)
             cta_state["cum_cost_usd"] = round(float(cta_state.get("cum_cost_usd", 0.0)) + cta_alloc_prev * cta_cost_ret, 4)
@@ -720,21 +762,31 @@ def run_autopilot_tick(
     gross_ret_pct = round((gross_share - 1.0) * 100.0, 4)
 
     # 4. Gross vs Net-of-Fee HWM Share Price Accounting
+    # ``pre_perf_net`` = net NAV after management fees but before the (accrued) performance fee.
+    # The perf fee accrues as a reversible liability each tick and is crystallized (paid, HWM reset)
+    # only at the first tick of a new fee period, using the previous period-end accrual.
     tick_gross_ret = (gross_equity / prev_gross - 1.0) if prev_gross > 0 else 0.0
-    net_pre_fee = prev_net * (1.0 + tick_gross_ret)
-    mgmt_fee_usd = round(net_pre_fee * (cfg.mgmt_fee_annual_pct / 100.0 / HOURS_PER_YEAR) * dt_hours, 4) if dt_hours > 0 else 0.0
-    net_after_mgmt = max(net_pre_fee - mgmt_fee_usd, 1.0)
-
     hwm_share = float(state.get("hwm_net_share_price", 1.0))
-    cand_share = net_after_mgmt / start_cap if start_cap > 0 else 1.0
-    perf_fee_usd = 0.0
-    if cand_share > hwm_share and cfg.perf_fee_pct > 0:
-        excess_usd = (cand_share - hwm_share) * start_cap
-        perf_fee_usd = round(excess_usd * (cfg.perf_fee_pct / 100.0), 4)
-        net_equity = round(net_after_mgmt - perf_fee_usd, 2)
-        hwm_share = round(net_equity / start_cap, 6)
-    else:
-        net_equity = round(net_after_mgmt, 2)
+    prev_accrued = float(state.get("accrued_perf_fee_usd", 0.0))
+    prev_pre_perf = float(state.get("pre_perf_net_equity_usd", prev_net + prev_accrued))
+    period_key = _fee_period_key(ts_ms, cfg.perf_fee_crystallization)
+    prev_period = str(state.get("perf_fee_period") or period_key)
+    perf_fee_usd = 0.0  # crystallized this tick
+    if prev_period != period_key and prev_accrued > 0 and start_cap > 0:
+        perf_fee_usd = round(prev_accrued, 4)
+        prev_pre_perf = prev_pre_perf - perf_fee_usd
+        hwm_share = max(hwm_share, round(prev_pre_perf / start_cap, 6))
+
+    pre_fee = prev_pre_perf * (1.0 + tick_gross_ret)
+    mgmt_fee_usd = round(pre_fee * (cfg.mgmt_fee_annual_pct / 100.0 / HOURS_PER_YEAR) * dt_hours, 4) if dt_hours > 0 else 0.0
+    pre_perf_net = max(pre_fee - mgmt_fee_usd, 1.0)
+
+    accrued_perf_fee_usd = 0.0
+    if cfg.perf_fee_pct > 0 and start_cap > 0:
+        cand_share = pre_perf_net / start_cap
+        if cand_share > hwm_share:
+            accrued_perf_fee_usd = round((cand_share - hwm_share) * start_cap * (cfg.perf_fee_pct / 100.0), 4)
+    net_equity = round(pre_perf_net - accrued_perf_fee_usd, 2)
 
     net_share = round(net_equity / start_cap, 6) if start_cap > 0 else 1.0
     net_ret_pct = round((net_share - 1.0) * 100.0, 4)
@@ -762,11 +814,12 @@ def run_autopilot_tick(
     lev_30d_avg, lev_30d_max = spa._compute_30d_leverage_stats(ticks_path, weighted_lev, ts_ms)
     net_dir_pct = round(actual_weights.get("crisis_cta", 0.0) * float(cta_snap["net_exposure"]) * 100.0, 3)
 
-    cta_state["weights"] = cta_snap["weights"]
-    cta_state["last_closes"] = new_last_closes
-    cta_state["gross_leverage"] = cta_snap["gross_leverage"]
-    cta_state["net_exposure"] = cta_snap["net_exposure"]
-    cta_state["assets"] = cta_snap["assets"]
+    if not nav_guard_triggered:
+        cta_state["weights"] = cta_snap["weights"]
+        cta_state["last_closes"] = new_last_closes
+        cta_state["gross_leverage"] = cta_snap["gross_leverage"]
+        cta_state["net_exposure"] = cta_snap["net_exposure"]
+        cta_state["assets"] = cta_snap["assets"]
 
     sleeve_summary = []
     for k in target_weights:
@@ -790,6 +843,10 @@ def run_autopilot_tick(
             "gross_share_price": gross_share,
             "net_share_price": net_share,
             "hwm_net_share_price": hwm_share,
+            "pre_perf_net_equity_usd": round(pre_perf_net, 4),
+            "accrued_perf_fee_usd": accrued_perf_fee_usd,
+            "perf_fee_period": period_key,
+            "perf_fee_crystallization": cfg.perf_fee_crystallization,
             "gross_return_pct": gross_ret_pct,
             "net_return_pct": net_ret_pct,
             "cum_mgmt_fee_usd": round(float(state.get("cum_mgmt_fee_usd", 0.0)) + mgmt_fee_usd, 4),

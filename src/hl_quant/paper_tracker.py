@@ -427,7 +427,7 @@ def run_paper_tick(
 
     _append_parquet(ticks_path, pd.DataFrame([tick_row]), dedup_subset=["tick_hour_ms"])
     if trade_rows:
-        _append_parquet(trades_path, pd.DataFrame(trade_rows), dedup_subset=["tick_hour_ms", "coin", "venue", "side"])
+        _append_parquet(trades_path, pd.DataFrame(trade_rows), dedup_subset=["tick_hour_ms", "coin"])
 
     state_out = {
         "starting_capital_usd": float(state["starting_capital_usd"]),
@@ -513,7 +513,7 @@ def format_telegram_summary(result: dict[str, Any], state: dict[str, Any]) -> st
     ]
 
     lines = [
-        f"📊 <b>Hyperliquid Metamodel · Paper L2</b>",
+        "📊 <b>Hyperliquid Metamodel · Paper L2</b>",
         f"🕒 <code>{html.escape(ts)}</code> · Tick <b>#{state.get('tick_count', 1)}</b> · {pnl_icon} <b>{net_pnl:+,.2f}$</b>",
         "<blockquote><pre>" + html.escape("\n".join(kpi_rows)) + "</pre></blockquote>",
     ]
@@ -676,11 +676,17 @@ def send_telegram_rich_message(
         payload["message_thread_id"] = int(thread_id)
     with httpx.Client(timeout=20.0, transport=transport) as client:
         resp = client.post(f"https://api.telegram.org/bot{bot_token}/sendRichMessage", json=payload)
-        resp.raise_for_status()
+        _raise_for_status_redacted(resp)
         body = resp.json()
         if not body.get("ok"):
             raise RuntimeError(f"Telegram API error: {body}")
         return {"ok": True, "message_id": body.get("result", {}).get("message_id")}
+
+
+def _raise_for_status_redacted(resp: httpx.Response) -> None:
+    """Like ``raise_for_status`` but never leaks the bot token embedded in the request URL."""
+    if resp.is_error:
+        raise RuntimeError(f"Telegram API HTTP {resp.status_code}: {resp.text[:300]}")
 
 
 def send_telegram_message(
@@ -704,7 +710,7 @@ def send_telegram_message(
         payload["message_thread_id"] = int(thread_id)
     with httpx.Client(timeout=15.0, transport=transport) as client:
         resp = client.post(f"https://api.telegram.org/bot{bot_token}/sendMessage", json=payload)
-        resp.raise_for_status()
+        _raise_for_status_redacted(resp)
         body = resp.json()
         if not body.get("ok"):
             raise RuntimeError(f"Telegram API error: {body}")

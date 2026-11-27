@@ -287,8 +287,9 @@ def test_safe_unwind_rechecks_positions_after_reduce_only_order() -> None:
             return {"bids": [["100", "1"]], "asks": [["101", "1"]]}
 
     class Bybit:
-        flat = False
-        calls: list[dict] = []
+        def __init__(self) -> None:
+            self.flat = False
+            self.calls: list[dict] = []
 
         def positions(self, symbol):
             return [] if self.flat else [{"size": "0.1", "side": "Sell"}]

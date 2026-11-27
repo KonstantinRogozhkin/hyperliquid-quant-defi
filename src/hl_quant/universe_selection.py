@@ -140,6 +140,8 @@ def discover_common_coins(
     """
     if venue not in cex.VENUES:
         raise cex.CexDataError(f"unknown venue {venue!r}")
+    if venue not in ("binance", "bybit"):
+        raise cex.CexDataError(f"discover_common_coins does not support venue {venue!r} yet")
 
     meta_ctx = hl_client.info({"type": "metaAndAssetCtxs"})
     if not (isinstance(meta_ctx, list) and len(meta_ctx) == 2 and isinstance(meta_ctx[0], dict) and "universe" in meta_ctx[0]):
@@ -311,6 +313,14 @@ def evaluate_universe(
     grid = tuple(grid)
     start_ms = int(window_start_ms) if window_start_ms is not None else min(int(p.index.min()) for p in panels.values())
     end_ms = int(window_end_ms) if window_end_ms is not None else max(int(p.index.max()) for p in panels.values())
+    if window_start_ms is not None or window_end_ms is not None:
+        panels = {
+            c: p[(p.index >= start_ms) & (p.index <= end_ms)]
+            for c, p in panels.items()
+            if not p[(p.index >= start_ms) & (p.index <= end_ms)].empty
+        }
+        if not panels:
+            raise ValueError("no panel rows fall within [window_start_ms, window_end_ms]")
     total_hours = int((end_ms - start_ms) // fa.HOUR_MS) + 1
     expected_train_hours = int(total_hours * train_fraction)
     split_hour_ms = start_ms + expected_train_hours * fa.HOUR_MS

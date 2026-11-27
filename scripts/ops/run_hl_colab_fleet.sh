@@ -11,7 +11,6 @@ mkdir -p "${SHARDS_DIR}"
 
 # Package minimal Python modules + shard runner for Colab upload
 tar -czf "${WORK_DIR}/code_bundle.tar.gz" -C "${ROOT_DIR}" \
-  src/overnight/__init__.py \
   src/hl_quant/__init__.py \
   src/hl_quant/funding_arb.py \
   src/hl_quant/alpha_families.py \

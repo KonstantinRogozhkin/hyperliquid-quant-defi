@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 import html
 import json
 import math
+import os
 from pathlib import Path
 import time
 from typing import Any, Protocol
@@ -273,6 +274,13 @@ def check_kill_switch(
     now = now_ms if now_ms is not None else int(time.time() * 1000)
     reasons: list[str] = []
 
+    if not (math.isfinite(account.equity_usd) and math.isfinite(account.free_margin_usd)):
+        reasons.append("non_finite_account_snapshot")
+        return reasons
+    if any(not math.isfinite(float(w)) for w in target_weights.values()):
+        reasons.append("non_finite_target_weight")
+        return reasons
+
     if account.equity_usd <= 0:
         reasons.append("zero_or_negative_equity")
         return reasons
@@ -510,7 +518,7 @@ class HyperliquidTestnetSDKAdapter:
         except ImportError as exc:
             raise RuntimeError("Install hyperliquid-python-sdk to submit live Testnet orders") from exc
         wallet = Account.from_key(private_key)
-        self._exchange = Exchange(wallet, base_url=TESTNET_API_URL, account_address=account_address)
+        self._exchange = Exchange(wallet, base_url=TESTNET_API_URL, account_address=account_address, timeout=10.0)
 
     def place_alo_order(self, order: PlannedOrder) -> dict[str, Any]:
         resp = self._exchange.order(
@@ -660,6 +668,13 @@ def execute_rebalance_cycle(
     """
     hwm = max(float(high_water_mark_usd or 0.0), 0.0) or account.equity_usd
     skipped_unquoted = sorted(set(skipped_unquoted_coins or []))
+    # Open positions on coins we cannot quote are unmanaged: neither rebalanced nor closable by the
+    # ALO planner. Surface them on every cycle (not only on the tick that tripped the kill-switch).
+    orphan_positions = {
+        c: account.positions_sz[c]
+        for c in skipped_unquoted
+        if abs(float(account.positions_sz.get(c, 0.0) or 0.0)) > 1e-12
+    }
     violations = check_kill_switch(account, target_weights, bbo, limits, high_water_mark_usd=hwm, now_ms=now_ms)
 
     # On kill-switch emergency, cancel ALL open orders; during normal rebalance, cancel only
@@ -678,6 +693,7 @@ def execute_rebalance_cycle(
             "placed_count": 0,
             "high_water_mark_usd": hwm,
             "skipped_unquoted_coins": skipped_unquoted,
+            "orphan_positions": orphan_positions,
             "orders": [],
         }
     else:
@@ -728,6 +744,7 @@ def execute_rebalance_cycle(
             "leverage_updates": leverage_updates,
             "blocked_isolated_coins": sorted(blocked_isolated_coins),
             "skipped_unquoted_coins": skipped_unquoted,
+            "orphan_positions": orphan_positions,
             "orders": placed,
         }
 
@@ -778,12 +795,17 @@ def update_high_water_mark(hwm_path: Path, equity_usd: float) -> float:
     prev = equity_usd
     if hwm_path.is_file():
         try:
-            prev = float(json.loads(hwm_path.read_text()).get("high_water_mark_usd", equity_usd))
-        except (ValueError, OSError):
+            raw = json.loads(hwm_path.read_text())
+            prev = float(raw.get("high_water_mark_usd", equity_usd)) if isinstance(raw, dict) else equity_usd
+            if not math.isfinite(prev):
+                prev = equity_usd
+        except (ValueError, OSError, TypeError):
             prev = equity_usd
     hwm = max(prev, equity_usd)
     hwm_path.parent.mkdir(parents=True, exist_ok=True)
-    hwm_path.write_text(json.dumps({"high_water_mark_usd": hwm, "updated_ms": int(time.time() * 1000)}, indent=2))
+    tmp = hwm_path.with_suffix(hwm_path.suffix + ".tmp")
+    tmp.write_text(json.dumps({"high_water_mark_usd": hwm, "updated_ms": int(time.time() * 1000)}, indent=2))
+    os.replace(tmp, hwm_path)
     return hwm
 
 

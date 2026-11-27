@@ -65,8 +65,9 @@ export function MultiSeriesChart({
           <line x1={pl} y1={zeroY} x2={width - pr} y2={zeroY} stroke="#475569" strokeDasharray="4 4" strokeWidth="1" />
         )}
         {valid.map((s) => {
+          const offset = maxLen - s.values.length;
           const pts = s.values
-            .map((v, i) => `${sx(i, s.values.length).toFixed(1)},${sy(v).toFixed(1)}`)
+            .map((v, i) => `${sx(i + offset, maxLen).toFixed(1)},${sy(v).toFixed(1)}`)
             .join(" ");
           return (
             <polyline

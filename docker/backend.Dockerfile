@@ -78,6 +78,6 @@ COPY --chown=appuser:appuser scripts ./scripts
 USER appuser
 
 HEALTHCHECK --interval=60s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "from pathlib import Path; import sys; p=Path('/app/data/paper/hl_worker_status.json'); sys.exit(0 if p.is_file() else 1)"
+    CMD python -c "import json, sys, datetime as d; s=json.load(open('/app/data/paper/hl_worker_status.json')); hb=d.datetime.strptime(s['heartbeat_utc'], '%Y-%m-%d %H:%M:%S UTC').replace(tzinfo=d.timezone.utc); sys.exit(0 if (d.datetime.now(d.timezone.utc) - hb).total_seconds() < 300 else 1)"
 
 CMD ["python", "-m", "hl_quant.scheduler"]

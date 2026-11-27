@@ -146,6 +146,38 @@ def deploy_sha_to_dokploy(
     if extract_env_var(refreshed.get("env") or "", sha_var) != sha:
         raise RuntimeError(f"Dokploy did not persist {sha_var}={sha}")
 
+    try:
+        return _poll_and_verify_dokploy_deploy(
+            client,
+            compose_id=compose_id,
+            sha=sha,
+            previous_sha=previous_sha,
+            public_url=public_url,
+            deploy_timeout_s=deploy_timeout_s,
+            verify_timeout_s=verify_timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+    except Exception:
+        if previous_sha != sha:
+            try:
+                client.update_compose_env(compose_id, old_env)
+                print(f"[deploy] rolled back {sha_var} to previous={previous_sha!r} after failure", flush=True)
+            except Exception as rb_exc:
+                print(f"[deploy] warning: failed to roll back {sha_var}: {rb_exc}", flush=True)
+        raise
+
+
+def _poll_and_verify_dokploy_deploy(
+    client: DokployClient,
+    *,
+    compose_id: str,
+    sha: str,
+    previous_sha: str | None,
+    public_url: str,
+    deploy_timeout_s: int,
+    verify_timeout_s: int,
+    poll_interval_s: float,
+) -> dict[str, Any]:
     before_ids = {str(item.get("deploymentId")) for item in client.list_deployments(compose_id)}
     client.trigger_deploy(compose_id, title=f"CI tested release {sha[:12]}")
 

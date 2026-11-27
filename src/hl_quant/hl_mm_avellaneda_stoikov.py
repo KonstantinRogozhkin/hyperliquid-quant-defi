@@ -716,8 +716,8 @@ def simulate_avellaneda_stoikov_on_l2(
     """Replay Avellaneda–Stoikov MM over an L2 book DataFrame (touch + optional trade-through fills)."""
     if l2_df.empty:
         raise ValueError("l2_df is empty")
-    df = l2_df.sort_values("recv_ms").reset_index(drop=True)
-    ts_col = "recv_ms" if "recv_ms" in df.columns else "book_time_ms"
+    ts_col = "recv_ms" if "recv_ms" in l2_df.columns else "book_time_ms"
+    df = l2_df.sort_values(ts_col).reset_index(drop=True)
     vol_est = EWMAVolatilityEstimator(
         horizon_sec=params.horizon_sec,
         half_life_sec=params.vol_half_life_sec,
@@ -2092,7 +2092,10 @@ async def run_multi_coin_mm_ws_session(
                     cancel_all.append({"coin": c_name, "oid": o.get("oid")})
                     stats[c_name]["cleanup_cancelled"] += 1
         if cancel_all:
-            await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_all)
+            try:
+                await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_all)
+            except Exception:
+                pass
 
         # 2. Optional flatten-on-exit per coin
         if flatten_on_exit:
@@ -2116,10 +2119,13 @@ async def run_multi_coin_mm_ws_session(
                         tif="Ioc",
                         reduce_only=True,
                     )
-                    await asyncio.to_thread(adapter.place_ioc_order, flat_ord)
-                    stats[c_name]["flattened_exit_sz"] = unwind_sz
-                    if not execute_live:
-                        ledgers[c_name].on_fill(unwind_side, mid, unwind_sz, fee_usd=unwind_sz * mid * 4.5e-4)
+                    try:
+                        await asyncio.to_thread(adapter.place_ioc_order, flat_ord)
+                        stats[c_name]["flattened_exit_sz"] = unwind_sz
+                        if not execute_live:
+                            ledgers[c_name].on_fill(unwind_side, mid, unwind_sz, fee_usd=unwind_sz * mid * 4.5e-4)
+                    except Exception:
+                        pass
 
         # 3. Disarm Dead Man's Switch so it never consumes a daily trigger on clean shutdown
         if dead_man_armed and hasattr(adapter, "schedule_cancel"):

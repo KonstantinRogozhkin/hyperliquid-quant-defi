@@ -87,3 +87,11 @@ def test_deploy_raises_on_failed_dokploy_status():
     client = _FakeDokployClient(final_status="error")
     with pytest.raises(RuntimeError, match="status='error'"):
         mod.deploy_sha_to_dokploy(client, compose_id="cmp-1", sha="d" * 40, poll_interval_s=0.01)
+
+
+def test_deploy_rolls_back_env_on_failed_dokploy_status():
+    client = _FakeDokployClient(final_status="error")
+    original_sha = "1" * 40
+    with pytest.raises(RuntimeError, match="status='error'"):
+        mod.deploy_sha_to_dokploy(client, compose_id="cmp-1", sha="e" * 40, poll_interval_s=0.01)
+    assert mod.extract_env_var(client.env, "DEPLOY_SHA") == original_sha

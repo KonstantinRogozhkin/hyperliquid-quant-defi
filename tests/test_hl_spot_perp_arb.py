@@ -95,6 +95,7 @@ def test_spot_perp_paper_full_lifecycle_hlp_accrual_and_flip_exit(tmp_path: Path
         entry_apr_pct=8.0,
         exit_apr_pct=2.0,
         hard_flip_apr_pct=-5.0,
+        require_hlp_hurdle=False,  # lifecycle mechanics test; hurdle covered separately
     )
 
     def make_markets(btc_px: float, btc_apr: float, paxg_px: float = 3600.0) -> list[dict[str, Any]]:
@@ -193,7 +194,9 @@ def test_spot_perp_paper_full_lifecycle_hlp_accrual_and_flip_exit(tmp_path: Path
 
 
 def test_bounded_nav_sanity_guard_blocks_corrupt_basis_spike(tmp_path: Path):
-    cfg = spa.SpotPerpPaperConfig(min_clean_streak=1, max_tick_nav_jump_pct=3.0, slot_equity_usd=45_000.0)
+    cfg = spa.SpotPerpPaperConfig(
+        min_clean_streak=1, max_tick_nav_jump_pct=3.0, slot_equity_usd=45_000.0, require_hlp_hurdle=False
+    )
     m_normal = [
         {
             "base_symbol": "BTC",

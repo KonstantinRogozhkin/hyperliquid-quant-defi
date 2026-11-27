@@ -87,9 +87,14 @@ def select_orthogonal_hypotheses(
 
 
 def _normalize_weights(w: np.ndarray, *, max_weight: float = 0.40) -> np.ndarray:
-    w = np.maximum(w, 0.0)
+    w = np.asarray(w, dtype=float)
+    w = np.where(np.isfinite(w), np.maximum(w, 0.0), 0.0)
+    if len(w) == 0:
+        return w
     if w.sum() <= 0:
         return np.full(len(w), 1.0 / len(w))
+    # A cap below 1/n is infeasible (weights must sum to 1); relax it to equal weight.
+    max_weight = max(max_weight, 1.0 / len(w))
     w = w / w.sum()
     # Iteratively clip to max_weight and redistribute
     for _ in range(10):

@@ -30,6 +30,7 @@ import pandas as pd
 
 from hl_quant import cross_dex_scanner as cds
 from hl_quant import hl_hip3_builder_arb as hip3
+from hl_quant.persistence_clock import streak_count, update_streak_map
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +53,7 @@ class Hip3PaperConfig:
     use_taker_fees: bool = True  # conservative atomic two-leg crossing assumption
     allow_only_isolated: bool = True  # track both Cross and half-sized Isolated pairs in paper
     max_missing_ticks: int = 3  # tolerate transient missing market before force-closing
+    min_streak_spacing_hours: float = 3.5  # local clean streak advances at most once per 4h window
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -177,7 +179,7 @@ def run_hip3_paper_tick(
         trade_rows: list[dict[str, Any]] = []
 
         # 1. Mark-to-market & accrue hourly funding on open dual-builder pairs
-        for base, pos in list(positions.items()):
+        for _base, pos in list(positions.items()):
             s_mkt = by_symbol.get(str(pos["short_symbol"]))
             l_mkt = by_symbol.get(str(pos["long_symbol"]))
             if not (s_mkt and l_mkt):
@@ -295,16 +297,21 @@ def run_hip3_paper_tick(
             min_spread_apr_pct=cfg.entry_apr_pct,
             book_fetcher=None,  # L2 books fetched below only for streak-qualified candidates
         )
-        prev_streaks: dict[str, int] = dict(state.get("clean_streaks") or {})
-        new_streaks: dict[str, int] = {}
-        for opp in opps:
-            key = f"{opp.base_symbol}:{opp.short_symbol}->{opp.long_symbol}"
+        clean_keys = [
+            f"{opp.base_symbol}:{opp.short_symbol}->{opp.long_symbol}"
+            for opp in opps
             if (
                 opp.spread_apr_pct >= cfg.entry_apr_pct
                 and not opp.oracle_risk_warning
                 and opp.oracle_divergence_bps <= cfg.max_oracle_div_bps
-            ):
-                new_streaks[key] = int(prev_streaks.get(key, 0)) + 1
+            )
+        ]
+        new_streaks = update_streak_map(
+            state.get("clean_streaks") or {},
+            clean_keys,
+            now_ms=ts_ms,
+            min_spacing_hours=cfg.min_streak_spacing_hours,
+        )
         state["clean_streaks"] = new_streaks
         external_streaks = _load_external_clean_streaks(frontier_summary_path)
 
@@ -336,7 +343,7 @@ def run_hip3_paper_tick(
                 continue
 
             key = f"{opp.base_symbol}:{opp.short_symbol}->{opp.long_symbol}"
-            eff_streak = max(int(new_streaks.get(key, 0)), int(external_streaks.get(key, 0)))
+            eff_streak = max(streak_count(new_streaks.get(key)), int(external_streaks.get(key, 0)))
             if eff_streak < cfg.min_clean_streak:
                 gated_stats["skipped_streak"] += 1
                 continue
@@ -362,16 +369,23 @@ def run_hip3_paper_tick(
             if not full_ok or l2_slip is None or exec_basis is None or l2_slip > cfg.max_l2_slip_bps:
                 gated_stats["skipped_l2_slip"] += 1
                 continue
-            if exec_basis < cfg.min_exec_basis_bps:
+            # Positions are marked on mark_px: an L2 basis better than the mark basis never realizes,
+            # and the part of the mark basis explained by builder oracle divergence is structural
+            # (it does not converge to zero), so it is never credited as an edge.
+            mark_credit = cds.credited_entry_basis_bps(exec_basis, opp.mark_basis_bps)
+            if mark_credit < cfg.min_exec_basis_bps:
                 gated_stats["skipped_basis"] += 1
                 continue
+            credited_basis = (
+                max(0.0, mark_credit - abs(float(opp.oracle_divergence_bps))) if mark_credit > 0 else mark_credit
+            )
 
             entry_fee_bps = _leg_fee_bps(s_mkt, use_taker=cfg.use_taker_fees) + _leg_fee_bps(
                 l_mkt, use_taker=cfg.use_taker_fees
             )
             rt_fee_bps = 2.0 * entry_fee_bps
             # Conservative 50% credit on positive entry basis (same policy as cross_dex_paper)
-            basis_credit = (0.5 * exec_basis) if exec_basis > 0 else exec_basis
+            basis_credit = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
             est_rt_cost_bps = max(0.0, rt_fee_bps + l2_slip - basis_credit)
             hourly_bps = opp.spread_apr_pct / (hip3.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
@@ -412,6 +426,7 @@ def run_hip3_paper_tick(
                 "entry_fee_bps": round(entry_fee_bps, 2),
                 "entry_l2_slip_bps": round(l2_slip, 2),
                 "entry_exec_basis_bps": round(exec_basis, 2),
+                "entry_credited_basis_bps": round(credited_basis, 2),
                 "live_mark_basis_bps": opp.mark_basis_bps,
                 "entry_payback_hours": round(be_hours, 1),
                 "entry_cost_usd": round(entry_cost_usd, 4),

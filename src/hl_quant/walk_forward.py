@@ -92,7 +92,7 @@ def simulate_portfolio_weights(
         w = np.where(np.isfinite(w), w, 0.0)
         if n > 0:
             w[-1] = 0.0  # flatten final unpriced hour
-        prev = np.concatenate([[0.0], w[:-1]])
+        prev = np.concatenate([[0.0], w[:-1]]) if n > 0 else w.copy()
         dw = np.abs(w - prev)
 
         hl_f = panel["hl_fund_next"].fillna(0.0).to_numpy(dtype=float)
@@ -348,6 +348,12 @@ def evaluate_walk_forward(
             rank_by=rank_by,
             min_train_tim=min_train_tim,
         )
+        if ranking.empty or "rank_score" not in ranking.columns:
+            fold_frames.append(pd.DataFrame(index=test_hours, dtype=float))
+            prev_signals = {}
+            cursor = test_end_idx
+            fold_idx += 1
+            continue
         pos_ranked = ranking[ranking["rank_score"] > 0]
         picked_df = pos_ranked if not pos_ranked.empty else ranking
         selected = picked_df["coin"].head(top_k).tolist()
