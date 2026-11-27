@@ -27,6 +27,7 @@ ARTIFACT_FILES: dict[str, str] = {
     "hip3": "hl_hip3_arb/snapshot.json",
     "hip3_paper": "hl_hip3_paper/state.json",
     "spot_perp_paper": "hl_spot_perp_paper/state.json",
+    "autopilot": "hl_autopilot/state.json",
     "boros": "hl_boros/snapshot.json",
     "yield_stack": "hl_hyperevm_yield_stack/snapshot.json",
     "onchain_events": "hl_onchain_events/latest_snapshot.json",
@@ -313,6 +314,17 @@ def create_app(
                 "scan": scan,
                 "ticks": _read_parquet_tail(resolved_data_root / "hl_spot_perp_paper" / "ticks.parquet", limit=200),
                 "trades": _read_parquet_tail(resolved_data_root / "hl_spot_perp_paper" / "trades.parquet", limit=100),
+            }
+        )
+
+    @app.get("/api/v1/autopilot")
+    def autopilot(response: Response) -> dict[str, Any]:
+        _no_store(response)
+        return sanitize_json(
+            {
+                "state": _read_json(resolved_data_root / "hl_autopilot" / "state.json"),
+                "ticks": _read_parquet_tail(resolved_data_root / "hl_autopilot" / "ticks.parquet", limit=200),
+                "rebalances": _read_parquet_tail(resolved_data_root / "hl_autopilot" / "rebalances.parquet", limit=100),
             }
         )
 

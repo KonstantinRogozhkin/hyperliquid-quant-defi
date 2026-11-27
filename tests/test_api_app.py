@@ -161,6 +161,15 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert r_sp.status_code == 200
     assert r_sp.json()["state"]["equity_usd"] == 100125.0
 
+    (tmp_path / "hl_autopilot").mkdir(parents=True)
+    (tmp_path / "hl_autopilot" / "state.json").write_text(
+        json.dumps({"gross_equity_usd": 250420.0, "net_equity_usd": 250360.0, "sleeves": []}),
+        encoding="utf-8",
+    )
+    r_ap = client.get("/api/v1/autopilot")
+    assert r_ap.status_code == 200
+    assert r_ap.json()["state"]["gross_equity_usd"] == 250420.0
+
     r_events = client.get("/api/v1/events/latest")
     assert r_events.status_code == 200
     assert r_events.json()["onchain_events"]["alerts_count"] == 1

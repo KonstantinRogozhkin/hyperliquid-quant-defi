@@ -1,0 +1,865 @@
+"""Multi-Strategy "Autopilot" Master Portfolio Allocator with Deadband Rebalancing & <=5% Crisis-CTA Sleeve.
+
+Inspired by Neutral Trade's *Neutral Autopilot* master vault:
+- **Market-Neutral Core (80–85%):** aggregates live/paper desk sleeves (``spot_perp_paper``,
+  ``cross_dex_paper``, ``hip3_paper``, plus Sharpe-gated ``metamodel_paper``) with shrinkage
+  inverse-volatility risk-parity weighting and per-sleeve concentration caps (<= 40%).
+- **Liquidity Reserve Floor (>= 10%):** HLP / USDC Savings buffer so margin swings never force
+  emergency unwinds.
+- **Directional Crisis-Alpha CTA Sleeve (hard cap <= 5.0%):** low-turnover multi-horizon
+  time-series momentum (10d/20d/40d TSMOM) over HyperCore majors + Gold RWA (``BTC, ETH, SOL,
+  HYPE, PAXG``) with volatility targeting and signal deadband — designed to deliver negative
+  correlation during bear drawdowns when funding compresses.
+- **Deadband Rebalancing:** avoids burning 5 bps execution drag on tiny weight drifts; only
+  rebalances when ``max(|actual_w - target_w|) >= rebalance_deadband_pct`` or a hard risk limit
+  is breached.
+- **Institutional NAV Hygiene:** Gross vs Net-of-Fee High-Water Mark (HWM) share-price tracking
+  plus a **Bounded NAV Sanity Guard** (circuit breaker against anomalous upstream ticks).
+
+100% read-only against Hyperliquid public APIs; zero live orders placed.
+"""
+
+from __future__ import annotations
+
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+import html
+import json
+import math
+from pathlib import Path
+import time
+from typing import Any
+
+import httpx
+import numpy as np
+import pandas as pd
+
+from hl_quant import hl_spot_perp_arb as spa
+
+HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+HOURS_PER_YEAR = 8760.0
+CTA_UNIVERSE: tuple[str, ...] = ("BTC", "ETH", "SOL", "HYPE", "PAXG")
+
+DEFAULT_BASE_WEIGHTS: dict[str, float] = {
+    "spot_perp_paper": 0.35,
+    "cross_dex_paper": 0.25,
+    "hip3_paper": 0.20,
+    "hlp_savings_reserve": 0.15,
+    "crisis_cta": 0.05,
+    "metamodel_paper": 0.00,
+}
+
+SLEEVE_CATEGORY: dict[str, str] = {
+    "spot_perp_paper": "Market Neutral",
+    "cross_dex_paper": "Market Neutral",
+    "hip3_paper": "Market Neutral",
+    "metamodel_paper": "Market Neutral (Obs)",
+    "hlp_savings_reserve": "Savings / Reserve",
+    "crisis_cta": "Directional CTA",
+}
+
+
+def _f(v: object, default: float = 0.0) -> float:
+    try:
+        x = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return default
+    return x if math.isfinite(x) else default
+
+
+def _read_json(path: Path) -> dict[str, Any] | None:
+    if not path.is_file():
+        return None
+    try:
+        obj = json.loads(path.read_text(encoding="utf-8"))
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        return None
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp.json")
+    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+    tmp.replace(path)
+
+
+def _append_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    new_df = pd.DataFrame(rows)
+    if path.is_file():
+        old = pd.read_parquet(path)
+        combined = pd.concat([old, new_df], ignore_index=True)
+    else:
+        combined = new_df
+    tmp = path.with_suffix(".tmp.parquet")
+    combined.to_parquet(tmp, index=False)
+    tmp.replace(path)
+
+
+@dataclass(frozen=True, slots=True)
+class AutopilotConfig:
+    starting_capital_usd: float = 250_000.0
+    max_single_sleeve_weight: float = 0.40
+    min_reserve_weight: float = 0.10
+    target_reserve_weight: float = 0.15
+    max_directional_weight: float = 0.05  # Neutral Autopilot hard cap: <= 5% Directional CTA
+    rebalance_deadband_pct: float = 3.0  # Rebalance only if max sleeve drift >= 3.0%
+    rebalance_cost_bps: float = 5.0  # Realistic HL reallocation cost
+    min_metamodel_sharpe: float = 0.50  # Keep observation-only metamodel at 0% unless live Sharpe >= 0.50
+    min_history_ticks_for_opt: int = 6
+    cta_target_ann_vol: float = 0.15
+    cta_max_leverage: float = 1.5
+    cta_max_asset_weight: float = 0.45
+    cta_weight_deadband: float = 0.10
+    cta_turnover_cost_bps: float = 5.0
+    mgmt_fee_annual_pct: float = 1.0  # Model Neutral Autopilot 1% annual management fee
+    perf_fee_pct: float = 10.0  # Model performance fee above HWM
+    max_tick_nav_jump_pct: float = 4.0  # Bounded NAV sanity guard
+    default_hlp_apr_pct: float = 12.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+# --------------------------------------------------------------------------- Crisis-Alpha CTA Sleeve
+
+
+def fetch_hypercore_daily_closes(
+    client: httpx.Client,
+    coins: tuple[str, ...] = CTA_UNIVERSE,
+    *,
+    lookback_days: int = 60,
+    now_ms: int | None = None,
+    info_url: str = HL_INFO_URL,
+) -> dict[str, list[float]]:
+    """Fetch strictly completed daily closes (up to ``lookback_days``) from HyperCore ``candleSnapshot``."""
+    end_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    start_ms = end_ms - (lookback_days + 5) * 86_400_000
+    out: dict[str, list[float]] = {}
+    for coin in coins:
+        try:
+            r = client.post(
+                info_url,
+                json={
+                    "type": "candleSnapshot",
+                    "req": {"coin": coin, "interval": "1d", "startTime": start_ms, "endTime": end_ms},
+                },
+            )
+            if r.status_code != 200:
+                continue
+            bars = r.json() or []
+            if not isinstance(bars, list):
+                continue
+            closes = [_f(b.get("c")) for b in bars if isinstance(b, dict) and _f(b.get("c")) > 0]
+            if closes:
+                out[coin] = closes[-lookback_days:]
+        except Exception:
+            continue
+    return out
+
+
+def compute_tsmom_signal(closes: list[float]) -> tuple[float, float]:
+    """Return ``(signal_in_minus1_plus1, ann_realized_vol)`` from causal 10d/20d/40d TSMOM."""
+    arr = np.asarray([c for c in closes if math.isfinite(c) and c > 0], dtype=float)
+    if len(arr) < 12:
+        return 0.0, 0.50
+    rets = np.diff(np.log(arr))
+    vol_win = min(20, len(rets))
+    daily_vol = float(np.std(rets[-vol_win:], ddof=1)) if vol_win >= 2 else 0.03
+    daily_vol = max(daily_vol, 0.005)
+    ann_vol = daily_vol * math.sqrt(365.0)
+
+    horizons = [h for h in (10, 20, 40) if len(arr) > h]
+    scores: list[float] = []
+    for h in horizons:
+        log_r = math.log(arr[-1] / arr[-1 - h])
+        # Risk-adjusted momentum z-score mapped smoothly via tanh to [-1, +1]
+        z = log_r / (daily_vol * math.sqrt(float(h)))
+        scores.append(math.tanh(0.8 * z))
+    sig = float(np.mean(scores)) if scores else 0.0
+    return round(sig, 4), round(ann_vol, 4)
+
+
+def compute_crisis_cta_weights(
+    daily_closes: dict[str, list[float]],
+    *,
+    prev_weights: dict[str, float] | None = None,
+    cfg: AutopilotConfig = AutopilotConfig(),
+) -> dict[str, Any]:
+    """Compute volatility-targeted low-turnover TSMOM CTA weights with signal deadband."""
+    prev = dict(prev_weights or {})
+    raw_weights: dict[str, float] = {}
+    asset_details: dict[str, dict[str, Any]] = {}
+    n_valid = 0
+
+    for coin, closes in sorted(daily_closes.items()):
+        if not closes:
+            continue
+        sig, ann_vol = compute_tsmom_signal(closes)
+        # Per-asset risk-parity contribution scaled toward cta_target_ann_vol
+        raw_w = sig * (cfg.cta_target_ann_vol / max(ann_vol, 0.08))
+        raw_weights[coin] = raw_w
+        asset_details[coin] = {
+            "coin": coin,
+            "last_close": round(float(closes[-1]), 6),
+            "tsmom_signal": sig,
+            "ann_vol_pct": round(ann_vol * 100.0, 2),
+        }
+        n_valid += 1
+
+    if n_valid == 0:
+        return {
+            "weights": {},
+            "gross_leverage": 0.0,
+            "net_exposure": 0.0,
+            "turnover": 0.0,
+            "assets": {},
+        }
+
+    # Normalize across universe so equal-risk sum targets cta_target_ann_vol, capped cleanly
+    scale = 1.0 / math.sqrt(float(n_valid))
+    target_w: dict[str, float] = {}
+    for coin, rw in raw_weights.items():
+        w = max(-cfg.cta_max_asset_weight, min(cfg.cta_max_asset_weight, rw * scale))
+        target_w[coin] = w
+
+    gross = sum(abs(w) for w in target_w.values())
+    if gross > cfg.cta_max_leverage and gross > 0:
+        f = cfg.cta_max_leverage / gross
+        target_w = {c: w * f for c, w in target_w.items()}
+
+    # Apply CTA deadband vs previous weights to suppress micro-churn
+    final_w: dict[str, float] = {}
+    turnover = 0.0
+    for coin, tw in target_w.items():
+        pw = float(prev.get(coin, 0.0))
+        if abs(tw - pw) < cfg.cta_weight_deadband:
+            fw = pw
+        else:
+            fw = tw
+        fw = round(fw, 4)
+        final_w[coin] = fw
+        turnover += abs(fw - pw)
+        asset_details[coin]["weight"] = fw
+        asset_details[coin]["target_weight"] = round(tw, 4)
+
+    # Account for any previously held asset that vanished from feed
+    for coin, pw in prev.items():
+        if coin not in final_w and abs(pw) > 1e-9:
+            turnover += abs(pw)
+
+    gross_final = round(sum(abs(w) for w in final_w.values()), 4)
+    net_final = round(sum(final_w.values()), 4)
+    return {
+        "weights": final_w,
+        "gross_leverage": gross_final,
+        "net_exposure": net_final,
+        "turnover": round(turnover, 4),
+        "assets": asset_details,
+    }
+
+
+# --------------------------------------------------------------------------- Sleeve Readers & Weight Optimizer
+
+
+def _read_sleeve_tick_returns(ticks_path: Path, eq_col: str = "equity_usd") -> list[float]:
+    if not ticks_path.is_file():
+        return []
+    try:
+        df = pd.read_parquet(ticks_path)
+        if df.empty or eq_col not in df.columns:
+            return []
+        eq = pd.to_numeric(df[eq_col], errors="coerce").dropna().to_numpy(dtype=float)
+        if len(eq) < 2:
+            return []
+        eq = eq[eq > 0]
+        if len(eq) < 2:
+            return []
+        rets = np.diff(eq) / eq[:-1]
+        return [float(r) for r in rets if math.isfinite(r)]
+    except Exception:
+        return []
+
+
+def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float = 12.0) -> dict[str, dict[str, Any]]:
+    """Read live state, equity, leverage, and return history for every desk sleeve under ``data_root``."""
+    out: dict[str, dict[str, Any]] = {}
+
+    # 1. Spot + Perp (+ 10% HLP)
+    sp_st = _read_json(data_root / "hl_spot_perp_paper" / "state.json")
+    sp_rets = _read_sleeve_tick_returns(data_root / "hl_spot_perp_paper" / "ticks.parquet")
+    if sp_st:
+        rt = sp_st.get("risk_telemetry") or {}
+        out["spot_perp_paper"] = {
+            "active": True,
+            "equity_usd": _f(sp_st.get("equity_usd"), 100_000.0),
+            "starting_capital_usd": _f(sp_st.get("starting_capital_usd"), 100_000.0),
+            "leverage": _f(rt.get("gross_leverage"), 1.25),
+            "positions_count": len(sp_st.get("positions") or {}),
+            "returns": sp_rets,
+            "venue": "HyperCore",
+        }
+
+    # 2. Cross-DEX Paper v2 (HL x Lighter x Extended)
+    cd_st = _read_json(data_root / "hl_cross_dex_paper" / "state.json")
+    cd_rets = _read_sleeve_tick_returns(data_root / "hl_cross_dex_paper" / "ticks.parquet")
+    if cd_st:
+        cd_pos = cd_st.get("positions") or {}
+        cd_eq = max(_f(cd_st.get("equity_usd"), 100_000.0), 1.0)
+        cd_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in cd_pos.values() if isinstance(p, dict))
+        out["cross_dex_paper"] = {
+            "active": True,
+            "equity_usd": cd_eq,
+            "starting_capital_usd": _f(cd_st.get("starting_capital_usd"), 100_000.0),
+            "leverage": round(cd_gross / cd_eq, 3),
+            "positions_count": len(cd_pos),
+            "returns": cd_rets,
+            "venue": "HL x Lighter/Extended",
+        }
+
+    # 3. HIP-3 Cross-Builder Split-Margin Paper
+    h3_st = _read_json(data_root / "hl_hip3_paper" / "state.json")
+    h3_rets = _read_sleeve_tick_returns(data_root / "hl_hip3_paper" / "ticks.parquet")
+    if h3_st:
+        h3_pos = h3_st.get("positions") or {}
+        h3_eq = max(_f(h3_st.get("equity_usd"), 50_000.0), 1.0)
+        h3_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in h3_pos.values() if isinstance(p, dict))
+        out["hip3_paper"] = {
+            "active": True,
+            "equity_usd": h3_eq,
+            "starting_capital_usd": _f(h3_st.get("starting_capital_usd"), 50_000.0),
+            "leverage": round(h3_gross / h3_eq, 3),
+            "positions_count": len(h3_pos),
+            "returns": h3_rets,
+            "venue": "HIP-3 Builders",
+        }
+
+    # 4. Metamodel Paper (Observation-only unless positive live OOS Sharpe)
+    mm_st = _read_json(data_root / "hl_metamodel" / "state.json")
+    mm_rets = _read_sleeve_tick_returns(data_root / "hl_metamodel" / "ticks.parquet")
+    if mm_st:
+        mm_pos = mm_st.get("positions") or {}
+        mm_lev = sum(
+            abs(_f(p.get("hl_weight"))) + abs(_f(p.get("cex_weight"))) for p in mm_pos.values() if isinstance(p, dict)
+        )
+        out["metamodel_paper"] = {
+            "active": True,
+            "equity_usd": _f(mm_st.get("equity_usd"), 100_000.0),
+            "starting_capital_usd": _f(mm_st.get("starting_capital_usd"), 100_000.0),
+            "leverage": round(mm_lev, 3),
+            "positions_count": len(mm_pos),
+            "returns": mm_rets,
+            "venue": "HL x CEX",
+        }
+
+    # 5. Live HLP / Savings Reserve benchmark APR
+    hlp_apr = default_hlp_apr_pct
+    if sp_st and _f(sp_st.get("hlp_apr_pct")) != 0.0:
+        hlp_apr = _f(sp_st.get("hlp_apr_pct"))
+    else:
+        fh = _read_json(data_root / "hl_frontier_history" / "latest_summary.json")
+        if fh and _f(fh.get("hlp_apr_pct")) != 0.0:
+            hlp_apr = _f(fh.get("hlp_apr_pct"))
+    out["hlp_savings_reserve"] = {
+        "active": True,
+        "apr_pct": round(hlp_apr, 2),
+        "leverage": 1.0,
+        "returns": [],
+        "venue": "HyperCore HLP / USDC",
+    }
+    return out
+
+
+def _sleeve_sharpe_and_vol(rets: list[float], *, periods_per_year: float = 2190.0) -> tuple[float, float]:
+    """Compute annualized Sharpe and volatility from 4h tick returns (2190 = 365 * 6)."""
+    if len(rets) < 3:
+        return 0.0, 0.05
+    arr = np.asarray(rets, dtype=float)
+    vol = float(np.std(arr, ddof=1)) * math.sqrt(periods_per_year)
+    mean = float(np.mean(arr)) * periods_per_year
+    if vol <= 1e-8:
+        return (2.0 if mean > 0 else 0.0), 0.01
+    return mean / vol, max(vol, 0.01)
+
+
+def compute_autopilot_target_weights(
+    sleeves: dict[str, dict[str, Any]],
+    *,
+    cta_active: bool = True,
+    cfg: AutopilotConfig = AutopilotConfig(),
+) -> dict[str, float]:
+    """Compute Neutral-Autopilot-style target weights honoring hard risk & diversification bounds."""
+    cta_w = cfg.max_directional_weight if cta_active else 0.0
+    mn_candidates = ["spot_perp_paper", "cross_dex_paper", "hip3_paper", "metamodel_paper"]
+
+    eligible_mn: list[str] = []
+    sharpe_map: dict[str, float] = {}
+    vol_map: dict[str, float] = {}
+
+    for name in mn_candidates:
+        info = sleeves.get(name)
+        if not info or not info.get("active"):
+            continue
+        rets = list(info.get("returns") or [])
+        sh, vol = _sleeve_sharpe_and_vol(rets)
+        sharpe_map[name] = sh
+        vol_map[name] = vol
+        if name == "metamodel_paper":
+            # Observation-only safeguard: allocate only if proven live positive Sharpe over >= 2x opt window
+            if len(rets) < max(12, cfg.min_history_ticks_for_opt) or sh < cfg.min_metamodel_sharpe:
+                continue
+        eligible_mn.append(name)
+
+    if not eligible_mn:
+        return {
+            "spot_perp_paper": 0.0,
+            "cross_dex_paper": 0.0,
+            "hip3_paper": 0.0,
+            "metamodel_paper": 0.0,
+            "hlp_savings_reserve": round(1.0 - cta_w, 4),
+            "crisis_cta": round(cta_w, 4),
+        }
+
+    # Reserve share: at least target_reserve_weight (and never below min_reserve_weight),
+    # growing automatically if few market-neutral sleeves are active so single-sleeve cap holds.
+    max_mn_total = min(1.0 - cta_w - cfg.target_reserve_weight, len(eligible_mn) * cfg.max_single_sleeve_weight)
+    mn_budget = max(0.0, max_mn_total)
+    reserve_w = max(cfg.min_reserve_weight, 1.0 - cta_w - mn_budget)
+
+    # Check if >= 2 sleeves have enough live tick history for shrinkage risk-parity optimization
+    with_hist = [n for n in eligible_mn if len(sleeves[n].get("returns") or []) >= cfg.min_history_ticks_for_opt]
+    raw: dict[str, float] = {}
+    if len(with_hist) >= 2:
+        for n in eligible_mn:
+            prior = max(DEFAULT_BASE_WEIGHTS.get(n, 0.15), 0.05)
+            if n in with_hist:
+                inv_vol = 1.0 / max(vol_map[n], 0.02)
+                # Positive Sharpe multiplier (0.25 floor if slightly negative so diversification survives noise)
+                tilt = max(0.25, min(2.5, 1.0 + 0.25 * sharpe_map[n]))
+                raw[n] = 0.5 * prior + 0.5 * (inv_vol * tilt / 20.0)
+            else:
+                raw[n] = prior
+    else:
+        for n in eligible_mn:
+            raw[n] = max(DEFAULT_BASE_WEIGHTS.get(n, 0.15), 0.05)
+
+    # Normalize & iteratively clip to max_single_sleeve_weight
+    tot = sum(raw.values()) or 1.0
+    mn_weights = {n: raw[n] / tot * mn_budget for n in eligible_mn}
+    for _ in range(10):
+        over = [n for n, w in mn_weights.items() if w > cfg.max_single_sleeve_weight + 1e-9]
+        if not over:
+            break
+        excess = sum(mn_weights[n] - cfg.max_single_sleeve_weight for n in over)
+        for n in over:
+            mn_weights[n] = cfg.max_single_sleeve_weight
+        under = [n for n in mn_weights if n not in over]
+        if not under:
+            reserve_w += excess
+            break
+        u_sum = sum(mn_weights[n] for n in under) or float(len(under))
+        for n in under:
+            share = (mn_weights[n] / u_sum) if sum(mn_weights[x] for x in under) > 0 else (1.0 / len(under))
+            mn_weights[n] += excess * share
+
+    final = {
+        "spot_perp_paper": 0.0,
+        "cross_dex_paper": 0.0,
+        "hip3_paper": 0.0,
+        "metamodel_paper": 0.0,
+        "hlp_savings_reserve": reserve_w,
+        "crisis_cta": cta_w,
+    }
+    for n, w in mn_weights.items():
+        final[n] = w
+
+    # Clean final sum == 1.0
+    s_tot = sum(final.values()) or 1.0
+    final = {k: round(v / s_tot, 4) for k, v in final.items()}
+    # Fix tiny rounding residual on reserve
+    diff = round(1.0 - sum(final.values()), 4)
+    final["hlp_savings_reserve"] = round(final["hlp_savings_reserve"] + diff, 4)
+    return final
+
+
+# --------------------------------------------------------------------------- Master Tick Engine
+
+
+def _load_or_init_autopilot_state(state_path: Path, cfg: AutopilotConfig) -> dict[str, Any]:
+    if state_path.is_file():
+        st = json.loads(state_path.read_text(encoding="utf-8"))
+        st.setdefault("sleeve_allocations_usd", {})
+        st.setdefault("last_sleeve_equities", {})
+        st.setdefault("cta_state", {"weights": {}, "last_closes": {}, "cum_pnl_usd": 0.0, "cum_cost_usd": 0.0})
+        st.setdefault("rebalances_count", 0)
+        st.setdefault("nav_guard_triggers", 0)
+        return st
+    return {
+        "starting_capital_usd": cfg.starting_capital_usd,
+        "gross_equity_usd": cfg.starting_capital_usd,
+        "net_equity_usd": cfg.starting_capital_usd,
+        "gross_share_price": 1.0,
+        "net_share_price": 1.0,
+        "hwm_net_share_price": 1.0,
+        "gross_return_pct": 0.0,
+        "net_return_pct": 0.0,
+        "cum_mgmt_fee_usd": 0.0,
+        "cum_perf_fee_usd": 0.0,
+        "cum_rebalance_cost_usd": 0.0,
+        "last_tick_ms": 0,
+        "sleeve_allocations_usd": {},
+        "last_sleeve_equities": {},
+        "cta_state": {
+            "weights": {},
+            "last_closes": {},
+            "cum_pnl_usd": 0.0,
+            "cum_cost_usd": 0.0,
+        },
+        "rebalances_count": 0,
+        "nav_guard_triggers": 0,
+    }
+
+
+def run_autopilot_tick(
+    client: httpx.Client | None = None,
+    *,
+    data_root: Path,
+    state_dir: Path | None = None,
+    cfg: AutopilotConfig = AutopilotConfig(),
+    now_ms: int | None = None,
+    daily_closes: dict[str, list[float]] | None = None,
+    info_url: str = HL_INFO_URL,
+) -> dict[str, Any]:
+    """Run one idempotent Neutral-Autopilot multi-strategy portfolio tick with deadband rebalancing."""
+    ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    obs_utc = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    out_dir = state_dir or (data_root / "hl_autopilot")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    state_path = out_dir / "state.json"
+    ticks_path = out_dir / "ticks.parquet"
+    rebal_path = out_dir / "rebalances.parquet"
+
+    state = _load_or_init_autopilot_state(state_path, cfg)
+    sleeves = collect_desk_sleeve_metrics(data_root, default_hlp_apr_pct=cfg.default_hlp_apr_pct)
+
+    own_client = client is None and daily_closes is None
+    http_client = client or (httpx.Client(timeout=20.0) if own_client else None)
+    try:
+        if daily_closes is None:
+            assert http_client is not None
+            closes_map = fetch_hypercore_daily_closes(http_client, CTA_UNIVERSE, now_ms=ts_ms, info_url=info_url)
+        else:
+            closes_map = dict(daily_closes)
+    finally:
+        if own_client and http_client is not None:
+            http_client.close()
+
+    prev_ms = int(state.get("last_tick_ms", 0))
+    dt_hours = max(0.0, min(48.0, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
+    prev_gross = float(state.get("gross_equity_usd", cfg.starting_capital_usd))
+    prev_net = float(state.get("net_equity_usd", cfg.starting_capital_usd))
+    start_cap = float(state.get("starting_capital_usd", cfg.starting_capital_usd))
+
+    # 1. Update Crisis-Alpha CTA sleeve MTM & target weights
+    cta_state = dict(state.get("cta_state") or {})
+    prev_cta_w: dict[str, float] = dict(cta_state.get("weights") or {})
+    prev_cta_px: dict[str, float] = dict(cta_state.get("last_closes") or {})
+
+    cta_tick_ret = 0.0
+    if prev_cta_w and prev_ms > 0:
+        for coin, w in prev_cta_w.items():
+            c_list = closes_map.get(coin)
+            p0 = _f(prev_cta_px.get(coin))
+            if c_list and p0 > 0:
+                p1 = float(c_list[-1])
+                cta_tick_ret += w * ((p1 - p0) / p0)
+
+    cta_snap = compute_crisis_cta_weights(closes_map, prev_weights=prev_cta_w, cfg=cfg)
+    cta_cost_ret = cta_snap["turnover"] * (cfg.cta_turnover_cost_bps / 1e4)
+    cta_net_ret = cta_tick_ret - cta_cost_ret
+    new_last_closes = {c: float(vals[-1]) for c, vals in closes_map.items() if vals}
+
+    # 2. Compute target master weights
+    target_weights = compute_autopilot_target_weights(
+        sleeves,
+        cta_active=bool(cta_snap["weights"]),
+        cfg=cfg,
+    )
+
+    alloc_usd: dict[str, float] = dict(state.get("sleeve_allocations_usd") or {})
+    last_eq_map: dict[str, float] = dict(state.get("last_sleeve_equities") or {})
+    is_initial = prev_ms == 0 or not alloc_usd
+
+    sleeve_tick_pnl: dict[str, float] = {}
+    nav_guard_triggered = False
+    nav_guard_reason = ""
+
+    if is_initial:
+        alloc_usd = {k: round(prev_gross * w, 2) for k, w in target_weights.items()}
+        for name in ("spot_perp_paper", "cross_dex_paper", "hip3_paper", "metamodel_paper"):
+            if name in sleeves:
+                last_eq_map[name] = float(sleeves[name]["equity_usd"])
+    else:
+        # Accrue sleeve-level returns onto existing allocations
+        raw_pnl_total = 0.0
+        provisional_alloc = dict(alloc_usd)
+        for name, cur_alloc in alloc_usd.items():
+            if cur_alloc <= 0:
+                sleeve_tick_pnl[name] = 0.0
+                continue
+            r = 0.0
+            if name == "hlp_savings_reserve":
+                hlp_apr = _f(sleeves["hlp_savings_reserve"].get("apr_pct"), cfg.default_hlp_apr_pct)
+                r = (hlp_apr / 100.0 / HOURS_PER_YEAR) * dt_hours
+            elif name == "crisis_cta":
+                r = cta_net_ret
+            elif name in sleeves:
+                cur_eq = float(sleeves[name]["equity_usd"])
+                prev_s_eq = _f(last_eq_map.get(name), cur_eq)
+                r = (cur_eq - prev_s_eq) / prev_s_eq if prev_s_eq > 0 else 0.0
+                last_eq_map[name] = cur_eq
+            pnl = cur_alloc * r
+            sleeve_tick_pnl[name] = round(pnl, 4)
+            provisional_alloc[name] = max(0.0, cur_alloc + pnl)
+            raw_pnl_total += pnl
+
+        # Bounded NAV Sanity Guard
+        if prev_gross > 0 and abs(raw_pnl_total) / prev_gross * 100.0 > cfg.max_tick_nav_jump_pct:
+            nav_guard_triggered = True
+            nav_guard_reason = (
+                f"Master NAV jump {raw_pnl_total / prev_gross * 100.0:+.2f}% exceeded "
+                f"+/-{cfg.max_tick_nav_jump_pct:.1f}% guard; skipping MTM & rebalance"
+            )
+            state["nav_guard_triggers"] = int(state.get("nav_guard_triggers", 0)) + 1
+            sleeve_tick_pnl = {k: 0.0 for k in alloc_usd}
+        else:
+            alloc_usd = provisional_alloc
+            cta_alloc_prev = float(state.get("sleeve_allocations_usd", {}).get("crisis_cta", 0.0))
+            cta_state["cum_pnl_usd"] = round(float(cta_state.get("cum_pnl_usd", 0.0)) + cta_alloc_prev * cta_tick_ret, 4)
+            cta_state["cum_cost_usd"] = round(float(cta_state.get("cum_cost_usd", 0.0)) + cta_alloc_prev * cta_cost_ret, 4)
+
+    # 3. Deadband Rebalance check
+    gross_before_rebal = sum(alloc_usd.values())
+    actual_weights = {
+        k: round(alloc_usd.get(k, 0.0) / max(gross_before_rebal, 1.0), 4) for k in target_weights
+    }
+    max_drift_pct = round(
+        max((abs(actual_weights.get(k, 0.0) - target_weights[k]) * 100.0 for k in target_weights), default=0.0), 3
+    )
+
+    hard_breach = (
+        actual_weights.get("crisis_cta", 0.0) > cfg.max_directional_weight + 0.005
+        or actual_weights.get("hlp_savings_reserve", 0.0) < cfg.min_reserve_weight - 0.02
+    )
+    should_rebalance = (not nav_guard_triggered) and (
+        is_initial or max_drift_pct >= cfg.rebalance_deadband_pct or hard_breach
+    )
+
+    rebal_cost_usd = 0.0
+    rebal_turnover = 0.0
+    rebal_reason = ""
+    if should_rebalance:
+        rebal_turnover = 0.5 * sum(abs(target_weights[k] - actual_weights.get(k, 0.0)) for k in target_weights)
+        rebal_cost_usd = 0.0 if is_initial else round(gross_before_rebal * rebal_turnover * (cfg.rebalance_cost_bps / 1e4), 4)
+        post_eq = max(gross_before_rebal - rebal_cost_usd, 1.0)
+        alloc_usd = {k: round(post_eq * w, 2) for k, w in target_weights.items()}
+        actual_weights = dict(target_weights)
+        if not is_initial:
+            state["rebalances_count"] = int(state.get("rebalances_count", 0)) + 1
+            rebal_reason = "hard_limit_breach" if hard_breach else f"deadband_drift({max_drift_pct:.2f}%)"
+            _append_parquet(
+                rebal_path,
+                [
+                    {
+                        "tick_ms": ts_ms,
+                        "observed_at_utc": obs_utc,
+                        "reason": rebal_reason,
+                        "max_drift_pct": max_drift_pct,
+                        "turnover_pct": round(rebal_turnover * 100.0, 2),
+                        "cost_usd": rebal_cost_usd,
+                        "gross_equity_usd": round(post_eq, 2),
+                    }
+                ],
+            )
+
+    gross_equity = round(sum(alloc_usd.values()), 2)
+    gross_share = round(gross_equity / start_cap, 6) if start_cap > 0 else 1.0
+    gross_ret_pct = round((gross_share - 1.0) * 100.0, 4)
+
+    # 4. Gross vs Net-of-Fee HWM Share Price Accounting
+    tick_gross_ret = (gross_equity / prev_gross - 1.0) if prev_gross > 0 else 0.0
+    net_pre_fee = prev_net * (1.0 + tick_gross_ret)
+    mgmt_fee_usd = round(net_pre_fee * (cfg.mgmt_fee_annual_pct / 100.0 / HOURS_PER_YEAR) * dt_hours, 4) if dt_hours > 0 else 0.0
+    net_after_mgmt = max(net_pre_fee - mgmt_fee_usd, 1.0)
+
+    hwm_share = float(state.get("hwm_net_share_price", 1.0))
+    cand_share = net_after_mgmt / start_cap if start_cap > 0 else 1.0
+    perf_fee_usd = 0.0
+    if cand_share > hwm_share and cfg.perf_fee_pct > 0:
+        excess_usd = (cand_share - hwm_share) * start_cap
+        perf_fee_usd = round(excess_usd * (cfg.perf_fee_pct / 100.0), 4)
+        net_equity = round(net_after_mgmt - perf_fee_usd, 2)
+        hwm_share = round(net_equity / start_cap, 6)
+    else:
+        net_equity = round(net_after_mgmt, 2)
+
+    net_share = round(net_equity / start_cap, 6) if start_cap > 0 else 1.0
+    net_ret_pct = round((net_share - 1.0) * 100.0, 4)
+
+    # 5. Consolidated Risk Telemetry (weighted leverage, 30D avg/max, venue breakdown)
+    weighted_lev = 0.0
+    venue_breakdown: dict[str, float] = {}
+    for k, usd in alloc_usd.items():
+        if usd <= 0:
+            continue
+        w = usd / max(gross_equity, 1.0)
+        if k == "crisis_cta":
+            lev_k = float(cta_snap["gross_leverage"])
+            venue_k = "HyperCore Perp (CTA)"
+        elif k in sleeves:
+            lev_k = float(sleeves[k].get("leverage", 1.0))
+            venue_k = str(sleeves[k].get("venue", "HyperCore"))
+        else:
+            lev_k = 1.0
+            venue_k = "HyperCore"
+        weighted_lev += w * lev_k
+        venue_breakdown[venue_k] = round(venue_breakdown.get(venue_k, 0.0) + usd, 2)
+
+    weighted_lev = round(weighted_lev, 3)
+    lev_30d_avg, lev_30d_max = spa._compute_30d_leverage_stats(ticks_path, weighted_lev, ts_ms)
+    net_dir_pct = round(actual_weights.get("crisis_cta", 0.0) * float(cta_snap["net_exposure"]) * 100.0, 3)
+
+    cta_state["weights"] = cta_snap["weights"]
+    cta_state["last_closes"] = new_last_closes
+    cta_state["gross_leverage"] = cta_snap["gross_leverage"]
+    cta_state["net_exposure"] = cta_snap["net_exposure"]
+    cta_state["assets"] = cta_snap["assets"]
+
+    sleeve_summary = []
+    for k in target_weights:
+        sleeve_summary.append(
+            {
+                "name": k,
+                "category": SLEEVE_CATEGORY.get(k, "Other"),
+                "target_weight_pct": round(target_weights[k] * 100.0, 2),
+                "actual_weight_pct": round(actual_weights.get(k, 0.0) * 100.0, 2),
+                "drift_pct": round((actual_weights.get(k, 0.0) - target_weights[k]) * 100.0, 2),
+                "allocation_usd": round(alloc_usd.get(k, 0.0), 2),
+                "tick_pnl_usd": round(sleeve_tick_pnl.get(k, 0.0), 4),
+            }
+        )
+
+    state.update(
+        {
+            "gross_equity_usd": gross_equity,
+            "equity_usd": gross_equity,  # Standard key for downstream analytics readers
+            "net_equity_usd": net_equity,
+            "gross_share_price": gross_share,
+            "net_share_price": net_share,
+            "hwm_net_share_price": hwm_share,
+            "gross_return_pct": gross_ret_pct,
+            "net_return_pct": net_ret_pct,
+            "cum_mgmt_fee_usd": round(float(state.get("cum_mgmt_fee_usd", 0.0)) + mgmt_fee_usd, 4),
+            "cum_perf_fee_usd": round(float(state.get("cum_perf_fee_usd", 0.0)) + perf_fee_usd, 4),
+            "cum_rebalance_cost_usd": round(float(state.get("cum_rebalance_cost_usd", 0.0)) + rebal_cost_usd, 4),
+            "last_tick_ms": ts_ms,
+            "observed_at_utc": obs_utc,
+            "target_weights": target_weights,
+            "actual_weights": actual_weights,
+            "sleeve_allocations_usd": alloc_usd,
+            "last_sleeve_equities": last_eq_map,
+            "sleeves": sleeve_summary,
+            "cta_state": cta_state,
+            "risk_telemetry": {
+                "gross_leverage": weighted_lev,
+                "leverage_30d_avg": lev_30d_avg,
+                "leverage_30d_max": lev_30d_max,
+                "net_directional_exposure_pct": net_dir_pct,
+                "directional_sleeve_pct": round(actual_weights.get("crisis_cta", 0.0) * 100.0, 2),
+                "reserve_sleeve_pct": round(actual_weights.get("hlp_savings_reserve", 0.0) * 100.0, 2),
+                "max_weight_drift_pct": max_drift_pct,
+                "rebalanced_this_tick": bool(should_rebalance and not is_initial),
+                "rebalance_reason": rebal_reason,
+                "venue_breakdown_usd": venue_breakdown,
+                "nav_guard_triggered": nav_guard_triggered,
+                "nav_guard_reason": nav_guard_reason,
+            },
+        }
+    )
+
+    _write_json_atomic(state_path, state)
+    _append_parquet(
+        ticks_path,
+        [
+            {
+                "tick_ms": ts_ms,
+                "observed_at_utc": obs_utc,
+                "equity_usd": gross_equity,
+                "net_equity_usd": net_equity,
+                "gross_share_price": gross_share,
+                "net_share_price": net_share,
+                "gross_return_pct": gross_ret_pct,
+                "net_return_pct": net_ret_pct,
+                "gross_leverage": weighted_lev,
+                "net_directional_exposure_pct": net_dir_pct,
+                "max_weight_drift_pct": max_drift_pct,
+                "rebalanced": bool(should_rebalance and not is_initial),
+                "rebalance_cost_usd": rebal_cost_usd,
+                "nav_guard_triggered": nav_guard_triggered,
+            }
+        ],
+    )
+    return {"state": state}
+
+
+def format_autopilot_markdown(result: dict[str, Any]) -> str:
+    st = result["state"]
+    rt = st.get("risk_telemetry") or {}
+    lines = [
+        f"# Hyperliquid Neutral Autopilot — Master Portfolio ({st.get('observed_at_utc', '')})",
+        "",
+        f"- **Gross Equity:** `${st['gross_equity_usd']:,.2f}` (`{st['gross_return_pct']:+.4f}%` · Share `${st['gross_share_price']:.4f}`)",
+        f"- **Net Equity (1% mgmt / 10% HWM perf):** `${st['net_equity_usd']:,.2f}` (`{st['net_return_pct']:+.4f}%` · Share `${st['net_share_price']:.4f}`)",
+        f"- **Risk:** Leverage `{rt.get('gross_leverage', 0):.2f}x` (30D avg `{rt.get('leverage_30d_avg', 0):.2f}x` / max `{rt.get('leverage_30d_max', 0):.2f}x`) · "
+        f"CTA Cap `{rt.get('directional_sleeve_pct', 0):.2f}%` (Net Dir `{rt.get('net_directional_exposure_pct', 0):+.2f}%`) · "
+        f"Reserve `{rt.get('reserve_sleeve_pct', 0):.2f}%` · Max Drift `{rt.get('max_weight_drift_pct', 0):.2f}%`",
+        "",
+        "| Sleeve | Category | Target % | Actual % | Drift % | Allocation | Tick PnL |",
+        "|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for s in st.get("sleeves") or []:
+        lines.append(
+            f"| **{s['name']}** | {s['category']} | {s['target_weight_pct']:.2f}% | {s['actual_weight_pct']:.2f}% | "
+            f"{s['drift_pct']:+.2f}% | ${s['allocation_usd']:,.2f} | ${s['tick_pnl_usd']:+.2f} |"
+        )
+    cta_assets = (st.get("cta_state") or {}).get("assets") or {}
+    if cta_assets:
+        lines += [
+            "",
+            "## Crisis-Alpha Directional CTA Sleeve (TSMOM 10d/20d/40d, <= 5% Cap)",
+            "",
+            "| Asset | Close | TSMOM Signal | Ann Vol | Weight |",
+            "|---|---:|---:|---:|---:|",
+        ]
+        for c, a in sorted(cta_assets.items()):
+            px_s = f"${a['last_close']:,.2f}" if a["last_close"] >= 10.0 else f"${a['last_close']:.4f}"
+            lines.append(
+                f"| **{c}** | {px_s} | {a['tsmom_signal']:+.3f} | "
+                f"{a['ann_vol_pct']:.1f}% | {a['weight']:+.2f} |"
+            )
+    return "\n".join(lines) + "\n"
+
+
+def format_autopilot_telegram_rich_html(result: dict[str, Any]) -> str:
+    st = result["state"]
+    rt = st.get("risk_telemetry") or {}
+    return (
+        f"<h1>🧭 Neutral Autopilot Master · {html.escape(str(st.get('observed_at_utc', '')))}</h1>"
+        f"<p>Gross: <b>${st['gross_equity_usd']:,.2f}</b> ({st['gross_return_pct']:+.3f}%) · "
+        f"Net HWM: <b>${st['net_equity_usd']:,.2f}</b> ({st['net_return_pct']:+.3f}%)</p>"
+        f"<p>Lev: <b>{rt.get('gross_leverage', 0):.2f}x</b> · CTA: <b>{rt.get('directional_sleeve_pct', 0):.1f}%</b> "
+        f"(dir {rt.get('net_directional_exposure_pct', 0):+.2f}%) · Reserve: <b>{rt.get('reserve_sleeve_pct', 0):.1f}%</b> · "
+        f"Drift: {rt.get('max_weight_drift_pct', 0):.2f}%</p>"
+    )
