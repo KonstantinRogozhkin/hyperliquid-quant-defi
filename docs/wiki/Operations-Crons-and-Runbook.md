@@ -57,6 +57,10 @@ make bench-mm
 .venv/bin/python scripts/analytics/run_cross_dex_arb_scan.py --min-day-vol-usd 500000 --top-n 10
 .venv/bin/python scripts/analytics/run_hl_onchain_event_tick.py
 .venv/bin/python scripts/analytics/run_hl_frontier_persistence_tick.py
+.venv/bin/python scripts/analytics/run_hl_hip3_paper_tick.py
+
+# Безопасный перенос локальных macOS-кронов на 13-джобовый Dokploy worker (с бэкапом)
+python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl-quant.95-217-163-111.sslip.io --apply
 
 # Пересборка автономного 6-вкладочного HTML-дашборда
 make dashboard

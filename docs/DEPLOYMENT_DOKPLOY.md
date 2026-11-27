@@ -4,7 +4,7 @@ This repository ships as a three-container Docker Compose stack behind Dokploy T
 
 - **`frontend`** (`nginx:1.27-alpine` + React/Vite/TS SPA): serves the live quant desk UI, `/build-info.json`, and proxies `/api/*` → `http://backend:8000` (single public domain, zero CORS setup).
 - **`backend`** (`python:3.11-slim` + `FastAPI`/`uvicorn`): read-only telemetry API mounted on `/app/data:ro`, never receives wallet private keys or Telegram tokens.
-- **`worker`** (`python:3.11-slim` + `hl_quant.scheduler` + `--extra testnet`): runs all 12 UTC jobs (the 7 core schedules plus 5 read-only dashboard scanners: `cross_dex_scan`, `hyperevm_defi_scan`, `liq_funding_alpha`, `mm_calibration`, and `settlement_study`), writes atomically to shared volume `hl-data:/app/data:rw`, and seeds any missing read-only tab in the background on startup.
+- **`worker`** (`python:3.11-slim` + `hl_quant.scheduler` + `--extra testnet`): runs all **13 UTC jobs** (the 7 core schedules plus 6 read-only dashboard/paper scanners: `hip3_paper`, `cross_dex_scan`, `hyperevm_defi_scan`, `liq_funding_alpha`, `mm_calibration`, and `settlement_study`), preserves job health across restarts, sends cooldown-gated Telegram alerts on job failure/recovery, writes atomically to shared volume `hl-data:/app/data:rw`, and seeds any missing read-only tab in the background on startup.
 
 ---
 

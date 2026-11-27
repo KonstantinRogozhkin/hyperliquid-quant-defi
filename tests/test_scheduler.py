@@ -288,3 +288,38 @@ def test_worker_preserves_last_known_job_state_across_restarts(tmp_path: Path, m
     assert by_name["metamodel_paper"]["state"] == "ok"
     assert by_name["cross_dex_paper"]["state"] == "idle"
     assert by_name["testnet_executor"]["state"] == "disabled"
+
+
+def test_worker_sends_cooldown_gated_failure_and_recovery_alerts(tmp_path: Path):
+    outcomes = [1, 1, 0, 0]  # fail #1 (alert), fail #2 within cooldown (suppressed), ok #3 (recovery), ok #4 (quiet)
+    sent_alerts: list[str] = []
+
+    def scripted_runner(_cmd: list[str], _env: dict[str, str], _timeout: int) -> int:
+        return outcomes.pop(0)
+
+    sched = WorkerScheduler(
+        data_dir=tmp_path,
+        telegram_enabled=True,
+        runner=scripted_runner,
+        readonly_retries=0,
+        alert_cooldown_s=3600.0,
+        alert_sender=sent_alerts.append,
+    )
+    job = next(j for j in sched.jobs if j.name == "onchain_events")
+
+    assert sched.run_job(job) == 1
+    assert len(sent_alerts) == 1
+    assert "сбой onchain_events" in sent_alerts[0]
+
+    # Second consecutive failure within 1h cooldown is suppressed
+    assert sched.run_job(job) == 1
+    assert len(sent_alerts) == 1
+
+    # Recovery sends a single green recovery alert
+    assert sched.run_job(job) == 0
+    assert len(sent_alerts) == 2
+    assert "восстановлен onchain_events" in sent_alerts[1]
+
+    # Subsequent healthy run sends no alert
+    assert sched.run_job(job) == 0
+    assert len(sent_alerts) == 2

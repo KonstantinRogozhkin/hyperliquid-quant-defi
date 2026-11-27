@@ -15,6 +15,7 @@ from __future__ import annotations
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+import html
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,8 @@ import time
 from typing import Any, Callable
 
 import typer
+
+from hl_quant import paper_tracker as pt
 
 ROOT_DIR = Path(__file__).resolve().parents[2]
 
@@ -447,6 +450,36 @@ def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def format_worker_alert_rich_html(
+    *,
+    job: JobSpec,
+    recovered: bool,
+    exit_code: int,
+    duration_s: float,
+    attempts: int,
+    last_error: str | None,
+    build_sha: str,
+    observed_at_utc: str,
+) -> str:
+    """Format a concise Telegram Rich HTML operational alert for worker job failure or recovery."""
+    icon = "🟢" if recovered else "🚨"
+    title = f"hl-worker: восстановлен {job.name}" if recovered else f"hl-worker: сбой {job.name}"
+    err_html = (
+        f"<p><b>Ошибка:</b> <code>{html.escape(last_error[:240])}</code></p>"
+        if (not recovered and last_error)
+        else ""
+    )
+    return (
+        f"<h1>{icon} {html.escape(title)}</h1>"
+        f"<p><b>Время:</b> {html.escape(observed_at_utc)} · <b>SHA:</b> <code>{html.escape(build_sha[:12])}</code><br>"
+        f"<b>Расписание:</b> <code>{html.escape(job.cron_expr)}</code> · "
+        f"<b>Exit code:</b> <code>{exit_code}</code> · "
+        f"<b>Попыток:</b> {attempts} · <b>Время:</b> {duration_s:.1f}s</p>"
+        f"{err_html}"
+        "<footer>Автоматический watchdog hl_quant.scheduler (1ч cooldown на повторные алерты)</footer>"
+    )
+
+
 class WorkerScheduler:
     """UTC scheduler executing isolated subprocess ticks with non-overlapping per-job concurrency."""
 
@@ -461,6 +494,8 @@ class WorkerScheduler:
         max_workers: int = 4,
         readonly_retries: int = 1,
         readonly_retry_delay_s: float = 15.0,
+        alert_cooldown_s: float = 3600.0,
+        alert_sender: Callable[[str], Any] | None = None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.data_dir = Path(
@@ -472,6 +507,10 @@ class WorkerScheduler:
         self.max_workers = max(1, int(max_workers))
         self.readonly_retries = max(0, int(readonly_retries))
         self.readonly_retry_delay_s = max(0.0, float(readonly_retry_delay_s))
+        self.alert_cooldown_s = max(0.0, float(alert_cooldown_s))
+        self._alert_sender = alert_sender
+        self._last_failure_alert_mono: dict[str, float] = {}
+        self._alerted_failed_jobs: set[str] = set()
         self._thread_local = threading.local()
         has_tg_token = bool(
             os.environ.get("TELEGRAM_SIGNAL_BOT_TOKEN", "").strip()
@@ -697,8 +736,10 @@ class WorkerScheduler:
             print(f"[hl-worker] starting {job.name} ({job.cron_expr})", flush=True)
             max_attempts = (1 + self.readonly_retries) if job.readonly else 1
             exit_code = 1
+            attempts_used = 0
             last_err: str | None = None
             for attempt in range(1, max_attempts + 1):
+                attempts_used = attempt
                 self._thread_local.last_stderr = None
                 exit_code = self._runner(cmd, env, job.timeout_s)
                 last_err = getattr(self._thread_local, "last_stderr", None)
@@ -713,11 +754,13 @@ class WorkerScheduler:
                     break
             duration = round(time.monotonic() - t0, 2)
             end_dt = datetime.now(tz=timezone.utc)
+            end_utc_str = end_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
             with self._status_lock:
                 entry = self._state[job.name]
+                was_failed = entry.get("state") == "failed" or (job.name in self._alerted_failed_jobs)
                 entry["state"] = "ok" if exit_code == 0 else "failed"
-                entry["last_finished_at_utc"] = end_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                entry["last_finished_at_utc"] = end_utc_str
                 entry["last_exit_code"] = exit_code
                 entry["last_duration_s"] = duration
                 entry["last_error"] = None if exit_code == 0 else (last_err or f"exit_code={exit_code}")
@@ -725,11 +768,74 @@ class WorkerScheduler:
                     entry["runs_ok"] = int(entry["runs_ok"]) + 1
                 else:
                     entry["runs_failed"] = int(entry["runs_failed"]) + 1
+                final_err = entry["last_error"]
             print(f"[hl-worker] finished {job.name} rc={exit_code} in {duration:.1f}s", flush=True)
             self.publish_status(end_dt)
+            self._maybe_send_job_alert(
+                job=job,
+                exit_code=exit_code,
+                was_failed=was_failed,
+                duration_s=duration,
+                attempts=attempts_used,
+                last_error=final_err,
+                observed_at_utc=end_utc_str,
+            )
             return exit_code
         finally:
             lock.release()
+
+    def _dispatch_alert_html(self, rich_html: str) -> None:
+        if self._alert_sender is not None:
+            self._alert_sender(rich_html)
+            return
+        token, chat_id, thread_id = pt.load_telegram_credentials((self.root_dir / ".env",))
+        if token and chat_id:
+            pt.send_telegram_rich_message(rich_html, bot_token=token, chat_id=chat_id, thread_id=thread_id)
+
+    def _maybe_send_job_alert(
+        self,
+        *,
+        job: JobSpec,
+        exit_code: int,
+        was_failed: bool,
+        duration_s: float,
+        attempts: int,
+        last_error: str | None,
+        observed_at_utc: str,
+    ) -> None:
+        if not self.telegram_enabled or self._stop_event.is_set():
+            return
+        now_mono = time.monotonic()
+        should_send = False
+        recovered = False
+        with self._status_lock:
+            if exit_code != 0:
+                last_sent = self._last_failure_alert_mono.get(job.name)
+                if last_sent is None or (now_mono - last_sent) >= self.alert_cooldown_s:
+                    self._last_failure_alert_mono[job.name] = now_mono
+                    self._alerted_failed_jobs.add(job.name)
+                    should_send = True
+            elif was_failed:
+                self._alerted_failed_jobs.discard(job.name)
+                self._last_failure_alert_mono.pop(job.name, None)
+                should_send = True
+                recovered = True
+        if not should_send:
+            return
+        try:
+            rich = format_worker_alert_rich_html(
+                job=job,
+                recovered=recovered,
+                exit_code=exit_code,
+                duration_s=duration_s,
+                attempts=attempts,
+                last_error=last_error,
+                build_sha=os.environ.get("HL_BUILD_SHA", "dev"),
+                observed_at_utc=observed_at_utc,
+            )
+            self._dispatch_alert_html(rich)
+        except Exception as exc:
+            print(f"[hl-worker] failed to send Telegram alert for {job.name}: {exc}", file=sys.stderr, flush=True)
 
     def _bootstrap_sentinel_for(self, job_name: str) -> Path | None:
         sentinels = {
