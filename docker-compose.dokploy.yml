@@ -55,6 +55,8 @@ services:
       HL_TESTNET_PRIVATE_KEY: ${HL_TESTNET_PRIVATE_KEY:-}
       HL_TESTNET_ACCOUNT_ADDRESS: ${HL_TESTNET_ACCOUNT_ADDRESS:-}
       HL_TESTNET_MAX_CHILD_USD: ${HL_TESTNET_MAX_CHILD_USD:-250}
+      # Coins owned by the MM on the shared Testnet address (executor leaves their orders/inventory alone).
+      HL_MM_COINS: ${HL_MM_COINS:-}
       HL_PAPER_MAX_COINS: ${HL_PAPER_MAX_COINS:-35}
       HL_SNAPSHOT_COINS: ${HL_SNAPSHOT_COINS:-BTC,ETH,SOL,HYPE,DOGE,XRP,SUI,ENA,WIF,kPEPE,AVAX,LINK,TAO}
     volumes:

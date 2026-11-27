@@ -530,6 +530,7 @@ class HyperliquidClient:
         api_url = constants.TESTNET_API_URL if use_testnet else constants.MAINNET_API_URL
         self.account_address = account_address
         self.api_url = api_url
+        self.use_testnet = bool(use_testnet)
         self._info = Info(api_url, skip_ws=True, timeout=10.0)
         self._wallet = Account.from_key(api_wallet_private_key)
         self._exchange = Exchange(self._wallet, base_url=api_url, account_address=account_address, timeout=10.0)
@@ -570,6 +571,10 @@ class HyperliquidClient:
         return dict(self._info.user_fees(self.account_address) or {})
 
     def create_ioc(self, *, asset: str, is_buy: bool, quantity: Decimal, price: Decimal, client_id: str, reduce_only: bool) -> Any:
+        # Re-check the real-money opt-in on every mainnet order (as the Binance/Bybit clients do),
+        # so revoking the env flag mid-process stops further HL submissions.
+        if not self.use_testnet:
+            require_mainnet_execution_opt_in()
         # A cloid is not supplied: it could be linked to an order identity and must never leave memory.
         self._exchange.expires_after = int((time.time() + 10.0) * 1000)
         response = self._exchange.order(
@@ -1171,6 +1176,10 @@ class MicroExecutionRunner:
         if self.contract.execution_mode != "mainnet_only":
             # Binance/Bybit clients are mainnet-only; a testnet_only contract must never reach them.
             raise PreflightBlocked("execution_mode_not_supported_by_mainnet_clients")
+        # The Binance/Bybit legs are real mainnet orders, so the Hyperliquid hedge leg must be on
+        # mainnet too: a Testnet HL client (the default) would "hedge" real exposure with mock USDC.
+        if str(getattr(self.hyperliquid, "api_url", "") or "").rstrip("/") != HYPERLIQUID:
+            raise PreflightBlocked("hyperliquid_network_mismatch_for_mainnet_contract")
         symbol, perp = f"{asset}USDC", f"{asset}PERP"
         books, span_ms = self._market_snapshot(asset)
         if span_ms > self.contract.max_snapshot_sync_span_ms:

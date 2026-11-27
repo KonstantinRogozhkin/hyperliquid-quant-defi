@@ -13,9 +13,11 @@ flowchart TD
     STATE["Целевые веса метамодели<br/>(data/paper/hl_metamodel/state.json)"] --> FILT["Фильтр листинга Testnet +<br/>исключение onlyIsolated (ZRO и др.)"]
     FILT --> NEUT["Доллар-нейтрализация<br/>sum(w)=0, gross ≤ 0.90"]
     NEUT --> KS{"Pre-Trade Kill-Switch<br/>• DD от HWM < 5%<br/>• Free margin ≥ 20%<br/>• Stale book ≤ 30с"}
-    KS -->|"Нарушение"| HALT["Отмена всех открытых ордеров<br/>+ алерт в Telegram"]
+    KS -->|"Риск аккаунта<br/>(DD / маржа / gross / cap)"| DERISK["Отмена всех ордеров →<br/>reduce-only de-risk<br/>(DD ≥ лимита: flatten всего)"]
+    KS -->|"Разрыв фида<br/>(missing_quote)"| GAP["Стоп ребаланса;<br/>reduce-only закрытие сирот по oracle"]
+    KS -->|"Битые данные<br/>(non-finite / stale)"| HALT["Полная остановка:<br/>ни одного ордера"]
     KS -->|"OK"| CANCEL["Отмена устаревших ордеров"]
-    CANCEL --> LEV["update_leverage<br/>cross:3x / isolated:2x<br/>(блок входа при отказе)"]
+    CANCEL --> LEV["update_leverage<br/>cross:3x / isolated:2x<br/>(блок входа при любом отказе)"]
     LEV --> SLICE["Ребаланс дельты позиции →<br/>нарезка на дочерние ALO-ордера<br/>(5 sig figs, 6-szDecimals)"]
     SLICE --> AUDIT["Запись в hl_testnet_audit.jsonl +<br/>обновление HWM + Telegram Rich HTML"]
 ```
@@ -33,6 +35,13 @@ flowchart TD
    - Через `userAbstraction` + `spotClearinghouseState` + `clearinghouseState` определяется режим аккаунта.
    - В режиме `unifiedAccount` / `portfolioMargin` поле `spot.USDC.total` уже включает заблокированную маржу Perps и живой Unrealized PnL (проверено до 6-го знака против `portfolio.day.accountValueHistory`).
    - `equity_usd = spot.USDC.total`, `free_margin_usd = max(0, spot.USDC.total - spot.USDC.hold)` — без двойного учёта маржи и без ложных срабатываний drawdown kill-switch.
+5. **Kill-switch не замораживает убытки:**
+   - Нарушения риска аккаунта (`drawdown_limit`, `low_free_margin`, `gross_leverage`, `coin_cap`) отменяют все ордера адреса и затем ставят только `reduce_only` ALO к целевым весам. При пробое drawdown-лимита (`flatten_on_drawdown=True`) закрываются все позиции.
+   - `missing_quote` (разрыв фида Testnet) останавливает ребаланс по BBO, но разрешает пассивное закрытие сирот.
+   - `non_finite_*`, `zero_or_negative_equity`, `stale_feed` — полная остановка без единого ордера.
+   - Режим цикла пишется в аудит как `derisk_mode`: `flatten`, `reduce_only`, `orphan_unwind_only` или `none`.
+6. **Сироты (позиции без двустороннего стакана) закрываются:** `plan_orphan_unwind_orders` ставит `reduce_only` ALO по oracle-цене (`metaAndAssetCtxs`) с учётом уцелевшей стороны стакана: продажа строго выше лучшего bid, покупка строго ниже лучшего ask. Если монета всё ещё в целях стратегии, урезается только излишек сверх целевого размера, а позиция противоположного знака закрывается полностью.
+7. **Изоляция от MM на общем адресе:** id ордеров из `data/paper/hl_mm_testnet/mm_audit.jsonl` и монеты из `HL_MM_COINS` (или `--mm-coins`) считаются чужими. Executor не отменяет эти ордера (кроме аварии по риску аккаунта) и не закрывает в ноль нецелевой инвентарь MM; его gross резервируется при нейтрализации и учитывается в gross kill-switch.
 
 ---
 

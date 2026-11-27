@@ -159,6 +159,9 @@ class MMSessionSummary:
     vpin_widen_events: int = 0
     rate_limit_throttles: int = 0
     mempool_priority_eligible: bool = True
+    # True when shutdown could not confirm every MM order was cancelled, so the exchange-side
+    # Dead Man's Switch was intentionally left armed to sweep the leftovers.
+    dms_left_armed: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -445,6 +448,15 @@ def compute_funding_settlement_overlay_bps(
     return 0.0
 
 
+def reduce_only_is_valid(side: str, sz: float, account_position_sz: float) -> bool:
+    """True when a ``side`` order of ``sz`` only reduces the signed *account* position."""
+    if sz <= 0:
+        return False
+    if side == "sell":
+        return account_position_sz >= sz - 1e-12
+    return account_position_sz <= -sz + 1e-12
+
+
 def compute_as_quotes(
     book: L2BookSnapshot,
     spec: AssetSpec,
@@ -456,11 +468,17 @@ def compute_as_quotes(
     lead_impulse_bps: float = 0.0,
     portfolio_other_inv_usd: float = 0.0,
     funding_overlay_bps: float = 0.0,
+    account_position_sz: float | None = None,
 ) -> MMQuoteDecision:
     """Compute Avellaneda–Stoikov reservation price, optimal spread, and post-only ALO quotes.
 
     Supports external CEX lead-lag fair-price shifting & toxic-side pulling, cross-asset
     portfolio beta inventory coupling, and hourly ``:59->:05`` funding-unwind overlay.
+
+    ``inventory_sz`` is the MM *session* inventory (drives skew and caps). The exchange applies
+    ``reduceOnly`` to the *account* position, which on a shared address also holds other engines'
+    inventory; pass ``account_position_sz`` so the unwind side is only flagged reduce-only when it
+    actually reduces the account position (otherwise Hyperliquid rejects it and the MM sticks).
     """
     inv_usd = inventory_sz * book.mid_px
     eff_inv_usd = inv_usd + params.portfolio_beta_coupling * portfolio_other_inv_usd
@@ -572,6 +590,10 @@ def compute_as_quotes(
     if ask_px is None or ask_sz <= 0 or ask_sz * ask_px < params.min_order_usd:
         ask_px = None
         ask_sz = 0.0
+
+    if account_position_sz is not None:
+        bid_reduce_only = bid_reduce_only and reduce_only_is_valid("buy", bid_sz, account_position_sz)
+        ask_reduce_only = ask_reduce_only and reduce_only_is_valid("sell", ask_sz, account_position_sz)
 
     # 4. Lead-Lag toxic-side instant pull (protect stale quotes when Binance jumps sharply)
     if params.lead_pull_bps > 0:
@@ -1173,6 +1195,7 @@ def run_live_mm_session(
                 sigma_tau_bps=sigma_tau,
                 params=params,
                 toxicity_mult=tox_mult,
+                account_position_sz=ledger.start_sz + ledger.net_sz,
             )
             eff_halt = adverse_halt or dec.halt_reason
             if eff_halt:
@@ -1791,6 +1814,7 @@ async def run_multi_coin_mm_ws_session(
             "vpin_widen_events": 0,
             "rate_limit_throttles": 0,
             "cleanup_cancelled": 0,
+            "dms_left_armed": False,
             "flattened_exit_sz": 0.0,
             "half_spreads": [],
             "sigmas": [],
@@ -2020,6 +2044,7 @@ async def run_multi_coin_mm_ws_session(
                 lead_impulse_bps=lead_imp,
                 portfolio_other_inv_usd=other_inv_usd,
                 funding_overlay_bps=fund_ov_bps,
+                account_position_sz=ledgers[c_name].start_sz + ledgers[c_name].net_sz,
             )
             if abs(lead_imp) >= params.lead_pull_bps and params.lead_pull_bps > 0:
                 st["lead_pulls"] += 1
@@ -2202,6 +2227,37 @@ async def run_multi_coin_mm_ws_session(
             except Exception:
                 pass
 
+        # 1b. Verify nothing of ours is still resting before the exchange-side Dead Man's Switch is
+        # disarmed; if a cancel failed (timeout / 429) or verification is impossible, keep the DMS
+        # armed so Hyperliquid cancels the leftovers at its trigger time instead of never.
+        mm_orders_cleared = True
+        if execute_live and account_address:
+            mm_orders_cleared = False
+            for _attempt in range(2):
+                try:
+                    oo_resp = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address})
+                    oo_resp.raise_for_status()
+                    oo_check = oo_resp.json()
+                    if not isinstance(oo_check, list):
+                        break
+                except Exception:
+                    break
+                leftovers = [
+                    {"coin": str(o.get("coin") or ""), "oid": int(o["oid"])}
+                    for o in oo_check
+                    if isinstance(o, dict)
+                    and o.get("oid") is not None
+                    and str(o.get("coin") or "") in all_mm_oids
+                    and int(o["oid"]) in all_mm_oids[str(o.get("coin") or "")]
+                ]
+                if not leftovers:
+                    mm_orders_cleared = True
+                    break
+                try:
+                    await asyncio.to_thread(adapter.cancel_all_open_orders, leftovers)
+                except Exception:
+                    pass
+
         # 2. Optional flatten-on-exit per coin
         if flatten_on_exit:
             for c_name in coin_list:
@@ -2213,6 +2269,10 @@ async def run_multi_coin_mm_ws_session(
                 unwind_sz = round_hl_size(abs(net), sp.sz_decimals)
                 if unwind_sz > 0 and unwind_sz * mid >= 10.5:
                     unwind_side = "sell" if net > 0 else "buy"
+                    # Returning the session delta to zero may *increase* the shared account
+                    # position (other engines' inventory); reduceOnly would then be rejected.
+                    acct_pos = ledgers[c_name].start_sz + net
+                    flat_reduce_only = reduce_only_is_valid(unwind_side, unwind_sz, acct_pos)
                     raw_px = mid * (0.9975 if unwind_side == "sell" else 1.0025)
                     limit_px = round_hl_price(raw_px, sp.sz_decimals, side=unwind_side)
                     flat_ord = PlannedOrder(
@@ -2222,7 +2282,7 @@ async def run_multi_coin_mm_ws_session(
                         sz=unwind_sz,
                         notional_usd=round(unwind_sz * mid, 2),
                         tif="Ioc",
-                        reduce_only=True,
+                        reduce_only=flat_reduce_only,
                     )
                     try:
                         flat_resp = await asyncio.to_thread(adapter.place_ioc_order, flat_ord)
@@ -2237,8 +2297,12 @@ async def run_multi_coin_mm_ws_session(
                     except Exception:
                         pass
 
-        # 3. Disarm Dead Man's Switch so it never consumes a daily trigger on clean shutdown
-        if dead_man_armed and hasattr(adapter, "schedule_cancel"):
+        # 3. Disarm Dead Man's Switch so it never consumes a daily trigger on clean shutdown —
+        # only once every MM order is confirmed gone (see 1b).
+        if dead_man_armed and not mm_orders_cleared:
+            for c_name in coin_list:
+                stats[c_name]["dms_left_armed"] = True
+        if dead_man_armed and mm_orders_cleared and hasattr(adapter, "schedule_cancel"):
             try:
                 await asyncio.to_thread(adapter.schedule_cancel, None)
             except Exception:
@@ -2292,6 +2356,7 @@ async def run_multi_coin_mm_ws_session(
             quotes_modified=st["modified"],
             lead_pulls=st["lead_pulls"],
             dead_man_refreshes=dead_man_refreshes,
+            dms_left_armed=bool(st["dms_left_armed"]),
             urgent_cancels=st["urgent_cancels"],
             api_requests_per_usd_vol=round(api_reqs / max(lg.volume_usd, 1.0), 3),
             vpin_widen_events=st["vpin_widen_events"],

@@ -24,6 +24,7 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from hl_quant import hl_testnet_executor as ex  # noqa: E402
+from hl_quant import hl_testnet_risk as risk  # noqa: E402
 from hl_quant import paper_tracker as pt  # noqa: E402
 
 app = typer.Typer(add_completion=False, help=__doc__)
@@ -77,6 +78,13 @@ def main(
     hwm_state: Path = typer.Option(
         ROOT / "data/paper/hl_testnet_hwm.json", help="Persisted equity high-water mark for the drawdown kill-switch"
     ),
+    mm_audit_log: Path = typer.Option(
+        ROOT / "data/paper/hl_mm_testnet/mm_audit.jsonl",
+        help="MM order log; its order ids (and their coins) are excluded from executor cancels/closes",
+    ),
+    mm_coins: str | None = typer.Option(
+        None, help="Comma-separated coins owned by the MM on this address (default: env HL_MM_COINS)"
+    ),
 ) -> None:
     _load_dotenv(ROOT / ".env")
     target_weights = _load_targets(state_json, targets)
@@ -108,9 +116,25 @@ def main(
                 open_orders=[],
                 observed_at_ms=int(time.time() * 1000),
             )
+        mm_order_oids = ex.load_logged_order_oids(mm_audit_log)
+        raw_mm_coins = mm_coins if mm_coins is not None else os.getenv("HL_MM_COINS", "")
+        foreign_coin_set = {c.strip() for c in raw_mm_coins.split(",") if c.strip()} | {
+            str(o.get("coin") or "")
+            for o in account.open_orders
+            if ex.safe_int(o.get("oid")) in mm_order_oids
+        }
+        foreign_coin_set.discard("")
         coins_to_quote = sorted(set(valid_targets.keys()) | set(account.positions_sz.keys()))
-        bbo = ex.fetch_testnet_bbo(client, coins_to_quote)
+        book_tops = ex.fetch_testnet_book_tops(client, coins_to_quote)
+        bbo = ex.two_sided_bbo(book_tops)
+        try:
+            # Oracle prices let the executor close positions whose Testnet book is one-sided/empty.
+            reference_px = {c: ctx.oracle_px for c, ctx in risk.fetch_testnet_asset_ctxs(client).items()}
+        except (httpx.HTTPError, ValueError):
+            reference_px = {}
         skipped_unquoted: list[str] = []
+        # Strategy intent for coins that may lack a book: orphan unwinds keep holdings within it.
+        intended_targets = dict(valid_targets)
         if targets is None:
             valid_targets, skipped_unquoted = ex.filter_unquoted_targets(
                 valid_targets,
@@ -122,9 +146,14 @@ def main(
                 orphan_gross_w = 0.0
                 if account.equity_usd > 0:
                     for c, sz in account.positions_sz.items():
-                        if abs(sz) > 1e-12 and c not in bbo:
-                            ntl = float(account.position_notional_usd.get(c, 0.0) or 0.0)
+                        if abs(sz) <= 1e-12 or c in valid_targets:
+                            continue
+                        ntl = float(account.position_notional_usd.get(c, 0.0) or 0.0)
+                        if c not in bbo:
                             orphan_net_w += ntl / account.equity_usd
+                            orphan_gross_w += abs(ntl) / account.equity_usd
+                        elif c in foreign_coin_set:
+                            # MM inventory stays on the book: reserve its gross, leave its net to the MM.
                             orphan_gross_w += abs(ntl) / account.equity_usd
                 rem_gross = max(0.0, min(0.90, limits.max_gross_leverage) - orphan_gross_w)
                 valid_targets = ex.neutralize_target_weights(
@@ -157,6 +186,11 @@ def main(
         audit_log_path=audit_log,
         funding_apr_by_coin=funding_apr_by_coin,
         skipped_unquoted_coins=skipped_unquoted,
+        book_tops=book_tops,
+        reference_px=reference_px,
+        foreign_order_oids=mm_order_oids,
+        foreign_coins=foreign_coin_set,
+        orphan_target_weights=intended_targets,
     )
     if account_addr:
         ex.save_high_water_mark(hwm_state, hwm)

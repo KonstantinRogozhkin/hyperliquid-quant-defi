@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import replace
 from decimal import Decimal
 from pathlib import Path
+from types import SimpleNamespace
 
 import httpx
 import pytest
 
 from hl_quant.cross_usdc_micro_execution import (
+    HYPERLIQUID,
     BinanceClient,
     BybitClient,
     MicroExecutionError,
@@ -273,9 +275,24 @@ def test_stale_l2_blocks_before_any_order() -> None:
         def _market_snapshot(self, asset: str):
             return {}, 5_001
 
-    runner = StaleRunner(contract(), binance=object(), bybit=object(), hyperliquid=object())
+    runner = StaleRunner(contract(), binance=object(), bybit=object(), hyperliquid=SimpleNamespace(api_url=HYPERLIQUID))
     with pytest.raises(PreflightBlocked, match="stale_or_unsynchronized_l2"):
         runner.execute_asset("BTC", confirmation="micro-test-run")
+
+
+def test_mainnet_contract_refuses_testnet_hyperliquid_hedge_leg() -> None:
+    class SnapshotMustNotRun(MicroExecutionRunner):
+        def _market_snapshot(self, asset: str):
+            raise AssertionError("network read before network check")
+
+    testnet_hl = SimpleNamespace(api_url="https://api.hyperliquid-testnet.xyz")
+    runner = SnapshotMustNotRun(contract(), binance=object(), bybit=object(), hyperliquid=testnet_hl)
+    with pytest.raises(PreflightBlocked, match="hyperliquid_network_mismatch"):
+        runner.execute_asset("BTC", confirmation="micro-test-run")
+    for missing in (object(), SimpleNamespace(api_url="")):
+        runner = SnapshotMustNotRun(contract(), binance=object(), bybit=object(), hyperliquid=missing)
+        with pytest.raises(PreflightBlocked, match="hyperliquid_network_mismatch"):
+            runner.execute_asset("BTC", confirmation="micro-test-run")
 
 
 def test_safe_unwind_rechecks_positions_after_reduce_only_order() -> None:
