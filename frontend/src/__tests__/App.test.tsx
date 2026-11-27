@@ -906,3 +906,49 @@ describe("App", () => {
     expect(screen.getByText(/orphans: SKY, VVV/)).toBeInTheDocument();
   });
 });
+
+describe("i18n & tooltips", () => {
+  it("switches the UI between EN and RU and remembers the choice", async () => {
+    mockFetch(makeOverview());
+    const user = userEvent.setup();
+    const { unmount } = render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    expect(screen.getByRole("button", { name: "EN" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("Metamodel Open Positions (Live Paper Ledger)")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "RU" }));
+    expect(screen.getByRole("button", { name: "RU" })).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByText("Открытые позиции метамодели (paper-журнал)")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Обновить" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Аналитика и риски" })).toBeInTheDocument();
+    expect(document.documentElement.lang).toBe("ru");
+    expect(window.localStorage.getItem("hl_desk_lang")).toBe("ru");
+
+    unmount();
+    render(<App />);
+    expect(await screen.findByText("Открытые позиции метамодели (paper-журнал)")).toBeInTheDocument();
+  });
+
+  it("shows plain-language tooltips for table columns and blocks on hover and focus", async () => {
+    mockFetch(makeOverview());
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    const posSection = screen.getByText("Metamodel Open Positions (Live Paper Ledger)").closest("section")!;
+    await user.hover(within(posSection).getByText("HL Weight"));
+    expect(screen.getByRole("tooltip")).toHaveTextContent(/Share of capital in the Hyperliquid leg/);
+    await user.unhover(within(posSection).getByText("HL Weight"));
+    expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+
+    const infoIcons = within(posSection).getAllByLabelText("What is this?");
+    infoIcons[0].focus();
+    expect(await screen.findByRole("tooltip")).toHaveTextContent(/Positions the metamodel currently holds/);
+    infoIcons[0].blur();
+
+    await user.click(screen.getByRole("button", { name: "RU" }));
+    await user.hover(within(posSection).getByText("Вес HL"));
+    expect(screen.getByRole("tooltip")).toHaveTextContent(/Доля капитала в позиции на Hyperliquid/);
+  });
+});
