@@ -343,6 +343,45 @@ th {
   gap: 16px;
 }
 
+.segmented {
+  display: inline-flex;
+  gap: 4px;
+}
+
+.btn-sm {
+  padding: 4px 10px;
+  font-size: 12px;
+}
+
+.bar-row {
+  margin-bottom: 10px;
+}
+
+.bar-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+.bar-track {
+  height: 7px;
+  background: var(--panel-alt);
+  border-radius: 999px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+}
+
+.bar-fill {
+  height: 100%;
+  background: var(--cyan);
+  border-radius: 999px;
+}
+
+.bar-fill-green {
+  background: var(--green);
+}
+
 @media (max-width: 640px) {
   .app-shell {
     padding: 12px;

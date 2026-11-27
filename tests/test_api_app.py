@@ -170,6 +170,13 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert r_ap.status_code == 200
     assert r_ap.json()["state"]["gross_equity_usd"] == 250420.0
 
+    r_an = client.get("/api/v1/analytics")
+    assert r_an.status_code == 200
+    an_body = r_an.json()
+    assert "leaderboard" in an_body
+    assert "correlation" in an_body
+    assert "risk_exposure" in an_body
+
     r_events = client.get("/api/v1/events/latest")
     assert r_events.status_code == 200
     assert r_events.json()["onchain_events"]["alerts_count"] == 1

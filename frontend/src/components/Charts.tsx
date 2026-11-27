@@ -1,4 +1,167 @@
-import type { CoinCalibration } from "../types";
+import type { CoinCalibration, OlsScatterPoint } from "../types";
+
+export interface SeriesLine {
+  id: string;
+  name: string;
+  color: string;
+  values: number[];
+}
+
+export function MultiSeriesChart({
+  series,
+  dates,
+  height = 210,
+}: {
+  series: SeriesLine[];
+  dates: string[];
+  height?: number;
+}) {
+  const valid = series.filter((s) => s.values.length >= 2);
+  if (valid.length === 0) {
+    return <div className="muted">Waiting for at least 2 observations across selected strategies...</div>;
+  }
+
+  const width = 760;
+  const pl = 48;
+  const pr = 18;
+  const pt = 14;
+  const pb = 26;
+
+  const allVals = valid.flatMap((s) => s.values);
+  const minVal = Math.min(...allVals);
+  const maxVal = Math.max(...allVals);
+  const span = Math.max(maxVal - minVal, 1e-4);
+  const maxLen = Math.max(...valid.map((s) => s.values.length), 2);
+
+  const sx = (i: number, len: number) =>
+    pl + ((width - pl - pr) * i) / Math.max(len - 1, 1);
+  const sy = (v: number) => height - pb - ((height - pt - pb) * (v - minVal)) / span;
+  const zeroY = minVal <= 0 && maxVal >= 0 ? sy(0) : null;
+
+  const firstDate = dates[0]?.slice(0, 10) ?? "";
+  const lastDate = dates[dates.length - 1]?.slice(0, 10) ?? "";
+
+  return (
+    <div>
+      <svg
+        viewBox={`0 0 ${width} ${height}`}
+        className="chart-svg"
+        role="img"
+        aria-label="Multi-strategy cumulative performance chart"
+      >
+        {[0, 0.25, 0.5, 0.75, 1].map((frac, idx) => {
+          const y = pt + (height - pt - pb) * frac;
+          const v = maxVal - span * frac;
+          return (
+            <g key={idx}>
+              <line x1={pl} y1={y} x2={width - pr} y2={y} stroke="#1e293b" strokeWidth="1" />
+              <text x={4} y={y + 3} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+                {v >= 0 ? `+${v.toFixed(1)}%` : `${v.toFixed(1)}%`}
+              </text>
+            </g>
+          );
+        })}
+        {zeroY !== null && (
+          <line x1={pl} y1={zeroY} x2={width - pr} y2={zeroY} stroke="#475569" strokeDasharray="4 4" strokeWidth="1" />
+        )}
+        {valid.map((s) => {
+          const pts = s.values
+            .map((v, i) => `${sx(i, s.values.length).toFixed(1)},${sy(v).toFixed(1)}`)
+            .join(" ");
+          return (
+            <polyline
+              key={s.id}
+              points={pts}
+              fill="none"
+              stroke={s.color}
+              strokeWidth="2.2"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          );
+        })}
+        <text x={pl} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+          {firstDate || `t=0`}
+        </text>
+        <text x={width - pr - 72} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+          {lastDate || `t=${maxLen - 1}`}
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+export function OlsScatterChart({
+  points,
+  beta,
+  alphaAnnPct,
+  factorName,
+  strategyName,
+}: {
+  points: OlsScatterPoint[];
+  beta: number | null;
+  alphaAnnPct: number | null;
+  factorName: string;
+  strategyName: string;
+}) {
+  if (points.length < 3 || beta === null) {
+    return <div className="muted">Need at least 3 overlapping daily returns for OLS regression plot.</div>;
+  }
+
+  const width = 420;
+  const height = 210;
+  const pl = 46;
+  const pr = 16;
+  const pt = 14;
+  const pb = 28;
+
+  const xs = points.map((p) => p.factor_ret_pct);
+  const ys = points.map((p) => p.strat_ret_pct);
+  const maxAbsX = Math.max(Math.max(...xs.map(Math.abs)), 0.5);
+  const maxAbsY = Math.max(Math.max(...ys.map(Math.abs)), 0.25);
+
+  const sx = (x: number) => pl + ((width - pl - pr) * (x + maxAbsX)) / (2 * maxAbsX);
+  const sy = (y: number) => height - pb - ((height - pt - pb) * (y + maxAbsY)) / (2 * maxAbsY);
+
+  const alphaDailyPct = (alphaAnnPct ?? 0) / 365;
+  const yLeft = alphaDailyPct + beta * -maxAbsX;
+  const yRight = alphaDailyPct + beta * maxAbsX;
+
+  return (
+    <svg
+      viewBox={`0 0 ${width} ${height}`}
+      className="chart-svg"
+      role="img"
+      aria-label={`OLS regression scatter ${strategyName} vs ${factorName}`}
+    >
+      <line x1={pl} y1={sy(0)} x2={width - pr} y2={sy(0)} stroke="#334155" strokeWidth="1" />
+      <line x1={sx(0)} y1={pt} x2={sx(0)} y2={height - pb} stroke="#334155" strokeWidth="1" />
+      <line
+        x1={sx(-maxAbsX)}
+        y1={sy(Math.max(-maxAbsY, Math.min(maxAbsY, yLeft)))}
+        x2={sx(maxAbsX)}
+        y2={sy(Math.max(-maxAbsY, Math.min(maxAbsY, yRight)))}
+        stroke="#f59e0b"
+        strokeWidth="2"
+      />
+      {points.map((p, idx) => (
+        <circle key={idx} cx={sx(p.factor_ret_pct)} cy={sy(p.strat_ret_pct)} r="3.2" fill="#38bdf8" fillOpacity="0.8" />
+      ))}
+      <text x={pl} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+        {factorName} -{maxAbsX.toFixed(1)}%
+      </text>
+      <text x={width - pr - 64} y={height - 6} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+        +{maxAbsX.toFixed(1)}%
+      </text>
+      <text x={4} y={pt + 8} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+        +{maxAbsY.toFixed(2)}%
+      </text>
+      <text x={4} y={height - pb} fill="#94a3b8" fontSize="10" fontFamily="monospace">
+        -{maxAbsY.toFixed(2)}%
+      </text>
+    </svg>
+  );
+}
 
 export function EquityCurveChart({
   values,

@@ -348,4 +348,28 @@ def render_prometheus_metrics(
             )
             b.emit("hl_mm_calibration_sigma_1s_bps", cal.get("empirical_sigma_1s_bps"), help_text="Empirical 1s volatility bps", labels=mlbl)
 
+    # 9. HyperCore Spot+Perp (+10% HLP) & Neutral Autopilot Master Vault
+    sp = overview.get("spot_perp_paper")
+    if isinstance(sp, dict):
+        b.emit("hl_spot_perp_equity_usd", sp.get("equity_usd"), help_text="HyperCore Spot+Perp paper equity USD")
+        b.emit("hl_spot_perp_return_pct", sp.get("return_pct"), help_text="HyperCore Spot+Perp paper return %")
+        b.emit("hl_spot_perp_blended_apr_pct", sp.get("blended_portfolio_apr_pct"), help_text="Spot+Perp + 10% HLP blended portfolio APR %")
+        b.emit("hl_spot_perp_hlp_reserve_usd", sp.get("hlp_reserve_usd"), help_text="Spot+Perp HLP reserve allocation USD")
+        sp_rt = sp.get("risk_telemetry")
+        if isinstance(sp_rt, dict):
+            b.emit("hl_spot_perp_gross_leverage", sp_rt.get("gross_leverage"), help_text="Spot+Perp current gross leverage")
+            b.emit("hl_spot_perp_net_delta_pct", sp_rt.get("net_delta_pct"), help_text="Spot+Perp net delta % of equity")
+
+    ap_st = overview.get("autopilot")
+    if isinstance(ap_st, dict):
+        b.emit("hl_autopilot_gross_equity_usd", ap_st.get("gross_equity_usd"), help_text="Neutral Autopilot master gross equity USD")
+        b.emit("hl_autopilot_net_equity_usd", ap_st.get("net_equity_usd"), help_text="Neutral Autopilot master net HWM equity USD")
+        b.emit("hl_autopilot_gross_return_pct", ap_st.get("gross_return_pct"), help_text="Neutral Autopilot gross return %")
+        b.emit("hl_autopilot_net_return_pct", ap_st.get("net_return_pct"), help_text="Neutral Autopilot net HWM return %")
+        ap_rt = ap_st.get("risk_telemetry")
+        if isinstance(ap_rt, dict):
+            b.emit("hl_autopilot_gross_leverage", ap_rt.get("gross_leverage"), help_text="Neutral Autopilot weighted gross leverage")
+            b.emit("hl_autopilot_max_drift_pct", ap_rt.get("max_weight_drift_pct"), help_text="Neutral Autopilot max sleeve drift vs target %")
+            b.emit("hl_autopilot_directional_exposure_pct", ap_rt.get("net_directional_exposure_pct"), help_text="Neutral Autopilot net directional exposure %")
+
     return b.render()
