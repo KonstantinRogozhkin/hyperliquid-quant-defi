@@ -258,6 +258,9 @@ def run_paper_tick(
     cex_fee_bps: float = 2.0,
     l2_spread_fraction: float = 0.5,
     hl_spread_fraction: float | None = None,
+    cex_mid_prices: dict[str, dict[str, float]] | None = None,
+    rebalance_deadband_weight: float = 0.0,
+    max_tick_nav_jump_pct: float = 8.0,
 ) -> dict[str, Any]:
     """Execute one idempotent paper-trading tick and persist updated ledger."""
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -277,6 +280,7 @@ def run_paper_tick(
             "last_tick_hour_ms": None,
             "positions": {},
             "tick_count": 0,
+            "nav_guard_triggers": 0,
         }
 
     prev_hour_ms = state.get("last_tick_hour_ms")
@@ -285,6 +289,7 @@ def run_paper_tick(
 
     equity = float(state["equity_usd"])
     prev_pos: dict[str, dict[str, Any]] = state.get("positions", {})
+    nav_guard_triggers = int(state.get("nav_guard_triggers", 0) or 0)
 
     # A held coin missing from this tick's market data cannot be marked to market;
     # treating it as closed would drop its PnL and charge exit costs. Skip the tick instead.
@@ -296,6 +301,14 @@ def run_paper_tick(
             "equity_usd": state["equity_usd"],
             "missing_coins": missing_held,
         }
+
+    def _cur_cex_px(venue: str, coin_name: str) -> float:
+        if cex_mid_prices:
+            v_map = cex_mid_prices.get(venue.lower()) or cex_mid_prices.get(venue) or {}
+            live_px = v_map.get(coin_name)
+            if live_px is not None and math.isfinite(float(live_px)) and float(live_px) > 0:
+                return float(live_px)
+        return _last_known(_cex_frames(market, venue)[0], coin_name, tick_hour_ms)
 
     # 1. Mark-to-market PnL and funding accrual over (prev_hour_ms, tick_hour_ms]
     price_pnl_usd = 0.0
@@ -321,8 +334,8 @@ def run_paper_tick(
                 c_fn_pnl += equity * (-hw) * hl_f_sum
 
             for venue, cw in _cex_legs(p).items():
-                cex_close_df, cex_fund_df = _cex_frames(market, venue)
-                cur_cex_px = _last_known(cex_close_df, coin, tick_hour_ms)
+                _, cex_fund_df = _cex_frames(market, venue)
+                cur_cex_px = _cur_cex_px(venue, coin)
                 prev_px = prev_cex_px.get(venue, 0.0)
                 if prev_px > 0 and math.isfinite(cur_cex_px):
                     c_px_pnl += equity * cw * (cur_cex_px / prev_px - 1.0)
@@ -334,80 +347,130 @@ def run_paper_tick(
             fund_pnl_usd += c_fn_pnl
             coin_tick_pnl[coin] = c_px_pnl + c_fn_pnl
 
-    # 2. Compute new target weights and L2-priced turnover costs
-    targets = compute_latest_target_positions(market, active_sleeves)
-    all_coins = sorted(set(prev_pos.keys()) | set(targets.keys()))
-    cost_pnl_usd = 0.0
-    total_turnover = 0.0
-    coin_trade_cost: dict[str, float] = {}
-    trade_rows: list[dict[str, Any]] = []
-
-    for coin in all_coins:
-        old_hw = float(prev_pos.get(coin, {}).get("hl_weight", 0.0))
-        old_legs = _cex_legs(prev_pos.get(coin, {}))
-        new_hw = float(targets.get(coin, {}).get("hl_weight", 0.0))
-        new_legs = dict(targets.get(coin, {}).get("cex_legs", {}))
-        old_cw = sum(old_legs.values())
-        new_cw = sum(new_legs.values())
-        dhw = abs(new_hw - old_hw)
-        # Turnover per venue: moving a hedge from one CEX to another closes one leg and opens another.
-        dcw = sum(abs(new_legs.get(v, 0.0) - old_legs.get(v, 0.0)) for v in set(old_legs) | set(new_legs))
-        if dhw < 1e-6 and dcw < 1e-6:
-            continue
-
-        q = quotes.get(coin)
-        l2_sp_bps = q.spread_bps if q is not None else 2.0
-        # hl_spread_fraction=0 when hl_fee_bps is already an all-in measured execution cost.
-        hl_frac = l2_spread_fraction if hl_spread_fraction is None else hl_spread_fraction
-        hl_eff_bps = hl_fee_bps + hl_frac * l2_sp_bps
-        cex_eff_bps = cex_fee_bps + l2_spread_fraction * l2_sp_bps
-        trade_cost_usd = -equity * (dhw * hl_eff_bps + dcw * cex_eff_bps) / 1e4
-        cost_pnl_usd += trade_cost_usd
-        coin_trade_cost[coin] = trade_cost_usd
-        total_turnover += dhw + dcw
-        trade_rows.append(
-            {
-                "tick_hour_ms": tick_hour_ms,
-                "coin": coin,
-                "old_hl_w": old_hw,
-                "new_hl_w": new_hw,
-                "old_cex_w": old_cw,
-                "new_cex_w": new_cw,
-                "l2_spread_bps": round(l2_sp_bps, 3),
-                "l2_top5_bid_usd": round(q.top5_bid_usd, 1) if q is not None else np.nan,
-                "l2_top5_ask_usd": round(q.top5_ask_usd, 1) if q is not None else np.nan,
-                "trade_cost_usd": round(trade_cost_usd, 4),
-            }
+    # 1b. Bounded NAV Sanity Guard: clamp anomalous single-tick MTM jumps and freeze positions
+    nav_guard_triggered = False
+    nav_guard_reason = ""
+    raw_mtm_pnl = price_pnl_usd + fund_pnl_usd
+    if (
+        prev_hour_ms is not None
+        and equity > 0
+        and max_tick_nav_jump_pct > 0.0
+        and abs(raw_mtm_pnl) / equity * 100.0 > max_tick_nav_jump_pct
+    ):
+        nav_guard_triggered = True
+        nav_guard_triggers += 1
+        nav_guard_reason = (
+            f"Tick MTM jump {raw_mtm_pnl / equity * 100.0:+.2f}% exceeded "
+            f"+/-{max_tick_nav_jump_pct:.1f}% guard; clamping MTM & freezing rebalance"
         )
+        price_pnl_usd = 0.0
+        fund_pnl_usd = 0.0
+        cost_pnl_usd = 0.0
+        total_turnover = 0.0
+        trade_rows: list[dict[str, Any]] = []
+        new_positions: dict[str, dict[str, Any]] = {c: dict(p) for c, p in prev_pos.items()}
+        new_equity = equity
+    else:
+        # 2. Compute new target weights (with optional micro-turnover deadband) and L2-priced costs
+        raw_targets = compute_latest_target_positions(market, active_sleeves)
+        targets: dict[str, dict[str, Any]] = {}
+        for coin, t in raw_targets.items():
+            if rebalance_deadband_weight > 0.0 and coin in prev_pos:
+                old_p = prev_pos[coin]
+                old_hw = float(old_p.get("hl_weight", 0.0))
+                old_legs = _cex_legs(old_p)
+                cand_hw = float(t.get("hl_weight", 0.0))
+                cand_legs = dict(t.get("cex_legs", {}))
+                same_hl_dir = old_hw != 0.0 and cand_hw != 0.0 and (old_hw * cand_hw > 0.0)
+                same_venues = bool(old_legs) and set(old_legs) == set(cand_legs) and all(
+                    old_legs[v] * cand_legs[v] > 0.0 for v in old_legs
+                )
+                if same_hl_dir and same_venues:
+                    dhw_cand = abs(cand_hw - old_hw)
+                    dcw_cand = sum(abs(cand_legs[v] - old_legs[v]) for v in old_legs)
+                    if dhw_cand < rebalance_deadband_weight and dcw_cand < rebalance_deadband_weight:
+                        targets[coin] = {
+                            "hl_weight": old_hw,
+                            "cex_legs": dict(old_legs),
+                            "cex_weight": round(sum(old_legs.values()), 6),
+                            "cex_venue": old_p.get("cex_venue") or t.get("cex_venue"),
+                        }
+                        continue
+            targets[coin] = t
+
+        all_coins = sorted(set(prev_pos.keys()) | set(targets.keys()))
+        cost_pnl_usd = 0.0
+        total_turnover = 0.0
+        coin_trade_cost: dict[str, float] = {}
+        trade_rows = []
+
+        for coin in all_coins:
+            old_hw = float(prev_pos.get(coin, {}).get("hl_weight", 0.0))
+            old_legs = _cex_legs(prev_pos.get(coin, {}))
+            new_hw = float(targets.get(coin, {}).get("hl_weight", 0.0))
+            new_legs = dict(targets.get(coin, {}).get("cex_legs", {}))
+            old_cw = sum(old_legs.values())
+            new_cw = sum(new_legs.values())
+            dhw = abs(new_hw - old_hw)
+            # Turnover per venue: moving a hedge from one CEX to another closes one leg and opens another.
+            dcw = sum(abs(new_legs.get(v, 0.0) - old_legs.get(v, 0.0)) for v in set(old_legs) | set(new_legs))
+            if dhw < 1e-6 and dcw < 1e-6:
+                continue
+
+            q = quotes.get(coin)
+            l2_sp_bps = q.spread_bps if q is not None else 2.0
+            # hl_spread_fraction=0 when hl_fee_bps is already an all-in measured execution cost.
+            hl_frac = l2_spread_fraction if hl_spread_fraction is None else hl_spread_fraction
+            hl_eff_bps = hl_fee_bps + hl_frac * l2_sp_bps
+            cex_eff_bps = cex_fee_bps + l2_spread_fraction * l2_sp_bps
+            trade_cost_usd = -equity * (dhw * hl_eff_bps + dcw * cex_eff_bps) / 1e4
+            cost_pnl_usd += trade_cost_usd
+            coin_trade_cost[coin] = trade_cost_usd
+            total_turnover += dhw + dcw
+            trade_rows.append(
+                {
+                    "tick_hour_ms": tick_hour_ms,
+                    "coin": coin,
+                    "old_hl_w": old_hw,
+                    "new_hl_w": new_hw,
+                    "old_cex_w": old_cw,
+                    "new_cex_w": new_cw,
+                    "l2_spread_bps": round(l2_sp_bps, 3),
+                    "l2_top5_bid_usd": round(q.top5_bid_usd, 1) if q is not None else np.nan,
+                    "l2_top5_ask_usd": round(q.top5_ask_usd, 1) if q is not None else np.nan,
+                    "trade_cost_usd": round(trade_cost_usd, 4),
+                }
+            )
+
+        net_pnl_usd = price_pnl_usd + fund_pnl_usd + cost_pnl_usd
+        new_equity = equity + net_pnl_usd
+
+        # Snapshot current prices & cumulative open-position PnL into new positions state
+        new_positions = {}
+        for coin, t in targets.items():
+            cur_hl_px = quotes[coin].mid_px if coin in quotes else _last_known(market.hl_close, coin, tick_hour_ms)
+            # Each CEX leg is marked with its own venue's price; never substitute the HL price,
+            # which differs by basis (and by contract scale for 1000x-style symbols).
+            cex_px_by_venue: dict[str, float] = {}
+            for venue in t["cex_legs"]:
+                px = _cur_cex_px(venue, coin)
+                if math.isfinite(px) and px > 0:
+                    cex_px_by_venue[venue] = px
+            prev_cum = float(prev_pos.get(coin, {}).get("cum_pnl_usd", 0.0)) if coin in prev_pos else 0.0
+            cum_pnl = prev_cum + coin_tick_pnl.get(coin, 0.0) + coin_trade_cost.get(coin, 0.0)
+            new_positions[coin] = {
+                **t,
+                "last_hl_px": cur_hl_px,
+                "last_cex_px_by_venue": cex_px_by_venue,
+                "last_cex_px": cex_px_by_venue.get(t["cex_venue"]) if t["cex_venue"] else None,
+                "l2_spread_bps": round(quotes[coin].spread_bps, 3) if coin in quotes else None,
+                "cum_pnl_usd": round(cum_pnl, 4),
+            }
 
     net_pnl_usd = price_pnl_usd + fund_pnl_usd + cost_pnl_usd
-    new_equity = equity + net_pnl_usd
-
-    # Snapshot current prices & cumulative open-position PnL into new positions state
-    new_positions: dict[str, dict[str, Any]] = {}
-    for coin, t in targets.items():
-        cur_hl_px = quotes[coin].mid_px if coin in quotes else _last_known(market.hl_close, coin, tick_hour_ms)
-        # Each CEX leg is marked with its own venue's price; never substitute the HL price,
-        # which differs by basis (and by contract scale for 1000x-style symbols).
-        cex_px_by_venue: dict[str, float] = {}
-        for venue in t["cex_legs"]:
-            px = _last_known(_cex_frames(market, venue)[0], coin, tick_hour_ms)
-            if math.isfinite(px) and px > 0:
-                cex_px_by_venue[venue] = px
-        prev_cum = float(prev_pos.get(coin, {}).get("cum_pnl_usd", 0.0)) if coin in prev_pos else 0.0
-        cum_pnl = prev_cum + coin_tick_pnl.get(coin, 0.0) + coin_trade_cost.get(coin, 0.0)
-        new_positions[coin] = {
-            **t,
-            "last_hl_px": cur_hl_px,
-            "last_cex_px_by_venue": cex_px_by_venue,
-            "last_cex_px": cex_px_by_venue.get(t["cex_venue"]) if t["cex_venue"] else None,
-            "l2_spread_bps": round(quotes[coin].spread_bps, 3) if coin in quotes else None,
-            "cum_pnl_usd": round(cum_pnl, 4),
-        }
-
-    gross_hl = sum(abs(p["hl_weight"]) for p in new_positions.values())
-    gross_cex = sum(sum(abs(w) for w in p["cex_legs"].values()) for p in new_positions.values())
-    net_beta_hl = sum(p["hl_weight"] + p["cex_weight"] for p in new_positions.values())
+    gross_hl = sum(abs(float(p.get("hl_weight", 0.0))) for p in new_positions.values())
+    gross_cex = sum(sum(abs(float(w)) for w in _cex_legs(p).values()) for p in new_positions.values())
+    net_beta_hl = sum(float(p.get("hl_weight", 0.0)) + float(p.get("cex_weight", 0.0)) for p in new_positions.values())
     median_l2_bps = float(np.median([q.spread_bps for q in quotes.values()])) if quotes else np.nan
 
     tick_row = {
@@ -423,6 +486,7 @@ def run_paper_tick(
         "net_exposure": net_beta_hl,
         "active_coins": len(new_positions),
         "median_l2_spread_bps": median_l2_bps,
+        "nav_guard_triggered": nav_guard_triggered,
     }
 
     _append_parquet(ticks_path, pd.DataFrame([tick_row]), dedup_subset=["tick_hour_ms"])
@@ -434,6 +498,8 @@ def run_paper_tick(
         "equity_usd": new_equity,
         "last_tick_hour_ms": tick_hour_ms,
         "tick_count": int(state.get("tick_count", 0)) + 1,
+        "nav_guard_triggers": nav_guard_triggers,
+        "nav_guard_reason": nav_guard_reason,
         "positions": new_positions,
         "sleeves": [{"name": s.spec.name, "weight": s.weight} for s in active_sleeves],
     }

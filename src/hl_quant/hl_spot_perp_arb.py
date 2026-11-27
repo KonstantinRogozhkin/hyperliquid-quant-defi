@@ -564,6 +564,56 @@ def _load_or_init_state(state_path: Path, cfg: SpotPerpPaperConfig) -> dict[str,
     }
 
 
+def _PerpMMR(max_leverage: object) -> float:
+    """Hyperliquid maintenance margin fraction: ``1 / (2 * max_leverage)`` (e.g. 40x -> 1.25%, 3x -> 16.67%)."""
+    try:
+        lev = float(max_leverage)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        lev = 10.0
+    if not math.isfinite(lev) or lev < 1.0:
+        lev = 10.0
+    return 0.5 / lev
+
+
+def fetch_settled_funding_sum(
+    client: httpx.Client,
+    coins: list[str] | set[str],
+    start_ms: int,
+    end_ms: int,
+    *,
+    info_url: str = HL_INFO_URL,
+) -> dict[str, float]:
+    """Sum realized hourly ``fundingHistory`` rates over ``[start_ms, end_ms]`` per perp coin."""
+    out: dict[str, float] = {}
+    if end_ms < start_ms:
+        return out
+    for coin in sorted({str(c) for c in coins if c}):
+        try:
+            resp = client.post(
+                info_url,
+                json={"type": "fundingHistory", "coin": coin, "startTime": int(start_ms), "endTime": int(end_ms)},
+            )
+            if resp.status_code != 200:
+                continue
+            rows = resp.json()
+            if not isinstance(rows, list) or not rows:
+                continue
+            total_rate = 0.0
+            valid = 0
+            for item in rows:
+                if not isinstance(item, dict) or "fundingRate" not in item:
+                    continue
+                t = int(_f(item.get("time"), -1))
+                if start_ms <= t <= end_ms:
+                    total_rate += _f(item.get("fundingRate"), 0.0)
+                    valid += 1
+            if valid > 0:
+                out[coin] = total_rate
+        except Exception:
+            continue
+    return out
+
+
 def _compute_30d_leverage_stats(ticks_path: Path, current_leverage: float, now_ms: int) -> tuple[float, float]:
     """Compute Neutral-style ``(leverage_30d_avg, leverage_30d_max)`` from persisted tick history."""
     vals = [current_leverage]
@@ -646,7 +696,18 @@ def run_spot_perp_paper_tick(
         tick_hlp_usd = hlp_usd * (hlp_apr / 100.0 / HOURS_PER_YEAR) * dt_hours if dt_hours > 0 else 0.0
         hlp_usd = round(hlp_usd + tick_hlp_usd, 4)
 
-        # 2. Mark-to-market open positions (delta-neutral spot + short perp) & accrue hourly funding
+        # 2. Mark-to-market open positions (delta-neutral spot + short perp) & accrue settled hourly funding
+        expected_settlements = (ts_ms // 3_600_000) - (prev_ms // 3_600_000) if prev_ms > 0 else 0
+        settled_rates: dict[str, float] = {}
+        if prev_ms > 0 and expected_settlements > 0 and positions and markets is None and http_client is not None:
+            settled_rates = fetch_settled_funding_sum(
+                http_client,
+                list(positions.keys()),
+                prev_ms + 1,
+                ts_ms,
+                info_url=info_url,
+            )
+
         for base, pos in list(positions.items()):
             opp = by_base.get(base)
             if opp is None:
@@ -663,10 +724,19 @@ def run_spot_perp_paper_tick(
             basis_pnl = spot_pnl + perp_pnl
             perp_notional = qty * cur_perp
             spot_notional = qty * cur_spot
-            fund_pnl = perp_notional * opp.funding_rate_h * dt_hours
+            if prev_ms > 0 and markets is None and expected_settlements == 0:
+                # Sub-hour re-run with zero `:00` settlements crossed accrues zero settled funding.
+                fund_pnl = 0.0
+            elif base in settled_rates:
+                fund_pnl = perp_notional * settled_rates[base]
+            else:
+                fund_pnl = perp_notional * opp.funding_rate_h * dt_hours
 
             # Update perp margin with unrealized perp PnL + funding accrued on perp account
             perp_margin = float(pos["perp_margin_usd"]) + perp_pnl + fund_pnl
+            max_lev = int(pos.get("max_leverage") or opp.max_leverage or 10)
+            pos["max_leverage"] = max_lev
+            mmr = _PerpMMR(max_lev)
 
             pos["last_spot_px"] = cur_spot
             pos["last_perp_px"] = cur_perp
@@ -675,7 +745,7 @@ def run_spot_perp_paper_tick(
             pos["perp_margin_usd"] = round(perp_margin, 2)
             pos["effective_perp_leverage"] = round(perp_notional / max(perp_margin, 1.0), 3)
             pos["perp_liq_distance_pct"] = round(
-                max(0.0, (perp_margin / max(perp_notional, 1.0) - 0.05) * 100.0), 2
+                max(0.0, (perp_margin / max(perp_notional, 1.0) - mmr) * 100.0), 2
             )
             pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + dt_hours, 2)
             pos["live_funding_apr_pct"] = opp.funding_apr_pct
@@ -721,8 +791,9 @@ def run_spot_perp_paper_tick(
                         pos["perp_margin_usd"] = round(float(pos["perp_margin_usd"]) + topup, 2)
                         free_cash = round(free_cash - topup, 2)
                         pos["effective_perp_leverage"] = round(perp_ntl / max(pos["perp_margin_usd"], 1.0), 3)
+                        mmr_top = _PerpMMR(pos.get("max_leverage", 10))
                         pos["perp_liq_distance_pct"] = round(
-                            max(0.0, (pos["perp_margin_usd"] / max(perp_ntl, 1.0) - 0.05) * 100.0), 2
+                            max(0.0, (pos["perp_margin_usd"] / max(perp_ntl, 1.0) - mmr_top) * 100.0), 2
                         )
                         state["rebalances_count"] = int(state.get("rebalances_count", 0)) + 1
                         trade_rows.append(
@@ -890,6 +961,7 @@ def run_spot_perp_paper_tick(
                     "asset_tier": opp.asset_tier,
                     "is_proxy_hedge": opp.is_proxy_hedge,
                     "only_isolated": opp.only_isolated,
+                    "max_leverage": opp.max_leverage,
                     "qty": round(qty, 8),
                     "entry_spot_px": opp.spot_mid_px,
                     "entry_perp_px": opp.perp_mark_px,
@@ -900,7 +972,8 @@ def run_spot_perp_paper_tick(
                     "perp_margin_usd": round(perp_margin_after_fee, 2),
                     "effective_perp_leverage": round((qty * opp.perp_mark_px) / perp_margin_after_fee, 3),
                     "perp_liq_distance_pct": round(
-                        max(0.0, (perp_margin_after_fee / max(qty * opp.perp_mark_px, 1.0) - 0.05) * 100.0), 2
+                        max(0.0, (perp_margin_after_fee / max(qty * opp.perp_mark_px, 1.0) - _PerpMMR(opp.max_leverage)) * 100.0),
+                        2,
                     ),
                     "entry_funding_apr_pct": opp.funding_apr_pct,
                     "live_funding_apr_pct": opp.funding_apr_pct,
@@ -930,11 +1003,19 @@ def run_spot_perp_paper_tick(
                     }
                 )
 
-        # 6. Compute final equity & Neutral-style Live Risk & Exposure telemetry
+        # 6. Compute final equity, exit-cost liquidation NAV & Neutral-style Live Risk & Exposure telemetry
+        for p in positions.values():
+            est_slip = float(p.get("entry_l2_slip_bps", 3.0))
+            est_exit_usd = round(float(p["spot_notional_usd"]) * (cfg.one_way_fee_bps + est_slip) / 1e4, 4)
+            p["est_exit_cost_usd"] = est_exit_usd
+            p["liquidation_net_pnl_usd"] = round(float(p.get("net_pnl_usd", 0.0)) - est_exit_usd, 4)
+
         spot_total_usd = sum(float(p["spot_notional_usd"]) for p in positions.values())
         perp_total_usd = sum(float(p["perp_notional_usd"]) for p in positions.values())
         perp_margin_total_usd = sum(float(p["perp_margin_usd"]) for p in positions.values())
         final_equity = round(spot_total_usd + perp_margin_total_usd + hlp_usd + free_cash, 2)
+        est_exit_costs_usd = round(sum(float(p.get("est_exit_cost_usd", 0.0)) for p in positions.values()), 2)
+        liquidation_equity_usd = round(final_equity - est_exit_costs_usd, 2)
         start_cap = float(state.get("starting_capital_usd", cfg.starting_capital_usd))
         ret_pct = round((final_equity / start_cap - 1.0) * 100.0, 4) if start_cap > 0 else 0.0
         share_price = round(final_equity / start_cap, 6) if start_cap > 0 else 1.0
@@ -976,6 +1057,8 @@ def run_spot_perp_paper_tick(
         state.update(
             {
                 "equity_usd": final_equity,
+                "est_exit_costs_usd": est_exit_costs_usd,
+                "liquidation_equity_usd": liquidation_equity_usd,
                 "share_price": share_price,
                 "return_pct": ret_pct,
                 "hlp_reserve_usd": round(hlp_usd, 2),

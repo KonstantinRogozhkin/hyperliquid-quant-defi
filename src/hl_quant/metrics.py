@@ -870,8 +870,10 @@ def render_prometheus_metrics(
     if isinstance(attr, dict):
         eq = _num(attr.get("equity_usd")) or 0.0
         net_pnl = _num(attr.get("net_attributed_pnl_usd")) or 0.0
-        sc = max(eq - net_pnl, 1.0)
-        ret = round(net_pnl / sc * 100.0, 4)
+        dep_sc = _num(attr.get("deposited_capital_usd"))
+        sc = dep_sc if (dep_sc is not None and dep_sc > 0.0) else max(eq - net_pnl, 1.0)
+        acct_ret = _num(attr.get("account_return_pct"))
+        ret = round(acct_ret, 4) if acct_ret is not None else round(net_pnl / sc * 100.0, 4)
         pos_cnt = int(_num(attr.get("open_positions_count")) or 0)
         tot_notional = sum(abs(_num(c.get("position_usd")) or 0.0) for c in (attr.get("per_coin") or []) if isinstance(c, dict))
         liq_w = len(attr.get("liq_warnings") or [])

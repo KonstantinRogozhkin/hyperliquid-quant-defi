@@ -398,9 +398,12 @@ def compute_hourly_settlement_microstructure(
 # --------------------------------------------------------------------------- Live Async Orchestrator
 
 
+DEFAULT_TOP_WHALES = 60
+
+
 async def run_liquidation_and_funding_alpha_scan(
     *,
-    top_whales: int = 45,
+    top_whales: int = DEFAULT_TOP_WHALES,
     top_funding_coins: int = 8,
     min_oi_usd: float = 2_000_000.0,
     lookback_hours: int = 6,

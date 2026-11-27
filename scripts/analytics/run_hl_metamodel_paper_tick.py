@@ -45,6 +45,18 @@ def main(
     hl_spread_fraction: float = typer.Option(0.0, help="Extra share of the live HL spread on top of --hl-fee-bps"),
     cex_fee_bps: float = typer.Option(2.0, help="CEX maker fee (bps); CEX execution was not measured"),
     cex_spread_fraction: float = typer.Option(0.5, help="Share of the live HL spread charged on the CEX leg"),
+    rebalance_deadband: float = typer.Option(
+        0.015,
+        min=0.0,
+        max=0.10,
+        help="Minimum single-leg weight change required to rebalance an existing same-direction position (suppresses micro-turnover fee bleed)",
+    ),
+    max_tick_nav_jump_pct: float = typer.Option(
+        8.0,
+        min=0.0,
+        max=50.0,
+        help="Bounded NAV Sanity Guard single-tick MTM jump threshold (%)",
+    ),
     attribution_json: Path = typer.Option(
         ROOT / "data/paper/hl_testnet_attribution/attribution.json",
         help="Optional live Testnet attribution JSON used for dynamic ALO fill-rate throttling",
@@ -154,6 +166,22 @@ def main(
         market = af.build_wide_market(bundle)
         quotes = pt.fetch_l2_quotes(hl_client, tracked_coins)
 
+        # Fetch synchronous live CEX BBO mid prices at the exact same wall-clock instant as HL L2 quotes
+        # so delta-neutral MTM does not mix `:07` HL prices with `:00` CEX candle closes.
+        cex_sym_by_coin = {c: us.cex_symbol(c) for c in tracked_coins}
+        okx_sym_by_coin = {c: cex.okx_symbol(c) for c in tracked_coins}
+        cex_mid_prices: dict[str, dict[str, float]] = {"bybit": {}, "binance": {}, "okx": {}}
+        for venue_name, v_client, sym_map in (
+            ("bybit", by_client, cex_sym_by_coin),
+            ("binance", bn_client, cex_sym_by_coin),
+            ("okx", okx_client, okx_sym_by_coin),
+        ):
+            try:
+                raw_mids = cex.fetch_live_mid_prices(v_client, venue_name, set(sym_map.values()))
+                cex_mid_prices[venue_name] = {c: raw_mids[s] for c, s in sym_map.items() if s in raw_mids}
+            except Exception:  # noqa: BLE001
+                cex_mid_prices[venue_name] = {}
+
     sleeves = pt.default_frozen_metamodel()
     if attribution_json.is_file():
         try:
@@ -173,6 +201,9 @@ def main(
         cex_fee_bps=cex_fee_bps,
         l2_spread_fraction=cex_spread_fraction,
         hl_spread_fraction=hl_spread_fraction,
+        cex_mid_prices=cex_mid_prices,
+        rebalance_deadband_weight=rebalance_deadband,
+        max_tick_nav_jump_pct=max_tick_nav_jump_pct,
     )
     if telegram and result.get("status") == "ok":
         state = json.loads((state_dir / "state.json").read_text())

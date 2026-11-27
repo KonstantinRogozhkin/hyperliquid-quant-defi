@@ -235,7 +235,8 @@ def compute_v3_virtual_depth_and_slippage(
 
     In Uniswap V3, virtual token0 reserve inside the active tick is ``x_virt = L / sqrtP``
     (in raw units), so one-side virtual USD depth is ``V_virt = (L / sqrtP) / 10^dec0 * p0_usd``.
-    Average execution price impact for a clip ``dV`` inside the tick is ``dV / V_virt * 1e4`` bps.
+    Under constant-product virtual reserves ``x_virt * y_virt = L^2``, the exact in-tick average
+    execution price impact for a clip ``dV`` vs initial mid price is ``dV / (V_virt + dV) * 1e4`` bps.
     """
     if liquidity_raw <= 0 or sqrt_price_x96 <= 0 or token0_usd <= 0:
         return 0.0, {c: 9999.0 for c in clips_usd}
@@ -246,7 +247,7 @@ def compute_v3_virtual_depth_and_slippage(
     v_depth_usd = x_virt_human * token0_usd
     if v_depth_usd <= 0 or not math.isfinite(v_depth_usd):
         return 0.0, {c: 9999.0 for c in clips_usd}
-    impacts = {c: round(min((c / v_depth_usd) * 1e4, 9999.0), 2) for c in clips_usd}
+    impacts = {c: round(min((c / (v_depth_usd + c)) * 1e4, 9999.0), 2) for c in clips_usd}
     return round(v_depth_usd, 2), impacts
 
 
@@ -544,31 +545,36 @@ def scan_hyperevm_vs_hypercore_arb(
     *,
     pools: tuple[PoolSpec, ...] = DEFAULT_HYPEREVM_POOLS,
     core_fee_bps: float = 4.5,
+    core_spot_fee_bps: float | None = None,
     usdt0_per_usdc: float = 1.0,
     stable_leg_fee_bps: float = 1.0,
     rpc_url: str = HYPEREVM_RPC_URL,
 ) -> list[EvmPoolArbOpportunity]:
     """Compare live HyperEVM V3 pool prices against HyperCore with peg normalization & V3 slippage."""
+    spot_taker_bps = float(core_spot_fee_bps) if core_spot_fee_bps is not None else (7.0 if core_fee_bps == 4.5 else core_fee_bps)
 
-    def _core_usd(perp_coin: str) -> float:
+    def _core_usd_and_fee(perp_coin: str) -> tuple[float, float]:
         for sp_k, p_k in SPOT_TO_PERP_ALIAS.items():
             if p_k == perp_coin and sp_k in spots and spots[sp_k]["day_vol_usd"] > 100_000:
-                return float(spots[sp_k]["mid_px"])
-        return float(perps.get(perp_coin, {}).get("mid_px", 0.0))
+                return float(spots[sp_k]["mid_px"]), spot_taker_bps
+        return float(perps.get(perp_coin, {}).get("mid_px", 0.0)), core_fee_bps
 
     results: list[EvmPoolArbOpportunity] = []
     for pool in pools:
-        base_usd = _core_usd(pool.core_base_perp)
+        base_usd, base_core_fee = _core_usd_and_fee(pool.core_base_perp)
         if base_usd <= 0:
             continue
         if pool.core_quote_perp is None:
             core_ref = base_usd
             quote_usd = 1.0
+            eff_core_fee_bps = base_core_fee
         else:
-            quote_usd = _core_usd(pool.core_quote_perp)
+            quote_usd, quote_core_fee = _core_usd_and_fee(pool.core_quote_perp)
             if quote_usd <= 0:
                 continue
             core_ref = base_usd / quote_usd
+            # Cross-asset pools (e.g. UBTC/WHYPE, UETH/WHYPE) require hedging BOTH base and quote legs on HyperCore.
+            eff_core_fee_bps = base_core_fee + quote_core_fee
 
         try:
             st = read_v3_pool_state(client, pool, rpc_url=rpc_url)
@@ -598,7 +604,8 @@ def scan_hyperevm_vs_hypercore_arb(
             dec0=int(st["dec0"]),
             token0_usd=token0_usd,
         )
-        net_bps = abs(peg_adj_bps) - pool.fee_bps - core_fee_bps - extra_stable_fee
+        net_bps = abs(peg_adj_bps) - pool.fee_bps - eff_core_fee_bps - extra_stable_fee
+        net_5k = net_bps - slips[5_000.0]
         net_25k = net_bps - slips[25_000.0]
         direction = "Buy Core → Sell EVM" if peg_adj_bps > 0 else "Buy EVM → Sell Core"
 
@@ -612,7 +619,7 @@ def scan_hyperevm_vs_hypercore_arb(
                 gross_spread_bps=round(gross_bps, 2),
                 peg_adjusted_spread_bps=round(peg_adj_bps, 2),
                 pool_fee_bps=pool.fee_bps,
-                core_fee_bps=core_fee_bps,
+                core_fee_bps=round(eff_core_fee_bps, 2),
                 stable_leg_fee_bps=extra_stable_fee,
                 net_arb_bps=round(net_bps, 2),
                 direction=direction,
@@ -622,7 +629,7 @@ def scan_hyperevm_vs_hypercore_arb(
                 slippage_25k_bps=slips[25_000.0],
                 slippage_100k_bps=slips[100_000.0],
                 net_arb_25k_bps=round(net_25k, 2),
-                executable=net_bps > 0.0 and liq > 0,
+                executable=(net_5k > 0.0) and (liq > 0),
             )
         )
     results.sort(key=lambda r: -r.net_arb_bps)

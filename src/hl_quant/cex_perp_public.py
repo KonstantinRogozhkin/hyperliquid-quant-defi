@@ -403,6 +403,73 @@ def okx_symbol(coin: str) -> str:
     return f"{base}-USDT-SWAP"
 
 
+def _pos_float(val: Any) -> float:
+    try:
+        x = float(val)
+    except (TypeError, ValueError):
+        return 0.0
+    return x if x > 0.0 and x == x and x != float("inf") else 0.0
+
+
+def fetch_live_mid_prices(
+    client: Any,
+    venue: str,
+    symbols: list[str] | set[str] | tuple[str, ...] | None = None,
+) -> dict[str, float]:
+    """Fetch synchronous live BBO mid prices (``symbol -> mid_px``) for a CEX linear perp venue.
+
+    Used by ``run_hl_metamodel_paper_tick`` so CEX hedge legs are marked to market at the same
+    wall-clock instant as Hyperliquid's live L2 quotes rather than a stale ``:00`` candle close.
+    """
+    want = {str(s) for s in symbols} if symbols is not None else None
+    out: dict[str, float] = {}
+    v = venue.lower()
+    if v == "binance":
+        body = client.get("/fapi/v1/ticker/bookTicker", {})
+        rows = body if isinstance(body, list) else ([body] if isinstance(body, dict) else [])
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("symbol") or "")
+            if not sym or (want is not None and sym not in want):
+                continue
+            bid = _pos_float(item.get("bidPrice"))
+            ask = _pos_float(item.get("askPrice"))
+            if bid > 0.0 and ask > 0.0:
+                out[sym] = 0.5 * (bid + ask)
+    elif v == "bybit":
+        body = client.get("/v5/market/tickers", {"category": "linear"})
+        for item in _bybit_list(body, "tickers"):
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("symbol") or "")
+            if not sym or (want is not None and sym not in want):
+                continue
+            bid = _pos_float(item.get("bid1Price"))
+            ask = _pos_float(item.get("ask1Price"))
+            mid = (0.5 * (bid + ask)) if (bid > 0.0 and ask > 0.0) else (
+                _pos_float(item.get("markPrice")) or _pos_float(item.get("lastPrice"))
+            )
+            if mid > 0.0:
+                out[sym] = mid
+    elif v == "okx":
+        body = client.get("/api/v5/market/tickers", {"instType": "SWAP"})
+        for item in _okx_data(body, "tickers"):
+            if not isinstance(item, dict):
+                continue
+            sym = str(item.get("instId") or "")
+            if not sym or (want is not None and sym not in want):
+                continue
+            bid = _pos_float(item.get("bidPx"))
+            ask = _pos_float(item.get("askPx"))
+            mid = (0.5 * (bid + ask)) if (bid > 0.0 and ask > 0.0) else _pos_float(item.get("last"))
+            if mid > 0.0:
+                out[sym] = mid
+    else:
+        raise ValueError(f"unsupported venue: {venue}")
+    return out
+
+
 def _page_guard(pages: list[Any], max_pages: int, symbol: str) -> None:
     if len(pages) >= max_pages:
         raise CexDataError(f"pagination exceeded {max_pages} pages for {symbol}")

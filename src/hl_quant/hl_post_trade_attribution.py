@@ -87,6 +87,8 @@ class PostTradeAttribution:
     audit_fill_volume_usd: float = 0.0  # volume of fills belonging to audited orders only
     mixed_account_warning: str = ""
     withdrawable_usd: float = 0.0
+    deposited_capital_usd: float = 0.0
+    account_return_pct: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -300,11 +302,23 @@ def fetch_post_trade_snapshot(
     except Exception:
         markout_series = {}
 
+    ledger_updates: list[dict[str, Any]] = []
+    try:
+        lu_r = client.post(
+            info_url,
+            json={"type": "userNonFundingLedgerUpdates", "user": account_address, "startTime": int(start_time_ms)},
+        )
+        if lu_r.status_code == 200 and isinstance(lu_r.json(), list):
+            ledger_updates = lu_r.json()
+    except Exception:
+        ledger_updates = []
+
     return {
         "account_address": account_address,
         "observed_at_ms": int(datetime.now(tz=timezone.utc).timestamp() * 1000),
         "markout_series": markout_series,
         "user_abstraction": user_abstraction,
+        "ledger_updates": ledger_updates,
         "fills": fills if isinstance(fills, list) else [],
         "funding": funding if isinstance(funding, list) else [],
         "clearinghouse": ch if isinstance(ch, dict) else {},
@@ -350,7 +364,67 @@ def extract_audit_oids(audit_log_path: Path | None, *, min_ts_ms: int | None = N
     return oids
 
 
-def load_paper_comparison(paper_dir: Path | None, testnet_net_pnl_usd: float, testnet_equity_usd: float) -> dict[str, Any] | None:
+def compute_net_deposited_capital_usd(
+    ledger_updates: list[dict[str, Any]] | None,
+    account_address: str,
+) -> float | None:
+    """Compute true external net USDC capital deposited into ``account_address`` from L1 ledger updates.
+
+    Internal ``accountClassTransfer`` events (Spot <-> Perp within the same wallet) are intentionally
+    ignored because ``total_eq`` already consolidates Perp + Spot equity.
+    Returns ``None`` when no external USDC ledger flows exist so offline callers fall back cleanly.
+    """
+    if not ledger_updates:
+        return None
+    me = account_address.strip().lower()
+    net_flow = 0.0
+    found = False
+    for row in ledger_updates:
+        if not isinstance(row, dict):
+            continue
+        delta = row.get("delta") if isinstance(row.get("delta"), dict) else row
+        dtype = str(delta.get("type") or "").strip()
+        if dtype in {"", "accountClassTransfer"}:
+            continue
+        if dtype == "deposit":
+            amt = abs(_f(delta.get("usdc")))
+            if amt > 0:
+                net_flow += amt
+                found = True
+        elif dtype == "withdraw":
+            amt = abs(_f(delta.get("usdc")))
+            fee = abs(_f(delta.get("fee")))
+            if amt > 0 or fee > 0:
+                net_flow -= amt + fee
+                found = True
+        elif dtype in {"internalTransfer", "subAccountTransfer", "spotTransfer", "send"}:
+            tok = str(delta.get("token") or "USDC").strip().upper()
+            if tok != "USDC":
+                continue
+            amt = abs(_f(delta.get("usdc"), _f(delta.get("amount"))))
+            fee = abs(_f(delta.get("fee")))
+            src = str(delta.get("user") or "").strip().lower()
+            dst = str(delta.get("destination") or "").strip().lower()
+            if amt <= 0:
+                continue
+            if me and dst == me and src != me:
+                net_flow += amt
+                found = True
+            elif me and src == me and dst != me:
+                net_flow -= amt + fee
+                found = True
+    if not found or net_flow <= 0.0:
+        return None
+    return round(net_flow, 4)
+
+
+def load_paper_comparison(
+    paper_dir: Path | None,
+    testnet_net_pnl_usd: float,
+    testnet_equity_usd: float,
+    *,
+    deposited_capital_usd: float | None = None,
+) -> dict[str, Any] | None:
     """Compare live Testnet cumulative return against the parallel Paper L2 ledger."""
     if paper_dir is None:
         return None
@@ -365,12 +439,16 @@ def load_paper_comparison(paper_dir: Path | None, testnet_net_pnl_usd: float, te
     start_cap = float(state.get("starting_capital_usd", 100_000.0))
     paper_eq = float(ticks["equity_usd"].iloc[-1])
     paper_ret_pct = (paper_eq / start_cap - 1.0) * 100.0 if start_cap > 0 else 0.0
-    testnet_start = max(1.0, testnet_equity_usd - testnet_net_pnl_usd)
+    if deposited_capital_usd is not None and deposited_capital_usd > 0.0:
+        testnet_start = float(deposited_capital_usd)
+    else:
+        testnet_start = max(1.0, testnet_equity_usd - testnet_net_pnl_usd)
     testnet_ret_pct = (testnet_net_pnl_usd / testnet_start) * 100.0
     return {
         "paper_ticks": int(len(ticks)),
         "paper_equity_usd": round(paper_eq, 2),
         "paper_return_pct": round(paper_ret_pct, 4),
+        "testnet_deposited_usd": round(testnet_start, 2),
         "testnet_return_pct": round(testnet_ret_pct, 4),
         "tracking_diff_pct": round(testnet_ret_pct - paper_ret_pct, 4),
     }
@@ -615,7 +693,13 @@ def compute_post_trade_attribution(
 
     per_coin.sort(key=lambda c: (-c.position_usd, -c.fill_volume_usd, c.coin))
     net_attr = tot_realized + tot_unrealized + tot_funding - tot_fees
-    paper_cmp = load_paper_comparison(paper_dir, net_attr, total_eq)
+    dep_cap = compute_net_deposited_capital_usd(
+        snapshot.get("ledger_updates"),
+        str(snapshot.get("account_address", "")),
+    )
+    eff_dep_cap = dep_cap if (dep_cap is not None and dep_cap > 0.0) else max(1.0, total_eq - net_attr)
+    acct_ret_pct = ((total_eq - eff_dep_cap) / eff_dep_cap * 100.0) if dep_cap is not None else (net_attr / eff_dep_cap * 100.0)
+    paper_cmp = load_paper_comparison(paper_dir, net_attr, total_eq, deposited_capital_usd=dep_cap)
 
     # Address API Rate-Limit Health:
     # Standard HyperCore grants 1 request per 1 USDC traded (+10k initial buffer).
@@ -695,6 +779,8 @@ def compute_post_trade_attribution(
         audit_fill_volume_usd=round(audit_vol, 2),
         mixed_account_warning=mixed_warning,
         withdrawable_usd=round(withdrawable, 4),
+        deposited_capital_usd=round(eff_dep_cap, 4),
+        account_return_pct=round(acct_ret_pct, 4),
     )
 
 

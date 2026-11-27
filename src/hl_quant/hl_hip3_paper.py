@@ -487,14 +487,33 @@ def run_hip3_paper_tick(
                 }
             )
 
-        # 5. Update portfolio equity, split-margin utilization, and persist atomically
+        # 5. Update portfolio equity, exit-cost liquidation NAV, split-margin utilization, and persist atomically
+        for p in positions.values():
+            s_q = float(p.get("short_qty") or 0.0)
+            l_q = float(p.get("long_qty") or 0.0)
+            s_px = float(p.get("last_short_px") or 0.0)
+            l_px = float(p.get("last_long_px") or 0.0)
+            cur_leg_ntl = (
+                0.5 * (s_q * s_px + l_q * l_px)
+                if (s_q > 0 and l_q > 0 and s_px > 0 and l_px > 0)
+                else float(p.get("leg_notional_usd", 0.0))
+            )
+            est_exit_bps = float(p.get("entry_fee_bps", 1.8)) + float(p.get("entry_l2_slip_bps", 2.0))
+            est_exit_usd = round(cur_leg_ntl * est_exit_bps * 1e-4, 4)
+            p["est_exit_cost_usd"] = est_exit_usd
+            p["liquidation_net_pnl_usd"] = round(float(p.get("net_pnl_usd", 0.0)) - est_exit_usd, 4)
+
         tick_net_pnl = tick_funding_usd + tick_basis_mtm_usd - tick_costs_usd
         new_equity = round(float(state["equity_usd"]) + tick_net_pnl, 4)
+        est_exit_costs_usd = round(sum(float(p.get("est_exit_cost_usd", 0.0)) for p in positions.values()), 4)
+        liquidation_equity_usd = round(new_equity - est_exit_costs_usd, 4)
         start_cap = float(state["starting_capital_usd"])
         margin_locked = round(sum(float(p.get("margin_locked_usd", 0.0)) for p in positions.values()), 2)
         margin_util = round((margin_locked / new_equity) * 100.0, 2) if new_equity > 0 else 0.0
 
         state["equity_usd"] = new_equity
+        state["est_exit_costs_usd"] = est_exit_costs_usd
+        state["liquidation_equity_usd"] = liquidation_equity_usd
         state["return_pct"] = round(((new_equity / start_cap) - 1.0) * 100.0, 4) if start_cap > 0 else 0.0
         state["margin_locked_usd"] = margin_locked
         state["margin_utilization_pct"] = margin_util
@@ -513,6 +532,7 @@ def run_hip3_paper_tick(
             "ny_session": ny_session,
             "dt_hours": round(dt_hours, 3),
             "equity_usd": new_equity,
+            "liquidation_equity_usd": liquidation_equity_usd,
             "active_pairs": len(positions),
             "gross_notional_usd": round(sum(float(p["leg_notional_usd"]) * 2.0 for p in positions.values()), 2),
             "margin_locked_usd": margin_locked,
