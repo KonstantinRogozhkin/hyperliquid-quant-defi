@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -15,25 +15,14 @@ fi
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
-export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
+export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 STATE_DIR="${HL_PAPER_STATE_DIR:-${ROOT_DIR}/data/paper/hl_metamodel}"
+LOCK_FILE="${HL_LOCK_FILE:-${TMPDIR:-/tmp}/hl_metamodel_paper_tick.flock}"
 
-LOCK_DIR="${ROOT_DIR}/.neira/state/hl_metamodel_paper.lock"
-mkdir -p "${ROOT_DIR}/.neira/state"
-if mkdir "${LOCK_DIR}" 2>/dev/null; then
-  echo "$$" > "${LOCK_DIR}/pid"
-else
-  if [[ -f "${LOCK_DIR}/pid" ]]; then
-    ACTIVE_PID="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
-    if [[ -n "${ACTIVE_PID}" ]] && kill -0 "${ACTIVE_PID}" 2>/dev/null; then
-      exit 0
-    fi
-  fi
-  rm -rf "${LOCK_DIR}"
-  mkdir "${LOCK_DIR}"
-  echo "$$" > "${LOCK_DIR}/pid"
+if [[ "${HL_OPS_LOCK_HELD:-0}" != "1" ]]; then
+  cd "${ROOT_DIR}"
+  HL_OPS_LOCK_HELD=1 exec "${PYTHON_BIN}" -m hl_quant.ops_lock "${LOCK_FILE}" -- zsh "$0" "$@"
 fi
-trap 'rm -rf "${LOCK_DIR}"' EXIT
 
 RUN_DATE="$(date -u +%F)"
 RUN_TIME="$(date -u +%H%M)"
@@ -49,4 +38,5 @@ CMD=(
 if [[ "${HL_PAPER_TELEGRAM}" == "1" || "${HL_PAPER_TELEGRAM:l}" == "true" ]]; then
   CMD+=(--telegram)
 fi
+CMD+=("$@")
 "${CMD[@]}" | tee -a "${LOG_DIR}/run_hl_metamodel_paper_tick.log"

@@ -102,6 +102,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
+      GH_TOKEN: ${{ github.token }}
       REGISTRY: ghcr.io
       NS: ${{ needs.gate.outputs.namespace }}
       SHA: ${{ needs.gate.outputs.sha }}
@@ -214,15 +215,26 @@ jobs:
           sleep 2
           test "$(curl -fsS http://127.0.0.1:18080/nginx-health)" = "ok"
           curl -fsS http://127.0.0.1:18080/index.html | grep -q "Hyperliquid Quant DeFi"
+          curl -fsSI http://127.0.0.1:18080/index.html | grep -qi "x-content-type-options: nosniff"
           curl -fsS http://127.0.0.1:18080/build-info.json | python3 -c "import json, sys; d=json.load(sys.stdin); assert d['sha']=='$SHA', d; print('frontend smoke OK:', d)"
 
       - name: Push verified immutable SHA images to GHCR
         run: |
           set -euo pipefail
+          current_sha="$(curl -fsS --retry 3 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/main" \
+            | python3 -c 'import json, sys; print(json.load(sys.stdin)["sha"])')"
           for svc in hl-backend hl-worker hl-frontend; do
             docker push "$REGISTRY/$NS/$svc:sha-$SHA"
-            docker push "$REGISTRY/$NS/$svc:latest"
+            if [ "$current_sha" = "$SHA" ]; then
+              docker push "$REGISTRY/$NS/$svc:latest"
+            fi
           done
+          if [ "$current_sha" != "$SHA" ]; then
+            echo "::notice title=Latest tag skipped::main moved to $current_sha; pushed immutable :sha-$SHA tags only"
+          fi
           {
             echo "### Published Verified GHCR Images"
             echo "- Source SHA: \`$SHA\`"
@@ -250,6 +262,7 @@ jobs:
           persist-credentials: false
 
       - name: Confirm SHA is still main tip before production rollout
+        id: tip
         run: |
           set -euo pipefail
           current_sha="$(curl -fsS --retry 3 \
@@ -257,13 +270,19 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/$GITHUB_REPOSITORY/commits/main" \
             | python3 -c 'import json, sys; print(json.load(sys.stdin)["sha"])')"
-          test "$current_sha" = "$SHA"
+          if [ "$current_sha" != "$SHA" ]; then
+            echo "::notice title=Deploy superseded::main moved to $current_sha; skipping Dokploy rollout for obsolete SHA $SHA"
+            echo "is_tip=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "is_tip=true" >> "$GITHUB_OUTPUT"
 
       - name: Deploy immutable SHA release to Dokploy and verify live probes
+        if: steps.tip.outputs.is_tip == 'true'
         run: python3 scripts/ops/deploy_dokploy.py "$SHA"
 
       - name: Record GitHub Deployment status
-        if: success()
+        if: success() && steps.tip.outputs.is_tip == 'true'
         run: |
           set -euo pipefail
           payload="$(python3 -c 'import json, os; print(json.dumps({"ref": "main", "sha": os.environ["SHA"], "environment": "production", "auto_merge": False, "required_contexts": [], "description": "Dokploy release " + os.environ["SHA"][:12]}))')"

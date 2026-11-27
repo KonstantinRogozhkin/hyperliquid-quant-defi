@@ -13,6 +13,7 @@ import html
 import json
 import math
 from pathlib import Path
+import threading
 from typing import Any
 
 import pandas as pd
@@ -32,6 +33,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
 
 
 _PARQUET_CACHE: dict[str, tuple[int, int, int | None, list[dict[str, Any]]]] = {}
+_PARQUET_CACHE_LOCK = threading.Lock()
 
 
 def _read_parquet_records(path: Path, limit: int | None = None, *, head: bool = False) -> list[dict[str, Any]]:
@@ -40,17 +42,19 @@ def _read_parquet_records(path: Path, limit: int | None = None, *, head: bool = 
     try:
         st = path.stat()
         cache_key = f"{path.resolve()}::{head}"
-        cached = _PARQUET_CACHE.get(cache_key)
-        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size and cached[2] == limit:
-            return list(cached[3])
+        with _PARQUET_CACHE_LOCK:
+            cached = _PARQUET_CACHE.get(cache_key)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size and cached[2] == limit:
+                return [dict(r) for r in cached[3]]
         df = pd.read_parquet(path)
         if limit is not None:
             df = df.head(limit) if head else df.tail(limit)
         records = df.to_dict(orient="records")
-        if len(_PARQUET_CACHE) > 64:
-            _PARQUET_CACHE.clear()
-        _PARQUET_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, limit, records)
-        return list(records)
+        with _PARQUET_CACHE_LOCK:
+            if len(_PARQUET_CACHE) > 64:
+                _PARQUET_CACHE.clear()
+            _PARQUET_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, limit, records)
+        return [dict(r) for r in records]
     except Exception:
         return []
 
@@ -60,13 +64,46 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
     base = ts.collect_tear_sheet_data(data_root)
     cross_paper_state = _read_json(data_root / "hl_cross_dex_paper" / "state.json")
     paper_ticks = _read_parquet_records(data_root / "hl_metamodel" / "ticks.parquet", limit=720)
+    paper_info = base.get("paper")
+    if isinstance(paper_info, dict):
+        mm_state = _read_json(data_root / "hl_metamodel" / "state.json") or {}
+        all_paper_ticks = _read_parquet_records(data_root / "hl_metamodel" / "ticks.parquet")
+        paper_info = dict(paper_info)
+        if "nav_guard_triggers" in mm_state:
+            paper_info["nav_guard_triggers"] = int(mm_state.get("nav_guard_triggers", 0) or 0)
+        last_tick = all_paper_ticks[-1] if all_paper_ticks else {}
+        if isinstance(last_tick, dict):
+            if last_tick.get("gross_hl") is not None:
+                paper_info["gross_hl"] = _nf(last_tick.get("gross_hl"))
+            if last_tick.get("gross_cex") is not None:
+                paper_info["gross_cex"] = _nf(last_tick.get("gross_cex"))
+            paper_info["nav_guard_triggered"] = bool(
+                last_tick.get("nav_guard_triggered") or mm_state.get("nav_guard_pending_tick_hour_ms") is not None
+            )
+        if all_paper_ticks:
+            paper_info["cum_funding_usd"] = round(
+                sum(_nf(t.get("fund_pnl_usd")) for t in all_paper_ticks if isinstance(t, dict)),
+                4,
+            )
+            paper_info["cum_costs_usd"] = round(
+                abs(sum(_nf(t.get("cost_pnl_usd")) for t in all_paper_ticks if isinstance(t, dict))),
+                4,
+            )
+        base = {**base, "paper": paper_info}
     mm_quotes = _read_parquet_records(data_root / "hl_mm_testnet" / "quotes.parquet", limit=200)
-    # Prefer the expanded 52-day (60k-event) :00 funding study when present, else fallback to 17-day
-    study_dir = (
-        data_root / "hl_funding_settlement_study_52d"
-        if (data_root / "hl_funding_settlement_study_52d" / "stats.parquet").is_file()
-        else data_root / "hl_funding_settlement_study"
-    )
+    # Prefer the live daily hl_funding_settlement_study when present (or pick newer mtime if both exist)
+    live_study_dir = data_root / "hl_funding_settlement_study"
+    legacy_52d_dir = data_root / "hl_funding_settlement_study_52d"
+    live_stats = live_study_dir / "stats.parquet"
+    legacy_stats = legacy_52d_dir / "stats.parquet"
+    if live_stats.is_file() and legacy_stats.is_file():
+        study_dir = live_study_dir if live_stats.stat().st_mtime >= legacy_stats.stat().st_mtime else legacy_52d_dir
+    elif live_stats.is_file():
+        study_dir = live_study_dir
+    elif legacy_stats.is_file():
+        study_dir = legacy_52d_dir
+    else:
+        study_dir = live_study_dir
     settlement_stats = _read_parquet_records(study_dir / "stats.parquet")
     settlement_meta = _read_json(study_dir / "meta.json")
     settlement_last_attempt = _read_json(study_dir / "last_attempt.json")
@@ -301,7 +338,12 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     for p in sorted(cd_positions, key=lambda x: -_nf(x.get("live_spread_apr_pct"), 0.0)):
         net_p = _nf(p.get("net_pnl_usd"), 0.0)
         venue = str(p.get("other_dex") or "lighter")
-        mode_lbl = "H1-Combo" if _nf(p.get("entry_exec_basis_bps"), 0.0) >= 8.0 else "Carry"
+        entry_type_raw = p.get("entry_type")
+        if entry_type_raw is not None and str(entry_type_raw).strip() != "":
+            is_combo = str(entry_type_raw) == "basis_carry_combo"
+        else:
+            is_combo = _nf(p.get("entry_exec_basis_bps"), 0.0) >= 8.0
+        mode_lbl = "H1-Combo" if is_combo else "Carry"
         pill_cls = "green" if mode_lbl == "H1-Combo" else "gray"
         cdp_rows += (
             "<tr>"
@@ -448,7 +490,15 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
             dv, hv = dev_m.loc[key], hld_m.loc[key]
             net_m = float(hv["net_maker_bps"])
             t_v = float(hv["t_stat"])
-            if float(dv["net_maker_bps"]) > 0 and net_m > 0 and t_v >= 2.0:
+            t_clust_raw = hv.get("t_stat_clustered") if hasattr(hv, "get") else None
+            t_clust = float(t_clust_raw) if (t_clust_raw is not None and pd.notna(t_clust_raw)) else t_v
+            ex_top1_raw = hv.get("ex_top1_gross_bps") if hasattr(hv, "get") else None
+            if ex_top1_raw is not None and pd.notna(ex_top1_raw):
+                cost_bps = float(hv["mean_gross_bps"]) - net_m
+                ex_top1_net_ok = (float(ex_top1_raw) - cost_bps) > 0.0
+            else:
+                ex_top1_net_ok = True
+            if float(dv["net_maker_bps"]) > 0 and net_m > 0 and t_v >= 2.0 and t_clust >= 2.0 and ex_top1_net_ok:
                 v_pill = '<span class="pill green">GO</span>'
             elif float(dv["mean_gross_bps"]) > 1.0 and float(hv["mean_gross_bps"]) > 1.0 and t_v >= 2.0:
                 v_pill = '<span class="pill amber">MM Overlay</span>'

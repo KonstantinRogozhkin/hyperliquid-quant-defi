@@ -11,6 +11,7 @@ services:
       HL_DATA_DIR: /app/data
       HL_DATA_ROOT: /app/data/paper
       HL_BUILD_SHA: ${DEPLOY_SHA}
+      HL_CORS_ORIGINS: ${HL_CORS_ORIGINS:-}
     volumes:
       - hl-data:/app/data:ro
     healthcheck:
@@ -59,6 +60,12 @@ services:
       HL_MM_COINS: ${HL_MM_COINS:-}
       HL_PAPER_MAX_COINS: ${HL_PAPER_MAX_COINS:-35}
       HL_SNAPSHOT_COINS: ${HL_SNAPSHOT_COINS:-BTC,ETH,SOL,HYPE,DOGE,XRP,SUI,ENA,WIF,kPEPE,AVAX,LINK,TAO}
+      HL_LIQ_TOP_WHALES: ${HL_LIQ_TOP_WHALES:-60}
+      HL_LIQ_TOP_FUNDING_COINS: ${HL_LIQ_TOP_FUNDING_COINS:-8}
+      HL_MM_CALIBRATION_COINS: ${HL_MM_CALIBRATION_COINS:-BTC,ETH}
+      HL_MM_CALIBRATION_SEC: ${HL_MM_CALIBRATION_SEC:-300}
+      HL_SETTLEMENT_INTERVAL: ${HL_SETTLEMENT_INTERVAL:-15m}
+      HL_SETTLEMENT_MAX_COINS: ${HL_SETTLEMENT_MAX_COINS:-35}
     volumes:
       - hl-data:/app/data:rw
     restart: unless-stopped

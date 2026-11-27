@@ -44,11 +44,16 @@ class _FakeDokployClient:
     def list_deployments(self, _compose_id: str) -> list[dict[str, Any]]:
         self.poll_count += 1
         if len(self.deployments) > 1 and self.poll_count >= 2:
-            self.deployments[-1]["status"] = self.final_status
+            last = self.deployments[-1]
+            if "Rollback" in str(last.get("title") or ""):
+                last["status"] = "done"
+            else:
+                last["status"] = self.final_status
         return list(self.deployments)
 
-    def trigger_deploy(self, _compose_id: str, title: str) -> None:
-        self.deployments.append({"deploymentId": "dep-new", "status": "running", "title": title})
+    def trigger_deploy(self, _compose_id: str, title: str = "") -> None:
+        dep_id = "dep-new" if len(self.deployments) == 1 else f"dep-rb-{len(self.deployments)}"
+        self.deployments.append({"deploymentId": dep_id, "status": "running", "title": title})
 
 
 def test_deploy_sha_to_dokploy_happy_path_and_live_verification(monkeypatch):
@@ -58,6 +63,8 @@ def test_deploy_sha_to_dokploy_happy_path_and_live_verification(monkeypatch):
     def fake_fetch_json(url: str, *, timeout_s: int = 10) -> dict[str, Any]:
         if url.endswith("/api/v1/healthz"):
             return {"status": "ok", "sha": sha}
+        if url.endswith("/api/v1/scheduler/status"):
+            return {"build_info": {"sha": sha}, "worker_status": {"service": "hl-worker"}}
         return {"sha": sha}
 
     monkeypatch.setattr(mod, "fetch_json", fake_fetch_json)

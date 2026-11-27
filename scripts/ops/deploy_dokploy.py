@@ -51,8 +51,20 @@ def upsert_env_var(env_text: str, key: str, value: str) -> str:
 
 
 def extract_env_var(env_text: str, key: str) -> str | None:
-    match = re.search(rf"(?m)^{re.escape(key)}=['\"]?([^'\"\r\n]+)['\"]?$", env_text or "")
-    return match.group(1).strip() if match else None
+    match = re.search(rf"(?m)^\s*{re.escape(key)}\s*=\s*(.*)$", env_text or "")
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    if not raw:
+        return ""
+    if raw[0] in ('"', "'"):
+        quote = raw[0]
+        end_idx = raw.find(quote, 1)
+        if end_idx != -1:
+            return raw[1:end_idx].strip()
+        raw = raw[1:]
+    raw = raw.split("#", 1)[0].strip()
+    return raw.strip("\"'").strip()
 
 
 class DokployClient:
@@ -77,7 +89,19 @@ class DokployClient:
             with urlopen(req, timeout=self.timeout_s) as resp:
                 raw = resp.read()
             return json.loads(raw) if raw else {}
-        except (HTTPError, URLError, ValueError, OSError) as exc:
+        except HTTPError as exc:
+            # Never echo request payload: compose env contains deployment secrets.
+            endpoint_name = endpoint.split("?", 1)[0]
+            snippet = ""
+            try:
+                err_body = exc.read()
+                if err_body:
+                    snippet = err_body.decode("utf-8", errors="replace").strip().replace("\n", " ")[:200]
+            except Exception:
+                snippet = ""
+            detail = f"HTTP {exc.code}" + (f": {snippet}" if snippet else "")
+            raise RuntimeError(f"Dokploy API call '{endpoint_name}' failed ({detail})") from exc
+        except (URLError, ValueError, OSError) as exc:
             # Never echo request payload: compose env contains deployment secrets.
             endpoint_name = endpoint.split("?", 1)[0]
             raise RuntimeError(f"Dokploy API call '{endpoint_name}' failed: {type(exc).__name__}") from exc
@@ -95,7 +119,7 @@ class DokployClient:
         rows = self.request(f"deployment.allByCompose?{urlencode({'composeId': compose_id})}")
         return rows if isinstance(rows, list) else []
 
-    def trigger_deploy(self, compose_id: str, title: str) -> None:
+    def trigger_deploy(self, compose_id: str, title: str = "Automated Dokploy deploy") -> None:
         self.request("compose.deploy", {"composeId": compose_id, "title": title})
 
 
@@ -112,6 +136,92 @@ def fetch_json(url: str, *, timeout_s: int = 10) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise RuntimeError(f"Expected JSON object from {url}")
     return data
+
+
+def wait_for_latest_deployment(
+    client: DokployClient,
+    *,
+    compose_id: str,
+    before_ids: set[str],
+    deploy_timeout_s: int,
+    poll_interval_s: float,
+) -> str | None:
+    deadline = time.monotonic() + deploy_timeout_s
+    tracked_id: str | None = None
+    while time.monotonic() < deadline:
+        try:
+            rows = client.list_deployments(compose_id)
+        except RuntimeError as exc:
+            print(f"[deploy] transient poll error, retrying: {exc}", flush=True)
+            time.sleep(poll_interval_s)
+            continue
+
+        if tracked_id is None:
+            fresh = [item for item in rows if str(item.get("deploymentId")) not in before_ids]
+            if len(fresh) > 1:
+                raise RuntimeError("Multiple concurrent Dokploy deployments detected; refusing to guess")
+            if fresh:
+                tracked_id = str(fresh[0].get("deploymentId"))
+                print(f"[deploy] tracking Dokploy deployment {tracked_id}", flush=True)
+
+        current = next((item for item in rows if tracked_id and str(item.get("deploymentId")) == tracked_id), None)
+        if current is not None:
+            status = str(current.get("status") or "").lower()
+            if status == "done":
+                print(f"[deploy] Dokploy deployment {tracked_id} finished cleanly", flush=True)
+                return tracked_id
+            if status in {"error", "failed", "cancelled"}:
+                raise RuntimeError(f"Dokploy deployment {tracked_id} ended with status='{status}'")
+        time.sleep(poll_interval_s)
+    raise RuntimeError(f"Dokploy deployment timed out after {deploy_timeout_s}s")
+
+
+def verify_live_probes(
+    public_url: str,
+    *,
+    expected_sha: str,
+    verify_timeout_s: int = 180,
+    poll_interval_s: float = 10.0,
+) -> dict[str, Any]:
+    if not public_url:
+        return {}
+    base = public_url.rstrip("/")
+    checks = {
+        "frontend_build": f"{base}/build-info.json",
+        "backend_build": f"{base}/api/v1/build-info.json",
+        "backend_health": f"{base}/api/v1/healthz",
+        "scheduler_status": f"{base}/api/v1/scheduler/status",
+    }
+    verify_deadline = time.monotonic() + verify_timeout_s
+    last_err = ""
+    while time.monotonic() < verify_deadline:
+        try:
+            fe = fetch_json(checks["frontend_build"])
+            be = fetch_json(checks["backend_build"])
+            hz = fetch_json(checks["backend_health"])
+            sc = fetch_json(checks["scheduler_status"])
+            sc_build = sc.get("build_info")
+            sc_sha = sc_build.get("sha") if isinstance(sc_build, dict) else None
+            ws = sc.get("worker_status")
+            ws_valid = ws is None or isinstance(ws, dict)
+            if (
+                fe.get("sha") == expected_sha
+                and be.get("sha") == expected_sha
+                and hz.get("status") == "ok"
+                and sc_sha == expected_sha
+                and ws_valid
+            ):
+                verified = {"frontend": fe, "backend": be, "health": hz, "scheduler": sc}
+                print(f"[deploy] live verification passed for sha={expected_sha[:12]}", flush=True)
+                return verified
+            last_err = (
+                f"mismatch fe={fe.get('sha')} be={be.get('sha')} "
+                f"health={hz.get('status')} sched_sha={sc_sha} ws_valid={ws_valid}"
+            )
+        except Exception as exc:
+            last_err = str(exc)
+        time.sleep(min(poll_interval_s, 5.0))
+    raise RuntimeError(f"Post-deploy verification failed after {verify_timeout_s}s ({last_err})")
 
 
 def deploy_sha_to_dokploy(
@@ -146,104 +256,50 @@ def deploy_sha_to_dokploy(
     if extract_env_var(refreshed.get("env") or "", sha_var) != sha:
         raise RuntimeError(f"Dokploy did not persist {sha_var}={sha}")
 
+    deploy_triggered = False
     try:
-        return _poll_and_verify_dokploy_deploy(
+        before_ids = {str(item.get("deploymentId")) for item in client.list_deployments(compose_id)}
+        client.trigger_deploy(compose_id, title=f"CI tested release {sha[:12]}")
+        deploy_triggered = True
+        tracked_id = wait_for_latest_deployment(
             client,
             compose_id=compose_id,
-            sha=sha,
-            previous_sha=previous_sha,
-            public_url=public_url,
+            before_ids=before_ids,
             deploy_timeout_s=deploy_timeout_s,
+            poll_interval_s=poll_interval_s,
+        )
+        verified = verify_live_probes(
+            public_url,
+            expected_sha=sha,
             verify_timeout_s=verify_timeout_s,
             poll_interval_s=poll_interval_s,
         )
+        return {
+            "compose_id": compose_id,
+            "deployment_id": tracked_id,
+            "previous_sha": previous_sha,
+            "deployed_sha": sha,
+            "verified": verified,
+        }
     except Exception:
         if previous_sha != sha:
             try:
                 client.update_compose_env(compose_id, old_env)
                 print(f"[deploy] rolled back {sha_var} to previous={previous_sha!r} after failure", flush=True)
+                if deploy_triggered and previous_sha:
+                    rb_before = {str(item.get("deploymentId")) for item in client.list_deployments(compose_id)}
+                    client.trigger_deploy(compose_id, title=f"Rollback to {previous_sha[:12]}")
+                    wait_for_latest_deployment(
+                        client,
+                        compose_id=compose_id,
+                        before_ids=rb_before,
+                        deploy_timeout_s=deploy_timeout_s,
+                        poll_interval_s=poll_interval_s,
+                    )
+                    print(f"[deploy] redeployed previous {sha_var}={previous_sha[:12]} cleanly", flush=True)
             except Exception as rb_exc:
                 print(f"[deploy] warning: failed to roll back {sha_var}: {rb_exc}", flush=True)
         raise
-
-
-def _poll_and_verify_dokploy_deploy(
-    client: DokployClient,
-    *,
-    compose_id: str,
-    sha: str,
-    previous_sha: str | None,
-    public_url: str,
-    deploy_timeout_s: int,
-    verify_timeout_s: int,
-    poll_interval_s: float,
-) -> dict[str, Any]:
-    before_ids = {str(item.get("deploymentId")) for item in client.list_deployments(compose_id)}
-    client.trigger_deploy(compose_id, title=f"CI tested release {sha[:12]}")
-
-    deadline = time.monotonic() + deploy_timeout_s
-    tracked_id: str | None = None
-    while time.monotonic() < deadline:
-        try:
-            rows = client.list_deployments(compose_id)
-        except RuntimeError as exc:
-            print(f"[deploy] transient poll error, retrying: {exc}", flush=True)
-            time.sleep(poll_interval_s)
-            continue
-
-        if tracked_id is None:
-            fresh = [item for item in rows if str(item.get("deploymentId")) not in before_ids]
-            if len(fresh) > 1:
-                raise RuntimeError("Multiple concurrent Dokploy deployments detected; refusing to guess")
-            if fresh:
-                tracked_id = str(fresh[0].get("deploymentId"))
-                print(f"[deploy] tracking Dokploy deployment {tracked_id}", flush=True)
-
-        current = next((item for item in rows if tracked_id and str(item.get("deploymentId")) == tracked_id), None)
-        if current is not None:
-            status = str(current.get("status") or "").lower()
-            if status == "done":
-                print(f"[deploy] Dokploy deployment {tracked_id} finished cleanly", flush=True)
-                break
-            if status in {"error", "failed", "cancelled"}:
-                raise RuntimeError(f"Dokploy deployment {tracked_id} ended with status='{status}'")
-        time.sleep(poll_interval_s)
-    else:
-        raise RuntimeError(f"Dokploy deployment timed out after {deploy_timeout_s}s")
-
-    verified: dict[str, Any] = {}
-    if public_url:
-        base = public_url.rstrip("/")
-        checks = {
-            "frontend_build": f"{base}/build-info.json",
-            "backend_build": f"{base}/api/v1/build-info.json",
-            "backend_health": f"{base}/api/v1/healthz",
-        }
-        verify_deadline = time.monotonic() + verify_timeout_s
-        last_err = ""
-        while time.monotonic() < verify_deadline:
-            try:
-                fe = fetch_json(checks["frontend_build"])
-                be = fetch_json(checks["backend_build"])
-                hz = fetch_json(checks["backend_health"])
-                if fe.get("sha") == sha and be.get("sha") == sha and hz.get("status") == "ok":
-                    verified = {"frontend": fe, "backend": be, "health": hz}
-                    print(f"[deploy] live verification passed for sha={sha[:12]}", flush=True)
-                    break
-                last_err = f"mismatch fe={fe.get('sha')} be={be.get('sha')} health={hz.get('status')}"
-            except Exception as exc:
-                last_err = str(exc)
-            time.sleep(min(poll_interval_s, 5.0))
-        else:
-            raise RuntimeError(f"Post-deploy verification failed after {verify_timeout_s}s ({last_err})")
-
-    return {
-        "compose_id": compose_id,
-        "deployment_id": tracked_id,
-        "previous_sha": previous_sha,
-        "deployed_sha": sha,
-        "verified": verified,
-    }
 
 
 def main(argv: list[str]) -> int:

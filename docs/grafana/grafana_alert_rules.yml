@@ -69,7 +69,7 @@ groups:
             model: { type: threshold, expression: A, conditions: [{ evaluator: { type: lt, params: [1] } }], refId: C }
 
       - uid: hl-crit-liq-risk
-        title: "CRITICAL: Testnet Liquidation or ADL Warning"
+        title: "CRITICAL: Testnet Liquidation Warning"
         condition: C
         for: 1m
         noDataState: OK
@@ -78,18 +78,38 @@ groups:
           severity: critical
           service: hyperliquid-quant-defi
         annotations:
-          summary: "Active liquidation/ADL warning or min liquidation distance < 20%"
+          summary: "Active liquidation warning or min liquidation distance < 20%"
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
-            model: { expr: "(max(hl_testnet_liq_warnings + hl_testnet_adl_warnings) or on() vector(0)) + (max(hl_testnet_min_liq_distance_pct < bool 20) or on() vector(0))", instant: true, refId: A }
+            model: { expr: "(max(hl_testnet_liq_warnings) or vector(0)) + (max(hl_testnet_min_liq_distance_pct < bool 20) or vector(0))", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-crit-adl-risk
+        title: "CRITICAL: Testnet High ADL Rank Warning"
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "One or more open Testnet positions triggered high Auto-Deleveraging (ADL) risk thresholds"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(hl_testnet_adl_warnings)", instant: true, refId: A }
           - refId: C
             datasourceUid: __expr__
             model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
 
       - uid: hl-crit-nav-guard
-        title: "CRITICAL: Bounded NAV Sanity Guard Triggered"
+        title: "CRITICAL: Bounded NAV Sanity Guard Active"
         condition: C
         for: 1m
         noDataState: OK
@@ -98,12 +118,12 @@ groups:
           severity: critical
           service: hyperliquid-quant-defi
         annotations:
-          summary: "Bounded NAV Sanity Guard tripped on Spot+Perp or Autopilot ledger"
+          summary: "Bounded NAV Sanity Guard currently active on a desk strategy ledger"
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
-            model: { expr: "hl_desk_nav_guard_triggers_total", instant: true, refId: A }
+            model: { expr: "hl_desk_nav_guard_active", instant: true, refId: A }
           - refId: C
             datasourceUid: __expr__
             model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
@@ -213,6 +233,66 @@ groups:
     folder: Hyperliquid Quant DeFi
     interval: 1m
     rules:
+      - uid: hl-warn-artifact-stale
+        title: "WARNING: Telemetry Artifact Stale (> 6h) or Missing"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Core 4h/15m telemetry artifact missing or has not refreshed for > 360 minutes"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "(max(hl_artifact_age_minutes{artifact!~\"mm_calibration|settlement_study|testnet_.*\"} > bool 360) or vector(0)) + (max(hl_artifact_exists{artifact!~\"mm_calibration|settlement_study|testnet_.*\"} == bool 0) or vector(0))", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-warn-settlement-degraded
+        title: "WARNING: Settlement Study Collection Degraded (< 80%)"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Latest :00 funding settlement study collected < 80% of requested coins"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(hl_settlement_study_degraded)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-warn-alo-fill-low
+        title: "WARNING: Testnet ALO Fill Rate Low (< 65%)"
+        condition: C
+        for: 30m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Real ALO post-only fill rate dropped below 65% (target >= 85%)"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "min(hl_testnet_alo_fill_rate_pct)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: lt, params: [65] } }], refId: C }
+
       - uid: hl-warn-testnet-drawdown
         title: "WARNING: Testnet Drawdown > 2% from HWM"
         condition: C
@@ -273,6 +353,26 @@ groups:
             datasourceUid: __expr__
             model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [1.0] } }], refId: C }
 
+      - uid: hl-warn-coin-mark-oracle
+        title: "WARNING: Testnet Per-Coin Mark-vs-Oracle Deviation > 15%"
+        condition: C
+        for: 30m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "At least one open Testnet perp position has |mark/oracle - 1| > 15% for 30m"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(abs(hl_testnet_mark_oracle_max_dev_pct))", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [15.0] } }], refId: C }
+
       - uid: hl-warn-testnet-risk-stale
         title: "WARNING: Testnet Risk Probe Stale (> 45 min)"
         condition: C
@@ -288,7 +388,7 @@ groups:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
-            model: { expr: "(max(hl_artifact_age_minutes{artifact=\"testnet_risk\"} > bool 45) or on() vector(0)) + (max((hl_artifact_exists{artifact=\"testnet_risk\"} == bool 0) * on() hl_worker_job_enabled{worker_job=\"testnet_risk_probe\"}) or on() vector(0))", instant: true, refId: A }
+            model: { expr: "(max((hl_artifact_age_minutes{artifact=\"testnet_risk\"} > bool 45) * ignoring(artifact, worker_job) (hl_worker_job_enabled{worker_job=\"testnet_risk_probe\"} == bool 1)) or vector(0)) + (max((hl_artifact_exists{artifact=\"testnet_risk\"} == bool 0) * ignoring(artifact, worker_job) (hl_worker_job_enabled{worker_job=\"testnet_risk_probe\"} == bool 1)) or vector(0))", instant: true, refId: A }
           - refId: C
             datasourceUid: __expr__
             model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
@@ -308,7 +408,7 @@ groups:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
-            model: { expr: "(max(hl_artifact_age_minutes{artifact=\"testnet_attribution\"} > bool 300) or on() vector(0)) + (max((hl_artifact_exists{artifact=\"testnet_attribution\"} == bool 0) * on() hl_worker_job_enabled{worker_job=\"testnet_attribution\"}) or on() vector(0))", instant: true, refId: A }
+            model: { expr: "(max((hl_artifact_age_minutes{artifact=\"testnet_attribution\"} > bool 300) * ignoring(artifact, worker_job) (hl_worker_job_enabled{worker_job=\"testnet_attribution\"} == bool 1)) or vector(0)) + (max((hl_artifact_exists{artifact=\"testnet_attribution\"} == bool 0) * ignoring(artifact, worker_job) (hl_worker_job_enabled{worker_job=\"testnet_attribution\"} == bool 1)) or vector(0))", instant: true, refId: A }
           - refId: C
             datasourceUid: __expr__
             model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }

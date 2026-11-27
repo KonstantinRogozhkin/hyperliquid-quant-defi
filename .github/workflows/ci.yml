@@ -6,14 +6,17 @@ on:
     paths:
       - "src/**"
       - "tests/**"
-      - "scripts/**/*.py"
+      - "scripts/**"
       - "config/**"
       - "frontend/**"
       - "docker/**"
+      - "docker-compose.yml"
+      - "docker-compose.dokploy.yml"
       - "docs/grafana/**"
       - "pyproject.toml"
       - "uv.lock"
       - ".github/workflows/ci.yml"
+      - ".github/workflows/release.yml"
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -55,7 +58,7 @@ jobs:
           fi
           echo "Changed files:"
           printf '%s\n' "$CHANGED"
-          if printf '%s\n' "$CHANGED" | grep -Eq '^(src/|tests/|scripts/.*\.py$|config/|docs/grafana/|pyproject\.toml$|uv\.lock$|docker/backend\.Dockerfile$|\.github/workflows/ci\.yml$)'; then
+          if printf '%s\n' "$CHANGED" | grep -Eq '^(src/|tests/|scripts/|config/|docs/grafana/|pyproject\.toml$|uv\.lock$|docker/|docker-compose\.yml$|docker-compose\.dokploy\.yml$|\.github/workflows/(ci|release)\.yml$)'; then
             echo "run_py=true" >> "$GITHUB_OUTPUT"
           else
             echo "run_py=false" >> "$GITHUB_OUTPUT"
@@ -103,7 +106,7 @@ jobs:
           else
             CHANGED="$(git diff --name-only HEAD^1 HEAD)"
           fi
-          if printf '%s\n' "$CHANGED" | grep -Eq '^(frontend/|docker/frontend\.Dockerfile$|docker/nginx\.conf$|\.github/workflows/ci\.yml$)'; then
+          if printf '%s\n' "$CHANGED" | grep -Eq '^(frontend/|docker/frontend\.Dockerfile$|docker/nginx\.conf$|docker-compose\.yml$|docker-compose\.dokploy\.yml$|\.github/workflows/(ci|release)\.yml$)'; then
             echo "run_fe=true" >> "$GITHUB_OUTPUT"
           else
             echo "run_fe=false" >> "$GITHUB_OUTPUT"
