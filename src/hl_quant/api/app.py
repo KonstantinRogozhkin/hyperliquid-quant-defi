@@ -26,6 +26,7 @@ ARTIFACT_FILES: dict[str, str] = {
     "frontier_history": "hl_frontier_history/latest_summary.json",
     "hip3": "hl_hip3_arb/snapshot.json",
     "hip3_paper": "hl_hip3_paper/state.json",
+    "spot_perp_paper": "hl_spot_perp_paper/state.json",
     "boros": "hl_boros/snapshot.json",
     "yield_stack": "hl_hyperevm_yield_stack/snapshot.json",
     "onchain_events": "hl_onchain_events/latest_snapshot.json",
@@ -297,6 +298,21 @@ def create_app(
                 "history_tail": _read_parquet_tail(
                     resolved_data_root / "hl_frontier_history" / "hip3_history.parquet", limit=100
                 ),
+            }
+        )
+
+    @app.get("/api/v1/spot-perp")
+    def spot_perp(response: Response) -> dict[str, Any]:
+        _no_store(response)
+        scan = _read_json(resolved_data_root / "hl_spot_perp_paper" / "snapshot.json") or _read_json(
+            resolved_data_root / "hl_spot_perp_arb" / "snapshot.json"
+        )
+        return sanitize_json(
+            {
+                "state": _read_json(resolved_data_root / "hl_spot_perp_paper" / "state.json"),
+                "scan": scan,
+                "ticks": _read_parquet_tail(resolved_data_root / "hl_spot_perp_paper" / "ticks.parquet", limit=200),
+                "trades": _read_parquet_tail(resolved_data_root / "hl_spot_perp_paper" / "trades.parquet", limit=100),
             }
         )
 

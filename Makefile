@@ -1,4 +1,4 @@
-.PHONY: lint test api frontend-dev frontend-test frontend-build docker-up dashboard scan-hip3 scan-boros scan-evm bench-mm
+.PHONY: lint test api frontend-dev frontend-test frontend-build docker-up dashboard scan-hip3 scan-spot-perp scan-boros scan-evm bench-mm
 
 PYTHON := .venv/bin/python
 PYTEST := .venv/bin/pytest
@@ -31,6 +31,9 @@ dashboard:
 
 scan-hip3:
 	$(PYTHON) scripts/analytics/run_hl_hip3_arb_scan.py
+
+scan-spot-perp:
+	$(PYTHON) scripts/analytics/run_hl_spot_perp_scan.py
 
 scan-boros:
 	$(PYTHON) scripts/analytics/run_hl_boros_scan.py

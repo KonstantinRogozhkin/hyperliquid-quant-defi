@@ -195,6 +195,17 @@ def build_job_specs() -> list[JobSpec]:
             cmd.append("--telegram")
         return cmd
 
+    def _spot_perp_paper_cmd(root: Path, data_dir: Path, tg: bool) -> list[str]:
+        cmd = [
+            py,
+            str(root / "scripts/analytics/run_hl_spot_perp_paper_tick.py"),
+            "--state-dir",
+            str(data_dir / "paper/hl_spot_perp_paper"),
+        ]
+        if tg:
+            cmd.append("--telegram")
+        return cmd
+
     def _cross_dex_scan_cmd(root: Path, data_dir: Path, _tg: bool) -> list[str]:
         return [
             py,
@@ -372,6 +383,19 @@ def build_job_specs() -> list[JobSpec]:
             readonly=True,
             bootstrap_eligible=True,
             build_command=_cross_dex_scan_cmd,
+            is_enabled=_default_enabled,
+            has_required_credentials=_default_enabled,
+        ),
+        JobSpec(
+            name="spot_perp_paper",
+            description="HyperCore Native Spot+Perp Funding Arb + 10% HLP Paper Tick (4h :27)",
+            cron_expr="27 */4 * * *",
+            minutes=(27,),
+            hours=four_hour,
+            timeout_s=240,
+            readonly=True,
+            bootstrap_eligible=True,
+            build_command=_spot_perp_paper_cmd,
             is_enabled=_default_enabled,
             has_required_credentials=_default_enabled,
         ),
