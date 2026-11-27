@@ -50,6 +50,7 @@ class RiskLimits:
     avoid_pre_settlement_neg_funding: bool = True
     neg_funding_apr_threshold: float = -25.0
     pre_settlement_window_min: int = 5
+    max_unquoted_coin_fraction: float = 0.35
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +230,34 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
 
 
 # --------------------------------------------------------------------------- Kill-switch & Order planner
+
+
+def filter_unquoted_targets(
+    target_weights: dict[str, float],
+    bbo: dict[str, tuple[float, float, int]],
+    *,
+    max_missing_fraction: float = 0.35,
+) -> tuple[dict[str, float], list[str]]:
+    """Drop thinly-quoted Testnet coins lacking a two-sided BBO unless missing share exceeds safety threshold.
+
+    Fail-closed guarantee: if all targets are missing, if fewer than 2 quoted coins remain
+    when >= 2 non-zero targets were requested, or if the unquoted fraction exceeds
+    ``max_missing_fraction``, returns the original ``target_weights`` unchanged so
+    ``check_kill_switch`` halts the cycle on systemic feed outages.
+    """
+    nonzero = {c: float(w) for c, w in target_weights.items() if abs(float(w)) > 1e-9}
+    if not nonzero:
+        return dict(target_weights), []
+    missing = sorted(c for c in nonzero if c not in bbo)
+    if not missing:
+        return dict(target_weights), []
+    quoted_count = len(nonzero) - len(missing)
+    missing_frac = len(missing) / len(nonzero)
+    if quoted_count <= 0 or (len(nonzero) >= 2 and quoted_count < 2) or missing_frac > max_missing_fraction + 1e-9:
+        return dict(target_weights), []
+    missing_set = set(missing)
+    filtered = {c: float(w) for c, w in target_weights.items() if c not in missing_set}
+    return filtered, missing
 
 
 def check_kill_switch(
@@ -622,6 +651,7 @@ def execute_rebalance_cycle(
     now_ms: int | None = None,
     funding_apr_by_coin: dict[str, float] | None = None,
     cancel_unmanaged_orders: bool = False,
+    skipped_unquoted_coins: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run one complete Testnet rebalance cycle: kill-switch -> cancel stale -> place sliced ALO orders.
 
@@ -629,6 +659,7 @@ def execute_rebalance_cycle(
     drawdown gate only compares equity with itself and can never fire.
     """
     hwm = max(float(high_water_mark_usd or 0.0), 0.0) or account.equity_usd
+    skipped_unquoted = sorted(set(skipped_unquoted_coins or []))
     violations = check_kill_switch(account, target_weights, bbo, limits, high_water_mark_usd=hwm, now_ms=now_ms)
 
     # On kill-switch emergency, cancel ALL open orders; during normal rebalance, cancel only
@@ -636,7 +667,7 @@ def execute_rebalance_cycle(
     if violations or cancel_unmanaged_orders:
         orders_to_cancel = list(account.open_orders)
     else:
-        managed_coins = set(target_weights.keys()) | set(account.positions_sz.keys())
+        managed_coins = set(target_weights.keys()) | set(account.positions_sz.keys()) | set(skipped_unquoted)
         orders_to_cancel = [o for o in account.open_orders if str(o.get("coin") or "") in managed_coins]
     cancelled = adapter.cancel_all_open_orders(orders_to_cancel) if orders_to_cancel else []
     if violations:
@@ -646,6 +677,7 @@ def execute_rebalance_cycle(
             "cancelled_count": len(cancelled),
             "placed_count": 0,
             "high_water_mark_usd": hwm,
+            "skipped_unquoted_coins": skipped_unquoted,
             "orders": [],
         }
     else:
@@ -695,6 +727,7 @@ def execute_rebalance_cycle(
             "high_water_mark_usd": hwm,
             "leverage_updates": leverage_updates,
             "blocked_isolated_coins": sorted(blocked_isolated_coins),
+            "skipped_unquoted_coins": skipped_unquoted,
             "orders": placed,
         }
 
@@ -781,6 +814,11 @@ def format_testnet_telegram_rich_html(
     ]
     if result.get("violations"):
         parts.append(f"<p><b>⚠️ Kill-switch:</b> {html.escape(', '.join(result['violations']))}</p>")
+    if result.get("skipped_unquoted_coins"):
+        parts.append(
+            f"<p><b>ℹ️ Пропущены (пустой стакан Testnet):</b> "
+            f"{html.escape(', '.join(result['skipped_unquoted_coins']))}</p>"
+        )
 
     orders = result.get("orders") or []
     if orders:
