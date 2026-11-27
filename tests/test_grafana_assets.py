@@ -215,6 +215,14 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
     prom_names = {r["alert"] for grp in groups for r in grp["rules"]}
     for required in ("HLTestnetDrawdownNearKillSwitch", "HLTestnetOrphanPositions", "HLTestnetRiskProbeStale", "HLTestnetAttributionStale"):
         assert required in prom_names
+    # Freshness alerts must also fire when the artifact was never written (no age sample at all).
+    by_uid = {r["uid"]: r for r in g_rules}
+    by_alert = {r["alert"]: r for grp in groups for r in grp["rules"]}
+    for uid, alert in (("hl-warn-testnet-risk-stale", "HLTestnetRiskProbeStale"), ("hl-warn-testnet-attr-stale", "HLTestnetAttributionStale")):
+        assert "hl_artifact_exists" in by_uid[uid]["data"][0]["model"]["expr"]
+        assert "hl_worker_job_enabled" in by_uid[uid]["data"][0]["model"]["expr"]
+        assert "hl_artifact_exists" in by_alert[alert]["expr"]
+        assert "hl_worker_job_enabled" in by_alert[alert]["expr"]
     for rule in g_rules:
         expr = str(rule["data"][0]["model"]["expr"])
         assert "bool(" not in expr, f"Invalid PromQL bool(...) function in '{rule['title']}'; use '< bool' / '> bool'"

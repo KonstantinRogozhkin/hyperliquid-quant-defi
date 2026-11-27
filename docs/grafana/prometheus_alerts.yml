@@ -181,20 +181,22 @@ groups:
 
       - alert: HLTestnetRiskProbeStale
         expr: hl_artifact_age_minutes{artifact="testnet_risk"} > 45
+          or on() (hl_artifact_exists{artifact="testnet_risk"} == 0 and on() hl_worker_job_enabled{worker_job="testnet_risk_probe"} == 1)
         for: 5m
         labels:
           severity: warning
           service: hyperliquid-quant-defi
         annotations:
-          summary: "Testnet 15m risk probe stale ({{ $value | humanize }} min)"
+          summary: "Testnet 15m risk probe stale (> 45 min) or snapshot missing"
           description: "hl_testnet_risk/latest.json has not refreshed in > 45 min; live drawdown/orphan telemetry is blind. Check the testnet_risk_probe worker job."
 
       - alert: HLTestnetAttributionStale
         expr: hl_artifact_age_minutes{artifact="testnet_attribution"} > 300
+          or on() (hl_artifact_exists{artifact="testnet_attribution"} == 0 and on() hl_worker_job_enabled{worker_job="testnet_attribution"} == 1)
         for: 15m
         labels:
           severity: warning
           service: hyperliquid-quant-defi
         annotations:
-          summary: "Testnet attribution stale ({{ $value | humanize }} min, cadence 4h)"
+          summary: "Testnet attribution stale (> 5h, cadence 4h) or artifact missing"
           description: "hl_testnet_* attribution gauges (equity, PnL, per-coin) are frozen at the last successful 4h run. Check the testnet_attribution worker job."
