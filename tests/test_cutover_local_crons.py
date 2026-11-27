@@ -48,10 +48,10 @@ def _make_fetcher(
     now_utc: datetime | None = None,
 ):
     now = now_utc or datetime(2026, 11, 26, 22, 0, 0, tzinfo=timezone.utc)
-    hb = (now - timedelta(seconds=heartbeat_age_sec)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    hb = (now - timedelta(seconds=heartbeat_age_sec)).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     jobs = []
-    for name in ("snapshot", "metamodel_paper", "frontier_persistence", "onchain_events"):
+    for name in ("market_snapshot", "metamodel_paper", "frontier_persistence", "onchain_events"):
         jobs.append(
             {
                 "name": name,

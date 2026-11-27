@@ -34,7 +34,7 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BACKUP_DIR = ROOT / "data" / "crontab_backups"
-DEFAULT_REQUIRED_JOBS = ("snapshot", "metamodel_paper", "frontier_persistence", "onchain_events")
+DEFAULT_REQUIRED_JOBS = ("market_snapshot", "metamodel_paper", "frontier_persistence", "onchain_events")
 
 BEGIN_RE = re.compile(r"^#\s*BEGIN\s+hyperliquid-quant-defi\s+(?P<label>.+?)\s*$")
 END_RE = re.compile(r"^#\s*END\s+hyperliquid-quant-defi\s+(?P<label>.+?)\s*$")
@@ -68,7 +68,9 @@ class CutoverPlan:
 
 def _parse_iso_utc(raw: str) -> datetime:
     text = raw.strip()
-    if text.endswith("Z"):
+    if text.endswith(" UTC"):
+        text = text[:-4] + "+00:00"
+    elif text.endswith("Z"):
         text = text[:-1] + "+00:00"
     dt = datetime.fromisoformat(text)
     if dt.tzinfo is None:
