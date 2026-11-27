@@ -31,6 +31,7 @@ ARTIFACT_FILES: dict[str, str] = {
     "cross_dex_scan": "hl_cross_dex_v2/opportunities.parquet",
     "hyperevm_defi": "hl_hyperevm_defi/snapshot.json",
     "testnet_attribution": "hl_testnet_attribution/attribution.json",
+    "testnet_audit": "hl_testnet_audit.jsonl",
     "worker_status": "hl_worker_status.json",
 }
 
@@ -95,6 +96,68 @@ def _read_parquet_tail(path: Path, limit: int = 100) -> list[dict[str, Any]]:
         return df.to_dict(orient="records")
     except Exception:
         return []
+
+
+def _read_metamodel_positions(data_root: Path) -> list[dict[str, Any]]:
+    state = _read_json(data_root / "hl_metamodel" / "state.json")
+    raw_pos = (state or {}).get("positions")
+    if not isinstance(raw_pos, dict):
+        return []
+    rows: list[dict[str, Any]] = []
+    for coin, info in raw_pos.items():
+        if not isinstance(info, dict):
+            continue
+        rows.append(
+            {
+                "coin": str(coin),
+                "hl_weight": float(info.get("hl_weight", 0.0) or 0.0),
+                "cex_weight": float(info.get("cex_weight", 0.0) or 0.0),
+                "cex_venue": str(info.get("cex_venue") or ""),
+                "last_hl_px": info.get("last_hl_px"),
+                "l2_spread_bps": info.get("l2_spread_bps"),
+                "cum_pnl_usd": float(info.get("cum_pnl_usd", 0.0) or 0.0),
+            }
+        )
+    rows.sort(key=lambda r: (-abs(r["hl_weight"]), r["coin"]))
+    return rows
+
+
+def _read_testnet_audit_tail(data_root: Path, limit: int = 15) -> list[dict[str, Any]]:
+    path = data_root / "hl_testnet_audit.jsonl"
+    if not path.is_file():
+        return []
+    records: list[dict[str, Any]] = []
+    try:
+        lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+    except OSError:
+        return []
+    for line in reversed(lines[-limit:]):
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        ts_ms = int(rec.get("ts_ms") or 0)
+        obs = (
+            datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if ts_ms > 0
+            else None
+        )
+        records.append(
+            {
+                "ts_ms": ts_ms,
+                "observed_at_utc": obs,
+                "status": str(rec.get("status") or "unknown"),
+                "violations": list(rec.get("violations") or []),
+                "cancelled_count": int(rec.get("cancelled_count", 0) or 0),
+                "placed_count": int(rec.get("placed_count", 0) or 0),
+                "total_notional_usd": float(rec.get("total_notional_usd", 0.0) or 0.0),
+                "high_water_mark_usd": float(rec.get("high_water_mark_usd", 0.0) or 0.0),
+                "blocked_isolated_coins": list(rec.get("blocked_isolated_coins") or []),
+            }
+        )
+    return records
 
 
 def collect_artifact_freshness(data_root: Path, now_utc: datetime | None = None) -> dict[str, dict[str, Any]]:
@@ -188,7 +251,15 @@ def create_app(
         payload["build_info"] = dict(build_payload)
         payload["worker_status"] = _read_json(resolved_data_root / "hl_worker_status.json")
         payload["artifact_freshness"] = collect_artifact_freshness(resolved_data_root)
+        payload["paper_positions"] = _read_metamodel_positions(resolved_data_root)
+        payload["testnet_audit_recent"] = _read_testnet_audit_tail(resolved_data_root, limit=15)
         return sanitize_json(payload)
+
+    @app.get("/api/v1/metamodel/positions")
+    def metamodel_positions(response: Response) -> dict[str, Any]:
+        _no_store(response)
+        positions = _read_metamodel_positions(resolved_data_root)
+        return sanitize_json({"count": len(positions), "positions": positions})
 
     @app.get("/api/v1/hip3/persistence")
     def hip3_persistence(response: Response) -> dict[str, Any]:
@@ -221,6 +292,7 @@ def create_app(
         return sanitize_json(
             {
                 "attribution": _read_json(resolved_data_root / "hl_testnet_attribution" / "attribution.json"),
+                "testnet_audit_recent": _read_testnet_audit_tail(resolved_data_root, limit=15),
                 "mm_session": _read_json(resolved_data_root / "hl_mm_testnet" / "summary.json"),
                 "mm_calibration": _read_json(resolved_data_root / "hl_mm_calibration" / "calibration.json"),
             }

@@ -8,4 +8,5 @@
 * [⛓️ HyperEVM (999), L1Read & HLP](HyperEVM-DeFi-and-HLP-Scanner)
 * [🏛️ HIP-3, Pendle Boros & Yield Stack](HIP3-Boros-and-HyperEVM-Yield-Stack)
 * [🏆 Whale Liq Map, :00 OOS & H6](Liquidation-Heatmap-Funding-Alpha-and-Tear-Sheet)
-* [⚙️ Operations, 7 Crons & Runbook](Operations-Crons-and-Runbook)
+* [🐳 Docker, Dokploy & Full-Stack CI/CD](Docker-Dokploy-Fullstack-CICD)
+* [⚙️ Operations, Crons & Runbook](Operations-Crons-and-Runbook)

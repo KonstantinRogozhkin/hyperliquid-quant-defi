@@ -107,6 +107,24 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
         json.dumps({"service": "hl-worker", "heartbeat_utc": "2026-11-26 22:45:00 UTC", "jobs": []}),
         encoding="utf-8",
     )
+    (tmp_path / "hl_metamodel").mkdir(parents=True)
+    (tmp_path / "hl_metamodel" / "state.json").write_text(
+        json.dumps(
+            {
+                "starting_capital_usd": 100000.0,
+                "equity_usd": 99800.0,
+                "positions": {
+                    "ETH": {"hl_weight": -0.12, "cex_weight": 0.12, "cex_venue": "bybit", "last_hl_px": 3000.0, "l2_spread_bps": 0.5, "cum_pnl_usd": 12.5},
+                    "BTC": {"hl_weight": 0.05, "cex_weight": 0.0, "cex_venue": "", "last_hl_px": 60000.0, "l2_spread_bps": 0.2, "cum_pnl_usd": -4.0},
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    (tmp_path / "hl_testnet_audit.jsonl").write_text(
+        json.dumps({"ts_ms": 1_795_734_634_563, "status": "ok", "violations": [], "cancelled_count": 1, "placed_count": 7, "total_notional_usd": 380.34, "high_water_mark_usd": 999.0}) + "\n",
+        encoding="utf-8",
+    )
 
     r_hip3 = client.get("/api/v1/hip3/persistence")
     assert r_hip3.status_code == 200
@@ -121,9 +139,16 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     r_attr = client.get("/api/v1/attribution")
     assert r_attr.status_code == 200
     assert r_attr.json()["attribution"]["total_fills"] == 14
+    assert r_attr.json()["testnet_audit_recent"][0]["placed_count"] == 7
+
+    r_pos = client.get("/api/v1/metamodel/positions")
+    assert r_pos.status_code == 200
+    assert r_pos.json()["count"] == 2
+    assert r_pos.json()["positions"][0]["coin"] == "ETH"
 
     r_sched = client.get("/api/v1/scheduler/status")
     assert r_sched.status_code == 200
     sched_body = r_sched.json()
     assert sched_body["worker_status"]["service"] == "hl-worker"
     assert sched_body["artifact_freshness"]["frontier_history"]["exists"] is True
+    assert sched_body["artifact_freshness"]["testnet_audit"]["exists"] is True
