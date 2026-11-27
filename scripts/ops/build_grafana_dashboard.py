@@ -743,14 +743,42 @@ def build_dashboard() -> dict[str, Any]:
             next_id(),
             "Testnet Equity & High-Water Mark (USD)",
             [
-                _target("A", "hl_testnet_equity_usd", legend="Equity USD"),
+                _target("A", "hl_testnet_equity_usd", legend="Equity USD (4h attribution)"),
                 _target("B", "hl_testnet_hwm_usd", legend="HWM USD"),
+                _target("C", "hl_testnet_live_equity_usd", legend="Live Equity USD (15m probe)"),
             ],
             0,
             55,
-            12,
+            8,
             h=7,
             unit="currencyUSD",
+        )
+    )
+    panels.append(
+        _stat(
+            next_id(),
+            "Live Drawdown vs HWM",
+            "hl_testnet_drawdown_pct",
+            8,
+            55,
+            4,
+            h=3,
+            unit="percent",
+            decimals=2,
+            thresholds=[{"color": "green", "value": None}, {"color": "yellow", "value": 2.0}, {"color": "red", "value": 3.5}],
+        )
+    )
+    panels.append(
+        _stat(
+            next_id(),
+            "Orphan Notional (no 2-sided book)",
+            "hl_testnet_live_orphan_notional_usd",
+            8,
+            58,
+            4,
+            h=4,
+            unit="currencyUSD",
+            thresholds=[{"color": "green", "value": None}, {"color": "yellow", "value": 1}, {"color": "red", "value": 150}],
         )
     )
     panels.append(

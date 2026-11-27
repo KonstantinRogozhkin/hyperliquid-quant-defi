@@ -108,6 +108,11 @@ def test_drawdown_kill_switch_uses_persisted_high_water_mark(tmp_path: Path):
     )
     assert res["status"] == "kill_switch_triggered"
     assert any(v.startswith("drawdown_limit") for v in res["violations"])
+    assert res["equity_usd"] == pytest.approx(9_000.0)
+    assert res["drawdown_pct"] == pytest.approx(10.0)
+    assert res["orphan_notional_usd"] == 0.0
+    assert ex.drawdown_pct(11_000.0, 10_000.0) == 0.0
+    assert ex.drawdown_pct(9_500.0, 0.0) == 0.0
 
     # Without a stored mark the gate can only compare equity with itself.
     res_none = ex.execute_rebalance_cycle(_acct(9_000.0), {"BTC": 0.1}, meta, bbo, ex.DryRunAdapter(), now_ms=now)
@@ -168,6 +173,8 @@ def test_fetch_testnet_account_unified_vs_standard_equity():
         snap = ex.fetch_testnet_account(client, "0xUNIFIED")
     assert snap.equity_usd == pytest.approx(998.71)
     assert snap.free_margin_usd == pytest.approx(998.71 - 61.35)
+    assert snap.position_unrealized_pnl_usd == {"ETH": pytest.approx(-0.26)}
+    assert snap.position_entry_px == {}  # no entryPx in payload -> omitted, never 0
 
     def standard_handler(req: httpx.Request) -> httpx.Response:
         t = json.loads(req.content)["type"]

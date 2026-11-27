@@ -301,6 +301,80 @@ def render_prometheus_metrics(
                     help_text="Open Testnet positions currently unquoted and unmanaged",
                 )
 
+    # 3b. Read-only 15m live Testnet risk probe (equity vs HWM, orphans, mark-vs-oracle)
+    risk = overview.get("testnet_risk")
+    if isinstance(risk, dict):
+        b.emit("hl_testnet_live_equity_usd", risk.get("equity_usd"), help_text="Live Testnet equity USD from 15m risk probe")
+        b.emit("hl_testnet_live_free_margin_usd", risk.get("free_margin_usd"), help_text="Live Testnet free margin USD from 15m risk probe")
+        b.emit("hl_testnet_drawdown_pct", risk.get("drawdown_pct"), help_text="Live Testnet drawdown below equity HWM, percent")
+        b.emit(
+            "hl_testnet_drawdown_headroom_pct",
+            risk.get("drawdown_headroom_pct"),
+            help_text="Percentage points left before the executor drawdown kill-switch",
+        )
+        b.emit("hl_testnet_gross_leverage", risk.get("gross_leverage"), help_text="Live Testnet gross notional / equity")
+        b.emit("hl_testnet_live_open_positions", risk.get("open_positions"), help_text="Live Testnet open perp positions")
+        b.emit(
+            "hl_testnet_unrealized_pnl_mark_usd",
+            risk.get("unrealized_pnl_mark_usd"),
+            help_text="Live Testnet unrealized PnL at exchange mark price USD",
+        )
+        b.emit(
+            "hl_testnet_unrealized_pnl_oracle_usd",
+            risk.get("unrealized_pnl_oracle_usd"),
+            help_text="Live Testnet unrealized PnL re-priced at oracle USD",
+        )
+        b.emit(
+            "hl_testnet_mark_oracle_pnl_gap_pct",
+            risk.get("mark_oracle_pnl_gap_pct"),
+            help_text="Abs(mark uPnL - oracle uPnL) as percent of Testnet equity",
+        )
+        b.emit(
+            "hl_testnet_mark_oracle_max_dev_pct",
+            risk.get("max_mark_oracle_dev_pct"),
+            help_text="Largest signed mark/oracle - 1 deviation across open Testnet positions, percent",
+        )
+        r_orphans = risk.get("orphan_positions")
+        if isinstance(r_orphans, dict):
+            b.emit(
+                "hl_testnet_live_orphan_positions",
+                len(r_orphans),
+                help_text="Live Testnet positions without a two-sided book (unmanageable by ALO planner)",
+            )
+        b.emit("hl_testnet_live_orphan_notional_usd", risk.get("orphan_notional_usd"), help_text="Gross USD notional of live Testnet orphan positions")
+        b.emit(
+            "hl_testnet_live_orphan_unrealized_pnl_usd",
+            risk.get("orphan_unrealized_pnl_usd"),
+            help_text="Mark-based unrealized PnL of live Testnet orphan positions USD",
+        )
+        obs_ms = _num(risk.get("observed_at_ms"))
+        if obs_ms is not None and obs_ms > 0:
+            b.emit("hl_testnet_risk_observed_ts_seconds", obs_ms / 1000.0, help_text="Unix time of the latest Testnet risk probe")
+        for crow in risk.get("per_coin") or []:
+            if not isinstance(crow, dict) or not crow.get("coin"):
+                continue
+            rl = {"coin": str(crow["coin"]), "book": str(crow.get("book") or "unknown")}
+            b.emit("hl_testnet_live_position_usd", crow.get("notional_usd"), help_text="Live Testnet signed position notional USD", labels=rl)
+            b.emit(
+                "hl_testnet_live_position_upnl_mark_usd",
+                crow.get("unrealized_pnl_mark_usd"),
+                help_text="Live Testnet per-coin unrealized PnL at mark USD",
+                labels=rl,
+            )
+            b.emit(
+                "hl_testnet_live_position_upnl_oracle_usd",
+                crow.get("unrealized_pnl_oracle_usd"),
+                help_text="Live Testnet per-coin unrealized PnL at oracle USD",
+                labels=rl,
+            )
+            b.emit(
+                "hl_testnet_live_position_mark_oracle_dev_pct",
+                crow.get("mark_oracle_dev_pct"),
+                help_text="Live Testnet per-coin mark/oracle - 1 deviation, percent",
+                labels=rl,
+            )
+            b.emit("hl_testnet_live_position_orphan", bool(crow.get("orphan")), help_text="1 if the live Testnet position is an orphan", labels=rl)
+
     # 4. HIP-3 Split-Margin Paper Ledger & Persistence
     hp = overview.get("hip3_paper")
     if isinstance(hp, dict):

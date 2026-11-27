@@ -106,11 +106,21 @@ groups:
           summary: "CRITICAL: Strategy Max Drawdown > 5% or HyperCore API Quota > 0.85 req/$"
           description: "Desk strategy drawdown breached 5% safety limit or API request rate is approaching HyperCore's 1 req/$1 volume ceiling."
 
+      - alert: HLTestnetDrawdownNearKillSwitch
+        expr: hl_testnet_drawdown_pct > 3.5
+        for: 5m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "CRITICAL: Testnet equity {{ $value | humanize }}% below HWM (kill-switch at 5%)"
+          description: "15m risk probe shows live Testnet drawdown > 3.5%. Check hl_testnet_unrealized_pnl_oracle_usd vs mark and orphan positions in /api/v1/overview testnet_risk."
+
   - name: hyperliquid-quant-defi-warning
     interval: 60s
     rules:
       - alert: HLArtifactStale
-        expr: hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_audit"} > 360
+        expr: hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_.*"} > 360
         for: 15m
         labels:
           severity: warning
@@ -138,3 +148,53 @@ groups:
         annotations:
           summary: "Testnet ALO post-only fill rate degraded (< 65%)"
           description: "Real ALO fill rate dropped to {{ $value }}% (target >= 85%). Check BBO spread conditions."
+
+      - alert: HLTestnetDrawdownWarning
+        expr: hl_testnet_drawdown_pct > 2.0
+        for: 15m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Testnet equity {{ $value | humanize }}% below HWM (warning > 2%)"
+          description: "Live Testnet drawdown from the executor HWM exceeded 2% for 15m; kill-switch fires at 5% on the next 4h executor cycle."
+
+      - alert: HLTestnetOrphanPositions
+        expr: hl_testnet_live_orphan_positions > 0
+        for: 30m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "{{ $value }} Testnet position(s) have no two-sided book (orphans)"
+          description: "The ALO planner cannot price, rebalance or close these positions. See hl_testnet_live_position_orphan and hl_testnet_live_orphan_notional_usd; unwind manually with reduce-only limits near oracle."
+
+      - alert: HLTestnetMarkOracleDislocation
+        expr: hl_testnet_mark_oracle_pnl_gap_pct > 1.0
+        for: 30m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Testnet mark-vs-oracle uPnL gap is {{ $value | humanize }}% of equity"
+          description: "Thin Testnet books moved mark prices away from oracle; mark-based PnL and drawdown overstate (or understate) economic exposure."
+
+      - alert: HLTestnetRiskProbeStale
+        expr: hl_artifact_age_minutes{artifact="testnet_risk"} > 45
+        for: 5m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Testnet 15m risk probe stale ({{ $value | humanize }} min)"
+          description: "hl_testnet_risk/latest.json has not refreshed in > 45 min; live drawdown/orphan telemetry is blind. Check the testnet_risk_probe worker job."
+
+      - alert: HLTestnetAttributionStale
+        expr: hl_artifact_age_minutes{artifact="testnet_attribution"} > 300
+        for: 15m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Testnet attribution stale ({{ $value | humanize }} min, cadence 4h)"
+          description: "hl_testnet_* attribution gauges (equity, PnL, per-coin) are frozen at the last successful 4h run. Check the testnet_attribution worker job."

@@ -41,6 +41,7 @@ ARTIFACT_FILES: dict[str, str] = {
     "settlement_study": "hl_funding_settlement_study/stats.parquet",
     "testnet_attribution": "hl_testnet_attribution/attribution.json",
     "testnet_audit": "hl_testnet_audit.jsonl",
+    "testnet_risk": "hl_testnet_risk/latest.json",
     "worker_status": "hl_worker_status.json",
 }
 
@@ -175,7 +176,18 @@ def _audit_record(rec: dict[str, Any]) -> dict[str, Any]:
         "blocked_isolated_coins": list(rec.get("blocked_isolated_coins") or []),
         "skipped_unquoted_coins": list(rec.get("skipped_unquoted_coins") or []),
         "orphan_positions": dict(rec.get("orphan_positions") or {}),
+        "equity_usd": _opt_float(rec.get("equity_usd")),
+        "drawdown_pct": _opt_float(rec.get("drawdown_pct")),
+        "orphan_notional_usd": _opt_float(rec.get("orphan_notional_usd")),
     }
+
+
+def _opt_float(raw: Any) -> float | None:
+    """Optional numeric audit field (absent on records written before it existed)."""
+    if raw is None:
+        return None
+    x = float(raw)
+    return x if math.isfinite(x) else None
 
 
 def collect_artifact_freshness(data_root: Path, now_utc: datetime | None = None) -> dict[str, dict[str, Any]]:
@@ -269,6 +281,7 @@ def create_app(
         payload["artifact_freshness"] = collect_artifact_freshness(resolved_data_root)
         payload["paper_positions"] = _read_metamodel_positions(resolved_data_root)
         payload["testnet_audit_recent"] = _read_testnet_audit_tail(resolved_data_root, limit=15)
+        payload["testnet_risk"] = _read_json(resolved_data_root / "hl_testnet_risk" / "latest.json")
         return payload
 
     @app.get("/metrics")
@@ -361,6 +374,7 @@ def create_app(
             {
                 "attribution": _read_json(resolved_data_root / "hl_testnet_attribution" / "attribution.json"),
                 "testnet_audit_recent": _read_testnet_audit_tail(resolved_data_root, limit=15),
+                "testnet_risk": _read_json(resolved_data_root / "hl_testnet_risk" / "latest.json"),
                 "mm_session": _read_json(resolved_data_root / "hl_mm_testnet" / "summary.json"),
                 "mm_calibration": _read_json(resolved_data_root / "hl_mm_calibration" / "calibration.json"),
             }

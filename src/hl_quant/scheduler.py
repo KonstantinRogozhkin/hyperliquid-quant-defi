@@ -1,7 +1,7 @@
 """Container-native UTC job scheduler replacing local macOS crons for Docker / Dokploy.
 
-Runs the 9 core Hyperliquid research/paper/testnet jobs plus 6 read-only dashboard/analytics
-scanners (15 UTC jobs total) in isolated subprocesses with:
+Runs the 10 core Hyperliquid research/paper/testnet jobs plus 6 read-only dashboard/analytics
+scanners (16 UTC jobs total) in isolated subprocesses with:
 - Catch-up slot evaluation + per-job non-overlapping worker threads (so a slow job at :05 never
   skips another job scheduled at :10)
 - Atomic ``hl_worker_status.json`` telemetry
@@ -292,6 +292,16 @@ def build_job_specs() -> list[JobSpec]:
             cmd.append("--telegram")
         return cmd
 
+    def _risk_probe_cmd(root: Path, data_dir: Path, _tg: bool) -> list[str]:
+        return [
+            py,
+            str(root / "scripts/analytics/run_hl_testnet_risk_probe.py"),
+            "--hwm-state",
+            str(data_dir / "paper/hl_testnet_hwm.json"),
+            "--output-json",
+            str(data_dir / "paper/hl_testnet_risk/latest.json"),
+        ]
+
     four_hour = (0, 4, 8, 12, 16, 20)
     return [
         JobSpec(
@@ -486,6 +496,19 @@ def build_job_specs() -> list[JobSpec]:
             readonly=True,
             bootstrap_eligible=True,
             build_command=_attribution_cmd,
+            is_enabled=_testnet_attr_enabled,
+            has_required_credentials=_testnet_attr_enabled,
+        ),
+        JobSpec(
+            name="testnet_risk_probe",
+            description="Read-only Testnet live equity/drawdown/orphan & mark-vs-oracle risk probe (15m :02)",
+            cron_expr="2-59/15 * * * *",
+            minutes=(2, 17, 32, 47),
+            hours=None,
+            timeout_s=90,
+            readonly=True,
+            bootstrap_eligible=True,
+            build_command=_risk_probe_cmd,
             is_enabled=_testnet_attr_enabled,
             has_required_credentials=_testnet_attr_enabled,
         ),
@@ -913,6 +936,7 @@ class WorkerScheduler:
             "mm_calibration": self.paper_dir / "hl_mm_calibration" / "calibration.json",
             "settlement_study": self.paper_dir / "hl_funding_settlement_study" / "stats.parquet",
             "testnet_attribution": self.paper_dir / "hl_testnet_attribution" / "attribution.json",
+            "testnet_risk_probe": self.paper_dir / "hl_testnet_risk" / "latest.json",
         }
         return sentinels.get(job_name)
 

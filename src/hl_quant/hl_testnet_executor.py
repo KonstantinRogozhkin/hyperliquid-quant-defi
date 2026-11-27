@@ -65,6 +65,10 @@ class AccountSnapshot:
     # Signed USD mark value per held coin (+long, -short) from clearinghouseState, so unquoted
     # orphan positions are still counted in gross leverage and dollar-neutrality checks.
     position_notional_usd: dict[str, float] = field(default_factory=dict)
+    # Per-coin average entry price and exchange-reported (mark-based) unrealized PnL, used by the
+    # read-only risk probe to re-price positions at the oracle on thin Testnet books.
+    position_entry_px: dict[str, float] = field(default_factory=dict)
+    position_unrealized_pnl_usd: dict[str, float] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +184,8 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
     positions_sz: dict[str, float] = {}
     position_leverage: dict[str, tuple[str, int]] = {}
     position_notional_usd: dict[str, float] = {}
+    position_entry_px: dict[str, float] = {}
+    position_unrealized_pnl_usd: dict[str, float] = {}
     for entry in st.get("assetPositions") or []:
         pos = entry.get("position") or {}
         coin = str(pos.get("coin") or "").strip()
@@ -191,6 +197,12 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
                 pos_val = abs(szi) * abs(float(pos.get("entryPx", 0.0) or 0.0))
             if pos_val > 0.0:
                 position_notional_usd[coin] = math.copysign(pos_val, szi)
+            entry_px = float(pos.get("entryPx", 0.0) or 0.0)
+            if math.isfinite(entry_px) and entry_px > 0.0:
+                position_entry_px[coin] = entry_px
+            upnl = float(pos.get("unrealizedPnl", 0.0) or 0.0)
+            if math.isfinite(upnl):
+                position_unrealized_pnl_usd[coin] = upnl
             lev = pos.get("leverage") if isinstance(pos.get("leverage"), dict) else {}
             if lev:
                 position_leverage[coin] = (str(lev.get("type", "cross")), int(float(lev.get("value", 1))))
@@ -237,6 +249,8 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
         observed_at_ms=int(time.time() * 1000),
         position_leverage=position_leverage,
         position_notional_usd=position_notional_usd,
+        position_entry_px=position_entry_px,
+        position_unrealized_pnl_usd=position_unrealized_pnl_usd,
     )
 
 
@@ -271,6 +285,13 @@ def filter_unquoted_targets(
     return filtered, missing
 
 
+def drawdown_pct(equity_usd: float, high_water_mark_usd: float) -> float:
+    """Percent drawdown of ``equity_usd`` below the high-water mark (0 when at/above HWM or HWM unset)."""
+    if not (math.isfinite(equity_usd) and math.isfinite(high_water_mark_usd)) or high_water_mark_usd <= 0:
+        return 0.0
+    return max(0.0, (1.0 - equity_usd / high_water_mark_usd) * 100.0)
+
+
 def check_kill_switch(
     account: AccountSnapshot,
     target_weights: dict[str, float],
@@ -296,7 +317,7 @@ def check_kill_switch(
         return reasons
 
     if high_water_mark_usd > 0:
-        dd_pct = (1.0 - account.equity_usd / high_water_mark_usd) * 100.0
+        dd_pct = drawdown_pct(account.equity_usd, high_water_mark_usd)
         if dd_pct >= limits.max_drawdown_pct:
             reasons.append(f"drawdown_limit:{dd_pct:.2f}%>={limits.max_drawdown_pct:.2f}%")
 
@@ -699,6 +720,15 @@ def execute_rebalance_cycle(
         if abs(float(account.positions_sz.get(c, 0.0) or 0.0)) > 1e-12
     }
     violations = check_kill_switch(account, target_weights, bbo, limits, high_water_mark_usd=hwm, now_ms=now_ms)
+    # Persist the account view the kill-switch evaluated, so the audit trail (and /metrics) show
+    # equity, drawdown and orphan exposure even on cycles where nothing trips.
+    orphan_notional_usd = sum(abs(float(account.position_notional_usd.get(c, 0.0) or 0.0)) for c in orphan_positions)
+    account_fields: dict[str, Any] = {
+        "equity_usd": round(account.equity_usd, 6),
+        "free_margin_usd": round(account.free_margin_usd, 6),
+        "drawdown_pct": round(drawdown_pct(account.equity_usd, hwm), 4),
+        "orphan_notional_usd": round(orphan_notional_usd, 4),
+    }
 
     # On kill-switch emergency, cancel ALL open orders; during normal rebalance, cancel only
     # orders belonging to the rebalance coin scope so concurrent MM quotes on other coins survive.
@@ -717,6 +747,7 @@ def execute_rebalance_cycle(
             "high_water_mark_usd": hwm,
             "skipped_unquoted_coins": skipped_unquoted,
             "orphan_positions": orphan_positions,
+            **account_fields,
             "orders": [],
         }
     else:
@@ -741,7 +772,7 @@ def execute_rebalance_cycle(
             target_lev = max(1, min(spec.max_leverage, limits.default_cross_leverage if is_cross else limits.default_isolated_leverage))
             cur_mode, cur_lev = account.position_leverage.get(o.coin, ("", 0))
             expected_mode = "cross" if is_cross else "isolated"
-            if cur_mode == expected_mode and 0 < cur_lev <= target_lev:
+            if cur_mode == expected_mode and cur_lev == target_lev:
                 continue
             try:
                 upd = adapter.set_leverage(o.coin, target_lev, is_cross=is_cross)
@@ -768,6 +799,7 @@ def execute_rebalance_cycle(
             "blocked_isolated_coins": sorted(blocked_isolated_coins),
             "skipped_unquoted_coins": skipped_unquoted,
             "orphan_positions": orphan_positions,
+            **account_fields,
             "orders": placed,
         }
 

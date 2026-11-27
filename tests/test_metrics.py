@@ -32,6 +32,28 @@ def test_render_prometheus_metrics_emits_valid_exposition_lines():
         "testnet_audit_recent": [
             {"status": "ok", "high_water_mark_usd": 1006.55, "placed_count": 8, "skipped_unquoted_coins": ["JUP", "PONS"]}
         ],
+        "testnet_risk": {
+            "observed_at_ms": 1795806081453,
+            "equity_usd": 992.76,
+            "free_margin_usd": 847.51,
+            "drawdown_pct": 1.3698,
+            "drawdown_headroom_pct": 3.6302,
+            "gross_leverage": 0.3741,
+            "open_positions": 13,
+            "unrealized_pnl_mark_usd": -13.48,
+            "unrealized_pnl_oracle_usd": -6.96,
+            "mark_oracle_pnl_gap_pct": 0.6569,
+            "max_mark_oracle_dev_pct": 29.74,
+            "orphan_positions": {"SKY": {"szi": -975.0}, "VVV": {"szi": 1.71}},
+            "orphan_notional_usd": 89.41,
+            "orphan_unrealized_pnl_usd": -2.73,
+            "per_coin": [
+                {"coin": "SKY", "book": "ask_only", "notional_usd": -45.52, "unrealized_pnl_mark_usd": 0.03,
+                 "unrealized_pnl_oracle_usd": -0.1, "mark_oracle_dev_pct": -0.9, "orphan": True},
+                {"coin": "XMR", "book": "two_sided", "notional_usd": 52.29, "unrealized_pnl_mark_usd": -21.71,
+                 "unrealized_pnl_oracle_usd": -9.76, "mark_oracle_dev_pct": -18.3, "orphan": False},
+            ],
+        },
         "hip3_paper": {
             "equity_usd": 49996.135,
             "return_pct": -0.0077,
@@ -83,6 +105,16 @@ def test_render_prometheus_metrics_emits_valid_exposition_lines():
     assert 'hl_worker_job_failed{worker_job="onchain_events"} 1' in text
     assert "hl_testnet_equity_usd 1004.16" in text
     assert "hl_testnet_last_cycle_skipped_unquoted 2" in text
+    assert "hl_testnet_live_equity_usd 992.76" in text
+    assert "hl_testnet_drawdown_pct 1.3698" in text
+    assert "hl_testnet_live_orphan_positions 2" in text
+    assert "hl_testnet_live_orphan_notional_usd 89.41" in text
+    assert "hl_testnet_unrealized_pnl_oracle_usd -6.96" in text
+    assert "hl_testnet_mark_oracle_pnl_gap_pct 0.6569" in text
+    assert "hl_testnet_risk_observed_ts_seconds 1795806081.453" in text
+    assert 'hl_testnet_live_position_orphan{coin="SKY",book="ask_only"} 1' in text
+    assert 'hl_testnet_live_position_orphan{coin="XMR",book="two_sided"} 0' in text
+    assert 'hl_testnet_live_position_mark_oracle_dev_pct{coin="XMR",book="two_sided"} -18.3' in text
     assert "hl_hip3_paper_equity_usd 49996.135" in text
     assert 'hl_hip3_paper_pair_live_apr_pct{symbol="NVDA",short_dex="io",long_dex="xyz",margin_mode="cross"} 41.26' in text
     assert 'hl_cross_dex_paper_pair_live_apr_pct{coin="NEAR",other_dex="extended"} 37.77' in text

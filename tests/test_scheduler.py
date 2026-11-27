@@ -13,7 +13,16 @@ from hl_quant.scheduler import WorkerScheduler, app, build_job_specs
 
 def test_job_schedule_matching(tmp_path: Path):
     jobs = {j.name: j for j in build_job_specs()}
-    assert len(jobs) == 15
+    assert len(jobs) == 16
+
+    probe = jobs["testnet_risk_probe"]
+    assert probe.readonly is True
+    assert probe.should_run_at(datetime(2026, 11, 26, 14, 2, tzinfo=timezone.utc))
+    assert probe.should_run_at(datetime(2026, 11, 26, 14, 47, tzinfo=timezone.utc))
+    assert not probe.should_run_at(datetime(2026, 11, 26, 14, 10, tzinfo=timezone.utc))
+    probe_cmd = probe.build_command(Path("/app"), tmp_path, False)
+    assert str(tmp_path / "paper/hl_testnet_risk/latest.json") in probe_cmd
+    assert "--execute-testnet" not in probe_cmd
 
     assert jobs["onchain_events"].should_run_at(datetime(2026, 11, 26, 14, 15, tzinfo=timezone.utc))
     assert not jobs["onchain_events"].should_run_at(datetime(2026, 11, 26, 14, 16, tzinfo=timezone.utc))

@@ -2616,7 +2616,7 @@
       },
       "gridPos": {
         "h": 7,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 55
       },
@@ -2628,7 +2628,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "legendFormat": "Equity USD"
+          "legendFormat": "Equity USD (4h attribution)"
         },
         {
           "refId": "B",
@@ -2638,6 +2638,15 @@
             "uid": "${datasource}"
           },
           "legendFormat": "HWM USD"
+        },
+        {
+          "refId": "C",
+          "expr": "hl_testnet_live_equity_usd",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "Live Equity USD (15m probe)"
         }
       ],
       "options": {
@@ -2672,6 +2681,135 @@
     },
     {
       "id": 36,
+      "type": "stat",
+      "title": "Live Drawdown vs HWM",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 3,
+        "w": 4,
+        "x": 8,
+        "y": 55
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "hl_testnet_drawdown_pct",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 2.0
+              },
+              {
+                "color": "red",
+                "value": 3.5
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 37,
+      "type": "stat",
+      "title": "Orphan Notional (no 2-sided book)",
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      },
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 8,
+        "y": 58
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "hl_testnet_live_orphan_notional_usd",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "instant": true,
+          "range": false
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "values": false,
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": ""
+        },
+        "orientation": "auto",
+        "textMode": "auto",
+        "colorMode": "value",
+        "graphMode": "none",
+        "justifyMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "yellow",
+                "value": 1
+              },
+              {
+                "color": "red",
+                "value": 150
+              }
+            ]
+          }
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 38,
       "type": "stat",
       "title": "Testnet Net PnL",
       "datasource": {
@@ -2731,7 +2869,7 @@
       }
     },
     {
-      "id": 37,
+      "id": 39,
       "type": "stat",
       "title": "ALO Fill Rate",
       "datasource": {
@@ -2795,7 +2933,7 @@
       }
     },
     {
-      "id": 38,
+      "id": 40,
       "type": "stat",
       "title": "Maker Share",
       "datasource": {
@@ -2859,7 +2997,7 @@
       }
     },
     {
-      "id": 39,
+      "id": 41,
       "type": "stat",
       "title": "VW Markout (bps)",
       "datasource": {
@@ -2919,7 +3057,7 @@
       }
     },
     {
-      "id": 40,
+      "id": 42,
       "type": "stat",
       "title": "Min Liq Distance",
       "datasource": {
@@ -2983,7 +3121,7 @@
       }
     },
     {
-      "id": 41,
+      "id": 43,
       "type": "stat",
       "title": "API Reqs / $ Vol",
       "datasource": {
@@ -3047,7 +3185,7 @@
       }
     },
     {
-      "id": 42,
+      "id": 44,
       "type": "stat",
       "title": "Skipped Unquoted",
       "datasource": {
@@ -3111,7 +3249,7 @@
       }
     },
     {
-      "id": 43,
+      "id": 45,
       "type": "table",
       "title": "Testnet Per-Coin Positions, Net PnL, Maker %, Liq Distance & ADL Rank",
       "datasource": {
@@ -3336,7 +3474,7 @@
       }
     },
     {
-      "id": 44,
+      "id": 46,
       "type": "row",
       "title": "6. Frontier Yield: Pendle Boros Fixed Funding, HyperEVM (999) & HLP",
       "collapsed": false,
@@ -3348,7 +3486,7 @@
       }
     },
     {
-      "id": 45,
+      "id": 47,
       "type": "stat",
       "title": "HLP Benchmark APR",
       "datasource": {
@@ -3395,7 +3533,7 @@
       }
     },
     {
-      "id": 46,
+      "id": 48,
       "type": "stat",
       "title": "Best Composable Loop",
       "datasource": {
@@ -3442,7 +3580,7 @@
       }
     },
     {
-      "id": 47,
+      "id": 49,
       "type": "stat",
       "title": "HLP All-Time MM PnL",
       "datasource": {
@@ -3489,7 +3627,7 @@
       }
     },
     {
-      "id": 48,
+      "id": 50,
       "type": "stat",
       "title": "Boros Active HL Markets",
       "datasource": {
@@ -3536,7 +3674,7 @@
       }
     },
     {
-      "id": 49,
+      "id": 51,
       "type": "stat",
       "title": "USDT0 Peg Discount (bps)",
       "datasource": {
@@ -3583,7 +3721,7 @@
       }
     },
     {
-      "id": 50,
+      "id": 52,
       "type": "stat",
       "title": "L1Read Max Drift (bps)",
       "datasource": {
@@ -3647,7 +3785,7 @@
       }
     },
     {
-      "id": 51,
+      "id": 53,
       "type": "timeseries",
       "title": "HLP APR vs Best HyperEVM Composable Yield Stack (%)",
       "datasource": {
@@ -3720,7 +3858,7 @@
       }
     },
     {
-      "id": 52,
+      "id": 54,
       "type": "table",
       "title": "Pendle Boros — Live Fixed-Funding Bid APR vs Floating Spread",
       "datasource": {
@@ -3849,7 +3987,7 @@
       }
     },
     {
-      "id": 53,
+      "id": 55,
       "type": "row",
       "title": "7. On-Chain Alpha (H2/H4/H5/H6) & Avellaneda-Stoikov MM Calibration",
       "collapsed": false,
@@ -3861,7 +3999,7 @@
       }
     },
     {
-      "id": 54,
+      "id": 56,
       "type": "timeseries",
       "title": "H2 Whale Liquidation Walls (0–5% from Mark, USD)",
       "datasource": {
@@ -3916,7 +4054,7 @@
       }
     },
     {
-      "id": 55,
+      "id": 57,
       "type": "timeseries",
       "title": "Avellaneda-Stoikov Empirical Kappa (/bp) & R²",
       "datasource": {
@@ -3979,7 +4117,7 @@
       }
     },
     {
-      "id": 56,
+      "id": 58,
       "type": "stat",
       "title": "AS-MM Latency p50",
       "datasource": {
@@ -4027,7 +4165,7 @@
       }
     },
     {
-      "id": 57,
+      "id": 59,
       "type": "stat",
       "title": "AS-MM Latency p99",
       "datasource": {
@@ -4075,7 +4213,7 @@
       }
     },
     {
-      "id": 58,
+      "id": 60,
       "type": "stat",
       "title": "AS-MM Throughput",
       "datasource": {
@@ -4123,7 +4261,7 @@
       }
     },
     {
-      "id": 59,
+      "id": 61,
       "type": "stat",
       "title": "HIP-3 24h Builder Vol",
       "datasource": {
@@ -4170,7 +4308,7 @@
       }
     },
     {
-      "id": 60,
+      "id": 62,
       "type": "stat",
       "title": "5-DEX Top Spread APR",
       "datasource": {
@@ -4217,7 +4355,7 @@
       }
     },
     {
-      "id": 61,
+      "id": 63,
       "type": "stat",
       "title": "Spot+Perp L2 Eligible",
       "datasource": {
@@ -4264,7 +4402,7 @@
       }
     },
     {
-      "id": 62,
+      "id": 64,
       "type": "row",
       "title": "8. Scheduler Jobs (15 UTC Crons) & Artifact Freshness",
       "collapsed": false,
@@ -4276,7 +4414,7 @@
       }
     },
     {
-      "id": 63,
+      "id": 65,
       "type": "table",
       "title": "All 15 UTC Worker Jobs — Live Status, Runs & Duration",
       "datasource": {
@@ -4439,7 +4577,7 @@
       }
     },
     {
-      "id": 64,
+      "id": 66,
       "type": "bargauge",
       "title": "Artifact Freshness Age (min)",
       "datasource": {

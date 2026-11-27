@@ -187,3 +187,128 @@ groups:
           - refId: C
             datasourceUid: __expr__
             model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-crit-testnet-drawdown
+        title: "CRITICAL: Testnet Drawdown > 3.5% from HWM"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Live Testnet equity is more than 3.5% below the executor HWM (kill-switch at 5%)"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(hl_testnet_drawdown_pct)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [3.5] } }], refId: C }
+
+  - orgId: 1
+    name: hl-quant-warning
+    folder: Hyperliquid Quant DeFi
+    interval: 1m
+    rules:
+      - uid: hl-warn-testnet-drawdown
+        title: "WARNING: Testnet Drawdown > 2% from HWM"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Live Testnet equity is more than 2% below the executor HWM"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(hl_testnet_drawdown_pct)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [2.0] } }], refId: C }
+
+      - uid: hl-warn-testnet-orphans
+        title: "WARNING: Testnet Orphan Positions (no two-sided book)"
+        condition: C
+        for: 30m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Open Testnet positions the ALO planner cannot price or close; unwind with reduce-only limits near oracle"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(hl_testnet_live_orphan_positions)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-warn-testnet-mark-oracle
+        title: "WARNING: Testnet Mark-vs-Oracle uPnL Gap > 1% of Equity"
+        condition: C
+        for: 30m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Thin Testnet books pushed mark prices away from oracle; mark-based PnL misstates exposure"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(hl_testnet_mark_oracle_pnl_gap_pct)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [1.0] } }], refId: C }
+
+      - uid: hl-warn-testnet-risk-stale
+        title: "WARNING: Testnet Risk Probe Stale (> 45 min)"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "hl_testnet_risk/latest.json not refreshed for > 45 min; live drawdown/orphan telemetry is blind"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(hl_artifact_age_minutes{artifact=\"testnet_risk\"})", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [45] } }], refId: C }
+
+      - uid: hl-warn-testnet-attr-stale
+        title: "WARNING: Testnet Attribution Stale (> 5h)"
+        condition: C
+        for: 15m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "hl_testnet_* attribution gauges are frozen at the last successful 4h run"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(hl_artifact_age_minutes{artifact=\"testnet_attribution\"})", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [300] } }], refId: C }
