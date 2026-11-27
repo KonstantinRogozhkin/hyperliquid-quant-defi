@@ -183,7 +183,8 @@ def render_prometheus_metrics(
         for job in jobs:
             jname = str(job["name"])
             state = str(job.get("state") or "idle")
-            lbl = {"job": jname}
+            # Emit both `worker_job` (immune to Prometheus scrape `job` label collision) and `job` (backwards-compat)
+            lbl = {"job": jname, "worker_job": jname}
             b.emit("hl_worker_job_enabled", bool(job.get("enabled")), help_text="1 if job is enabled", labels=lbl)
             b.emit("hl_worker_job_ok", state == "ok", help_text="1 if job last state is ok", labels=lbl)
             b.emit("hl_worker_job_failed", state == "failed", help_text="1 if job last state is failed", labels=lbl)

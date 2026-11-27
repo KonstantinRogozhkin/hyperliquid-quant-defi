@@ -1031,11 +1031,11 @@ def build_dashboard() -> dict[str, Any]:
             "datasource": DS,
             "gridPos": {"h": 8, "w": 12, "x": 0, "y": 94},
             "targets": [
-                _target("A", "max by (job) (hl_worker_job_ok)", instant=True, table=True),
-                _target("B", "max by (job) (hl_worker_job_failed)", instant=True, table=True),
-                _target("C", "max by (job) (hl_worker_job_runs_ok_total)", instant=True, table=True),
-                _target("D", "max by (job) (hl_worker_job_runs_failed_total)", instant=True, table=True),
-                _target("E", "max by (job) (hl_worker_job_last_duration_seconds)", instant=True, table=True),
+                _target("A", "max by (worker_job) (hl_worker_job_ok)", instant=True, table=True),
+                _target("B", "max by (worker_job) (hl_worker_job_failed)", instant=True, table=True),
+                _target("C", "max by (worker_job) (hl_worker_job_runs_ok_total)", instant=True, table=True),
+                _target("D", "max by (worker_job) (hl_worker_job_runs_failed_total)", instant=True, table=True),
+                _target("E", "max by (worker_job) (hl_worker_job_last_duration_seconds)", instant=True, table=True),
             ],
             "transformations": [
                 {"id": "merge", "options": {}},
@@ -1044,7 +1044,7 @@ def build_dashboard() -> dict[str, Any]:
                     "options": {
                         "excludeByName": {"Time": True},
                         "renameByName": {
-                            "job": "Job",
+                            "worker_job": "Job",
                             "Value #A": "OK",
                             "Value #B": "Failed",
                             "Value #C": "Total OK",

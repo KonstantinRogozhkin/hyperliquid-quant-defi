@@ -4292,7 +4292,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (job) (hl_worker_job_ok)",
+          "expr": "max by (worker_job) (hl_worker_job_ok)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4303,7 +4303,7 @@
         },
         {
           "refId": "B",
-          "expr": "max by (job) (hl_worker_job_failed)",
+          "expr": "max by (worker_job) (hl_worker_job_failed)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4314,7 +4314,7 @@
         },
         {
           "refId": "C",
-          "expr": "max by (job) (hl_worker_job_runs_ok_total)",
+          "expr": "max by (worker_job) (hl_worker_job_runs_ok_total)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4325,7 +4325,7 @@
         },
         {
           "refId": "D",
-          "expr": "max by (job) (hl_worker_job_runs_failed_total)",
+          "expr": "max by (worker_job) (hl_worker_job_runs_failed_total)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4336,7 +4336,7 @@
         },
         {
           "refId": "E",
-          "expr": "max by (job) (hl_worker_job_last_duration_seconds)",
+          "expr": "max by (worker_job) (hl_worker_job_last_duration_seconds)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4358,7 +4358,7 @@
               "Time": true
             },
             "renameByName": {
-              "job": "Job",
+              "worker_job": "Job",
               "Value #A": "OK",
               "Value #B": "Failed",
               "Value #C": "Total OK",

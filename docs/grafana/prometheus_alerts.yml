@@ -23,8 +23,8 @@ groups:
           severity: critical
           service: hyperliquid-quant-defi
         annotations:
-          summary: "Hyperliquid scheduler job failed: {{ $labels.job }}"
-          description: "UTC worker job {{ $labels.job }} is in failed state. Check Dokploy hl-worker logs and /api/v1/scheduler/status."
+          summary: "Hyperliquid scheduler job failed: {{ $labels.worker_job }}"
+          description: "UTC worker job {{ $labels.worker_job }} is in failed state. Check Dokploy hl-worker logs and /api/v1/scheduler/status."
 
       - alert: HLTestnetKillSwitchTriggered
         expr: hl_testnet_last_cycle_ok == 0
