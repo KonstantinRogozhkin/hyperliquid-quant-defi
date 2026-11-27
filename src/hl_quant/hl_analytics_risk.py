@@ -251,13 +251,15 @@ def compute_series_performance(
     gross_ret, gross_apy = _pack_horizons(gross_shares)
     net_ret, net_apy = _pack_horizons(net_s)
 
-    # Trailing 90-day daily log returns for Sharpe & Sortino
+    # Trailing 90-day daily log returns for Sharpe & Sortino (require >= 5 distinct calendar days
+    # so intraday bootstrap ticks never produce inflated annualized ratios)
     sharpe_g = sortino_g = sharpe_n = sortino_n = None
     pos_days_pct = None
     win_streak = loss_streak = 0
+    unique_cal_days = len({d[:10] for d in dates})
 
     def _ratios(series: list[float]) -> tuple[float | None, float | None]:
-        if len(series) < 3:
+        if unique_cal_days < 5 or len(series) < 5:
             return None, None
         sub = np.asarray(series[-91:], dtype=float)
         sub = sub[sub > 0]

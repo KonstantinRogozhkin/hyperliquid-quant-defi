@@ -1,0 +1,130 @@
+# Prometheus alerting rules for Hyperliquid Quant DeFi
+# Drop into /etc/prometheus/alerts.yml (or /etc/prometheus/rules.d/hl_quant_defi.yml)
+# and reload Prometheus (`kill -HUP <pid>` or `POST /-/reload`).
+
+groups:
+  - name: hyperliquid-quant-defi-critical
+    interval: 60s
+    rules:
+      - alert: HLWorkerDown
+        expr: hl_worker_up == 0 or absent(hl_worker_up)
+        for: 3m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Hyperliquid Quant Worker is DOWN or metrics scrape is absent"
+          description: "hl_worker_up has been 0 or missing for >3m. Check hl-worker container and https://hl-quant.95-217-163-111.sslip.io/api/v1/metrics."
+
+      - alert: HLWorkerJobFailed
+        expr: hl_worker_job_failed == 1
+        for: 2m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Hyperliquid scheduler job failed: {{ $labels.job }}"
+          description: "UTC worker job {{ $labels.job }} is in failed state. Check Dokploy hl-worker logs and /api/v1/scheduler/status."
+
+      - alert: HLTestnetKillSwitchTriggered
+        expr: hl_testnet_last_cycle_ok == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Testnet ALO Executor tripped kill-switch or failed last cycle"
+          description: "hl_testnet_last_cycle_ok == 0. Inspect /api/v1/attribution and recent Testnet audit violations immediately."
+
+      - alert: HLTestnetLiquidationRisk
+        expr: hl_testnet_liq_warnings > 0 or hl_testnet_min_liq_distance_pct < 20
+        for: 1m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "CRITICAL: Testnet liquidation proximity warning"
+          description: "Liquidation warnings={{ $value }} or min liquidation distance dropped below 20% on live Testnet positions."
+
+      - alert: HLTestnetADLRisk
+        expr: hl_testnet_adl_warnings > 0
+        for: 2m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "CRITICAL: Testnet high ADL rank warning"
+          description: "One or more open Testnet positions triggered high Auto-Deleveraging (ADL) risk thresholds."
+
+      - alert: HLBoundedNavGuardTriggered
+        expr: hl_desk_nav_guard_triggers_total > 0
+        for: 1m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "CRITICAL: Bounded NAV Sanity Guard circuit breaker triggered"
+          description: "Anomalous single-tick NAV jump detected in Spot+Perp or Autopilot ledger (corrupt quote/oracle). Entries & rebalances paused."
+
+      - alert: HLHIP3OracleDivergenceCritical
+        expr: hl_hip3_paper_pair_oracle_div_bps > 30
+        for: 2m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "CRITICAL: HIP-3 builder oracle divergence > 30 bps on {{ $labels.symbol }}"
+          description: "Open HIP-3 pair {{ $labels.symbol }} ({{ $labels.short_dex }}/{{ $labels.long_dex }}) oracle divergence is {{ $value }} bps (approaching 35 bps emergency exit)."
+
+      - alert: HLSpotPerpDeltaOrMarginCritical
+        expr: abs(hl_spot_perp_net_delta_pct) > 2.0 or hl_spot_perp_min_perp_liq_distance_pct < 15
+        for: 5m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "CRITICAL: HyperCore Spot+Perp delta drift or short-perp margin risk"
+          description: "Spot+Perp net delta exceeded +-2.0% or short-perp liquidation buffer dropped below 15%."
+
+      - alert: HLAutopilotRiskLimitBreach
+        expr: hl_autopilot_directional_sleeve_pct > 6.0 or hl_autopilot_max_drift_pct > 6.0
+        for: 5m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "CRITICAL: Neutral Autopilot risk cap or drift limit breached"
+          description: "Crisis-CTA directional sleeve exceeded 6% (hard cap 5%) or sleeve weight drift exceeded 6% (deadband 3%)."
+
+      - alert: HLStrategyDrawdownOrApiQuotaCritical
+        expr: hl_strategy_max_dd_pct{category!="Benchmark"} > 5.0 or hl_testnet_api_reqs_per_usd_vol > 0.85
+        for: 5m
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "CRITICAL: Strategy Max Drawdown > 5% or HyperCore API Quota > 0.85 req/$"
+          description: "Desk strategy drawdown breached 5% safety limit or API request rate is approaching HyperCore's 1 req/$1 volume ceiling."
+
+  - name: hyperliquid-quant-defi-warning
+    interval: 60s
+    rules:
+      - alert: HLArtifactStale
+        expr: hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_attribution"} > 360
+        for: 15m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Telemetry artifact stale (> 6h): {{ $labels.artifact }}"
+          description: "Artifact {{ $labels.artifact }} has not refreshed for {{ $value | humanize }} minutes."
+
+      - alert: HLTestnetALOFillRateLow
+        expr: hl_testnet_alo_fill_rate_pct < 65
+        for: 30m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Testnet ALO post-only fill rate degraded (< 65%)"
+          description: "Real ALO fill rate dropped to {{ $value }}% (target >= 85%). Check BBO spread conditions."

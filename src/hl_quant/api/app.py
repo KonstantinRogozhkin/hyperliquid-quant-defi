@@ -266,7 +266,9 @@ def create_app(
     @app.get("/metrics")
     @app.get("/api/v1/metrics")
     def prometheus_metrics() -> PlainTextResponse:
-        body = render_prometheus_metrics(_build_overview_payload())
+        overview_payload = _build_overview_payload()
+        analytics_payload = build_desk_analytics_payload(resolved_data_root)
+        body = render_prometheus_metrics(overview_payload, analytics=analytics_payload)
         return PlainTextResponse(
             content=body,
             media_type=PROMETHEUS_CONTENT_TYPE,

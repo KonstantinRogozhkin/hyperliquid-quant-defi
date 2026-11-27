@@ -1,0 +1,189 @@
+# Grafana Unified Alerting provisioning file (drop into /etc/grafana/provisioning/alerting/)
+# Replace datasourceUid with your Prometheus UID if different from `prometheus`.
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: hl-quant-critical
+    folder: Hyperliquid Quant DeFi
+    interval: 1m
+    rules:
+      - uid: hl-crit-worker-down
+        title: "CRITICAL: HL Worker Down / Scrape Missing"
+        condition: C
+        for: 3m
+        noDataState: Alerting
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Hyperliquid Quant Worker heartbeat stale (>300s) or /api/v1/metrics scrape missing"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "hl_worker_up", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: lt, params: [1] } }], refId: C }
+
+      - uid: hl-crit-job-failed
+        title: "CRITICAL: HL Scheduler Job Failed"
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "One or more Hyperliquid UTC worker jobs failed"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "sum(hl_worker_job_failed)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-crit-testnet-killswitch
+        title: "CRITICAL: Testnet ALO Kill-Switch Triggered"
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Live Testnet ALO executor tripped kill-switch (hl_testnet_last_cycle_ok == 0)"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "hl_testnet_last_cycle_ok", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: lt, params: [1] } }], refId: C }
+
+      - uid: hl-crit-liq-risk
+        title: "CRITICAL: Testnet Liquidation or ADL Warning"
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Active liquidation/ADL warning or min liquidation distance < 20%"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "(hl_testnet_liq_warnings + hl_testnet_adl_warnings) + bool(hl_testnet_min_liq_distance_pct < 20)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-crit-nav-guard
+        title: "CRITICAL: Bounded NAV Sanity Guard Triggered"
+        condition: C
+        for: 1m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Bounded NAV Sanity Guard tripped on Spot+Perp or Autopilot ledger"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "hl_desk_nav_guard_triggers_total", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-crit-hip3-oracle-div
+        title: "CRITICAL: HIP-3 Oracle Divergence > 30 bps"
+        condition: C
+        for: 2m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Open HIP-3 cross-builder pair oracle divergence exceeded 30 bps"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "max(hl_hip3_paper_pair_oracle_div_bps)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [30] } }], refId: C }
+
+      - uid: hl-crit-spot-perp-risk
+        title: "CRITICAL: Spot+Perp Delta Drift (>2%) or Margin (<15%)"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "HyperCore Spot+Perp net delta drifted beyond +-2% or perp liquidation buffer < 15%"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "bool(abs(hl_spot_perp_net_delta_pct) > 2.0) + bool(hl_spot_perp_min_perp_liq_distance_pct < 15)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-crit-autopilot-breach
+        title: "CRITICAL: Autopilot CTA Cap (>6%) or Drift (>6%) Breach"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Neutral Autopilot breached directional CTA cap or deadband weight drift limit"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "bool(hl_autopilot_directional_sleeve_pct > 6.0) + bool(hl_autopilot_max_drift_pct > 6.0)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
+
+      - uid: hl-crit-dd-or-quota
+        title: "CRITICAL: Strategy Max DD > 5% or API Quota > 0.85 req/$"
+        condition: C
+        for: 5m
+        noDataState: OK
+        execErrState: Alerting
+        labels:
+          severity: critical
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Non-benchmark strategy exceeded 5% Max Drawdown or API rate limit > 0.85 req/$1"
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: prometheus
+            model: { expr: "count(hl_strategy_max_dd_pct{category!=\"Benchmark\"} > 5.0) or vector(0) + bool(hl_testnet_api_reqs_per_usd_vol > 0.85)", instant: true, refId: A }
+          - refId: C
+            datasourceUid: __expr__
+            model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }
