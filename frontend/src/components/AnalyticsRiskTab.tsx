@@ -1,10 +1,15 @@
 import { useMemo, useState } from "react";
 import { MultiSeriesChart, OlsScatterChart, type SeriesLine } from "./Charts";
+import { KpiLabel, SectionTitle, Th } from "./Tooltip";
+import { useLang } from "../i18n";
 import type { AnalyticsPayload, HorizonMetrics, LeaderboardRow, OverviewPayload } from "../types";
 
 const SERIES_COLORS = ["#10b981", "#38bdf8", "#a855f7", "#f59e0b", "#ec4899", "#94a3b8", "#f97316", "#22d3ee"];
 const MONTHS = ["1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"];
 const MONTH_LABELS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+const MONTH_LABELS_RU = ["Янв", "Фев", "Мар", "Апр", "Май", "Июн", "Июл", "Авг", "Сен", "Окт", "Ноя", "Дек"];
+const MONTH_NAMES_EN = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+const MONTH_NAMES_RU = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
 
 function fmtNum(v: number | null | undefined, digits = 2, suffix = "", signed = false): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "—";
@@ -33,6 +38,7 @@ export function AnalyticsRiskTab({
   analytics: AnalyticsPayload | null;
   overview: OverviewPayload | null;
 }) {
+  const { lang, t, p } = useLang();
   const [feeMode, setFeeMode] = useState<"gross" | "net">("net");
   const [showMode, setShowMode] = useState<"returns" | "apy">("returns");
   const [categoryFilter, setCategoryFilter] = useState<string>("ALL");
@@ -192,13 +198,15 @@ export function AnalyticsRiskTab({
   const spotPerpScan = overview?.spot_perp_scan;
   const corr = analytics?.correlation;
   const risk = analytics?.risk_exposure;
+  const dayUnit = t("d", "д");
+  const modeLabel = feeMode === "gross" ? t("GROSS", "БРУТТО") : t("NET", "НЕТТО");
 
   return (
     <div className="stack">
       {/* 1. Master Portfolio & Spot+Perp Flagship KPI Strip */}
       <section className="kpi-grid">
         <div className="card">
-          <div className="kpi-label">Neutral Autopilot (Master)</div>
+          <KpiLabel k="kpiAutopilot" />
           <div className="kpi-value">{fmtUsd(autopilot?.gross_equity_usd)}</div>
           <div className="kpi-sub">
             Gross {fmtNum(autopilot?.gross_return_pct, 2, "%", true)} · Net HWM{" "}
@@ -206,17 +214,17 @@ export function AnalyticsRiskTab({
           </div>
         </div>
         <div className="card">
-          <div className="kpi-label">Autopilot Leverage &amp; CTA Cap</div>
+          <KpiLabel k="kpiAutopilotLev" />
           <div className="kpi-value">
             {autopilot?.risk_telemetry ? `${fmtNum(autopilot.risk_telemetry.gross_leverage, 2)}x` : "—"}
           </div>
           <div className="kpi-sub">
-            CTA {fmtNum(autopilot?.risk_telemetry?.directional_sleeve_pct, 1, "%")} (≤5%) · Drift{" "}
+            CTA {fmtNum(autopilot?.risk_telemetry?.directional_sleeve_pct, 1, "%")} (≤5%) · {t("Drift", "Отклонение")}{" "}
             {fmtNum(autopilot?.risk_telemetry?.max_weight_drift_pct, 2, "%")}
           </div>
         </div>
         <div className="card">
-          <div className="kpi-label">HyperCore Spot+Perp (+10% HLP)</div>
+          <KpiLabel k="kpiSpotPerp" />
           <div className="kpi-value">{fmtUsd(spotPerp?.equity_usd)}</div>
           <div className="kpi-sub">
             Blended APR {fmtNum(spotPerp?.blended_portfolio_apr_pct, 2, "%", true)} · HLP{" "}
@@ -224,19 +232,21 @@ export function AnalyticsRiskTab({
           </div>
         </div>
         <div className="card">
-          <div className="kpi-label">Spot+Perp Leverage &amp; Delta</div>
+          <KpiLabel k="kpiSpotPerpLev" />
           <div className="kpi-value">
             {spotPerp?.risk_telemetry ? `${fmtNum(spotPerp.risk_telemetry.gross_leverage, 2)}x` : "—"}
           </div>
           <div className="kpi-sub">
-            30D max {fmtNum(spotPerp?.risk_telemetry?.leverage_30d_max, 2, "x")} · Δ{" "}
+            {t("30D max", "Макс. 30Д")} {fmtNum(spotPerp?.risk_telemetry?.leverage_30d_max, 2, "x")} · Δ{" "}
             {fmtNum(spotPerp?.risk_telemetry?.net_delta_pct, 3, "%", true)}
           </div>
         </div>
         <div className="card">
-          <div className="kpi-label">Bounded NAV Sanity Guards</div>
+          <KpiLabel k="kpiNavGuards" />
           <div className="kpi-value">{risk?.total_nav_guard_triggers ?? 0}</div>
-          <div className="kpi-sub">Circuit-breaker triggers across desk ledgers</div>
+          <div className="kpi-sub">
+            {t("Circuit-breaker triggers across desk ledgers", "Срабатывания предохранителей во всех журналах")}
+          </div>
         </div>
       </section>
 
@@ -244,35 +254,38 @@ export function AnalyticsRiskTab({
       <section className="card">
         <div className="section-header">
           <div>
-            <h2 className="section-title">Performance vs Buy &amp; Hold Leaderboard</h2>
+            <SectionTitle k="secLeaderboard" />
             <div className="section-sub">
-              Trailing 90D Sharpe &amp; Sortino · HWM Net-of-Fee simulation · Negative returns never annualized
+              {t(
+                "Trailing 90D Sharpe & Sortino · HWM Net-of-Fee simulation · Negative returns never annualized",
+                "Шарп и Сортино за последние 90Д · симуляция net после комиссий с HWM · отрицательная доходность не пересчитывается в годовую",
+              )}
             </div>
           </div>
           <div className="filter-row">
-            <div className="segmented" role="group" aria-label="Fee mode">
+            <div className="segmented" role="group" aria-label={t("Fee mode", "Учёт комиссий")}>
               <button
                 type="button"
                 className={`btn btn-sm ${feeMode === "gross" ? "tab-active" : ""}`}
                 onClick={() => setFeeMode("gross")}
               >
-                Gross
+                {t("Gross", "Брутто")}
               </button>
               <button
                 type="button"
                 className={`btn btn-sm ${feeMode === "net" ? "tab-active" : ""}`}
                 onClick={() => setFeeMode("net")}
               >
-                Net (HWM)
+                {t("Net (HWM)", "Нетто (HWM)")}
               </button>
             </div>
-            <div className="segmented" role="group" aria-label="Display mode">
+            <div className="segmented" role="group" aria-label={t("Display mode", "Режим отображения")}>
               <button
                 type="button"
                 className={`btn btn-sm ${showMode === "returns" ? "tab-active" : ""}`}
                 onClick={() => setShowMode("returns")}
               >
-                Returns
+                {t("Returns", "Доходность")}
               </button>
               <button
                 type="button"
@@ -284,32 +297,45 @@ export function AnalyticsRiskTab({
             </div>
             <select
               className="select"
-              aria-label="Filter leaderboard category"
+              aria-label={t("Filter leaderboard category", "Фильтр по категории")}
               value={categoryFilter}
               onChange={(e) => setCategoryFilter(e.target.value)}
             >
               {categories.map((c) => (
                 <option key={c} value={c}>
-                  {c === "ALL" ? "All Categories" : c}
+                  {c === "ALL" ? t("All Categories", "Все категории") : c}
                 </option>
               ))}
             </select>
             <button type="button" className="btn btn-sm" onClick={() => setShowMethodology((v) => !v)}>
-              {showMethodology ? "Hide Methodology" : "How calculated"}
+              {showMethodology ? t("Hide Methodology", "Скрыть методику") : t("How calculated", "Как считается")}
             </button>
             <button type="button" className="btn btn-sm" onClick={exportCsv}>
-              Export CSV
+              {t("Export CSV", "Экспорт CSV")}
             </button>
           </div>
         </div>
 
         {showMethodology && (
           <div className="alert-banner">
-            <strong>Methodology (Neutral Trade Standard):</strong> Sharpe &amp; Sortino use trailing 90-day daily log
-            returns (365d annualization). Net figures apply continuous annual management fee + High-Water Mark (HWM)
-            performance fee strictly above peak net NAV. Under APY view, negative period returns are shown as &ldquo;—&rdquo;
-            (never annualized; switch to Returns for period losses). Positive days, win/loss streaks, and drawdown
-            recovery days use daily NAV closes.
+            {lang === "ru" ? (
+              <>
+                <strong>Методика (стандарт Neutral Trade):</strong> Шарп и Сортино считаются по дневным
+                лог-доходностям за последние 90 дней (годовой пересчёт на 365 дней). Net-значения учитывают постоянную
+                годовую комиссию за управление и комиссию за результат по High-Water Mark (HWM) — только выше
+                предыдущего пика net NAV. В режиме APY отрицательная доходность за период показывается как
+                &laquo;—&raquo; (в годовую не пересчитывается; переключитесь на «Доходность», чтобы увидеть убытки).
+                Плюсовые дни, серии побед/поражений и восстановление после просадки считаются по дневным закрытиям NAV.
+              </>
+            ) : (
+              <>
+                <strong>Methodology (Neutral Trade Standard):</strong> Sharpe &amp; Sortino use trailing 90-day daily log
+                returns (365d annualization). Net figures apply continuous annual management fee + High-Water Mark (HWM)
+                performance fee strictly above peak net NAV. Under APY view, negative period returns are shown as
+                &ldquo;—&rdquo; (never annualized; switch to Returns for period losses). Positive days, win/loss streaks,
+                and drawdown recovery days use daily NAV closes.
+              </>
+            )}
           </div>
         )}
 
@@ -317,19 +343,19 @@ export function AnalyticsRiskTab({
           <table>
             <thead>
               <tr>
-                <th>Strategy / Benchmark</th>
-                <th>Category</th>
-                <th className="num">7D</th>
-                <th className="num">30D</th>
-                <th className="num">YTD</th>
-                <th className="num">All-Time</th>
-                <th className="num">Sharpe (90D)</th>
-                <th className="num">Sortino (90D)</th>
-                <th className="num">Max DD</th>
-                <th className="num">DD Recov</th>
-                <th className="num">Pos Days</th>
-                <th className="num">Win / Loss</th>
-                <th className="num">Share Px</th>
+                <Th k="colStratBench" />
+                <Th k="colCategory" />
+                <Th k="col7d" num />
+                <Th k="col30d" num />
+                <Th k="colYtd" num />
+                <Th k="colAllTime" num />
+                <Th k="colSharpe" num />
+                <Th k="colSortino" num />
+                <Th k="colMaxDd" num />
+                <Th k="colDdRecov" num />
+                <Th k="colPosDays" num />
+                <Th k="colWinLoss" num />
+                <Th k="colSharePx" num />
               </tr>
             </thead>
             <tbody>
@@ -369,14 +395,19 @@ export function AnalyticsRiskTab({
                     <td className="num">{fmtNum(so, 2)}</td>
                     <td className={`num ${dd > 5 ? "neg" : ""}`}>{fmtNum(dd, 2, "%")}</td>
                     <td className="num">
-                      {ddRec !== null && ddRec !== undefined ? `${fmtNum(ddRec, 1)}d` : "—"}
+                      {ddRec !== null && ddRec !== undefined ? `${fmtNum(ddRec, 1)}${dayUnit}` : "—"}
                       {ddUnder > 0 ? (
-                        <div className="section-sub neg">под водой {fmtNum(ddUnder, 1)}d</div>
+                        <div className="section-sub neg">
+                          {t("underwater", "под водой")} {fmtNum(ddUnder, 1)}
+                          {dayUnit}
+                        </div>
                       ) : null}
                     </td>
                     <td className="num">{fmtNum(r.positive_days_pct, 1, "%")}</td>
                     <td className="num">
-                      {r.longest_win_streak}d / {r.longest_loss_streak}d
+                      {r.longest_win_streak}
+                      {dayUnit} / {r.longest_loss_streak}
+                      {dayUnit}
                     </td>
                     <td className="num">
                       {r.is_benchmark ? fmtUsd(sp, 2) : sp !== null && sp !== undefined ? `$${fmtNum(sp, 4)}` : "—"}
@@ -387,7 +418,10 @@ export function AnalyticsRiskTab({
               {filteredLeaderboard.length === 0 && (
                 <tr>
                   <td colSpan={13} className="muted">
-                    No strategy ticks persisted yet. Run Spot+Perp or Autopilot ticks to populate analytics.
+                    {t(
+                      "No strategy ticks persisted yet. Run Spot+Perp or Autopilot ticks to populate analytics.",
+                      "Тиков стратегий пока нет. Запустите тики Spot+Perp или Autopilot, чтобы заполнить аналитику.",
+                    )}
                   </td>
                 </tr>
               )}
@@ -400,15 +434,20 @@ export function AnalyticsRiskTab({
       <section className="card">
         <div className="section-header">
           <div>
-            <h2 className="section-title">Cumulative Performance Comparison ({feeMode.toUpperCase()})</h2>
-            <div className="section-sub">Toggle strategies &amp; benchmarks · rebase to window start</div>
+            <SectionTitle k="secCumPerf" suffix={` (${modeLabel})`} />
+            <div className="section-sub">
+              {t(
+                "Toggle strategies & benchmarks · rebase to window start",
+                "Включайте/выключайте стратегии и бенчмарки · отсчёт от начала окна",
+              )}
+            </div>
           </div>
           <div className="filter-row">
             {[
-              { label: "7D", days: 7 },
-              { label: "30D", days: 30 },
-              { label: "90D", days: 90 },
-              { label: "All", days: 0 },
+              { label: t("7D", "7Д"), days: 7 },
+              { label: t("30D", "30Д"), days: 30 },
+              { label: t("90D", "90Д"), days: 90 },
+              { label: t("All", "Всё"), days: 0 },
             ].map((p) => (
               <button
                 key={p.label}
@@ -425,7 +464,7 @@ export function AnalyticsRiskTab({
                 checked={rebaseWindow}
                 onChange={(e) => setRebaseWindow(e.target.checked)}
               />
-              Rebase to window
+              {t("Rebase to window", "Отсчёт от начала окна")}
             </label>
           </div>
         </div>
@@ -461,9 +500,11 @@ export function AnalyticsRiskTab({
         <div className="card">
           <div className="section-header">
             <div>
-              <h2 className="section-title">Correlation Between Strategies (Pearson ρ)</h2>
+              <SectionTitle k="secCorrelation" />
               <div className="section-sub">
-                Lower-triangular daily log-return correlations ({corr?.overlap_days ?? 0} overlapping days)
+                {t("Lower-triangular daily log-return correlations", "Корреляции дневных лог-доходностей (нижний треугольник)")}{" "}
+                ({corr?.overlap_days ?? 0}{" "}
+                {p(corr?.overlap_days ?? 0, "overlapping day", "overlapping days", "общий день", "общих дня", "общих дней")})
               </div>
             </div>
           </div>
@@ -472,11 +513,17 @@ export function AnalyticsRiskTab({
               <table>
                 <thead>
                   <tr>
-                    <th>Strategy</th>
+                    <Th k="colCorrStrategy" />
                     {corr.ids.map((id) => (
-                      <th key={id} className="num">
-                        {id.slice(0, 10)}
-                      </th>
+                      <Th
+                        key={id}
+                        num
+                        label={id.slice(0, 10)}
+                        tip={t(
+                          `Correlation of each row strategy with "${corr.labels?.[id] ?? id}" (−1…+1).`,
+                          `Корреляция стратегии из строки со стратегией «${corr.labels?.[id] ?? id}» (от −1 до +1).`,
+                        )}
+                      />
                     ))}
                   </tr>
                 </thead>
@@ -501,16 +548,23 @@ export function AnalyticsRiskTab({
               </table>
             </div>
           ) : (
-            <div className="muted">Waiting for at least 3 overlapping days across desk strategies.</div>
+            <div className="muted">
+              {t(
+                "Waiting for at least 3 overlapping days across desk strategies.",
+                "Ждём минимум 3 общих дня у стратегий.",
+              )}
+            </div>
           )}
         </div>
 
         <div className="card">
           <div className="section-header">
             <div>
-              <h2 className="section-title">Market Exposure (OLS Regression)</h2>
+              <SectionTitle k="secOls" />
               <div className="section-sub">
-                Proof of market neutrality (β ≈ 0) against {activeFactor} ({factorBlock?.factor_days ?? 0}d)
+                {t("Proof of market neutrality (β ≈ 0) against", "Проверка рыночной нейтральности (β ≈ 0) относительно")}{" "}
+                {activeFactor} ({factorBlock?.factor_days ?? 0}
+                {dayUnit})
               </div>
             </div>
             <div className="filter-row">
@@ -532,11 +586,11 @@ export function AnalyticsRiskTab({
                 <table>
                   <thead>
                     <tr>
-                      <th>Strategy</th>
-                      <th className="num">β to {activeFactor}</th>
-                      <th className="num">R²</th>
-                      <th className="num">α (ann.)</th>
-                      <th className="num">Days</th>
+                      <Th k="colOlsStrategy" />
+                      <Th k="colBeta" num label={`β ${t("to", "к")} ${activeFactor}`} />
+                      <Th k="colR2" num />
+                      <Th k="colAlpha" num />
+                      <Th k="colDays" num />
                     </tr>
                   </thead>
                   <tbody>
@@ -577,7 +631,12 @@ export function AnalyticsRiskTab({
               )}
             </>
           ) : (
-            <div className="muted">Run Autopilot tick to populate HyperCore BTC/ETH/HYPE benchmark history for OLS.</div>
+            <div className="muted">
+              {t(
+                "Run Autopilot tick to populate HyperCore BTC/ETH/HYPE benchmark history for OLS.",
+                "Запустите тик Autopilot, чтобы накопить историю бенчмарков BTC/ETH/HYPE для OLS.",
+              )}
+            </div>
           )}
         </div>
       </section>
@@ -586,12 +645,14 @@ export function AnalyticsRiskTab({
       <section className="card">
         <div className="section-header">
           <div>
-            <h2 className="section-title">Monthly Historical Returns ({feeMode.toUpperCase()})</h2>
-            <div className="section-sub">Compound monthly return heatmap per strategy</div>
+            <SectionTitle k="secMonthly" suffix={` (${modeLabel})`} />
+            <div className="section-sub">
+              {t("Compound monthly return heatmap per strategy", "Тепловая карта сложной месячной доходности по стратегии")}
+            </div>
           </div>
           <select
             className="select"
-            aria-label="Select strategy for monthly returns"
+            aria-label={t("Select strategy for monthly returns", "Стратегия для месячной доходности")}
             value={activeMonthlyRow?.id ?? ""}
             onChange={(e) => setMonthlyStratId(e.target.value)}
           >
@@ -607,13 +668,19 @@ export function AnalyticsRiskTab({
             <table>
               <thead>
                 <tr>
-                  <th>Year</th>
-                  {MONTH_LABELS.map((m) => (
-                    <th key={m} className="num">
-                      {m}
-                    </th>
+                  <Th k="colYear" />
+                  {MONTH_LABELS.map((m, i) => (
+                    <Th
+                      key={m}
+                      num
+                      label={lang === "ru" ? MONTH_LABELS_RU[i] : m}
+                      tip={t(
+                        `Strategy return for ${MONTH_NAMES_EN[i]} of that year.`,
+                        `Доходность стратегии за ${MONTH_NAMES_RU[i]} этого года.`,
+                      )}
+                    />
                   ))}
-                  <th className="num">YTD</th>
+                  <Th k="colYearYtd" num />
                 </tr>
               </thead>
               <tbody>
@@ -642,7 +709,12 @@ export function AnalyticsRiskTab({
             </table>
           </div>
         ) : (
-          <div className="muted">Monthly matrix will populate once multi-day NAV closes accrue.</div>
+          <div className="muted">
+            {t(
+              "Monthly matrix will populate once multi-day NAV closes accrue.",
+              "Матрица заполнится, когда накопятся дневные закрытия NAV за несколько дней.",
+            )}
+          </div>
         )}
       </section>
 
@@ -651,20 +723,25 @@ export function AnalyticsRiskTab({
         <div className="card">
           <div className="section-header">
             <div>
-              <h2 className="section-title">Live Risk &amp; Exposure Telemetry</h2>
-              <div className="section-sub">Current / 30D Avg / 30D Max Leverage · Venue &amp; Market-Cap Concentration</div>
+              <SectionTitle k="secLiveRisk" />
+              <div className="section-sub">
+                {t(
+                  "Current / 30D Avg / 30D Max Leverage · Venue & Market-Cap Concentration",
+                  "Плечо: текущее / ср. 30Д / макс. 30Д · концентрация по площадкам и капитализации",
+                )}
+              </div>
             </div>
           </div>
           <div className="table-wrap" style={{ marginBottom: 14 }}>
             <table>
               <thead>
                 <tr>
-                  <th>Strategy</th>
-                  <th className="num">Lev (Cur)</th>
-                  <th className="num">30D Avg</th>
-                  <th className="num">30D Max</th>
-                  <th className="num">Net Exp %</th>
-                  <th className="num">NAV Guard</th>
+                  <Th k="colRiskStrategy" />
+                  <Th k="colLevCur" num />
+                  <Th k="colLev30Avg" num />
+                  <Th k="colLev30Max" num />
+                  <Th k="colNetExp" num />
+                  <Th k="colNavGuard" num />
                 </tr>
               </thead>
               <tbody>
@@ -690,7 +767,7 @@ export function AnalyticsRiskTab({
 
           <div className="grid-2" style={{ marginBottom: 0 }}>
             <div>
-              <div className="kpi-label">Venue Concentration</div>
+              <KpiLabel k="blkVenueConc" />
               {(risk?.venue_concentration ?? []).map((v) => (
                 <div key={v.label} className="bar-row">
                   <div className="bar-meta">
@@ -706,7 +783,7 @@ export function AnalyticsRiskTab({
               ))}
             </div>
             <div>
-              <div className="kpi-label">Asset / Market-Cap Tier Concentration</div>
+              <KpiLabel k="blkTierConc" />
               {(risk?.asset_tier_concentration ?? []).map((t) => (
                 <div key={t.label} className="bar-row">
                   <div className="bar-meta">
@@ -727,20 +804,25 @@ export function AnalyticsRiskTab({
         <div className="card">
           <div className="section-header">
             <div>
-              <h2 className="section-title">Neutral Autopilot Sleeves &amp; Crisis-CTA</h2>
-              <div className="section-sub">Deadband 3.0% rebalance · Hard ≤5% directional sleeve cap</div>
+              <SectionTitle k="secSleeves" />
+              <div className="section-sub">
+                {t(
+                  "Deadband 3.0% rebalance · Hard ≤5% directional sleeve cap",
+                  "Ребаланс при отклонении 3,0% · жёсткий лимит направленного рукава ≤5%",
+                )}
+              </div>
             </div>
           </div>
           <div className="table-wrap" style={{ marginBottom: 14 }}>
             <table>
               <thead>
                 <tr>
-                  <th>Sleeve</th>
-                  <th>Category</th>
-                  <th className="num">Target</th>
-                  <th className="num">Actual</th>
-                  <th className="num">Drift</th>
-                  <th className="num">Allocation</th>
+                  <Th k="colSleeve" />
+                  <Th k="colSleeveCategory" />
+                  <Th k="colTarget" num />
+                  <Th k="colActual" num />
+                  <Th k="colDriftPct" num />
+                  <Th k="colAllocation" num />
                 </tr>
               </thead>
               <tbody>
@@ -761,7 +843,7 @@ export function AnalyticsRiskTab({
                 {(autopilot?.sleeves ?? []).length === 0 && (
                   <tr>
                     <td colSpan={6} className="muted">
-                      Awaiting first Autopilot tick.
+                      {t("Awaiting first Autopilot tick.", "Ожидание первого тика Autopilot.")}
                     </td>
                   </tr>
                 )}
@@ -771,20 +853,22 @@ export function AnalyticsRiskTab({
 
           {spotPerpScan && (spotPerpScan.opportunities ?? []).length > 0 && (
             <>
-              <div className="kpi-label" style={{ marginTop: 10 }}>
-                HyperCore Native Spot+Perp L2 Scanner (HLP {fmtNum(spotPerpScan.hlp_apr_pct, 2, "%", true)})
-              </div>
+              <KpiLabel
+                k="blkSpotPerpScanner"
+                style={{ marginTop: 10 }}
+                suffix={` (HLP ${fmtNum(spotPerpScan.hlp_apr_pct, 2, "%", true)})`}
+              />
               <div className="table-wrap">
                 <table>
                   <thead>
                     <tr>
-                      <th>Pair</th>
-                      <th>Tier</th>
-                      <th className="num">Perp APR</th>
-                      <th className="num">Net Dep APR</th>
-                      <th className="num">Exec Basis</th>
-                      <th className="num">L2 Slip</th>
-                      <th>Status</th>
+                      <Th k="colPair" />
+                      <Th k="colTier" />
+                      <Th k="colPerpApr" num />
+                      <Th k="colNetDepApr" num />
+                      <Th k="colExecBasis" num />
+                      <Th k="colL2Slip" num />
+                      <Th k="colScanStatus" />
                     </tr>
                   </thead>
                   <tbody>

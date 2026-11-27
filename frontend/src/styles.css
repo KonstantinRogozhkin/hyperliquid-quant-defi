@@ -382,6 +382,83 @@ th {
   background: var(--green);
 }
 
+/* ───────── Tooltips & language toggle ───────── */
+.tip-anchor {
+  cursor: help;
+  outline: none;
+}
+
+.tip-anchor:focus-visible {
+  box-shadow: 0 0 0 2px rgba(56, 189, 248, 0.6);
+  border-radius: 4px;
+}
+
+.th-tip {
+  border-bottom: 1px dotted rgba(148, 163, 184, 0.55);
+}
+
+.th-tip:hover,
+.th-tip:focus-visible {
+  color: var(--text);
+  border-bottom-color: var(--cyan);
+}
+
+.tip-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  margin-left: 6px;
+  border-radius: 50%;
+  border: 1px solid rgba(148, 163, 184, 0.55);
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 700;
+  font-family: Georgia, "Times New Roman", serif;
+  font-style: italic;
+  text-transform: none;
+  letter-spacing: 0;
+  line-height: 1;
+  vertical-align: 1px;
+  flex-shrink: 0;
+}
+
+.tip-icon::before {
+  content: "i";
+}
+
+.tip-icon:hover,
+.tip-icon:focus-visible {
+  color: var(--cyan);
+  border-color: var(--cyan);
+}
+
+.tooltip {
+  position: fixed;
+  z-index: 1000;
+  padding: 8px 11px;
+  background: #1a2540;
+  color: var(--text);
+  border: 1px solid #2c3b5c;
+  border-radius: 8px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.45;
+  text-transform: none;
+  letter-spacing: normal;
+  white-space: normal;
+  text-align: left;
+  pointer-events: none;
+}
+
+.lang-toggle .btn-sm {
+  min-width: 36px;
+  font-weight: 600;
+}
+
 @media (max-width: 640px) {
   .app-shell {
     padding: 12px;

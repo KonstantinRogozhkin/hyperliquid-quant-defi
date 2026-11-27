@@ -1,18 +1,20 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AnalyticsRiskTab } from "./components/AnalyticsRiskTab";
 import { EquityCurveChart, KappaCalibrationChart } from "./components/Charts";
+import { KpiLabel, SectionTitle, Th, Tip } from "./components/Tooltip";
+import { LangProvider, LangToggle, useLang, type Lang } from "./i18n";
 import type { AnalyticsPayload, BuildInfo, CoinAttributionRow, OverviewPayload } from "./types";
 
 type TabId = "overview" | "analytics" | "frontier" | "crossdex" | "onchain" | "execution" | "ops";
 
-const TABS: Array<{ id: TabId; label: string }> = [
-  { id: "overview", label: "Overview & Metamodel" },
-  { id: "analytics", label: "Analytics & Risk" },
-  { id: "frontier", label: "HIP-3 · Boros · Yield" },
-  { id: "crossdex", label: "5-DEX & Paper" },
-  { id: "onchain", label: "On-Chain Alpha" },
-  { id: "execution", label: "Testnet & MM" },
-  { id: "ops", label: "Scheduler & Ops" },
+const TABS: Array<{ id: TabId; en: string; ru: string }> = [
+  { id: "overview", en: "Overview & Metamodel", ru: "Обзор и метамодель" },
+  { id: "analytics", en: "Analytics & Risk", ru: "Аналитика и риски" },
+  { id: "frontier", en: "HIP-3 · Boros · Yield", ru: "HIP-3 · Boros · Доходность" },
+  { id: "crossdex", en: "5-DEX & Paper", ru: "5-DEX и paper" },
+  { id: "onchain", en: "On-Chain Alpha", ru: "On-chain альфа" },
+  { id: "execution", en: "Testnet & MM", ru: "Testnet и MM" },
+  { id: "ops", en: "Scheduler & Ops", ru: "Планировщик и Ops" },
 ];
 
 function num(v: unknown): number | null {
@@ -49,19 +51,28 @@ function shortSha(sha?: string | null): string {
   return sha.length > 8 ? sha.slice(0, 8) : sha;
 }
 
-const CASCADE_BIAS_LABELS: Record<string, string> = {
-  downside_cascade: "Downside Cascade (лонг-ликвидации)",
-  upside_squeeze: "Upside Squeeze (шорт-ликвидации)",
-  balanced: "Сбалансировано",
+const CASCADE_BIAS_LABELS: Record<string, Record<Lang, string>> = {
+  downside_cascade: { en: "Downside Cascade (long liquidations)", ru: "Каскад вниз (ликвидации лонгов)" },
+  upside_squeeze: { en: "Upside Squeeze (short liquidations)", ru: "Сквиз вверх (ликвидации шортов)" },
+  balanced: { en: "Balanced", ru: "Сбалансировано" },
 };
 
-function cascadeBiasLabel(bias: unknown): string {
+function cascadeBiasLabel(bias: unknown, lang: Lang): string {
   if (bias === null || bias === undefined || bias === "") return "—";
   const key = String(bias);
-  return CASCADE_BIAS_LABELS[key] ?? key;
+  return CASCADE_BIAS_LABELS[key]?.[lang] ?? key;
 }
 
 export default function App() {
+  return (
+    <LangProvider>
+      <Desk />
+    </LangProvider>
+  );
+}
+
+function Desk() {
+  const { lang, t, p, g } = useLang();
   const [tab, setTab] = useState<TabId>("overview");
   const [data, setData] = useState<OverviewPayload | null>(null);
   const [analytics, setAnalytics] = useState<AnalyticsPayload | null>(null);
@@ -92,8 +103,10 @@ export default function App() {
         throw new Error(`Backend /api/v1/overview returned HTTP ${ovRes.status}`);
       }
       const ovJson = (await ovRes.json()) as OverviewPayload;
-      const anJson = anRes && anRes.ok ? ((await anRes.json()) as AnalyticsPayload) : null;
-      const feJson = feRes && feRes.ok ? ((await feRes.json()) as BuildInfo) : null;
+      // Optional payloads: a non-JSON body (e.g. Vite's SPA index.html fallback for /build-info.json in dev)
+      // must not take down the whole dashboard.
+      const anJson = anRes && anRes.ok ? ((await anRes.json().catch(() => null)) as AnalyticsPayload | null) : null;
+      const feJson = feRes && feRes.ok ? ((await feRes.json().catch(() => null)) as BuildInfo | null) : null;
       if (seq !== reqSeqRef.current) return;
       setData(ovJson);
       if (anJson) {
@@ -175,6 +188,8 @@ export default function App() {
   const anyAlert = Boolean(data?.onchain_events?.any_alert);
   const topHip3 = data?.frontier_history?.hip3_persistence?.[0];
   const paperValues = (data?.paper_ticks ?? []).map((t) => t.equity_usd).filter((n) => Number.isFinite(n));
+  const hip3OpenPairs = Object.keys(data?.hip3_paper?.positions ?? {}).length;
+  const crossDexOpenPairs = Object.keys(data?.cross_dex_paper?.positions ?? {}).length;
 
   return (
     <div className="app-shell">
@@ -182,54 +197,62 @@ export default function App() {
         <div className="brand">
           <h1>Hyperliquid Quant DeFi · Live Desk</h1>
           <div className="brand-sub">
-            {data ? `API snapshot: ${data.generated_at_utc}` : "Connecting to backend API..."}
+            {data
+              ? `${t("API snapshot", "Снимок API")}: ${data.generated_at_utc}`
+              : t("Connecting to backend API...", "Подключение к API бэкенда...")}
             {data?.frontier_history?.ny_session ? ` · NY: ${data.frontier_history.ny_session}` : ""}
           </div>
         </div>
         <div className="controls">
-          <span className={`pill ${anyAlert ? "pill-warn" : "pill-ok"}`}>
-            {anyAlert ? "⚡ On-Chain Alerts Active" : "● Calm Regime"}
-          </span>
-          <span className={`pill ${shaAligned ? "pill-info" : "pill-warn"}`} title={`FE ${feSha} / BE ${beSha}`}>
+          <LangToggle />
+          <Tip text={g("pillAlerts").tip} className={`pill ${anyAlert ? "pill-warn" : "pill-ok"}`}>
+            {anyAlert ? t("⚡ On-Chain Alerts Active", "⚡ Активны on-chain алерты") : t("● Calm Regime", "● Спокойный режим")}
+          </Tip>
+          <Tip
+            text={`${g("pillSha").tip} (FE ${feSha} / BE ${beSha})`}
+            className={`pill ${shaAligned ? "pill-info" : "pill-warn"}`}
+          >
             FE {shortSha(feSha)} · BE {shortSha(beSha)}
-          </span>
+          </Tip>
           <select
             className="select"
-            aria-label="Auto refresh interval"
+            aria-label={t("Auto refresh interval", "Интервал автообновления")}
             value={refreshSec}
             onChange={(e) => setRefreshSec(Number(e.target.value))}
           >
-            <option value={30}>Auto 30s</option>
-            <option value={60}>Auto 60s</option>
-            <option value={0}>Manual</option>
+            <option value={30}>{t("Auto 30s", "Авто 30с")}</option>
+            <option value={60}>{t("Auto 60s", "Авто 60с")}</option>
+            <option value={0}>{t("Manual", "Вручную")}</option>
           </select>
           <button type="button" className="btn" onClick={() => void loadAll()}>
-            Refresh
+            {t("Refresh", "Обновить")}
           </button>
         </div>
       </header>
 
       {error && (
         <div className="error-box">
-          <strong>Backend unreachable:</strong> {error}
+          <strong>{t("Backend unreachable:", "Бэкенд недоступен:")}</strong> {error}
         </div>
       )}
 
-      <nav className="tabs" aria-label="Dashboard sections">
-        {TABS.map((t) => (
+      <nav className="tabs" aria-label={t("Dashboard sections", "Разделы дашборда")}>
+        {TABS.map((tb) => (
           <button
-            key={t.id}
+            key={tb.id}
             type="button"
-            className={`tab ${tab === t.id ? "tab-active" : ""}`}
-            onClick={() => setTab(t.id)}
+            className={`tab ${tab === tb.id ? "tab-active" : ""}`}
+            onClick={() => setTab(tb.id)}
           >
-            {t.label}
+            {lang === "ru" ? tb.ru : tb.en}
           </button>
         ))}
       </nav>
 
       {loading && !data ? (
-        <div className="card muted">Loading Hyperliquid live desk telemetry...</div>
+        <div className="card muted">
+          {t("Loading Hyperliquid live desk telemetry...", "Загрузка телеметрии Hyperliquid live desk...")}
+        </div>
       ) : (
         <>
           {tab === "analytics" && <AnalyticsRiskTab analytics={analytics} overview={data} />}
@@ -238,15 +261,15 @@ export default function App() {
             <div className="stack">
               <section className="kpi-grid">
                 <div className="card">
-                  <div className="kpi-label">Metamodel Paper Equity</div>
+                  <KpiLabel k="kpiMetaEquity" />
                   <div className="kpi-value">{fmtUsd(data?.paper?.equity_usd)}</div>
                   <div className="kpi-sub">
-                    {fmtPct(data?.paper?.return_pct)} · {data?.paper?.active_positions ?? 0} pos ·{" "}
-                    {data?.paper?.ticks ?? 0} ticks
+                    {fmtPct(data?.paper?.return_pct)} · {data?.paper?.active_positions ?? 0} {t("pos", "поз.")} ·{" "}
+                    {data?.paper?.ticks ?? 0} {p(data?.paper?.ticks ?? 0, "tick", "ticks", "тик", "тика", "тиков")}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Testnet Live Equity</div>
+                  <KpiLabel k="kpiTestnetEquity" />
                   <div className="kpi-value">{fmtUsd(data?.attribution?.equity_usd)}</div>
                   <div className="kpi-sub">
                     Maker {fmtPct(data?.attribution?.maker_volume_share_pct, 1, false)} · ALO Fill{" "}
@@ -254,38 +277,39 @@ export default function App() {
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">5-DEX Dual-Leg Paper</div>
+                  <KpiLabel k="kpiCrossDexEquity" />
                   <div className="kpi-value">{fmtUsd(data?.cross_dex_paper?.equity_usd)}</div>
                   <div className="kpi-sub">
-                    Funding {fmtUsd(data?.cross_dex_paper?.cum_funding_usd)} ·{" "}
-                    {Object.keys(data?.cross_dex_paper?.positions ?? {}).length} open pairs
+                    {t("Funding", "Фандинг")} {fmtUsd(data?.cross_dex_paper?.cum_funding_usd)} ·{" "}
+                    {crossDexOpenPairs}{" "}
+                    {p(crossDexOpenPairs, "open pair", "open pairs", "открытая пара", "открытые пары", "открытых пар")}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">HIP-3 Clean Leader</div>
+                  <KpiLabel k="kpiHip3Leader" />
                   <div className="kpi-value">
                     {topHip3 ? `${topHip3.base_symbol} ${fmtPct(topHip3.latest_apr_pct, 1)}` : "—"}
                   </div>
                   <div className="kpi-sub">
                     {topHip3
                       ? `Clean streak ${topHip3.clean_streak} · Flips ${topHip3.direction_flips ?? 0} · Div ${fmtBps(topHip3.median_oracle_div_bps)}`
-                      : "Awaiting persistence tick"}
+                      : t("Awaiting persistence tick", "Ожидание тика устойчивости")}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">HLP Benchmark & TVL</div>
+                  <KpiLabel k="kpiHlp" />
                   <div className="kpi-value">{fmtPct(data?.frontier_history?.hlp_apr_pct)}</div>
                   <div className="kpi-sub">TVL {fmtUsd(data?.onchain_events?.hlp_tvl_usd)}</div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">AS-MM Engine Latency</div>
+                  <KpiLabel k="kpiLatency" />
                   <div className="kpi-value">
                     {data?.latency_bench ? `${fx(data.latency_bench.p50_us, 1)} µs` : "—"}
                   </div>
                   <div className="kpi-sub">
                     {data?.latency_bench
                       ? `p99 ${fx(data.latency_bench.p99_us, 1)} µs · ${Math.round(data.latency_bench.throughput_ticks_per_sec).toLocaleString()} tps`
-                      : "Benchmark not logged"}
+                      : t("Benchmark not logged", "Бенчмарк не записан")}
                   </div>
                 </div>
               </section>
@@ -293,28 +317,29 @@ export default function App() {
               <div className="grid-2">
                 <section className="card">
                   <div className="section-header">
-                    <h2 className="section-title">Metamodel L2 Paper Equity Curve</h2>
-                    <span className="section-sub">HL × Bybit Dollar-Neutral</span>
+                    <SectionTitle k="secEquityCurve" />
+                    <span className="section-sub">{t("HL × Bybit Dollar-Neutral", "HL × Bybit, долларово-нейтрально")}</span>
                   </div>
                   <EquityCurveChart values={paperValues} />
                 </section>
 
                 <section className="card">
                   <div className="section-header">
-                    <h2 className="section-title">:00 Funding Settlement OOS Study</h2>
+                    <SectionTitle k="secSettlement" />
                     <div className="filter-row">
                       <span className="section-sub">
-                        {data?.settlement_meta?.span_days ?? "—"}d ·{" "}
-                        {data?.settlement_meta?.total_settlement_events?.toLocaleString() ?? "—"} events
+                        {data?.settlement_meta?.span_days ?? "—"}
+                        {t("d", "д")} · {data?.settlement_meta?.total_settlement_events?.toLocaleString() ?? "—"}{" "}
+                        {p(data?.settlement_meta?.total_settlement_events ?? 0, "event", "events", "событие", "события", "событий")}
                       </span>
                       <select
                         className="select"
                         value={settlementSplit}
                         onChange={(e) => setSettlementSplit(e.target.value)}
                       >
-                        <option value="OOS">OOS only</option>
-                        <option value="IS">IS only</option>
-                        <option value="ALL">All splits</option>
+                        <option value="OOS">{t("OOS only", "Только OOS")}</option>
+                        <option value="IS">{t("IS only", "Только IS")}</option>
+                        <option value="ALL">{t("All splits", "Все выборки")}</option>
                       </select>
                     </div>
                   </div>
@@ -322,12 +347,12 @@ export default function App() {
                     <table>
                       <thead>
                         <tr>
-                          <th>Strategy</th>
-                          <th>Bucket</th>
-                          <th className="num">Events</th>
-                          <th className="num">Gross</th>
-                          <th className="num">t-stat</th>
-                          <th className="num">Net Maker</th>
+                          <Th k="colSettleStrategy" />
+                          <Th k="colBucket" />
+                          <Th k="colEvents" num />
+                          <Th k="colGross" num />
+                          <Th k="colTStat" num />
+                          <Th k="colNetMaker" num />
                         </tr>
                       </thead>
                       <tbody>
@@ -348,7 +373,7 @@ export default function App() {
                         {settlementFiltered.length === 0 && (
                           <tr>
                             <td colSpan={6} className="muted">
-                              No settlement study rows loaded yet.
+                              {t("No settlement study rows loaded yet.", "Строки исследования расчётов пока не загружены.")}
                             </td>
                           </tr>
                         )}
@@ -361,14 +386,18 @@ export default function App() {
               <section className="card">
                 <div className="section-header">
                   <div>
-                    <h2 className="section-title">Metamodel Open Positions (Live Paper Ledger)</h2>
+                    <SectionTitle k="secMetaPositions" />
                     <div className="section-sub">
-                      {data?.paper_positions?.length ?? 0} active HL × CEX positions sorted by |HL weight|
+                      {data?.paper_positions?.length ?? 0}{" "}
+                      {t(
+                        "active HL × CEX positions sorted by |HL weight|",
+                        `${p(data?.paper_positions?.length ?? 0, "", "", "активная позиция", "активные позиции", "активных позиций")} HL × CEX, отсортировано по |весу HL|`,
+                      )}
                     </div>
                   </div>
                   <input
                     className="input"
-                    placeholder="Filter coin (e.g. BTC, ETH)"
+                    placeholder={t("Filter coin (e.g. BTC, ETH)", "Фильтр по монете (напр. BTC, ETH)")}
                     value={posQuery}
                     onChange={(e) => setPosQuery(e.target.value)}
                   />
@@ -377,13 +406,13 @@ export default function App() {
                   <table>
                     <thead>
                       <tr>
-                        <th>Coin</th>
-                        <th className="num">HL Weight</th>
-                        <th>CEX Venue</th>
-                        <th className="num">CEX Weight</th>
-                        <th className="num">Last HL Px</th>
-                        <th className="num">L2 Spread</th>
-                        <th className="num">Cum PnL</th>
+                        <Th k="colCoin" />
+                        <Th k="colHlWeight" num />
+                        <Th k="colCexVenue" />
+                        <Th k="colCexWeight" num />
+                        <Th k="colLastHlPx" num />
+                        <Th k="colL2Spread" num />
+                        <Th k="colCumPnl" num />
                       </tr>
                     </thead>
                     <tbody>
@@ -409,7 +438,10 @@ export default function App() {
                       {paperPositionsFiltered.length === 0 && (
                         <tr>
                           <td colSpan={7} className="muted">
-                            No active metamodel positions matching filter.
+                            {t(
+                              "No active metamodel positions matching filter.",
+                              "Нет активных позиций метамодели под этот фильтр.",
+                            )}
                           </td>
                         </tr>
                       )}
@@ -425,19 +457,22 @@ export default function App() {
               <section className="card">
                 <div className="section-header">
                   <div>
-                    <h2 className="section-title">HIP-3 Split-Margin Paper Ledger</h2>
+                    <SectionTitle k="secHip3Paper" />
                     <div className="section-sub">
-                      Zero-bridge cross-builder L2 paper (Growth Mode taker fees, independent DEX margin, Oracle Div ≤ 15 bps, half-sized onlyIsolated)
+                      {t(
+                        "Zero-bridge cross-builder L2 paper (Growth Mode taker fees, independent DEX margin, Oracle Div ≤ 15 bps, half-sized onlyIsolated)",
+                        "Paper между билдерами без мостов (taker-комиссии Growth Mode, независимая маржа на каждой DEX, расхождение оракулов ≤ 15 bps, onlyIsolated — половинный размер)",
+                      )}
                     </div>
                   </div>
                   <div className="mono muted">
-                    {data?.hip3_paper?.observed_at_utc ?? "awaiting first tick"}
+                    {data?.hip3_paper?.observed_at_utc ?? t("awaiting first tick", "ожидание первого тика")}
                     {data?.hip3_paper?.ny_session ? ` · ${data.hip3_paper.ny_session}` : ""}
                   </div>
                 </div>
                 <div className="kpi-grid">
                   <div className="card">
-                    <div className="kpi-label">HIP-3 Paper Equity</div>
+                    <KpiLabel k="kpiHip3Equity" />
                     <div className="kpi-value">{fmtUsd(data?.hip3_paper?.equity_usd)}</div>
                     <div
                       className={`kpi-sub ${(data?.hip3_paper?.return_pct ?? 0) >= 0 ? "pos" : "neg"}`}
@@ -446,27 +481,27 @@ export default function App() {
                     </div>
                   </div>
                   <div className="card">
-                    <div className="kpi-label">Split-Margin Locked</div>
+                    <KpiLabel k="kpiHip3Margin" />
                     <div className="kpi-value">{fmtUsd(data?.hip3_paper?.margin_locked_usd)}</div>
                     <div className="kpi-sub">
                       {data?.hip3_paper
-                        ? `${fx(data.hip3_paper.margin_utilization_pct, 1)}% util · ${Object.keys(data.hip3_paper.positions ?? {}).length} open pairs`
+                        ? `${fx(data.hip3_paper.margin_utilization_pct, 1)}% util · ${hip3OpenPairs} ${p(hip3OpenPairs, "open pair", "open pairs", "открытая пара", "открытые пары", "открытых пар")}`
                         : "—"}
                     </div>
                   </div>
                   <div className="card">
-                    <div className="kpi-label">Funding / Basis / Fees</div>
+                    <KpiLabel k="kpiHip3Pnl" />
                     <div className="kpi-value">{fmtUsd(data?.hip3_paper?.cum_funding_usd)}</div>
                     <div className="kpi-sub">
-                      Basis {fmtUsd(data?.hip3_paper?.cum_basis_mtm_usd)} · Fees −
+                      {t("Basis", "Базис")} {fmtUsd(data?.hip3_paper?.cum_basis_mtm_usd)} · {t("Fees", "Комиссии")} −
                       {fmtUsd(data?.hip3_paper?.cum_costs_usd)}
                     </div>
                   </div>
                   <div className="card">
-                    <div className="kpi-label">Closed &amp; Payback</div>
+                    <KpiLabel k="kpiHip3Closed" />
                     <div className="kpi-value">{data?.hip3_paper?.closed_pairs_count ?? 0}</div>
                     <div className="kpi-sub">
-                      Payback achieved: {data?.hip3_paper?.payback_achieved_count ?? 0}
+                      {t("Payback achieved", "Окупилось")}: {data?.hip3_paper?.payback_achieved_count ?? 0}
                     </div>
                   </div>
                 </div>
@@ -474,16 +509,16 @@ export default function App() {
                   <table>
                     <thead>
                       <tr>
-                        <th>Ticker</th>
-                        <th>Legs</th>
-                        <th>Mode</th>
-                        <th className="num">Leg Notional</th>
-                        <th className="num">Live APR</th>
-                        <th className="num">Oracle Div</th>
-                        <th className="num">Hours</th>
-                        <th className="num">Funding</th>
-                        <th className="num">Basis MTM</th>
-                        <th className="num">Net PnL</th>
+                        <Th k="colTicker" />
+                        <Th k="colLegs" />
+                        <Th k="colMode" />
+                        <Th k="colLegNotional" num />
+                        <Th k="colLiveApr" num />
+                        <Th k="colOracleDiv" num />
+                        <Th k="colHours" num />
+                        <Th k="colFunding" num />
+                        <Th k="colBasisMtm" num />
+                        <Th k="colNetPnl" num />
                       </tr>
                     </thead>
                     <tbody>
@@ -506,7 +541,10 @@ export default function App() {
                           <td className={`num ${p.live_oracle_div_bps > 15 ? "warn" : ""}`}>
                             {fmtBps(p.live_oracle_div_bps)}
                           </td>
-                          <td className="num">{fx(p.hours_held, 1)}h</td>
+                          <td className="num">
+                            {fx(p.hours_held, 1)}
+                            {t("h", "ч")}
+                          </td>
                           <td className={`num ${p.cum_funding_usd >= 0 ? "pos" : "neg"}`}>
                             {fmtUsd(p.cum_funding_usd)}
                           </td>
@@ -518,10 +556,13 @@ export default function App() {
                           </td>
                         </tr>
                       ))}
-                      {Object.keys(data?.hip3_paper?.positions ?? {}).length === 0 && (
+                      {hip3OpenPairs === 0 && (
                         <tr>
                           <td colSpan={10} className="muted">
-                            No open HIP-3 paper pairs yet (waiting for clean_streak ≥ 2 with Oracle Div ≤ 15 bps).
+                            {t(
+                              "No open HIP-3 paper pairs yet (waiting for clean_streak ≥ 2 with Oracle Div ≤ 15 bps).",
+                              "Открытых paper-пар HIP-3 пока нет (ждём clean_streak ≥ 2 при расхождении оракулов ≤ 15 bps).",
+                            )}
                           </td>
                         </tr>
                       )}
@@ -533,15 +574,18 @@ export default function App() {
               <section className="card">
                 <div className="section-header">
                   <div>
-                    <h2 className="section-title">HIP-3 Cross-Builder Spread Persistence</h2>
+                    <SectionTitle k="secHip3Persist" />
                     <div className="section-sub">
-                      Clean streak requires APR ≥ 20%, Oracle Div ≤ 25 bps, unchanged legs, and no missing ticks
+                      {t(
+                        "Clean streak requires APR ≥ 20%, Oracle Div ≤ 25 bps, unchanged legs, and no missing ticks",
+                        "Чистая серия требует APR ≥ 20%, расхождение оракулов ≤ 25 bps, неизменные ноги и отсутствие пропущенных тиков",
+                      )}
                     </div>
                   </div>
                   <div className="filter-row">
                     <input
                       className="input"
-                      placeholder="Filter ticker (e.g. AAPL, NVDA)"
+                      placeholder={t("Filter ticker (e.g. AAPL, NVDA)", "Фильтр по тикеру (напр. AAPL, NVDA)")}
                       value={hip3Query}
                       onChange={(e) => setHip3Query(e.target.value)}
                     />
@@ -551,7 +595,7 @@ export default function App() {
                         checked={activeOnly}
                         onChange={(e) => setActiveOnly(e.target.checked)}
                       />
-                      Active only
+                      {t("Active only", "Только активные")}
                     </label>
                     <label className="checkbox-label">
                       <input
@@ -559,7 +603,7 @@ export default function App() {
                         checked={steadyOnly}
                         onChange={(e) => setSteadyOnly(e.target.checked)}
                       />
-                      Only steady (0 flips)
+                      {t("Only steady (0 flips)", "Только стабильные (0 разворотов)")}
                     </label>
                   </div>
                 </div>
@@ -567,17 +611,17 @@ export default function App() {
                   <table>
                     <thead>
                       <tr>
-                        <th>Ticker</th>
-                        <th>Status</th>
-                        <th>Legs</th>
-                        <th className="num">Ticks</th>
-                        <th className="num">Raw ≥20%</th>
-                        <th className="num">Clean Streak</th>
-                        <th className="num">Flips</th>
-                        <th className="num">Latest APR</th>
-                        <th className="num">Median APR</th>
-                        <th className="num">Oracle Div</th>
-                        <th>Mode</th>
+                        <Th k="colTicker" />
+                        <Th k="colStatus" />
+                        <Th k="colLegs" />
+                        <Th k="colTicks" num />
+                        <Th k="colRawStreak" num />
+                        <Th k="colCleanStreak" num />
+                        <Th k="colFlips" num />
+                        <Th k="colLatestApr" num />
+                        <Th k="colMedianApr" num />
+                        <Th k="colMedianOracleDiv" num />
+                        <Th k="colMode" />
                       </tr>
                     </thead>
                     <tbody>
@@ -621,7 +665,7 @@ export default function App() {
                       {hip3PersistenceFiltered.length === 0 && (
                         <tr>
                           <td colSpan={11} className="muted">
-                            No HIP-3 persistence rows matching filters.
+                            {t("No HIP-3 persistence rows matching filters.", "Нет строк HIP-3 под эти фильтры.")}
                           </td>
                         </tr>
                       )}
@@ -633,27 +677,31 @@ export default function App() {
               <div className="grid-2">
                 <section className="card">
                   <div className="section-header">
-                    <h2 className="section-title">Pendle Boros Fixed vs Floating Markets</h2>
+                    <SectionTitle k="secBoros" />
                     <span className="section-sub">
-                      {data?.boros?.hl_and_spread_count ?? 0} HL/Spread markets
+                      {data?.boros?.hl_and_spread_count ?? 0}{" "}
+                      {p(data?.boros?.hl_and_spread_count ?? 0, "HL/Spread market", "HL/Spread markets", "рынок HL/спред", "рынка HL/спред", "рынков HL/спред")}
                     </span>
                   </div>
                   <div className="table-wrap">
                     <table>
                       <thead>
                         <tr>
-                          <th>Market</th>
-                          <th className="num">DTM</th>
-                          <th className="num">Fixed Bid</th>
-                          <th className="num">Float</th>
-                          <th>Action</th>
+                          <Th k="colMarket" />
+                          <Th k="colDtm" num />
+                          <Th k="colFixedBid" num />
+                          <Th k="colFloat" num />
+                          <Th k="colAction" />
                         </tr>
                       </thead>
                       <tbody>
                         {(data?.boros?.markets ?? []).slice(0, 10).map((m) => (
                           <tr key={m.market_id}>
                             <td className="mono">{m.symbol}</td>
-                            <td className="num">{fx(m.days_to_maturity, 0)}d</td>
+                            <td className="num">
+                              {fx(m.days_to_maturity, 0)}
+                              {t("d", "д")}
+                            </td>
                             <td className="num">{fmtPct(m.best_bid_apr_pct, 1)}</td>
                             <td className="num">{fmtPct(m.floating_apr_pct, 1)}</td>
                             <td>
@@ -668,18 +716,18 @@ export default function App() {
 
                 <section className="card">
                   <div className="section-header">
-                    <h2 className="section-title">HyperEVM Composable Yield Stack</h2>
-                    <span className="section-sub">vs HLP Benchmark</span>
+                    <SectionTitle k="secYieldStack" />
+                    <span className="section-sub">{t("vs HLP Benchmark", "против бенчмарка HLP")}</span>
                   </div>
                   <div className="table-wrap">
                     <table>
                       <thead>
                         <tr>
-                          <th>Strategy</th>
-                          <th>Rate</th>
-                          <th className="num">Net APR</th>
-                          <th className="num">vs HLP</th>
-                          <th className="num">Liq Buf</th>
+                          <Th k="colYieldStrategy" />
+                          <Th k="colRateType" />
+                          <Th k="colNetApr" num />
+                          <Th k="colVsHlp" num />
+                          <Th k="colLiqBuf" num />
                         </tr>
                       </thead>
                       <tbody>
@@ -708,20 +756,22 @@ export default function App() {
             <div className="stack">
               <section className="kpi-grid">
                 <div className="card">
-                  <div className="kpi-label">Dual-Leg Paper Equity</div>
+                  <KpiLabel k="kpiDualEquity" />
                   <div className="kpi-value">{fmtUsd(data?.cross_dex_paper?.equity_usd)}</div>
-                  <div className="kpi-sub">Start {fmtUsd(data?.cross_dex_paper?.starting_capital_usd)}</div>
+                  <div className="kpi-sub">
+                    {t("Start", "Старт")} {fmtUsd(data?.cross_dex_paper?.starting_capital_usd)}
+                  </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Cumulative Funding</div>
+                  <KpiLabel k="kpiCumFunding" />
                   <div className="kpi-value pos">{fmtUsd(data?.cross_dex_paper?.cum_funding_usd)}</div>
                   <div className="kpi-sub">Basis MTM {fmtUsd(data?.cross_dex_paper?.cum_basis_mtm_usd)}</div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Execution Costs</div>
+                  <KpiLabel k="kpiExecCosts" />
                   <div className="kpi-value warn">{fmtUsd(data?.cross_dex_paper?.cum_costs_usd)}</div>
                   <div className="kpi-sub">
-                    Closed {data?.cross_dex_paper?.closed_pairs_count ?? 0} · Payback{" "}
+                    {t("Closed", "Закрыто")} {data?.cross_dex_paper?.closed_pairs_count ?? 0} · {t("Payback", "Окупилось")}{" "}
                     {data?.cross_dex_paper?.payback_achieved_count ?? 0}
                   </div>
                 </div>
@@ -729,19 +779,19 @@ export default function App() {
 
               <section className="card">
                 <div className="section-header">
-                  <h2 className="section-title">Open Dual-Leg Paper Positions</h2>
+                  <SectionTitle k="secDualPositions" />
                 </div>
                 <div className="table-wrap">
                   <table>
                     <thead>
                       <tr>
-                        <th>Coin</th>
-                        <th>Direction</th>
-                        <th className="num">Leg Size</th>
-                        <th className="num">Hours Held</th>
-                        <th className="num">Entry APR</th>
-                        <th className="num">Live APR</th>
-                        <th className="num">Entry Basis</th>
+                        <Th k="colCoin" />
+                        <Th k="colDirection" />
+                        <Th k="colLegSize" num />
+                        <Th k="colHoursHeld" num />
+                        <Th k="colEntryApr" num />
+                        <Th k="colLiveAprDual" num />
+                        <Th k="colEntryBasis" num />
                       </tr>
                     </thead>
                     <tbody>
@@ -752,7 +802,10 @@ export default function App() {
                           </td>
                           <td className="mono">{p.direction}</td>
                           <td className="num">{fmtUsd(p.leg_notional_usd, 0)}</td>
-                          <td className="num">{fx(p.hours_held, 1)}h</td>
+                          <td className="num">
+                            {fx(p.hours_held, 1)}
+                            {t("h", "ч")}
+                          </td>
                           <td className="num">{fmtPct(p.entry_spread_apr_pct, 1)}</td>
                           <td className={`num ${p.live_spread_apr_pct >= 10 ? "pos" : "warn"}`}>
                             {fmtPct(p.live_spread_apr_pct, 1)}
@@ -763,7 +816,7 @@ export default function App() {
                       {Object.keys(data?.cross_dex_paper?.positions ?? {}).length === 0 && (
                         <tr>
                           <td colSpan={7} className="muted">
-                            No open dual-leg paper positions.
+                            {t("No open dual-leg paper positions.", "Нет открытых двуногих paper-позиций.")}
                           </td>
                         </tr>
                       )}
@@ -774,15 +827,15 @@ export default function App() {
 
               <section className="card">
                 <div className="section-header">
-                  <h2 className="section-title">5-DEX Live Funding & Basis Opportunities</h2>
+                  <SectionTitle k="secDexOpps" />
                   <div className="filter-row">
-                    <span className="section-sub">Min Spread APR:</span>
+                    <span className="section-sub">{t("Min Spread APR:", "Мин. спред APR:")}</span>
                     <select
                       className="select"
                       value={crossDexMinApr}
                       onChange={(e) => setCrossDexMinApr(Number(e.target.value))}
                     >
-                      <option value={0}>All</option>
+                      <option value={0}>{t("All", "Все")}</option>
                       <option value={15}>≥ 15%</option>
                       <option value={30}>≥ 30%</option>
                       <option value={50}>≥ 50%</option>
@@ -793,14 +846,14 @@ export default function App() {
                   <table>
                     <thead>
                       <tr>
-                        <th>Coin</th>
-                        <th>Venue</th>
-                        <th>Direction</th>
-                        <th className="num">HL APR</th>
-                        <th className="num">Other APR</th>
-                        <th className="num">Spread APR</th>
-                        <th className="num">Fav Basis</th>
-                        <th className="num">Breakeven</th>
+                        <Th k="colCoin" />
+                        <Th k="colVenue" />
+                        <Th k="colDirection" />
+                        <Th k="colHlApr" num />
+                        <Th k="colOtherApr" num />
+                        <Th k="colSpreadApr" num />
+                        <Th k="colFavBasis" num />
+                        <Th k="colBreakeven" num />
                       </tr>
                     </thead>
                     <tbody>
@@ -817,7 +870,10 @@ export default function App() {
                           <td className="num">{fmtPct(o.other_apr_pct, 1)}</td>
                           <td className="num pos">{fmtPct(o.spread_apr_pct, 1)}</td>
                           <td className="num">{fmtBps(o.favorable_basis_bps, 1)}</td>
-                          <td className="num">{fx(o.breakeven_hours, 1)}h</td>
+                          <td className="num">
+                            {fx(o.breakeven_hours, 1)}
+                            {t("h", "ч")}
+                          </td>
                         </tr>
                       ))}
                     </tbody>
@@ -831,46 +887,49 @@ export default function App() {
             <div className="stack">
               {anyAlert && (
                 <div className="alert-banner">
-                  <strong>Active On-Chain Alerts ({data?.onchain_events?.observed_at_utc}):</strong>{" "}
+                  <strong>
+                    {t("Active On-Chain Alerts", "Активные on-chain алерты")} ({data?.onchain_events?.observed_at_utc}):
+                  </strong>{" "}
                   <span className="mono">
-                    {(data?.onchain_events?.active_alert_keys ?? []).join(" · ") || "Threshold active"}
+                    {(data?.onchain_events?.active_alert_keys ?? []).join(" · ") ||
+                      t("Threshold active", "Порог превышен")}
                   </span>
                 </div>
               )}
 
               <section className="kpi-grid">
                 <div className="card">
-                  <div className="kpi-label">HLP Vault TVL</div>
+                  <KpiLabel k="kpiHlpTvl" />
                   <div className="kpi-value">{fmtUsd(data?.onchain_events?.hlp_tvl_usd)}</div>
                   <div className="kpi-sub">
-                    Source: {String(data?.onchain_events?.hlp_mm_pnl?.pnl_source ?? "—")}
+                    {t("Source", "Источник")}: {String(data?.onchain_events?.hlp_mm_pnl?.pnl_source ?? "—")}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">HLP Deposit-Clean ΔPnL</div>
+                  <KpiLabel k="kpiHlpDelta" />
                   <div className="kpi-value">
                     {fmtUsd(data?.onchain_events?.hlp_mm_pnl?.hlp_pnl_delta_usd)}
                   </div>
                   <div className="kpi-sub">
-                    Regime: {String(data?.onchain_events?.hlp_mm_pnl?.mm_pnl_regime ?? "—")}
+                    {t("Regime", "Режим")}: {String(data?.onchain_events?.hlp_mm_pnl?.mm_pnl_regime ?? "—")}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">HyperEVM Chain 999</div>
+                  <KpiLabel k="kpiEvmChain" />
                   <div className="kpi-value">
                     {data?.hyperevm?.chain?.block_number
                       ? `#${Number(data.hyperevm.chain.block_number).toLocaleString()}`
                       : "—"}
                   </div>
                   <div className="kpi-sub">
-                    USDT0 peg disc {fmtBps(data?.hyperevm?.chain?.usdt0_peg_discount_bps, 2)}
+                    {t("USDT0 peg disc", "Дисконт USDT0")} {fmtBps(data?.hyperevm?.chain?.usdt0_peg_discount_bps, 2)}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Whales Scanned (H2)</div>
+                  <KpiLabel k="kpiWhales" />
                   <div className="kpi-value">{data?.liq_funding?.whales_scanned ?? "—"}</div>
                   <div className="kpi-sub">
-                    With positions: {data?.liq_funding?.whales_with_positions ?? "—"}
+                    {t("With positions", "С позициями")}: {data?.liq_funding?.whales_with_positions ?? "—"}
                   </div>
                 </div>
               </section>
@@ -878,18 +937,18 @@ export default function App() {
               <div className="grid-2">
                 <section className="card">
                   <div className="section-header">
-                    <h2 className="section-title">H2 Whale Liquidation Clusters</h2>
+                    <SectionTitle k="secLiqClusters" />
                   </div>
                   <div className="table-wrap">
                     <table>
                       <thead>
                         <tr>
-                          <th>Coin</th>
-                          <th className="num">Mark</th>
-                          <th className="num">Total 0–10%</th>
-                          <th className="num">Nearest L</th>
-                          <th className="num">Nearest S</th>
-                          <th>Bias</th>
+                          <Th k="colCoin" />
+                          <Th k="colMark" num />
+                          <Th k="colTotal010" num />
+                          <Th k="colNearestL" num />
+                          <Th k="colNearestS" num />
+                          <Th k="colBias" />
                         </tr>
                       </thead>
                       <tbody>
@@ -903,14 +962,17 @@ export default function App() {
                             <td className="num">{fmtPct(c.nearest_long_dist_pct, 1, false)}</td>
                             <td className="num">{fmtPct(c.nearest_short_dist_pct, 1, false)}</td>
                             <td>
-                              <span className="badge">{cascadeBiasLabel(c.cascade_bias)}</span>
+                              <span className="badge">{cascadeBiasLabel(c.cascade_bias, lang)}</span>
                             </td>
                           </tr>
                         ))}
                         {(data?.liq_funding?.clusters ?? []).length === 0 && (
                           <tr>
                             <td colSpan={6} className="muted">
-                              No dense liquidation walls detected in current scan.
+                              {t(
+                                "No dense liquidation walls detected in current scan.",
+                                "В текущем скане плотных стен ликвидаций не найдено.",
+                              )}
                             </td>
                           </tr>
                         )}
@@ -921,16 +983,16 @@ export default function App() {
 
                 <section className="card">
                   <div className="section-header">
-                    <h2 className="section-title">H4 HyperEVM L1Read Oracles</h2>
+                    <SectionTitle k="secL1Read" />
                   </div>
                   <div className="table-wrap">
                     <table>
                       <thead>
                         <tr>
-                          <th>Coin</th>
-                          <th className="num">L1Read Mark</th>
-                          <th className="num">REST Mark</th>
-                          <th className="num">Drift</th>
+                          <Th k="colCoin" />
+                          <Th k="colL1ReadMark" num />
+                          <Th k="colRestMark" num />
+                          <Th k="colDrift" num />
                         </tr>
                       </thead>
                       <tbody>
@@ -958,60 +1020,63 @@ export default function App() {
             <div className="stack">
               <section className="kpi-grid">
                 <div className="card">
-                  <div className="kpi-label">Testnet Equity</div>
+                  <KpiLabel k="kpiTnEquity" />
                   <div className="kpi-value">{fmtUsd(data?.attribution?.equity_usd)}</div>
                   <div className="kpi-sub">
-                    Open pos: {String(data?.attribution?.open_positions_count ?? "—")} · Fills:{" "}
-                    {String(data?.attribution?.total_fills ?? "—")}
+                    {t("Open pos", "Открыто поз.")}: {String(data?.attribution?.open_positions_count ?? "—")} ·{" "}
+                    {t("Fills", "Исполнений")}: {String(data?.attribution?.total_fills ?? "—")}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Maker Share & ALO Fill</div>
+                  <KpiLabel k="kpiMakerAlo" />
                   <div className="kpi-value pos">
                     {fmtPct(data?.attribution?.maker_volume_share_pct, 1, false)}
                   </div>
                   <div className="kpi-sub">
-                    ALO fill {fmtPct(data?.attribution?.real_alo_fill_rate_pct, 1, false)} · Fee{" "}
+                    ALO fill {fmtPct(data?.attribution?.real_alo_fill_rate_pct, 1, false)} · {t("Fee", "Комиссия")}{" "}
                     {fmtBps(data?.attribution?.effective_fee_bps, 2)}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Net Attributed PnL</div>
+                  <KpiLabel k="kpiNetAttr" />
                   <div className="kpi-value">{fmtUsd(data?.attribution?.net_attributed_pnl_usd)}</div>
                   <div className="kpi-sub">
                     VW Markout {fmtBps(data?.attribution?.vw_markout_bps, 2)}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">API Quota & Min Liq Dist</div>
+                  <KpiLabel k="kpiApiQuota" />
                   <div className="kpi-value">
                     {String(data?.attribution?.api_quota_health ?? "—")}
                   </div>
                   <div className="kpi-sub">
-                    Min liq dist {fmtPct(data?.attribution?.min_liq_distance_pct, 1, false)} · Volume{" "}
-                    {fmtUsd(data?.attribution?.total_volume_usd)}
+                    {t("Min liq dist", "Мин. до ликв.")} {fmtPct(data?.attribution?.min_liq_distance_pct, 1, false)} ·{" "}
+                    {t("Volume", "Объём")} {fmtUsd(data?.attribution?.total_volume_usd)}
                   </div>
                 </div>
               </section>
 
               <section className="card">
                 <div className="section-header">
-                  <h2 className="section-title">Per-Coin Testnet Attribution, Liq Distance & ADL Rank</h2>
-                  <span className="section-sub">{perCoinAttribution.length} tracked coins</span>
+                  <SectionTitle k="secPerCoin" />
+                  <span className="section-sub">
+                    {perCoinAttribution.length}{" "}
+                    {p(perCoinAttribution.length, "tracked coin", "tracked coins", "отслеживаемая монета", "отслеживаемые монеты", "отслеживаемых монет")}
+                  </span>
                 </div>
                 <div className="table-wrap">
                   <table>
                     <thead>
                       <tr>
-                        <th>Coin</th>
-                        <th className="num">Position USD</th>
-                        <th>Leverage</th>
-                        <th className="num">Fills</th>
-                        <th className="num">Maker %</th>
-                        <th className="num">Net PnL</th>
-                        <th className="num">VW Markout</th>
-                        <th className="num">Liq Dist</th>
-                        <th className="num">ADL Rank</th>
+                        <Th k="colCoin" />
+                        <Th k="colPositionUsd" num />
+                        <Th k="colLeverage" />
+                        <Th k="colFills" num />
+                        <Th k="colMakerPct" num />
+                        <Th k="colNetPnl" num />
+                        <Th k="colVwMarkout" num />
+                        <Th k="colLiqDist" num />
+                        <Th k="colAdlRank" num />
                       </tr>
                     </thead>
                     <tbody>
@@ -1046,7 +1111,7 @@ export default function App() {
                       {perCoinAttribution.length === 0 && (
                         <tr>
                           <td colSpan={9} className="muted">
-                            No per-coin attribution snapshot yet.
+                            {t("No per-coin attribution snapshot yet.", "Снимка атрибуции по монетам пока нет.")}
                           </td>
                         </tr>
                       )}
@@ -1057,20 +1122,22 @@ export default function App() {
 
               <section className="card">
                 <div className="section-header">
-                  <h2 className="section-title">Recent Testnet ALO Rebalance Cycles</h2>
-                  <span className="section-sub">Newest first from hl_testnet_audit.jsonl</span>
+                  <SectionTitle k="secAudit" />
+                  <span className="section-sub">
+                    {t("Newest first from hl_testnet_audit.jsonl", "Сначала новые, из hl_testnet_audit.jsonl")}
+                  </span>
                 </div>
                 <div className="table-wrap">
                   <table>
                     <thead>
                       <tr>
-                        <th>Time (UTC)</th>
-                        <th>Status</th>
-                        <th className="num">Cancelled</th>
-                        <th className="num">Placed ALO</th>
-                        <th className="num">Notional</th>
-                        <th className="num">HWM</th>
-                        <th>Violations</th>
+                        <Th k="colTimeUtc" />
+                        <Th k="colAuditStatus" />
+                        <Th k="colCancelled" num />
+                        <Th k="colPlacedAlo" num />
+                        <Th k="colNotional" num />
+                        <Th k="colHwm" num />
+                        <Th k="colViolations" />
                       </tr>
                     </thead>
                     <tbody>
@@ -1090,10 +1157,10 @@ export default function App() {
                             {[
                               rec.violations.length ? rec.violations.join(", ") : "",
                               rec.skipped_unquoted_coins?.length
-                                ? `skipped (no BBO): ${rec.skipped_unquoted_coins.join(", ")}`
+                                ? `${t("skipped (no BBO)", "пропущено (нет BBO)")}: ${rec.skipped_unquoted_coins.join(", ")}`
                                 : "",
                               rec.orphan_positions && Object.keys(rec.orphan_positions).length
-                                ? `orphans: ${Object.keys(rec.orphan_positions).join(", ")}`
+                                ? `${t("orphans", "сироты")}: ${Object.keys(rec.orphan_positions).join(", ")}`
                                 : "",
                             ]
                               .filter(Boolean)
@@ -1104,7 +1171,7 @@ export default function App() {
                       {(data?.testnet_audit_recent ?? []).length === 0 && (
                         <tr>
                           <td colSpan={7} className="muted">
-                            No rebalance audit records yet.
+                            {t("No rebalance audit records yet.", "Записей аудита ребалансов пока нет.")}
                           </td>
                         </tr>
                       )}
@@ -1117,15 +1184,14 @@ export default function App() {
                 {Object.values(data?.mm_calibration ?? {}).map((cal) => (
                   <section className="card" key={cal.coin}>
                     <div className="section-header">
-                      <h2 className="section-title">
-                        Avellaneda–Stoikov Empirical κ Calibration ({cal.coin})
-                      </h2>
+                      <SectionTitle k="secKappa" suffix={` (${cal.coin})`} />
                       <span className="badge badge-cyan">R² = {fx(cal.r2_fit, 3)}</span>
                     </div>
                     <KappaCalibrationChart cal={cal} />
                     <div className="kpi-sub" style={{ marginTop: 8 }}>
-                      κ = {fx(cal.kappa_per_bp, 3)}/bp · σ_τ = {fx(cal.empirical_sigma_tau_bps, 2)} bps ·
-                      Min half-spread = {fx(cal.implied_min_half_spread_bps, 2)} bps · {cal.trades_count} trades
+                      κ = {fx(cal.kappa_per_bp, 3)}/bp · σ_τ = {fx(cal.empirical_sigma_tau_bps, 2)} bps ·{" "}
+                      {t("Min half-spread", "Мин. полуспред")} = {fx(cal.implied_min_half_spread_bps, 2)} bps ·{" "}
+                      {cal.trades_count} {p(cal.trades_count, "trade", "trades", "сделка", "сделки", "сделок")}
                     </div>
                   </section>
                 ))}
@@ -1137,26 +1203,30 @@ export default function App() {
             <div className="stack">
               <section className="kpi-grid">
                 <div className="card">
-                  <div className="kpi-label">Frontend Build SHA</div>
+                  <KpiLabel k="kpiFeSha" />
                   <div className="kpi-value">{shortSha(feSha)}</div>
                   <div className="kpi-sub">{feBuild?.built_at || "local / dev"}</div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Backend Build SHA</div>
+                  <KpiLabel k="kpiBeSha" />
                   <div className="kpi-value">{shortSha(beSha)}</div>
                   <div className="kpi-sub">{data?.build_info?.built_at || "local / dev"}</div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Worker Heartbeat</div>
+                  <KpiLabel k="kpiHeartbeat" />
                   <div className="kpi-value">
                     {data?.worker_status ? "ONLINE" : "EXTERNAL / CRON"}
                   </div>
                   <div className="kpi-sub">
-                    {data?.worker_status?.heartbeat_utc ?? "Run hl-worker container to report heartbeat"}
+                    {data?.worker_status?.heartbeat_utc ??
+                      t(
+                        "Run hl-worker container to report heartbeat",
+                        "Запустите контейнер hl-worker, чтобы появился пульс",
+                      )}
                   </div>
                 </div>
                 <div className="card">
-                  <div className="kpi-label">Testnet Execution Gate</div>
+                  <KpiLabel k="kpiExecGate" />
                   <div className="kpi-value">
                     {data?.worker_status?.testnet_execution_enabled ? "ENABLED" : "READ-ONLY"}
                   </div>
@@ -1168,19 +1238,19 @@ export default function App() {
 
               <section className="card">
                 <div className="section-header">
-                  <h2 className="section-title">Docker Worker Scheduled Jobs (UTC)</h2>
+                  <SectionTitle k="secJobs" />
                 </div>
                 <div className="table-wrap">
                   <table>
                     <thead>
                       <tr>
-                        <th>Job</th>
-                        <th>Cron (UTC)</th>
-                        <th>State</th>
-                        <th>Last Finished</th>
-                        <th className="num">Duration</th>
-                        <th className="num">OK / Fail</th>
-                        <th>Next Run</th>
+                        <Th k="colJob" />
+                        <Th k="colCron" />
+                        <Th k="colState" />
+                        <Th k="colLastFinished" />
+                        <Th k="colDuration" num />
+                        <Th k="colOkFail" num />
+                        <Th k="colNextRun" />
                       </tr>
                     </thead>
                     <tbody>
@@ -1209,7 +1279,7 @@ export default function App() {
                           </td>
                           <td className="mono">{j.last_finished_at_utc ?? "—"}</td>
                           <td className="num">
-                            {num(j.last_duration_s) !== null ? `${fx(j.last_duration_s, 1)}s` : "—"}
+                            {num(j.last_duration_s) !== null ? `${fx(j.last_duration_s, 1)}${t("s", "с")}` : "—"}
                           </td>
                           <td className="num">
                             {j.runs_ok} / {j.runs_failed}
@@ -1220,7 +1290,10 @@ export default function App() {
                       {(data?.worker_status?.jobs ?? []).length === 0 && (
                         <tr>
                           <td colSpan={7} className="muted">
-                            No container worker heartbeat yet (expected when previewing local data without worker).
+                            {t(
+                              "No container worker heartbeat yet (expected when previewing local data without worker).",
+                              "Пульса от воркера пока нет (это нормально при просмотре локальных данных без воркера).",
+                            )}
                           </td>
                         </tr>
                       )}
@@ -1231,17 +1304,17 @@ export default function App() {
 
               <section className="card">
                 <div className="section-header">
-                  <h2 className="section-title">Shared Volume Artifact Freshness (/data/paper)</h2>
+                  <SectionTitle k="secFreshness" />
                 </div>
                 <div className="table-wrap">
                   <table>
                     <thead>
                       <tr>
-                        <th>Artifact</th>
-                        <th>Path</th>
-                        <th>Status</th>
-                        <th>Updated (UTC)</th>
-                        <th className="num">Age (min)</th>
+                        <Th k="colArtifact" />
+                        <Th k="colPath" />
+                        <Th k="colFileStatus" />
+                        <Th k="colUpdated" />
+                        <Th k="colAgeMin" num />
                       </tr>
                     </thead>
                     <tbody>

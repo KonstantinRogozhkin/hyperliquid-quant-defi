@@ -1,3 +1,4 @@
+import { useLang } from "../i18n";
 import type { CoinCalibration, OlsScatterPoint } from "../types";
 
 export interface SeriesLine {
@@ -24,9 +25,17 @@ export function MultiSeriesChart({
   dates: string[];
   height?: number;
 }) {
+  const { t } = useLang();
   const valid = series.filter((s) => s.values.length >= 2);
   if (valid.length === 0) {
-    return <div className="muted">Waiting for at least 2 observations across selected strategies...</div>;
+    return (
+      <div className="muted">
+        {t(
+          "Waiting for at least 2 observations across selected strategies...",
+          "Ждём минимум 2 наблюдения по выбранным стратегиям...",
+        )}
+      </div>
+    );
   }
 
   const width = 760;
@@ -140,8 +149,16 @@ export function OlsScatterChart({
   factorName: string;
   strategyName: string;
 }) {
+  const { t } = useLang();
   if (points.length < 3 || beta === null) {
-    return <div className="muted">Need at least 3 overlapping daily returns for OLS regression plot.</div>;
+    return (
+      <div className="muted">
+        {t(
+          "Need at least 3 overlapping daily returns for OLS regression plot.",
+          "Для графика регрессии OLS нужно минимум 3 общих дневных доходности.",
+        )}
+      </div>
+    );
   }
 
   const width = 420;
@@ -208,8 +225,9 @@ export function EquityCurveChart({
   stroke?: string;
   height?: number;
 }) {
+  const { t, p } = useLang();
   if (values.length < 2) {
-    return <div className="muted">Waiting for at least 2 equity ticks...</div>;
+    return <div className="muted">{t("Waiting for at least 2 equity ticks...", "Ждём минимум 2 тика капитала...")}</div>;
   }
   const width = 540;
   const padX = 12;
@@ -241,12 +259,12 @@ export function EquityCurveChart({
       </svg>
       <div className="section-header" style={{ marginTop: 6, marginBottom: 0 }}>
         <span className="section-sub mono">
-          Min ${minVal.toLocaleString("en-US", { maximumFractionDigits: 2 })} · Max $
+          {t("Min", "Мин")} ${minVal.toLocaleString("en-US", { maximumFractionDigits: 2 })} · {t("Max", "Макс")} $
           {maxVal.toLocaleString("en-US", { maximumFractionDigits: 2 })}
         </span>
         <span className={`mono ${pct >= 0 ? "pos" : "neg"}`}>
           {pct >= 0 ? "+" : ""}
-          {pct.toFixed(3)}% ({values.length} ticks)
+          {pct.toFixed(3)}% ({values.length} {p(values.length, "tick", "ticks", "тик", "тика", "тиков")})
         </span>
       </div>
     </div>
@@ -254,9 +272,10 @@ export function EquityCurveChart({
 }
 
 export function KappaCalibrationChart({ cal }: { cal: CoinCalibration }) {
+  const { t } = useLang();
   const curve = cal.depth_curve ?? [];
   if (curve.length === 0) {
-    return <div className="muted">No calibration points yet.</div>;
+    return <div className="muted">{t("No calibration points yet.", "Точек калибровки пока нет.")}</div>;
   }
   const width = 420;
   const height = 165;
