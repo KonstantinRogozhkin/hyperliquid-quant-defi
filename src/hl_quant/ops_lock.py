@@ -25,7 +25,9 @@ def run_locked(lock_path: Path, cmd: list[str]) -> int:
             return 0
         os.ftruncate(fd, 0)
         os.write(fd, f"{os.getpid()}\n".encode())
-        return subprocess.call(cmd)
+        # The child inherits the locked descriptor, so the lock survives until the protected
+        # command exits even if this guard process is killed first.
+        return subprocess.call(cmd, pass_fds=(fd,))
     finally:
         os.close(fd)  # releases the flock
 

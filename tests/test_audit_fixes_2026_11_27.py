@@ -252,3 +252,37 @@ def test_ops_lock_skips_when_held(tmp_path: Path) -> None:
         os.close(fd)
     assert ops_lock.run_locked(lock, cmd) == 0
     assert marker.exists()
+
+
+def test_ops_lock_survives_guard_death(tmp_path: Path) -> None:
+    import fcntl
+    import os
+    import signal
+    import subprocess
+    import sys
+    import time
+
+    lock = tmp_path / "y.flock"
+    src = str(Path(__file__).resolve().parents[1] / "src")
+    guard = subprocess.Popen(
+        [sys.executable, "-m", "hl_quant.ops_lock", str(lock), "--", sys.executable, "-c", "import time; time.sleep(3)"],
+        env={**os.environ, "PYTHONPATH": src},
+    )
+    time.sleep(0.8)
+    guard.send_signal(signal.SIGKILL)
+    guard.wait()
+    fd = os.open(lock, os.O_RDWR)
+    try:
+        with pytest.raises(BlockingIOError):
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # child still holds the lock
+    finally:
+        os.close(fd)
+
+
+def test_cross_dex_long_hl_book_and_mark_basis_share_denominator() -> None:
+    hb, ha = [(99.99, 1e3)], [(100.01, 1e3)]
+    ob, oa = [(102.99, 1e3)], [(103.01, 1e3)]
+    book = cds.compute_book_mid_basis_bps(hb, ha, ob, oa, short_hl=False)
+    mark = (103.0 - 100.0) / 100.0 * 1e4
+    assert book == pytest.approx(mark, abs=0.01)
+

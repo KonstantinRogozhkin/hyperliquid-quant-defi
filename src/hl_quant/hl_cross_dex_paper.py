@@ -315,7 +315,9 @@ def run_cross_dex_paper_tick(
             streak = streak_count(new_streaks.get(streak_key))
 
             # Quick mark-basis pre-filter before hitting L2 endpoints if persistence not yet met
-            mark_basis_dir = (h.mark_px - oth.mark_px) / oth.mark_px * 1e4 if short_hl else (oth.mark_px - h.mark_px) / oth.mark_px * 1e4
+            # Same directional denominator as cds.favorable_basis_bps / compute_book_mid_basis_bps
+            # (other venue when short HL, HL when long HL) so the two bases are comparable.
+            mark_basis_dir = (h.mark_px - oth.mark_px) / oth.mark_px * 1e4 if short_hl else (oth.mark_px - h.mark_px) / h.mark_px * 1e4
             could_be_combo = (
                 cfg.enable_basis_carry_combo
                 and spread_apr >= cfg.combo_min_apr_pct
