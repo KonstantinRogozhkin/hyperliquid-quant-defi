@@ -716,8 +716,8 @@ def simulate_avellaneda_stoikov_on_l2(
     """Replay Avellaneda–Stoikov MM over an L2 book DataFrame (touch + optional trade-through fills)."""
     if l2_df.empty:
         raise ValueError("l2_df is empty")
-    df = l2_df.sort_values("recv_ms").reset_index(drop=True)
-    ts_col = "recv_ms" if "recv_ms" in df.columns else "book_time_ms"
+    ts_col = "recv_ms" if "recv_ms" in l2_df.columns else "book_time_ms"
+    df = l2_df.sort_values(ts_col).reset_index(drop=True)
     vol_est = EWMAVolatilityEstimator(
         horizon_sec=params.horizon_sec,
         half_life_sec=params.vol_half_life_sec,

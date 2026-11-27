@@ -20,6 +20,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 from typing import Any
 
@@ -97,8 +98,14 @@ def run_id_for_params(
     if provider:
         identity["provider"] = provider
     digest = sha256(canonical_json(identity)).hexdigest()[:16]
-    label = "_".join(str(params[k]) for k in ("coin", "symbol", "interval") if k in params)
+    label = "_".join(_safe_component(str(params[k])) for k in ("coin", "symbol", "interval") if k in params)
     return f"{label}_{params['start_ms']}_{params['end_ms']}_{digest}"
+
+
+def _safe_component(value: str) -> str:
+    """Make a value safe as a single path component (spot symbols like ``HYPE/USDC`` contain ``/``)."""
+    cleaned = re.sub(r"[^A-Za-z0-9._@=+-]", "-", value).strip(".")
+    return cleaned or "x"
 
 
 def run_id_for(
@@ -240,8 +247,11 @@ def verify_run(run_dir: Path) -> dict[str, Any]:
     files = manifest.get("files")
     if not isinstance(files, dict) or not any(name.endswith(".parquet") for name in files):
         raise ManifestCorruptError(f"{run_dir}: manifest lists no parquet files")
+    root = Path(run_dir).resolve()
     for name, digest in files.items():
-        path = Path(run_dir) / name
+        path = (Path(run_dir) / name).resolve()
+        if not path.is_relative_to(root):
+            raise ManifestCorruptError(f"{run_dir}: {name} escapes run directory")
         if not path.is_file() or file_sha256(path) != digest:
             raise ManifestCorruptError(f"{run_dir}: {name} missing or hash mismatch")
     return manifest

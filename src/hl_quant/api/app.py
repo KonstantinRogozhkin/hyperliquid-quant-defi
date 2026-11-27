@@ -147,27 +147,32 @@ def _read_testnet_audit_tail(data_root: Path, limit: int = 15) -> list[dict[str,
             continue
         if not isinstance(rec, dict):
             continue
-        ts_ms = int(rec.get("ts_ms") or 0)
-        obs = (
-            datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            if ts_ms > 0
-            else None
-        )
-        records.append(
-            {
-                "ts_ms": ts_ms,
-                "observed_at_utc": obs,
-                "status": str(rec.get("status") or "unknown"),
-                "violations": list(rec.get("violations") or []),
-                "cancelled_count": int(rec.get("cancelled_count", 0) or 0),
-                "placed_count": int(rec.get("placed_count", 0) or 0),
-                "total_notional_usd": float(rec.get("total_notional_usd", 0.0) or 0.0),
-                "high_water_mark_usd": float(rec.get("high_water_mark_usd", 0.0) or 0.0),
-                "blocked_isolated_coins": list(rec.get("blocked_isolated_coins") or []),
-                "skipped_unquoted_coins": list(rec.get("skipped_unquoted_coins") or []),
-            }
-        )
+        try:
+            records.append(_audit_record(rec))
+        except (TypeError, ValueError, OverflowError):
+            continue  # skip malformed audit lines instead of 500-ing /overview and /metrics
     return records
+
+
+def _audit_record(rec: dict[str, Any]) -> dict[str, Any]:
+    ts_ms = int(rec.get("ts_ms") or 0)
+    obs = (
+        datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        if ts_ms > 0
+        else None
+    )
+    return {
+        "ts_ms": ts_ms,
+        "observed_at_utc": obs,
+        "status": str(rec.get("status") or "unknown"),
+        "violations": list(rec.get("violations") or []),
+        "cancelled_count": int(rec.get("cancelled_count", 0) or 0),
+        "placed_count": int(rec.get("placed_count", 0) or 0),
+        "total_notional_usd": float(rec.get("total_notional_usd", 0.0) or 0.0),
+        "high_water_mark_usd": float(rec.get("high_water_mark_usd", 0.0) or 0.0),
+        "blocked_isolated_coins": list(rec.get("blocked_isolated_coins") or []),
+        "skipped_unquoted_coins": list(rec.get("skipped_unquoted_coins") or []),
+    }
 
 
 def collect_artifact_freshness(data_root: Path, now_utc: datetime | None = None) -> dict[str, dict[str, Any]]:

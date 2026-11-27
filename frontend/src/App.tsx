@@ -19,6 +19,11 @@ function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
+function fx(v: unknown, digits = 2): string {
+  const n = num(v);
+  return n === null ? "—" : n.toFixed(digits);
+}
+
 function fmtUsd(v: unknown, digits = 2): string {
   const n = num(v);
   if (n === null) return "—";
@@ -248,11 +253,11 @@ export default function App() {
                 <div className="card">
                   <div className="kpi-label">AS-MM Engine Latency</div>
                   <div className="kpi-value">
-                    {data?.latency_bench ? `${data.latency_bench.p50_us.toFixed(1)} µs` : "—"}
+                    {data?.latency_bench ? `${fx(data.latency_bench.p50_us, 1)} µs` : "—"}
                   </div>
                   <div className="kpi-sub">
                     {data?.latency_bench
-                      ? `p99 ${data.latency_bench.p99_us.toFixed(1)} µs · ${Math.round(data.latency_bench.throughput_ticks_per_sec).toLocaleString()} tps`
+                      ? `p99 ${fx(data.latency_bench.p99_us, 1)} µs · ${Math.round(data.latency_bench.throughput_ticks_per_sec).toLocaleString()} tps`
                       : "Benchmark not logged"}
                   </div>
                 </div>
@@ -307,7 +312,7 @@ export default function App() {
                             <td className={`num ${row.mean_gross_bps >= 0 ? "pos" : "neg"}`}>
                               {fmtBps(row.mean_gross_bps, 2)}
                             </td>
-                            <td className="num">{row.t_stat.toFixed(2)}</td>
+                            <td className="num">{fx(row.t_stat, 2)}</td>
                             <td className={`num ${row.net_maker_bps >= 0 ? "pos" : "neg"}`}>
                               {fmtBps(row.net_maker_bps, 2)}
                             </td>
@@ -418,7 +423,7 @@ export default function App() {
                     <div className="kpi-value">{fmtUsd(data?.hip3_paper?.margin_locked_usd)}</div>
                     <div className="kpi-sub">
                       {data?.hip3_paper
-                        ? `${data.hip3_paper.margin_utilization_pct.toFixed(1)}% util · ${Object.keys(data.hip3_paper.positions ?? {}).length} open pairs`
+                        ? `${fx(data.hip3_paper.margin_utilization_pct, 1)}% util · ${Object.keys(data.hip3_paper.positions ?? {}).length} open pairs`
                         : "—"}
                     </div>
                   </div>
@@ -474,7 +479,7 @@ export default function App() {
                           <td className={`num ${p.live_oracle_div_bps > 15 ? "warn" : ""}`}>
                             {fmtBps(p.live_oracle_div_bps)}
                           </td>
-                          <td className="num">{p.hours_held.toFixed(1)}h</td>
+                          <td className="num">{fx(p.hours_held, 1)}h</td>
                           <td className={`num ${p.cum_funding_usd >= 0 ? "pos" : "neg"}`}>
                             {fmtUsd(p.cum_funding_usd)}
                           </td>
@@ -621,7 +626,7 @@ export default function App() {
                         {(data?.boros?.markets ?? []).slice(0, 10).map((m) => (
                           <tr key={m.market_id}>
                             <td className="mono">{m.symbol}</td>
-                            <td className="num">{m.days_to_maturity.toFixed(0)}d</td>
+                            <td className="num">{fx(m.days_to_maturity, 0)}d</td>
                             <td className="num">{fmtPct(m.best_bid_apr_pct, 1)}</td>
                             <td className="num">{fmtPct(m.floating_apr_pct, 1)}</td>
                             <td>
@@ -661,7 +666,7 @@ export default function App() {
                             <td className={`num ${s.spread_vs_hlp_pct >= 0 ? "pos" : "neg"}`}>
                               {fmtPct(s.spread_vs_hlp_pct, 2)}
                             </td>
-                            <td className="num">{s.liq_buffer_pct.toFixed(0)}%</td>
+                            <td className="num">{fx(s.liq_buffer_pct, 0)}%</td>
                           </tr>
                         ))}
                       </tbody>
@@ -720,7 +725,7 @@ export default function App() {
                           </td>
                           <td className="mono">{p.direction}</td>
                           <td className="num">{fmtUsd(p.leg_notional_usd, 0)}</td>
-                          <td className="num">{p.hours_held.toFixed(1)}h</td>
+                          <td className="num">{fx(p.hours_held, 1)}h</td>
                           <td className="num">{fmtPct(p.entry_spread_apr_pct, 1)}</td>
                           <td className={`num ${p.live_spread_apr_pct >= 10 ? "pos" : "warn"}`}>
                             {fmtPct(p.live_spread_apr_pct, 1)}
@@ -785,7 +790,7 @@ export default function App() {
                           <td className="num">{fmtPct(o.other_apr_pct, 1)}</td>
                           <td className="num pos">{fmtPct(o.spread_apr_pct, 1)}</td>
                           <td className="num">{fmtBps(o.favorable_basis_bps, 1)}</td>
-                          <td className="num">{o.breakeven_hours.toFixed(1)}h</td>
+                          <td className="num">{fx(o.breakeven_hours, 1)}h</td>
                         </tr>
                       ))}
                     </tbody>
@@ -1003,7 +1008,7 @@ export default function App() {
                           <td className="num">
                             {c.adl_rank_score !== null ? (
                               <span className={`badge ${c.adl_rank_score >= 2.0 ? "badge-warn" : "badge-ok"}`}>
-                                {c.adl_rank_score.toFixed(2)}
+                                {fx(c.adl_rank_score, 2)}
                               </span>
                             ) : (
                               "—"
@@ -1085,12 +1090,12 @@ export default function App() {
                       <h2 className="section-title">
                         Avellaneda–Stoikov Empirical κ Calibration ({cal.coin})
                       </h2>
-                      <span className="badge badge-cyan">R² = {cal.r2_fit.toFixed(3)}</span>
+                      <span className="badge badge-cyan">R² = {fx(cal.r2_fit, 3)}</span>
                     </div>
                     <KappaCalibrationChart cal={cal} />
                     <div className="kpi-sub" style={{ marginTop: 8 }}>
-                      κ = {cal.kappa_per_bp.toFixed(3)}/bp · σ_τ = {cal.empirical_sigma_tau_bps.toFixed(2)} bps ·
-                      Min half-spread = {cal.implied_min_half_spread_bps.toFixed(2)} bps · {cal.trades_count} trades
+                      κ = {fx(cal.kappa_per_bp, 3)}/bp · σ_τ = {fx(cal.empirical_sigma_tau_bps, 2)} bps ·
+                      Min half-spread = {fx(cal.implied_min_half_spread_bps, 2)} bps · {cal.trades_count} trades
                     </div>
                   </section>
                 ))}
@@ -1174,7 +1179,7 @@ export default function App() {
                           </td>
                           <td className="mono">{j.last_finished_at_utc ?? "—"}</td>
                           <td className="num">
-                            {j.last_duration_s !== null ? `${j.last_duration_s.toFixed(1)}s` : "—"}
+                            {num(j.last_duration_s) !== null ? `${fx(j.last_duration_s, 1)}s` : "—"}
                           </td>
                           <td className="num">
                             {j.runs_ok} / {j.runs_failed}
@@ -1222,7 +1227,7 @@ export default function App() {
                             </span>
                           </td>
                           <td className="mono">{info.updated_at_utc ?? "—"}</td>
-                          <td className="num">{info.age_minutes !== null ? info.age_minutes.toFixed(1) : "—"}</td>
+                          <td className="num">{num(info.age_minutes) !== null ? fx(info.age_minutes, 1) : "—"}</td>
                         </tr>
                       ))}
                     </tbody>

@@ -15,11 +15,27 @@ from datetime import datetime, timezone
 import html
 import json
 from pathlib import Path
+import threading
+import time
 from typing import Any
 
 import pandas as pd
 
 from hl_quant import hl_mm_avellaneda_stoikov as mm
+
+_LATENCY_TTL_S = 300.0
+_latency_lock = threading.Lock()
+_latency_cache: tuple[float, dict[str, float]] | None = None
+
+
+def _cached_latency_bench() -> dict[str, float]:
+    """Run the CPU micro-benchmark at most once per TTL (API/metrics endpoints call this per request)."""
+    global _latency_cache
+    with _latency_lock:
+        now = time.monotonic()
+        if _latency_cache is None or now - _latency_cache[0] > _LATENCY_TTL_S:
+            _latency_cache = (now, mm.benchmark_tick_to_quote_latency(3_000))
+        return dict(_latency_cache[1])
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -44,10 +60,13 @@ def collect_tear_sheet_data(data_root: Path) -> dict[str, Any]:
     ticks_p = data_root / "hl_metamodel" / "ticks.parquet"
     state_p = data_root / "hl_metamodel" / "state.json"
     if ticks_p.is_file() and state_p.is_file():
-        ticks = pd.read_parquet(ticks_p)
+        try:
+            ticks = pd.read_parquet(ticks_p)
+        except Exception:
+            ticks = pd.DataFrame()
         st = _read_json(state_p) or {}
-        if not ticks.empty:
-            start_cap = float(st.get("starting_capital_usd", 100_000.0))
+        if not ticks.empty and "equity_usd" in ticks.columns:
+            start_cap = float(st.get("starting_capital_usd") or 100_000.0)
             last_eq = float(ticks["equity_usd"].iloc[-1])
             paper_info = {
                 "ticks": int(len(ticks)),
@@ -60,11 +79,14 @@ def collect_tear_sheet_data(data_root: Path) -> dict[str, Any]:
     cross_dex_top: list[dict[str, Any]] = []
     cd_p = data_root / "hl_cross_dex_v2" / "opportunities.parquet"
     if cd_p.is_file():
-        cdf = pd.read_parquet(cd_p)
+        try:
+            cdf = pd.read_parquet(cd_p)
+        except Exception:
+            cdf = pd.DataFrame()
         if not cdf.empty:
             cross_dex_top = cdf.head(5).to_dict(orient="records")
 
-    latency = mm.benchmark_tick_to_quote_latency(3_000)
+    latency = _cached_latency_bench()
     return {
         "generated_at_utc": datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "attribution": attr,

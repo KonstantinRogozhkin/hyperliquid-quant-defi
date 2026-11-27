@@ -140,6 +140,8 @@ def discover_common_coins(
     """
     if venue not in cex.VENUES:
         raise cex.CexDataError(f"unknown venue {venue!r}")
+    if venue not in ("binance", "bybit"):
+        raise cex.CexDataError(f"discover_common_coins does not support venue {venue!r} yet")
 
     meta_ctx = hl_client.info({"type": "metaAndAssetCtxs"})
     if not (isinstance(meta_ctx, list) and len(meta_ctx) == 2 and isinstance(meta_ctx[0], dict) and "universe" in meta_ctx[0]):

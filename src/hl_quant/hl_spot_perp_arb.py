@@ -27,6 +27,7 @@ import pandas as pd
 from hl_quant import cross_dex_scanner as cds
 from hl_quant import hl_boros_fixed_funding as boros
 from hl_quant import hl_hyperevm_defi as evm
+from hl_quant.persistence_clock import advance_streak, streak_count, update_streak_map
 
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
 HOURS_PER_YEAR = 8760.0
@@ -184,6 +185,14 @@ class SpotPerpPaperConfig:
     hard_flip_apr_pct: float = -5.0  # Immediate exit on deep negative funding flip
     exit_confirm_ticks: int = 2  # Consecutive low-APR ticks before soft exit
     min_clean_streak: int = 2  # Consecutive eligible ticks before entry
+    # Wall-clock spacing between streak increments: manual re-runs / worker restarts inside the
+    # 4h cron window must not advance entry or exit gates (prevents minute-scale fee churn).
+    min_streak_spacing_hours: float = 3.5
+    min_hold_hours_before_soft_exit: float = 8.0  # soft funding-decay exits wait >= 8h after entry
+    # Opportunity-cost hurdle: a slot must out-earn parking the same capital in HLP
+    # (net_deposit_apr >= hlp_apr * hurdle_mult); otherwise skip the entry and its fees.
+    require_hlp_hurdle: bool = True
+    hlp_hurdle_mult: float = 1.0
     max_l2_slip_bps: float = 10.0
     min_exec_basis_bps: float = -12.0
     max_proxy_basis_bps: float = 120.0
@@ -282,7 +291,8 @@ def fetch_matched_spot_perp_markets(
             "funding_rate_h": _f(ctx.get("funding")),
             "day_vol_usd": _f(ctx.get("dayNtlVlm")),
             "oi_usd": _f(ctx.get("openInterest")) * mark,
-            "only_isolated": bool(u.get("onlyIsolated", False)),
+            "only_isolated": bool(u.get("onlyIsolated", False))
+            or str(u.get("marginMode") or "") in {"strictIsolated", "noCross", "onlyIsolated"},
             "max_leverage": int(u.get("maxLeverage") or 10),
         }
 
@@ -619,7 +629,7 @@ def run_spot_perp_paper_tick(
         prev_equity = float(state.get("equity_usd", cfg.starting_capital_usd))
 
         positions: dict[str, dict[str, Any]] = state.get("positions") or {}
-        low_apr_streaks: dict[str, int] = state.get("low_apr_streaks") or {}
+        low_apr_streaks: dict[str, Any] = state.get("low_apr_streaks") or {}
         trade_rows: list[dict[str, Any]] = []
 
         tick_funding_usd = 0.0
@@ -743,11 +753,20 @@ def run_spot_perp_paper_tick(
                 elif opp.is_proxy_hedge and abs(opp.mark_basis_bps) > cfg.max_proxy_basis_bps * 1.5:
                     exit_reason = f"proxy_basis_break({opp.mark_basis_bps:+.1f}bps)"
                 elif opp.funding_apr_pct < cfg.exit_apr_pct:
-                    low_apr_streaks[base] = int(low_apr_streaks.get(base, 0)) + 1
-                    if low_apr_streaks[base] >= cfg.exit_confirm_ticks:
+                    low_apr_streaks[base] = advance_streak(
+                        low_apr_streaks.get(base),
+                        qualifies=True,
+                        now_ms=ts_ms,
+                        min_spacing_hours=cfg.min_streak_spacing_hours,
+                    )
+                    held_h = float(pos.get("hours_held", 0.0))
+                    if (
+                        streak_count(low_apr_streaks[base]) >= cfg.exit_confirm_ticks
+                        and held_h >= cfg.min_hold_hours_before_soft_exit
+                    ):
                         exit_reason = f"funding_decay({opp.funding_apr_pct:+.1f}%)"
                 else:
-                    low_apr_streaks[base] = 0
+                    low_apr_streaks[base] = advance_streak(None, qualifies=False, now_ms=ts_ms)
 
             if exit_reason and not nav_guard_triggered:
                 notional = float(pos["perp_notional_usd"])
@@ -784,13 +803,15 @@ def run_spot_perp_paper_tick(
                 low_apr_streaks.pop(base, None)
 
         # 5. Update clean persistence streaks & evaluate new entries
-        clean_streaks: dict[str, int] = state.get("clean_streaks") or {}
         eligible_bases = {o.base_symbol for o in scan.opportunities if o.eligible}
-        for b in list(clean_streaks.keys()):
-            if b not in eligible_bases:
-                clean_streaks[b] = 0
-        for b in eligible_bases:
-            clean_streaks[b] = int(clean_streaks.get(b, 0)) + 1
+        clean_streaks = update_streak_map(
+            state.get("clean_streaks") or {},
+            eligible_bases,
+            now_ms=ts_ms,
+            min_spacing_hours=cfg.min_streak_spacing_hours,
+            keep_non_qualifying=True,
+        )
+        hurdle_apr = hlp_apr * cfg.hlp_hurdle_mult if cfg.require_hlp_hurdle else float("-inf")
 
         # Recompute total equity before sizing new entries
         deployed_eq = sum(float(p["spot_notional_usd"]) + float(p["perp_margin_usd"]) for p in positions.values())
@@ -817,7 +838,9 @@ def run_spot_perp_paper_tick(
                     break
                 if not opp.eligible or opp.base_symbol in positions:
                     continue
-                if int(clean_streaks.get(opp.base_symbol, 0)) < cfg.min_clean_streak:
+                if streak_count(clean_streaks.get(opp.base_symbol)) < cfg.min_clean_streak:
+                    continue
+                if opp.net_deposit_apr_pct < hurdle_apr:
                     continue
 
                 slot_eq = cfg.slot_equity_usd
@@ -833,7 +856,7 @@ def run_spot_perp_paper_tick(
 
                 notional = alloc_eq * cap_eff
                 perp_margin = alloc_eq - notional
-                entry_slip = float(opp.entry_l2_slip_bps or 3.0)
+                entry_slip = float(opp.entry_l2_slip_bps) if opp.entry_l2_slip_bps is not None else 3.0
                 entry_cost = notional * (cfg.one_way_fee_bps + entry_slip) / 1e4
                 perp_margin_after_fee = max(perp_margin - entry_cost, 1.0)
                 qty = notional / opp.spot_mid_px
@@ -883,7 +906,7 @@ def run_spot_perp_paper_tick(
                         "notional_usd": round(notional, 2),
                         "funding_apr_pct": opp.funding_apr_pct,
                         "cost_usd": round(entry_cost, 4),
-                        "reason": f"streak={clean_streaks[opp.base_symbol]},basis={opp.exec_basis_bps}bps",
+                        "reason": f"streak={streak_count(clean_streaks[opp.base_symbol])},basis={opp.exec_basis_bps}bps",
                     }
                 )
 

@@ -118,8 +118,14 @@ def extract_h2_liq_events(
             [d for d in (near_l, near_s) if d is not None],
             default=None,
         )
+        # A "near wall" only counts if there is real notional inside 0-5% (a dust position 1% away
+        # with total_0_5_usd == 0 must not raise an alert).
         is_alert = bool(
-            (min_wall is not None and min_wall <= cfg.h2_alert_wall_dist_pct)
+            (
+                min_wall is not None
+                and min_wall <= cfg.h2_alert_wall_dist_pct
+                and tot_0_5 >= cfg.h2_min_cluster_log_usd
+            )
             or (tot_0_5 >= cfg.h2_alert_0_5_usd)
             or (c.total_0_10_usd >= cfg.h2_alert_0_10_usd)
         )

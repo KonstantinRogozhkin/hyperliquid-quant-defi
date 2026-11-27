@@ -110,7 +110,7 @@ groups:
     interval: 60s
     rules:
       - alert: HLArtifactStale
-        expr: hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_attribution"} > 360
+        expr: hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_attribution|testnet_audit"} > 360
         for: 15m
         labels:
           severity: warning

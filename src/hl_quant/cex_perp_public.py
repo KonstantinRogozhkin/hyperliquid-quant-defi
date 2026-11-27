@@ -361,6 +361,8 @@ def _okx_funding(client, symbol, start_ms, end_ms, max_pages):
             oldest = t if oldest is None else min(oldest, t)
         if oldest is None or oldest <= start_ms or len(page) < OKX_FUNDING_LIMIT:
             break
+        if after_cursor is not None and oldest >= after_cursor:
+            break  # cursor did not advance; avoid looping until max_pages
         after_cursor = oldest
     return pages, events
 
@@ -389,6 +391,8 @@ def _okx_klines(client, symbol, start_ms, end_ms, max_pages):
             oldest = t if oldest is None else min(oldest, t)
         if oldest is None or oldest <= start_ms or len(page) < OKX_KLINE_LIMIT:
             break
+        if after_cursor is not None and oldest >= after_cursor:
+            break  # cursor did not advance; avoid looping until max_pages
         after_cursor = oldest
     return pages, bars
 

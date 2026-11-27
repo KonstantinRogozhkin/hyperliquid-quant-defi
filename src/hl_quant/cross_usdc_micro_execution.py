@@ -368,7 +368,10 @@ class BinanceClient:
         query = urlencode(values)
         values["signature"] = hmac.new(self.api_secret.encode(), query.encode(), sha256).hexdigest()
         response = self.client.request(method, f"{BINANCE}{path}", params=values, headers={"X-MBX-APIKEY": self.api_key})
-        payload = response.json()
+        try:
+            payload = response.json()
+        except ValueError:
+            payload = None
         if response.status_code >= 400:
             code = payload.get("code") if isinstance(payload, Mapping) else None
             safe_code = {
@@ -1082,7 +1085,7 @@ class MicroExecutionRunner:
                 "bybit": lambda: self.bybit.positions(perp),
                 "hyperliquid": self.hyperliquid.state,
             })
-            binance_qty = _binance_asset_balance(state["binance"], asset)
+            binance_qty = _binance_free_balance(state["binance"], asset)
             bybit_row = next((row for row in state["bybit"] if abs(_float(row.get("size")) or 0.0) > 0.0), None)
             bybit_qty = _decimal(bybit_row.get("size"), field="bybit_position_size") if bybit_row else Decimal("0")
             bybit_side = str(bybit_row.get("side") or "").lower() if bybit_row else ""
@@ -1103,10 +1106,10 @@ class MicroExecutionRunner:
                 binance_bid = _best_price(books["binance"], venue="binance", side="sell")
                 if binance_sell_qty >= binance_min_qty and binance_sell_qty * binance_bid >= binance_min_notional:
                     calls["binance"] = lambda: self.binance.create_ioc(symbol=symbol, side="SELL", quantity=binance_sell_qty, price=protected_limit(binance_bid, side="sell", adverse_bps=self.contract.max_adverse_execution_bps, tick=binance_tick), client_id=f"{client_tag}-bu")
-            if bybit_qty > 0:
+            if bybit_qty > 0 and round_to_step(bybit_qty, bybit_step) > 0:
                 side = "Buy" if bybit_side == "sell" else "Sell"
                 calls["bybit"] = lambda side=side: self.bybit.create_ioc(symbol=perp, side=side, quantity=round_to_step(bybit_qty, bybit_step), price=protected_limit(_best_price(books["bybit"], venue="bybit", side=side.lower()), side=side.lower(), adverse_bps=self.contract.max_adverse_execution_bps, tick=bybit_tick), client_id=f"{client_tag}-yu", reduce_only=True)
-            if hyper_szi != 0:
+            if hyper_szi != 0 and round_to_step(abs(hyper_szi), hyper_step) > 0:
                 is_buy = hyper_szi < 0
                 calls["hyperliquid"] = lambda is_buy=is_buy: self.hyperliquid.create_ioc(
                     asset=asset,
@@ -1151,6 +1154,9 @@ class MicroExecutionRunner:
             raise PreflightBlocked("one_time_confirmation_missing_or_mismatched")
         if asset not in self.contract.assets:
             raise MicroExecutionError("asset_not_in_contract")
+        if self.contract.execution_mode != "mainnet_only":
+            # Binance/Bybit clients are mainnet-only; a testnet_only contract must never reach them.
+            raise PreflightBlocked("execution_mode_not_supported_by_mainnet_clients")
         symbol, perp = f"{asset}USDC", f"{asset}PERP"
         books, span_ms = self._market_snapshot(asset)
         if span_ms > self.contract.max_snapshot_sync_span_ms:
@@ -1223,7 +1229,7 @@ class MicroExecutionRunner:
                 if self.contract.spot_quantity_mode == "match_rounded_perps"
                 else b_qty
             )
-            prospective_delta = abs(spot_qty - y_filled - h_filled) / spot_qty
+            prospective_delta = abs(spot_qty - y_filled - h_filled) / spot_qty if spot_qty > 0 else Decimal("1")
             if prospective_delta > self.contract.max_delta_mismatch_fraction:
                 unwound = self._safe_unwind(asset, filled=filled, books=books, client_tag=tag)
                 return {"asset": asset, "status": "failed_safe_unwind" if unwound else "failed_manual_intervention", "entry_span_ms": int(time.time() * 1000) - start_ms, "delta_mismatch_fraction": None, "safe_unwind_attempted": True}
@@ -1245,7 +1251,11 @@ class MicroExecutionRunner:
                 Decimal("0"),
             )
             binance_position_qty = max(Decimal("0"), b_filled - binance_base_fee)
-            delta_mismatch = abs(binance_position_qty - y_filled - h_filled) / binance_position_qty
+            delta_mismatch = (
+                abs(binance_position_qty - y_filled - h_filled) / binance_position_qty
+                if binance_position_qty > 0
+                else Decimal("1")
+            )
             entry_snapshot = self._account_snapshot(asset)
             if delta_mismatch > self.contract.max_delta_mismatch_fraction or not entry_snapshot["liquidation_distance_passed"]:
                 unwound = self._safe_unwind(asset, filled={"binance": b_filled, "bybit": y_filled, "hyperliquid": h_filled}, books=books, client_tag=tag)
@@ -1253,7 +1263,8 @@ class MicroExecutionRunner:
             time.sleep(self.contract.hold_seconds)
             exit_books, exit_span = self._market_snapshot(asset)
             if exit_span > self.contract.max_snapshot_sync_span_ms:
-                unwound = self._safe_unwind(asset, filled={"binance": b_filled, "bybit": y_filled, "hyperliquid": h_filled}, books=books, client_tag=tag)
+                # Prefer the (slightly unsynchronized) exit books over 60s-old entry books for unwind pricing.
+                unwound = self._safe_unwind(asset, filled={"binance": b_filled, "bybit": y_filled, "hyperliquid": h_filled}, books=exit_books, client_tag=tag)
                 return {"asset": asset, "status": "failed_safe_unwind" if unwound else "failed_manual_intervention", "entry_span_ms": int(time.time() * 1000) - start_ms, "delta_mismatch_fraction": float(delta_mismatch), "entry_snapshot": entry_snapshot, "safe_unwind_attempted": True}
             # Close all three legs promptly; the spot order first avoids holding an accidental net long.
             exit_start = int(time.time() * 1000)

@@ -692,7 +692,10 @@ class WorkerScheduler:
                         rc_final = int(proc.wait(timeout=15.0))
                     except subprocess.TimeoutExpired:
                         self._signal_process_group(proc, signal.SIGKILL)
-                        rc_final = int(proc.wait(timeout=2.0))
+                        try:
+                            rc_final = int(proc.wait(timeout=2.0))
+                        except subprocess.TimeoutExpired:
+                            rc_final = 137
                     break
                 if time.monotonic() >= deadline:
                     print(f"[hl-worker] job timed out after {timeout_s}s: {' '.join(cmd[:3])}", flush=True)
@@ -701,7 +704,10 @@ class WorkerScheduler:
                         proc.wait(timeout=5.0)
                     except subprocess.TimeoutExpired:
                         self._signal_process_group(proc, signal.SIGKILL)
-                        proc.wait(timeout=2.0)
+                        try:
+                            proc.wait(timeout=2.0)
+                        except subprocess.TimeoutExpired:
+                            pass
                     rc_final = 124
                     self._thread_local.last_stderr = f"timed out after {timeout_s}s"
                     break
@@ -771,6 +777,7 @@ class WorkerScheduler:
             t0 = time.monotonic()
             with self._status_lock:
                 entry = self._state[job.name]
+                prev_failed = entry.get("state") == "failed"
                 entry["state"] = "running"
                 entry["last_started_at_utc"] = start_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
             self.publish_status(start_dt)
@@ -806,7 +813,7 @@ class WorkerScheduler:
 
             with self._status_lock:
                 entry = self._state[job.name]
-                was_failed = entry.get("state") == "failed" or (job.name in self._alerted_failed_jobs)
+                was_failed = prev_failed or (job.name in self._alerted_failed_jobs)
                 entry["state"] = "ok" if exit_code == 0 else "failed"
                 entry["last_finished_at_utc"] = end_utc_str
                 entry["last_exit_code"] = exit_code
@@ -892,6 +899,8 @@ class WorkerScheduler:
             "cross_dex_paper": self.paper_dir / "hl_cross_dex_paper" / "state.json",
             "frontier_persistence": self.paper_dir / "hl_frontier_history" / "latest_summary.json",
             "hip3_paper": self.paper_dir / "hl_hip3_paper" / "state.json",
+            "spot_perp_paper": self.paper_dir / "hl_spot_perp_paper" / "state.json",
+            "autopilot_allocator": self.paper_dir / "hl_autopilot" / "state.json",
             "cross_dex_scan": self.paper_dir / "hl_cross_dex_v2" / "opportunities.parquet",
             "hyperevm_defi_scan": self.paper_dir / "hl_hyperevm_defi" / "snapshot.json",
             "liq_funding_alpha": self.paper_dir / "hl_liq_funding_alpha" / "snapshot.json",

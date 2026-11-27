@@ -27,6 +27,7 @@ import httpx
 import pandas as pd
 
 from hl_quant import cross_dex_scanner as cds
+from hl_quant.persistence_clock import streak_count, update_streak_map
 
 
 @dataclass(frozen=True, slots=True)
@@ -51,6 +52,10 @@ class CrossDexPaperConfig:
     combo_min_exec_basis_bps: float = 8.0
     combo_min_apr_pct: float = 12.0  # avoid low-carry majors that churn fees if structural basis never converges
     combo_max_hold_hours: float = 48.0  # time-stop if basis never converges once carry decays below exit_apr_pct
+    min_streak_spacing_hours: float = 3.5  # streaks advance at most once per ~4h cron window
+    # Reject entries where the L2 book mid basis and the mark basis disagree by more than this:
+    # the ledger marks on mark_px, so a book-only edge (stale/async snapshot) never realizes.
+    max_book_mark_divergence_bps: float = 6.0
 
     def other_fee_bps(self, dex: str) -> float:
         return self.lighter_fee_bps if dex == "lighter" else self.extended_fee_bps
@@ -267,18 +272,28 @@ def run_cross_dex_paper_tick(
         else pd.DataFrame()
     )
 
-    prev_streaks: dict[str, int] = dict(state.get("spread_streaks") or {})
-    new_streaks: dict[str, int] = {}
+    qualifying_keys: list[str] = []
     if not all_opps.empty:
         for r in all_opps.itertuples(index=False):
-            key = f"{r.coin}@{r.other_dex}:{r.direction}"
             if float(r.spread_apr_pct) >= cfg.entry_apr_pct:
-                new_streaks[key] = int(prev_streaks.get(key, 0)) + 1
+                qualifying_keys.append(f"{r.coin}@{r.other_dex}:{r.direction}")
+    new_streaks = update_streak_map(
+        state.get("spread_streaks") or {},
+        qualifying_keys,
+        now_ms=ts_ms,
+        min_spacing_hours=cfg.min_streak_spacing_hours,
+    )
     state["spread_streaks"] = new_streaks
 
     # 4. Evaluate candidates with Persistence Gate, Tight-L2 + Basis Gate, and H1 Basis+Carry Combo
     opened_coins: list[str] = []
-    gated_stats = {"skipped_persistence": 0, "skipped_l2_slip": 0, "skipped_basis": 0, "skipped_breakeven": 0}
+    gated_stats = {
+        "skipped_persistence": 0,
+        "skipped_l2_slip": 0,
+        "skipped_basis": 0,
+        "skipped_breakeven": 0,
+        "skipped_basis_source": 0,
+    }
     if not all_opps.empty and len(positions) < cfg.max_slots:
         # Check top 30 candidates by spread (and any with big favorable mark basis for H1 combo)
         min_scan_apr = min(cfg.entry_apr_pct, cfg.combo_min_apr_pct) if cfg.enable_basis_carry_combo else cfg.entry_apr_pct
@@ -297,7 +312,7 @@ def run_cross_dex_paper_tick(
             oth = venue_quotes[other_dex][coin]
             short_hl = direction.startswith("Short HL")
             streak_key = f"{coin}@{other_dex}:{direction}"
-            streak = int(new_streaks.get(streak_key, 0))
+            streak = streak_count(new_streaks.get(streak_key))
 
             # Quick mark-basis pre-filter before hitting L2 endpoints if persistence not yet met
             mark_basis_dir = (h.mark_px - oth.mark_px) / oth.mark_px * 1e4 if short_hl else (oth.mark_px - h.mark_px) / oth.mark_px * 1e4
@@ -321,26 +336,32 @@ def run_cross_dex_paper_tick(
                 gated_stats["skipped_l2_slip"] += 1
                 continue
 
+            book_mid_basis = cds.compute_book_mid_basis_bps(hb, ha, ob, oa, short_hl=short_hl)
+            if book_mid_basis is None or abs(book_mid_basis - mark_basis_dir) > cfg.max_book_mark_divergence_bps:
+                gated_stats["skipped_basis_source"] += 1
+                continue
+            credited_basis = cds.credited_entry_basis_bps(exec_basis, mark_basis_dir)
+
             oth_fee = cfg.other_fee_bps(other_dex)
             venue_rt_fee_bps = 2.0 * (cfg.hl_fee_bps + oth_fee) + cfg.bridge_drag_bps
             combo_basis_floor = max(cfg.combo_min_exec_basis_bps, venue_rt_fee_bps)
             is_h1_combo = (
                 cfg.enable_basis_carry_combo
                 and spread_apr >= cfg.combo_min_apr_pct
-                and exec_basis >= combo_basis_floor
+                and credited_basis >= combo_basis_floor
             )
             if not is_h1_combo:
                 if not passes_persist:
                     gated_stats["skipped_persistence"] += 1
                     continue
-                if exec_basis < cfg.min_exec_basis_bps:
+                if credited_basis < cfg.min_exec_basis_bps:
                     gated_stats["skipped_basis"] += 1
                     continue
 
             entry_cost_bps = cfg.hl_fee_bps + oth_fee + cfg.bridge_drag_bps + l2_slip
             # Credit only conservative 50% convergence for positive cross-DEX basis (persistent
             # venue oracle/mark offsets do not guarantee 100% reversion at exit); charge full adverse basis.
-            basis_credit_bps = (0.5 * exec_basis) if exec_basis > 0 else exec_basis
+            basis_credit_bps = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
             est_rt_cost_bps = max(0.0, venue_rt_fee_bps + l2_slip - basis_credit_bps)
             hourly_bps = spread_apr / (cds.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
@@ -370,6 +391,8 @@ def run_cross_dex_paper_tick(
                 "live_spread_apr_pct": spread_apr,
                 "entry_l2_slip_bps": round(l2_slip, 2),
                 "entry_exec_basis_bps": round(exec_basis, 2),
+                "entry_book_mid_basis_bps": round(book_mid_basis, 2),
+                "entry_credited_basis_bps": round(credited_basis, 2),
                 "live_mark_basis_bps": round(mark_basis_dir, 2),
                 "entry_breakeven_hours": round(be_hours, 1),
                 "entry_cost_usd": round(entry_cost_usd, 4),

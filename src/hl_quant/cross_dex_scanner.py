@@ -359,6 +359,44 @@ def compute_executable_cross_dex_entry_bps(
     return round(exec_basis, 2), round(max(0.0, slip_hl) + max(0.0, slip_oth), 2), full_ok
 
 
+def compute_book_mid_basis_bps(
+    hl_bids: list[tuple[float, float]],
+    hl_asks: list[tuple[float, float]],
+    other_bids: list[tuple[float, float]],
+    other_asks: list[tuple[float, float]],
+    *,
+    short_hl: bool,
+) -> float | None:
+    """Directional top-of-book mid basis (same sign convention as ``favorable_basis_bps``).
+
+    An executable VWAP basis can never beat this mid basis; if it beats the *mark* basis by a
+    wide margin the two price sources (mark/oracle vs. L2 book) disagree and the L2 edge is not
+    something the mark-to-market ledger will ever realize.
+    """
+    if not (hl_bids and hl_asks and other_bids and other_asks):
+        return None
+    hl_mid = 0.5 * (hl_bids[0][0] + hl_asks[0][0])
+    oth_mid = 0.5 * (other_bids[0][0] + other_asks[0][0])
+    if hl_mid <= 0 or oth_mid <= 0:
+        return None
+    if short_hl:
+        return round((hl_mid - oth_mid) / oth_mid * 1e4, 2)
+    return round((oth_mid - hl_mid) / hl_mid * 1e4, 2)
+
+
+def credited_entry_basis_bps(exec_basis_bps: float | None, mark_basis_bps: float | None) -> float:
+    """Basis edge that may be credited against costs: never more than the mark basis.
+
+    Positions are marked on ``mark_px``; a favorable L2 book basis that is not also present in the
+    mark basis (stale/async book, venue mark offset) cannot converge into realized PnL.
+    """
+    if exec_basis_bps is None:
+        return 0.0 if mark_basis_bps is None else min(0.0, float(mark_basis_bps))
+    if mark_basis_bps is None:
+        return float(exec_basis_bps)
+    return float(min(exec_basis_bps, mark_basis_bps))
+
+
 def scan_cross_dex_opportunities(
     hl_quotes: dict[str, DexMarketQuote],
     other_quotes: dict[str, DexMarketQuote],
@@ -430,6 +468,8 @@ def enrich_opportunities_with_l2_depth(
     slip_50k: list[float | None] = []
     depth_ok_50k: list[bool] = []
     be_10k_h: list[float] = []
+    book_mid: list[float | None] = []
+    credited: list[float] = []
 
     for r in sub.itertuples(index=False):
         coin = str(r.coin)
@@ -445,12 +485,21 @@ def enrich_opportunities_with_l2_depth(
         slip_50k.append(sl50)
         depth_ok_50k.append(ok50)
         hourly_bps = float(r.spread_apr_pct) / (HOURS_PER_YEAR * 100.0) * 1e4
-        eff_cost = round_trip_fee_bps + (sl10 if sl10 is not None else 0.0) - (eb10 if eb10 is not None else 0.0)
+        mid_b = compute_book_mid_basis_bps(hb, ha, ob, oa, short_hl=short_hl)
+        book_mid.append(mid_b)
+        mark_b = float(r.favorable_basis_bps) if hasattr(r, "favorable_basis_bps") else None
+        credit = credited_entry_basis_bps(eb10, mark_b)
+        credited.append(round(credit, 2))
+        # Entry slippage is already inside the VWAP exec basis; sl10 is charged once more as the
+        # symmetric exit-side slippage estimate.
+        eff_cost = round_trip_fee_bps + (sl10 if sl10 is not None else 0.0) - credit
         be_10k_h.append(round(max(0.0, eff_cost) / hourly_bps, 1) if hourly_bps > 1e-9 else float("inf"))
 
     sub["exec_basis_10k_bps"] = exec_10k
     sub["l2_slip_10k_bps"] = slip_10k
     sub["l2_slip_50k_bps"] = slip_50k
     sub["depth_50k_ok"] = depth_ok_50k
+    sub["book_mid_basis_bps"] = book_mid
+    sub["credited_basis_10k_bps"] = credited
     sub["depth_be_10k_h"] = be_10k_h
     return sub

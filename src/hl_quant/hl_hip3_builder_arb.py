@@ -337,8 +337,14 @@ def scan_hip3_cross_builder_arb(
             # Always respect per-builder deployerFeeScale in est_rt_maker_fee_bps (not only in Growth Mode).
             # eb5 already prices entry VWAP slippage, so adding 1x sl5 accounts for estimated exit slippage without double-counting.
             rt_m = opp.est_rt_maker_fee_bps if opp.est_rt_maker_fee_bps > 0 else round_trip_fee_bps
-            net_cost_m = max(0.0, rt_m + sl5 - eb5)
-            net_cost_t = max(0.0, opp.est_rt_taker_fee_bps + sl5 - eb5)
+            # Only basis that is (a) also present in the mark basis the ledger marks on and (b) not
+            # explained by structural builder-oracle divergence may be credited as convergence edge.
+            mark_credit = cds.credited_entry_basis_bps(eb5, opp.mark_basis_bps)
+            credit = (
+                max(0.0, mark_credit - abs(float(opp.oracle_divergence_bps))) if mark_credit > 0 else mark_credit
+            )
+            net_cost_m = max(0.0, rt_m + sl5 - credit)
+            net_cost_t = max(0.0, opp.est_rt_taker_fee_bps + sl5 - credit)
             hourly_bps = opp.spread_apr_pct / (HOURS_PER_YEAR * 100.0) * 1e4
             if hourly_bps > 1e-9:
                 be_h = round(net_cost_m / hourly_bps, 1)

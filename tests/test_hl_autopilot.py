@@ -76,7 +76,11 @@ def test_autopilot_deadband_rebalance_hwm_fees_and_nav_guard(tmp_path: Path):
 
     # Tick 1: initial bootstrap allocation
     r1 = ap.run_autopilot_tick(data_root=tmp_path, cfg=cfg, now_ms=t0, daily_closes=closes_t0)
-    assert r1["state"]["gross_equity_usd"] == pytest.approx(250_000.0, abs=1.0)
+    # Bootstrap charges the CTA book's entry turnover cost (5% sleeve x gross lev x 5 bps)
+    assert r1["state"]["cta_state"]["cum_cost_usd"] > 0.0
+    assert r1["state"]["gross_equity_usd"] == pytest.approx(
+        250_000.0 - r1["state"]["cta_state"]["cum_cost_usd"], abs=1.0
+    )
     assert r1["state"]["risk_telemetry"]["rebalanced_this_tick"] is False
 
     # Tick 2 (+4h): small +0.5% gain on spot_perp -> within 3% deadband (no rebalance!), HWM perf fee applies cleanly
@@ -85,8 +89,10 @@ def test_autopilot_deadband_rebalance_hwm_fees_and_nav_guard(tmp_path: Path):
     assert r2["state"]["risk_telemetry"]["rebalanced_this_tick"] is False
     assert r2["state"]["gross_equity_usd"] > 250_000.0
     assert r2["state"]["net_equity_usd"] < r2["state"]["gross_equity_usd"]
-    assert r2["state"]["cum_perf_fee_usd"] > 0.0
-    assert r2["state"]["hwm_net_share_price"] > 1.0
+    # Perf fee only ACCRUES intra-period (reversible liability); nothing is crystallized yet
+    assert r2["state"]["accrued_perf_fee_usd"] > 0.0
+    assert r2["state"]["cum_perf_fee_usd"] == 0.0
+    assert r2["state"]["hwm_net_share_price"] == 1.0
 
     # Tick 3 (+8h): corrupt +50% jump on spot_perp -> Bounded NAV Sanity Guard triggers!
     (sp_dir / "state.json").write_text(json.dumps({"equity_usd": 150_750.0, "starting_capital_usd": 100_000.0, "positions": {}, "hlp_apr_pct": 14.0}), encoding="utf-8")

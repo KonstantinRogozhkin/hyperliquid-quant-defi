@@ -82,6 +82,10 @@ def _f(v: object, default: float = 0.0) -> float:
     return x if math.isfinite(x) else default
 
 
+MIN_ACTIONABLE_VOLUME_24H_USD = 1.0  # strictly no trades in 24h -> stale quotes
+MIN_ACTIONABLE_OI_USD = 1_000.0  # dust OI (e.g. $1.50) -> not a market
+
+
 def parse_boros_market(
     raw: dict[str, Any],
     *,
@@ -128,6 +132,14 @@ def parse_boros_market(
             action = "Long Boros YU (Float > Ask)"
         else:
             action = "Monitor"
+
+    # Never recommend trading a market nobody trades: quoted APRs on a zero-volume / dust-OI book
+    # are stale indications, not executable prices.
+    oi_usd = _f(d.get("notionalOI"))
+    vol_usd = _f(d.get("volume24h"))
+    has_liq_fields = "volume24h" in d or "notionalOI" in d  # absent fields are unknown, not zero
+    if has_liq_fields and (vol_usd < MIN_ACTIONABLE_VOLUME_24H_USD or oi_usd < MIN_ACTIONABLE_OI_USD):
+        action = f"Illiquid (vol24h ${vol_usd:,.0f}, OI ${oi_usd:,.0f}) - no action"
 
     lt_apr: float | None = None
     locked_vs_lt: float | None = None

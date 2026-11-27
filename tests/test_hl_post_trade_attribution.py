@@ -61,8 +61,9 @@ def test_post_trade_attribution_math_alo_fill_rate_and_liq_warning(tmp_path: Pat
     assert attr.audit_orders_resting == 1
     # Net = 0 realized + 6.0 unrealized + 0.25 funding - 0.09 fee = +6.16
     assert attr.net_attributed_pnl_usd == pytest.approx(6.16)
-    # Buy at 60000, current mid 60600 -> +100 bps markout
-    assert attr.vw_markout_bps == pytest.approx(100.0, abs=0.1)
+    # Buy at 60000, current mid 60600 -> +100 bps is directional DRIFT, not a markout
+    assert attr.vw_mark_drift_bps == pytest.approx(100.0, abs=0.1)
+    assert attr.vw_markout_bps is None  # no post-fill series supplied -> no fake markout
     assert len(attr.liq_warnings) == 1
     assert "BTC" in attr.liq_warnings[0]
 

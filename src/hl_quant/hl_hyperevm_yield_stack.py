@@ -157,7 +157,10 @@ def build_hyperevm_yield_strategies(
             net_deposit_apr_pct=round(net_loop, 2),
             spread_vs_hlp_pct=round(net_loop - inp.hlp_apr_pct, 2),
             perp_leverage=round(1.0 / max(loop_ltv, 0.1), 1),
-            liq_buffer_pct=round(min(liq_buf_pct, (1.0 - loop_ltv / 0.78) * 100.0), 1),
+            # Short-perp buffer must use the loop's own leverage (1 / LTV), not the caller's perp_leverage.
+            liq_buffer_pct=round(
+                max(0.0, min((max(loop_ltv, 0.1) - 0.08) * 100.0, (1.0 - loop_ltv / 0.78) * 100.0)), 1
+            ),
             key_risks="Двусторонний риск ликвидации (обвал HYPE на CDP + ралли HYPE на перпе), рост borrow rate",
         )
     )

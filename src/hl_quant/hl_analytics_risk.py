@@ -26,6 +26,9 @@ import pandas as pd
 
 TRADING_DAYS_PER_YEAR = 365.0
 MS_PER_DAY = 86_400_000
+# Never annualize a return measured over fewer than this many elapsed days: compounding a few hours
+# (or a 7-day bounce) to 365 days produces meaningless four-digit APYs.
+MIN_APY_DAYS = 14.0
 
 
 def _f(v: object, default: float = 0.0) -> float:
@@ -88,16 +91,42 @@ def simulate_hwm_net_series(
     return net
 
 
-def _annualize_return_pct(ret_pct: float, days: float) -> float:
-    """Neutral Trade methodology: annualize positive returns cleanly; never annualize negative returns."""
-    if ret_pct < 0.0 or days <= 0.0:
+def simulate_net_series_from_inception(
+    dates: list[str],
+    gross_shares: list[float],
+    *,
+    inception_share: float | None,
+    mgmt_fee_annual_pct: float = 1.0,
+    perf_fee_pct: float = 20.0,
+) -> list[float]:
+    """Net-of-fee HWM series whose HWM starts at the inception share (not the first persisted tick)."""
+    if inception_share is None or not gross_shares:
+        return simulate_hwm_net_series(
+            dates, gross_shares, mgmt_fee_annual_pct=mgmt_fee_annual_pct, perf_fee_pct=perf_fee_pct
+        )
+    full = simulate_hwm_net_series(
+        [dates[0], *dates],
+        [float(inception_share), *gross_shares],
+        mgmt_fee_annual_pct=mgmt_fee_annual_pct,
+        perf_fee_pct=perf_fee_pct,
+    )
+    return full[1:]
+
+
+def _annualize_return_pct(ret_pct: float, days: float, *, min_days: float = MIN_APY_DAYS) -> float | None:
+    """Neutral Trade methodology: annualize positive returns; never annualize negative returns.
+
+    ``ret_pct`` must be the *unrounded* period return. Returns ``None`` when the elapsed span is
+    shorter than ``min_days`` (no APY is shown for too-short histories).
+    """
+    if days < min_days or days <= 0.0:
+        return None
+    if ret_pct < 0.0:
         return round(ret_pct, 2)
-    eff_days = max(days, 1.0)
     base = 1.0 + ret_pct / 100.0
     if base <= 0.0:
         return round(ret_pct, 2)
-    # Cap exponent so 1-day spikes don't explode to Inf
-    ann = (base ** min(TRADING_DAYS_PER_YEAR / eff_days, 365.0) - 1.0) * 100.0
+    ann = (base ** (TRADING_DAYS_PER_YEAR / days) - 1.0) * 100.0
     return round(min(ann, 9999.0), 2)
 
 
@@ -107,46 +136,66 @@ def _window_return(
     *,
     days_back: int | None = None,
     ytd: bool = False,
+    inception_share: float | None = None,
 ) -> tuple[float | None, float]:
-    """Return ``(ret_pct, elapsed_days)`` over trailing window or YTD."""
-    if len(shares) < 2 or not dates_dt:
-        return (0.0 if shares else None), 0.0
+    """Return unrounded ``(ret_pct, elapsed_days)`` over a trailing window, YTD, or since inception.
+
+    ``inception_share`` (1.0 for strategies: share price at ``starting_capital_usd``) anchors the
+    all-time return at inception, so entry costs paid before the first persisted tick are not
+    erased. YTD for a series with no inception anchor that starts after Jan 1 is ``None``
+    (a 90-day benchmark history is not a YTD return).
+    """
+    if not shares or not dates_dt:
+        return None, 0.0
     end_dt = dates_dt[-1]
     end_val = shares[-1]
+    first_span = max((end_dt - dates_dt[0]).total_seconds() / 86_400.0, 0.0)
+
+    if not ytd and days_back is None:
+        start_val = inception_share if inception_share is not None else shares[0]
+        if start_val <= 0 or (inception_share is None and len(shares) < 2):
+            return None, first_span
+        return (end_val / start_val - 1.0) * 100.0, first_span
 
     if ytd:
         target = datetime(end_dt.year, 1, 1, tzinfo=end_dt.tzinfo)
-    elif days_back is not None:
-        target = datetime.fromtimestamp(end_dt.timestamp() - days_back * 86_400.0, tz=end_dt.tzinfo)
     else:
-        start_val = shares[0]
-        span = max((end_dt - dates_dt[0]).total_seconds() / 86_400.0, 0.0)
-        if start_val <= 0:
-            return None, span
-        return round((end_val / start_val - 1.0) * 100.0, 2), span
+        assert days_back is not None
+        target = datetime.fromtimestamp(end_dt.timestamp() - days_back * 86_400.0, tz=end_dt.tzinfo)
 
-    # Find latest observation <= target (or earliest available if history is shorter than requested window)
+    if dates_dt[0] > target:
+        # History is shorter than the requested window
+        if ytd and inception_share is not None and inception_share > 0 and dates_dt[0].year == end_dt.year:
+            return (end_val / inception_share - 1.0) * 100.0, first_span
+        return None, 0.0
     idx = 0
     for i, d in enumerate(dates_dt):
         if d <= target:
             idx = i
         else:
             break
-    if days_back is not None and dates_dt[0] > target:
-        # Not enough history to cover the requested lookback window
-        return None, 0.0
     start_val = shares[idx]
     span = max((end_dt - dates_dt[idx]).total_seconds() / 86_400.0, 0.0)
     if start_val <= 0:
         return None, span
-    return round((end_val / start_val - 1.0) * 100.0, 2), span
+    return (end_val / start_val - 1.0) * 100.0, span
 
 
-def _compute_drawdown_stats(dates_dt: list[datetime], shares: list[float]) -> tuple[float, int]:
-    """Return ``(max_dd_pct_positive, max_recovery_days)``."""
-    if len(shares) < 2:
+def _daily_closes(dates_dt: list[datetime], shares: list[float]) -> list[float]:
+    """Resample an (possibly intraday) share series to one UTC calendar-day close per day."""
+    by_day: dict[str, float] = {}
+    for d, v in zip(dates_dt, shares, strict=False):
+        by_day[d.astimezone(timezone.utc).strftime("%Y-%m-%d")] = float(v)
+    return [by_day[k] for k in sorted(by_day)]
+
+
+def _compute_drawdown_stats(
+    dates_dt: list[datetime], shares: list[float], *, inception_share: float | None = None
+) -> tuple[float, int]:
+    """Return ``(max_dd_pct_positive, max_recovery_days)`` (peak seeded at the inception share)."""
+    if not shares or (len(shares) < 2 and inception_share is None):
         return 0.0, 0
-    peak = shares[0]
+    peak = max(shares[0], inception_share) if inception_share is not None else shares[0]
     peak_dt = dates_dt[0]
     max_dd = 0.0
     max_rec_days = 0
@@ -209,15 +258,21 @@ def compute_series_performance(
     mgmt_fee_pct: float = 1.0,
     perf_fee_pct: float = 20.0,
     is_benchmark: bool = False,
+    inception_share: float | None = None,
 ) -> dict[str, Any]:
-    """Compute full Neutral-Trade-grade performance metrics for one strategy or benchmark."""
+    """Compute full Neutral-Trade-grade performance metrics for one strategy or benchmark.
+
+    ``inception_share`` is the share price at inception (1.0 = ``starting_capital_usd``). When set,
+    all-time / YTD returns, drawdowns, daily stats and the monthly table are anchored to it.
+    """
     if net_shares is None:
         if is_benchmark:
             net_s = list(gross_shares)
         else:
-            net_s = simulate_hwm_net_series(
+            net_s = simulate_net_series_from_inception(
                 dates,
                 gross_shares,
+                inception_share=inception_share,
                 mgmt_fee_annual_pct=mgmt_fee_pct,
                 perf_fee_pct=perf_fee_pct,
             )
@@ -235,17 +290,15 @@ def compute_series_performance(
             dates_dt.append(datetime.now(tz=timezone.utc))
 
     def _pack_horizons(series: list[float]) -> tuple[dict[str, float | None], dict[str, float | None]]:
-        r7, d7 = _window_return(dates_dt, series, days_back=7)
-        r30, d30 = _window_return(dates_dt, series, days_back=30)
-        rytd, dytd = _window_return(dates_dt, series, ytd=True)
-        rall, dall = _window_return(dates_dt, series)
-        rets_map = {"7d": r7, "30d": r30, "ytd": rytd, "all_time": rall}
-        apy_map = {
-            "7d": _annualize_return_pct(r7, d7) if r7 is not None else None,
-            "30d": _annualize_return_pct(r30, d30) if r30 is not None else None,
-            "ytd": _annualize_return_pct(rytd, dytd) if rytd is not None else None,
-            "all_time": _annualize_return_pct(rall, dall) if rall is not None else None,
+        raw = {
+            "7d": _window_return(dates_dt, series, days_back=7),
+            "30d": _window_return(dates_dt, series, days_back=30),
+            "ytd": _window_return(dates_dt, series, ytd=True, inception_share=inception_share),
+            "all_time": _window_return(dates_dt, series, inception_share=inception_share),
         }
+        rets_map = {k: (round(r, 2) if r is not None else None) for k, (r, _) in raw.items()}
+        # Annualize the UNROUNDED return; spans < MIN_APY_DAYS yield None.
+        apy_map = {k: (_annualize_return_pct(r, d) if r is not None else None) for k, (r, d) in raw.items()}
         return rets_map, apy_map
 
     gross_ret, gross_apy = _pack_horizons(gross_shares)
@@ -256,7 +309,7 @@ def compute_series_performance(
     sharpe_g = sortino_g = sharpe_n = sortino_n = None
     pos_days_pct = None
     win_streak = loss_streak = 0
-    unique_cal_days = len({d[:10] for d in dates})
+    unique_cal_days = len({d.astimezone(timezone.utc).strftime("%Y-%m-%d") for d in dates_dt})
 
     def _ratios(series: list[float]) -> tuple[float | None, float | None]:
         if unique_cal_days < 5 or len(series) < 5:
@@ -273,7 +326,8 @@ def compute_series_performance(
         sh = round((mean_d / std_d) * math.sqrt(TRADING_DAYS_PER_YEAR), 2) if std_d > 1e-10 else None
         down = lr[lr < 0.0]
         if len(down) >= 2:
-            d_std = float(np.sqrt(np.mean(down * down)))
+            # Downside deviation over ALL periods (standard Sortino target semi-deviation).
+            d_std = float(np.sqrt(np.sum(down * down) / len(lr)))
             so = round((mean_d / d_std) * math.sqrt(TRADING_DAYS_PER_YEAR), 2) if d_std > 1e-10 else None
         elif len(down) == 0 and mean_d > 0:
             so = 99.0
@@ -281,17 +335,23 @@ def compute_series_performance(
             so = None
         return sh, so
 
+    # Positive-days % and win/loss streaks are computed on UTC calendar-day closes (never on raw
+    # intraday ticks) and only once >= 2 calendar days exist.
+    if unique_cal_days >= 2:
+        daily = _daily_closes(dates_dt, gross_shares)
+        if inception_share is not None and inception_share > 0:
+            daily = [inception_share, *daily]
+        arr_g = np.asarray(daily, dtype=float)
+        arr_g = arr_g[arr_g > 0]
+        if len(arr_g) >= 2:
+            pos_days_pct, win_streak, loss_streak = _compute_streaks(np.diff(np.log(arr_g)))
     if len(gross_shares) >= 2:
-        arr_g = np.asarray(gross_shares, dtype=float)
-        valid = arr_g > 0
-        if np.sum(valid) >= 2:
-            lr_all = np.diff(np.log(arr_g[valid]))
-            pos_days_pct, win_streak, loss_streak = _compute_streaks(lr_all)
         sharpe_g, sortino_g = _ratios(gross_shares)
         sharpe_n, sortino_n = _ratios(net_s)
 
-    max_dd_g, dd_rec_days = _compute_drawdown_stats(dates_dt, gross_shares)
-    max_dd_n, _ = _compute_drawdown_stats(dates_dt, net_s)
+    max_dd_g, dd_rec_days = _compute_drawdown_stats(dates_dt, gross_shares, inception_share=inception_share)
+    max_dd_n, _ = _compute_drawdown_stats(dates_dt, net_s, inception_share=inception_share)
+    elapsed_days = max((dates_dt[-1] - dates_dt[0]).total_seconds() / 86_400.0, 0.0) if dates_dt else 0.0
 
     return {
         "id": strategy_id,
@@ -302,7 +362,10 @@ def compute_series_performance(
         "equity_usd": round(equity_usd, 2) if equity_usd is not None else None,
         "share_price_gross": round(gross_shares[-1], 4) if gross_shares else None,
         "share_price_net": round(net_s[-1], 4) if net_s else None,
-        "days_tracked": len(dates),
+        "days_tracked": unique_cal_days,
+        "observations": len(dates),
+        "elapsed_days": round(elapsed_days, 3),
+        "apy_min_days": MIN_APY_DAYS,
         "gross_returns": gross_ret,
         "gross_apy": gross_apy,
         "net_returns": net_ret,
@@ -317,14 +380,16 @@ def compute_series_performance(
         "positive_days_pct": pos_days_pct,
         "longest_win_streak": win_streak,
         "longest_loss_streak": loss_streak,
-        "monthly_gross": compute_monthly_returns(dates_dt, gross_shares),
-        "monthly_net": compute_monthly_returns(dates_dt, net_s),
+        "monthly_gross": compute_monthly_returns(dates_dt, gross_shares, inception_share=inception_share),
+        "monthly_net": compute_monthly_returns(dates_dt, net_s, inception_share=inception_share),
     }
 
 
-def compute_monthly_returns(dates_dt: list[datetime], shares: list[float]) -> list[dict[str, Any]]:
+def compute_monthly_returns(
+    dates_dt: list[datetime], shares: list[float], *, inception_share: float | None = None
+) -> list[dict[str, Any]]:
     """Compute Year × Month return table (``jan..dec`` + ``ytd``) from share-price observations."""
-    if len(dates_dt) < 2 or len(dates_dt) != len(shares):
+    if len(dates_dt) != len(shares) or not dates_dt or (len(dates_dt) < 2 and inception_share is None):
         return []
     df = pd.DataFrame({"dt": dates_dt, "share": shares})
     df["year"] = [d.year for d in dates_dt]
@@ -332,7 +397,7 @@ def compute_monthly_returns(dates_dt: list[datetime], shares: list[float]) -> li
     month_end = df.groupby(["year", "month"], as_index=False).last().sort_values(["year", "month"])
 
     rows_by_year: dict[int, dict[str, Any]] = {}
-    prev_val = float(shares[0])
+    prev_val = float(inception_share) if inception_share is not None and inception_share > 0 else float(shares[0])
     for _, rec in month_end.iterrows():
         yr = int(rec["year"])
         mo = int(rec["month"])
@@ -483,11 +548,11 @@ def _load_daily_share_series_from_ticks(
 ) -> tuple[list[str], list[float], list[float] | None, float | None]:
     """Load daily-closed share price series from a strategy's ``ticks.parquet`` + ``state.json``."""
     st = _read_json(state_path) or {}
-    start_cap = _f(st.get("starting_capital_usd"), 100_000.0)
+    start_cap = _f(st.get("starting_capital_usd"), 0.0)
     cur_eq = _f(st.get("equity_usd"), _f(st.get("gross_equity_usd"), 0.0)) or None
 
     if not ticks_path.is_file():
-        if cur_eq is not None and start_cap > 0:
+        if cur_eq is not None and start_cap > 0:  # share vs. inception capital
             today = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d")
             sp = round(cur_eq / start_cap, 6)
             return [today], [sp], None, cur_eq
@@ -555,6 +620,53 @@ def _load_benchmarks(data_root: Path) -> dict[str, tuple[list[str], list[float]]
         closes = [_f(p["close"]) for p in pts if isinstance(p, dict) and p.get("date") and _f(p.get("close")) > 0]
         if len(dates) >= 2 and closes[0] > 0:
             out[str(sym).upper()] = (dates, closes)
+    return out
+
+
+_SLEEVE_TIER_LABEL = {
+    "hlp_savings_reserve": "HLP / USDC Reserve",
+    "crisis_cta": "Crypto - Directional CTA",
+    "cross_dex_paper": "Crypto - Cross-DEX Neutral",
+    "metamodel_paper": "Crypto - Multi-Factor Neutral",
+    "hip3_paper": "US Equities / HIP-3 Builders",
+}
+
+
+def _autopilot_look_through_tiers(
+    ap: dict[str, Any], sp: dict[str, Any] | None, h3: dict[str, Any] | None
+) -> dict[str, float]:
+    """Asset-tier USD breakdown of the Autopilot NAV (sums to its sleeve allocations)."""
+    out: dict[str, float] = {}
+
+    def _add(label: str, usd: float) -> None:
+        if usd > 0:
+            out[label] = round(out.get(label, 0.0) + usd, 2)
+
+    for sleeve, alloc_raw in (ap.get("sleeve_allocations_usd") or {}).items():
+        alloc = _f(alloc_raw)
+        if alloc <= 0:
+            continue
+        if sleeve == "spot_perp_paper" and sp:
+            sp_eq = _f(sp.get("equity_usd"))
+            tiers = (sp.get("risk_telemetry") or {}).get("asset_tier_breakdown_usd") or {}
+            if sp_eq > 0 and tiers:
+                scale = alloc / sp_eq
+                used = 0.0
+                for t, amt in tiers.items():
+                    part = max(0.0, _f(amt)) * scale
+                    used += part
+                    _add(str(t), part)
+                _add("Cash / HLP (Spot+Perp sleeve)", alloc - used)
+                continue
+        if sleeve == "hip3_paper" and h3:
+            h3_eq = _f(h3.get("equity_usd"))
+            locked = sum(_f(p.get("margin_locked_usd")) for p in (h3.get("positions") or {}).values() if isinstance(p, dict))
+            if h3_eq > 0:
+                frac = min(1.0, max(0.0, locked / h3_eq))
+                _add(_SLEEVE_TIER_LABEL["hip3_paper"], alloc * frac)
+                _add("Cash (HIP-3 sleeve)", alloc * (1.0 - frac))
+                continue
+        _add(_SLEEVE_TIER_LABEL.get(str(sleeve), str(sleeve)), alloc)
     return out
 
 
@@ -644,6 +756,12 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
         if not ap:
             venue_usd["HIP-3 Builders"] = round(venue_usd.get("HIP-3 Builders", 0.0) + h3_eq, 2)
 
+    # Asset-tier concentration must describe the SAME portfolio as venue concentration. When the
+    # Autopilot master vault exists, both are derived from its sleeve allocations (look-through into
+    # each sleeve's own tier mix, scaled to the USD the Autopilot actually allocates to it).
+    if ap and ap.get("sleeve_allocations_usd"):
+        tier_usd = _autopilot_look_through_tiers(ap, sp, h3)
+
     def _to_pct_rows(raw_map: dict[str, float]) -> list[dict[str, Any]]:
         tot = sum(v for v in raw_map.values() if v > 0)
         if tot <= 0:
@@ -730,9 +848,10 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
         )
         if not dates:
             continue
+        # Loader divides by starting_capital_usd (or the first equity if absent) -> inception share 1.0
         if net_s is None:
-            net_s = simulate_hwm_net_series(
-                dates, gross_s, mgmt_fee_annual_pct=spec["mgmt"], perf_fee_pct=spec["perf"]
+            net_s = simulate_net_series_from_inception(
+                dates, gross_s, inception_share=1.0, mgmt_fee_annual_pct=spec["mgmt"], perf_fee_pct=spec["perf"]
             )
         row = compute_series_performance(
             strategy_id=spec["id"],
@@ -745,6 +864,7 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
             mgmt_fee_pct=spec["mgmt"],
             perf_fee_pct=spec["perf"],
             is_benchmark=False,
+            inception_share=1.0,
         )
         leaderboard.append(row)
         curves[spec["id"]] = {
@@ -807,6 +927,9 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
             "sharpe_sortino_window_days": 90,
             "annualization_basis_days": 365,
             "negative_returns_annualized": False,
+            "apy_min_elapsed_days": MIN_APY_DAYS,
+            "return_anchor": "Strategies: inception share 1.0 = starting_capital_usd; benchmarks: first close",
+            "days_tracked": "Distinct UTC calendar days with observations (not tick count)",
             "net_fee_model": "Continuous annual management fee + High-Water Mark (HWM) performance fee on net NAV",
             "correlation_method": "Pearson rho on overlapping UTC daily log returns (lower-triangular)",
             "ols_method": "Daily log-return OLS y = alpha + beta * factor (annualized alpha = 365 * alpha_daily)",

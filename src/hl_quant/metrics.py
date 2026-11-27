@@ -606,7 +606,7 @@ def render_prometheus_metrics(
             starting_capital_usd=sc,
             return_pct=ret,
             net_return_pct=net_r_st if net_r_st is not None else net_r,
-            net_pnl_usd=round(eq - sc, 2),
+            net_pnl_usd=round((_num(ap_st.get("net_equity_usd")) or eq) - sc, 2),
             funding_pnl_usd=0.0,
             costs_usd=_num(ap_st.get("cum_rebalance_cost_usd")) or 0.0,
             live_apr_pct=_num(sp.get("blended_portfolio_apr_pct")) if isinstance(sp, dict) else 0.0,
