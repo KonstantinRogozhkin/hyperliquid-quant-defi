@@ -83,8 +83,26 @@ def test_hourly_funding_settlement_microstructure_math():
     assert row.funding_hourly_bps == pytest.approx(5.0)
     assert row.avg_post_1m_bps == pytest.approx(2.0, abs=0.05)
     assert row.avg_post_5m_bps == pytest.approx(4.0, abs=0.05)
-    # Net capture 5m = 5.0 funding + 4.0 snapback - 3.0 maker round-trip = +6.0 bps!
-    assert row.net_capture_5m_bps == pytest.approx(6.0, abs=0.1)
+    # Holding through T0 means entering at T-5m: the short pays the -2 bps pre-settlement drift.
+    # Net capture 5m = 5.0 funding - 2.0 pre-drift + 4.0 snapback - 3.0 maker round-trip = +4.0 bps.
+    assert row.avg_pre_5m_bps == pytest.approx(-2.0, abs=0.05)
+    assert row.net_capture_5m_bps == pytest.approx(4.0, abs=0.1)
+    assert row.settlements_with_history == 0
+
+    # Historical rates override the current one per settlement: if every past settlement was
+    # NEGATIVE (longs received), the same candles are measured from the long side instead.
+    hist = {base_hour + (h + 1) * hour: -0.0002 for h in range(3)}
+    row_hist = lfa.compute_hourly_settlement_microstructure(
+        candles, coin="TEST", mark_px=100.0, open_interest_usd=5_000_000.0, funding_hourly=0.0005,
+        funding_history=hist,
+    )
+    assert row_hist is not None and row_hist.settlements_with_history == 3
+    assert row_hist.receiver_side == "short"  # label still reflects the current rate
+    # Long: 2.0 funding + 2.0 pre-drift - 4.0 post (price fell) - 3.0 = -3.0 bps.
+    assert row_hist.net_capture_5m_bps == pytest.approx(-3.0, abs=0.1)
+    assert lfa.parse_funding_history(
+        [{"time": base_hour + hour + 59, "fundingRate": "-0.0002"}, {"time": "x"}, "junk"]
+    ) == {base_hour + hour: -0.0002}
 
     snap = lfa.LiquidationAndFundingAlphaSnapshot(
         observed_at_ms=1_795_710_000_000,

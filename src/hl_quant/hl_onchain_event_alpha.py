@@ -41,7 +41,9 @@ class OnChainEventConfig:
     h2_min_cluster_log_usd: float = 200_000.0
     h2_alert_wall_dist_pct: float = 2.5
     h2_alert_0_5_usd: float = 2_000_000.0
-    h2_alert_0_10_usd: float = 5_000_000.0
+    # Distance-weighted (0-2% x1.0, 2-5% x0.6, 5-10% x0.3 — the cascade_bias weights) notional of
+    # the dominant liquidation side. Raw 0-10% notional ignored distance: a lone wall 9% away fired.
+    h2_alert_weighted_usd: float = 5_000_000.0
     # H4 thresholds
     h4_min_depth_usd: float = 250_000.0
     h4_alert_peg_spread_bps: float = 10.0
@@ -118,8 +120,20 @@ def extract_h2_liq_events(
             [d for d in (near_l, near_s) if d is not None],
             default=None,
         )
+        long_w = (
+            float(c.long_liq_0_2_usd) * liq.BIAS_W_0_2
+            + float(c.long_liq_2_5_usd) * liq.BIAS_W_2_5
+            + float(c.long_liq_5_10_usd) * liq.BIAS_W_5_10
+        )
+        short_w = (
+            float(c.short_liq_0_2_usd) * liq.BIAS_W_0_2
+            + float(c.short_liq_2_5_usd) * liq.BIAS_W_2_5
+            + float(c.short_liq_5_10_usd) * liq.BIAS_W_5_10
+        )
+        weighted_near = max(long_w, short_w)
         # A "near wall" only counts if there is real notional inside 0-5% (a dust position 1% away
-        # with total_0_5_usd == 0 must not raise an alert).
+        # with total_0_5_usd == 0 must not raise an alert); far walls only alert when large enough
+        # after distance weighting (a $6M wall 9% away weighs $1.8M and stays silent).
         is_alert = bool(
             (
                 min_wall is not None
@@ -127,7 +141,7 @@ def extract_h2_liq_events(
                 and tot_0_5 >= cfg.h2_min_cluster_log_usd
             )
             or (tot_0_5 >= cfg.h2_alert_0_5_usd)
-            or (c.total_0_10_usd >= cfg.h2_alert_0_10_usd)
+            or (weighted_near >= cfg.h2_alert_weighted_usd)
         )
         rows.append(
             {
@@ -140,6 +154,7 @@ def extract_h2_liq_events(
                 "total_0_10_usd": round(c.total_0_10_usd, 2),
                 "long_0_5_usd": round(long_0_5, 2),
                 "short_0_5_usd": round(short_0_5, 2),
+                "weighted_near_usd": round(weighted_near, 2),
                 "nearest_wall_pct": round(min_wall, 3) if min_wall is not None else np.nan,
                 "cascade_bias": c.cascade_bias,
                 "alert": is_alert,

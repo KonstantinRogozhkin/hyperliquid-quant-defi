@@ -98,9 +98,13 @@ class HourlyFundingMicroRow:
     avg_pre_5m_bps: float  # signed in funding-receiver direction: T-5m -> T0
     avg_post_1m_bps: float  # signed in funding-receiver direction: T0 -> T+1m
     avg_post_5m_bps: float  # signed in funding-receiver direction: T0 -> T+5m
-    net_capture_1m_bps: float  # |funding_hourly_bps| + avg_post_1m_bps - 3.0 (2x maker)
-    net_capture_5m_bps: float  # |funding_hourly_bps| + avg_post_5m_bps - 3.0 (2x maker)
-    receiver_side: str  # machine enum: "short" (if funding > 0) or "long" (if funding < 0)
+    # Hold T-5m -> T+1m / T+5m in the receiver direction of EACH settlement's own rate:
+    # mean(|f_t| + pre_t + post_t) - 3.0 (2x maker). The pre-settlement drift is paid to get in.
+    net_capture_1m_bps: float
+    net_capture_5m_bps: float
+    receiver_side: str  # machine enum for the CURRENT rate: "short" (funding > 0) or "long" (< 0)
+    # Settlements priced with their historical rate (``fundingHistory``) vs the current-rate fallback.
+    settlements_with_history: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,6 +328,22 @@ def aggregate_liquidation_clusters(positions: list[WhaleLiqPosition], mark_price
 # --------------------------------------------------------------------------- Hourly :00 Funding Microstructure
 
 
+def parse_funding_history(rows: Any) -> dict[int, float]:
+    """``fundingHistory`` rows -> ``{settlement_hour_ms: rate}`` (times rounded to the nearest hour)."""
+    out: dict[int, float] = {}
+    if not isinstance(rows, list):
+        return out
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        t_ms = int(_f(row.get("time")))
+        rate = _f(row.get("fundingRate"), float("nan"))
+        if t_ms <= 0 or not math.isfinite(rate):
+            continue
+        out[int(round(t_ms / 3_600_000)) * 3_600_000] = rate
+    return out
+
+
 def compute_hourly_settlement_microstructure(
     candles_1m: list[dict[str, Any]],
     *,
@@ -332,11 +352,16 @@ def compute_hourly_settlement_microstructure(
     open_interest_usd: float,
     funding_hourly: float,
     round_trip_maker_bps: float = 3.0,
+    funding_history: dict[int, float] | None = None,
 ) -> HourlyFundingMicroRow | None:
     """Measure T-5m -> T0 drift and T0 -> T+1m / T+5m snapback around hourly ``:00`` funding settlements.
 
-    Returns are signed in the **funding-receiver's direction** (Short if ``funding > 0``, Long if
-    ``funding < 0``), so ``net_capture = |funding_bps| + post_ret_bps - round_trip_maker_bps``.
+    Each settlement is evaluated with ITS OWN rate from ``funding_history`` (``{settle_hour_ms:
+    rate}``; falls back to the current ``funding_hourly`` when missing): returns are signed in that
+    settlement's funding-receiver direction. Collecting the payment requires holding through T0, so
+    the capture of one settlement is ``|f_t| + pre_t + post_t`` (entry at T-5m, exit at T+1m/T+5m)
+    minus ``round_trip_maker_bps``. The previous formula ignored the pre-settlement drift and applied
+    the current rate/side to every past settlement (look-ahead).
     """
     if not candles_1m:
         return None
@@ -350,8 +375,7 @@ def compute_hourly_settlement_microstructure(
     if len(by_min) < 20:
         return None
 
-    # Funding receiver sign: if funding > 0, receiver is SHORT (-1); if funding < 0, receiver is LONG (+1)
-    recv_sgn = -1.0 if funding_hourly > 0 else 1.0
+    # Current-rate receiver (display only); each settlement below uses its own historical sign.
     receiver_side = "short" if funding_hourly > 0 else "long"
     fund_bps = funding_hourly * 1e4
     fund_apr = funding_hourly * 24.0 * 365.0 * 100.0
@@ -359,6 +383,10 @@ def compute_hourly_settlement_microstructure(
     pre_5m: list[float] = []
     post_1m: list[float] = []
     post_5m: list[float] = []
+    cap_1m: list[float] = []
+    cap_5m: list[float] = []
+    with_history = 0
+    hist = funding_history or {}
 
     hour_ms = 3_600_000
     min_ms = 60_000
@@ -370,9 +398,20 @@ def compute_hourly_settlement_microstructure(
         p_post1 = by_min.get(ts)  # close of :00 candle == T+1m
         p_post5 = by_min.get(ts + 4 * min_ms)  # close of :04 candle == T+5m
         if p_pre and p_post1 and p_post5:
-            pre_5m.append(recv_sgn * (p0_open - p_pre[0]) / p_pre[0] * 1e4)
-            post_1m.append(recv_sgn * (p_post1[1] - p0_open) / p0_open * 1e4)
-            post_5m.append(recv_sgn * (p_post5[1] - p0_open) / p0_open * 1e4)
+            rate_t = hist.get(ts)
+            if rate_t is not None and math.isfinite(rate_t):
+                with_history += 1
+            else:
+                rate_t = funding_hourly
+            sgn_t = -1.0 if rate_t > 0 else 1.0
+            pre = sgn_t * (p0_open - p_pre[0]) / p_pre[0] * 1e4
+            p1 = sgn_t * (p_post1[1] - p0_open) / p0_open * 1e4
+            p5 = sgn_t * (p_post5[1] - p0_open) / p0_open * 1e4
+            pre_5m.append(pre)
+            post_1m.append(p1)
+            post_5m.append(p5)
+            cap_1m.append(abs(rate_t) * 1e4 + pre + p1)
+            cap_5m.append(abs(rate_t) * 1e4 + pre + p5)
 
     if not post_1m:
         return None
@@ -389,9 +428,10 @@ def compute_hourly_settlement_microstructure(
         avg_pre_5m_bps=round(avg_pre, 2),
         avg_post_1m_bps=round(avg_p1, 2),
         avg_post_5m_bps=round(avg_p5, 2),
-        net_capture_1m_bps=round(abs(fund_bps) + avg_p1 - round_trip_maker_bps, 2),
-        net_capture_5m_bps=round(abs(fund_bps) + avg_p5 - round_trip_maker_bps, 2),
+        net_capture_1m_bps=round(float(np.mean(cap_1m)) - round_trip_maker_bps, 2),
+        net_capture_5m_bps=round(float(np.mean(cap_5m)) - round_trip_maker_bps, 2),
         receiver_side=receiver_side,
+        settlements_with_history=with_history,
     )
 
 
@@ -535,12 +575,19 @@ async def run_liquidation_and_funding_alpha_scan(
                     )
                     if r is None or r.status_code != 200:
                         return None
+                    fh = await _req_with_retry(
+                        "POST",
+                        info_url,
+                        json_body={"type": "fundingHistory", "coin": p["coin"], "startTime": start_ms, "endTime": now_ms},
+                    )
+                    history = parse_funding_history(fh.json() if fh is not None and fh.status_code == 200 else [])
                     return compute_hourly_settlement_microstructure(
                         r.json() or [],
                         coin=p["coin"],
                         mark_px=p["mark_px"],
                         open_interest_usd=p["oi_usd"],
                         funding_hourly=p["funding"],
+                        funding_history=history,
                     )
                 except Exception:
                     return None

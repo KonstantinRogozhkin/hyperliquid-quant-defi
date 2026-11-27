@@ -37,6 +37,7 @@ import pandas as pd
 from hl_quant import hl_spot_perp_arb as spa
 
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
+NAV_GUARD_CONFIRM_MS = 3_600_000
 HOURS_PER_YEAR = 8760.0
 CTA_UNIVERSE: tuple[str, ...] = ("BTC", "ETH", "SOL", "HYPE", "PAXG")
 
@@ -644,6 +645,9 @@ def run_autopilot_tick(
 
     prev_ms = int(state.get("last_tick_ms", 0))
     dt_hours = max(0.0, min(48.0, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
+    # Time-based accruals (HLP reserve yield, CTA perp carry) skipped by a NAV-guard clamp are
+    # carried forward and applied on the next accepted tick instead of being lost.
+    accrual_hours = min(48.0, dt_hours + max(0.0, _f(state.get("nav_guard_deferred_hours"))))
     prev_gross = float(state.get("gross_equity_usd", cfg.starting_capital_usd))
     prev_net = float(state.get("net_equity_usd", cfg.starting_capital_usd))
     start_cap = float(state.get("starting_capital_usd", cfg.starting_capital_usd))
@@ -670,7 +674,7 @@ def run_autopilot_tick(
     cta_turnover_cost_ret = cta_snap["turnover"] * (cfg.cta_turnover_cost_bps / 1e4)
     # Perp carry on the exposure held over the elapsed interval (previous weights)
     prev_cta_gross = sum(abs(float(w)) for w in prev_cta_w.values())
-    cta_funding_ret = prev_cta_gross * (cfg.cta_funding_cost_apr_pct / 100.0 / HOURS_PER_YEAR) * dt_hours
+    cta_funding_ret = prev_cta_gross * (cfg.cta_funding_cost_apr_pct / 100.0 / HOURS_PER_YEAR) * accrual_hours
     cta_cost_ret = cta_turnover_cost_ret + cta_funding_ret
     cta_net_ret = cta_tick_ret - cta_cost_ret
     new_last_closes = dict(cta_mark_map)
@@ -712,7 +716,7 @@ def run_autopilot_tick(
             r = 0.0
             if name == "hlp_savings_reserve":
                 hlp_apr = _f(sleeves["hlp_savings_reserve"].get("apr_pct"), cfg.default_hlp_apr_pct)
-                r = (hlp_apr / 100.0 / HOURS_PER_YEAR) * dt_hours
+                r = (hlp_apr / 100.0 / HOURS_PER_YEAR) * accrual_hours
             elif name == "crisis_cta":
                 r = cta_net_ret
             elif name in sleeves:
@@ -730,8 +734,26 @@ def run_autopilot_tick(
         for name in ("spot_perp_paper", "cross_dex_paper", "hip3_paper", "metamodel_paper"):
             if name in sleeves and _f(alloc_usd.get(name)) <= 0:
                 provisional_last_eq_map[name] = float(sleeves[name]["equity_usd"])
-        # Bounded NAV Sanity Guard
-        if prev_gross > 0 and abs(raw_pnl_total) / prev_gross * 100.0 > cfg.max_tick_nav_jump_pct:
+        # Bounded NAV Sanity Guard: clamp a jump once; if it persists on a tick >= 1h later, accept it.
+        # Baselines (sleeve equities, CTA closes) are not advanced on a clamp, so the accepting tick
+        # credits the full move; without confirmation a genuine jump froze NAV and rebalancing forever.
+        pending_raw = state.get("nav_guard_pending_ms")
+        nav_guard_pending: int | None = int(pending_raw) if pending_raw else None
+        jump_exceeded = prev_gross > 0 and abs(raw_pnl_total) / prev_gross * 100.0 > cfg.max_tick_nav_jump_pct
+        if jump_exceeded and nav_guard_pending is not None and ts_ms - nav_guard_pending >= NAV_GUARD_CONFIRM_MS:
+            nav_guard_reason = (
+                f"Master NAV jump {raw_pnl_total / prev_gross * 100.0:+.2f}% persisted since the clamped tick; "
+                "accepted as genuine"
+            )
+            jump_exceeded = False
+            nav_guard_pending = None
+        elif not jump_exceeded:
+            nav_guard_pending = None
+        state["nav_guard_pending_ms"] = (
+            (nav_guard_pending if nav_guard_pending is not None else ts_ms) if jump_exceeded else None
+        )
+        state["nav_guard_deferred_hours"] = round(accrual_hours, 6) if jump_exceeded else 0.0
+        if jump_exceeded:
             nav_guard_triggered = True
             nav_guard_reason = (
                 f"Master NAV jump {raw_pnl_total / prev_gross * 100.0:+.2f}% exceeded "
