@@ -48,7 +48,25 @@ def _sample_full_metrics_names() -> set[str]:
             "adl_warnings": [],
             "per_coin": [{"coin": "BTC", "leverage_mode": "cross", "position_usd": 120.0, "net_pnl_usd": 1.2, "liq_distance_pct": 400.0, "adl_rank_score": 0.5, "maker_share_pct": 100.0}],
         },
-        "testnet_audit_recent": [{"status": "ok", "high_water_mark_usd": 1006.0, "placed_count": 5, "skipped_unquoted_coins": []}],
+        "testnet_audit_recent": [{"status": "ok", "high_water_mark_usd": 1006.0, "placed_count": 5, "skipped_unquoted_coins": [], "orphan_positions": {}}],
+        "testnet_risk": {
+            "observed_at_ms": 1795806081453,
+            "equity_usd": 992.0,
+            "free_margin_usd": 847.0,
+            "drawdown_pct": 1.4,
+            "drawdown_headroom_pct": 3.6,
+            "gross_leverage": 0.37,
+            "open_positions": 1,
+            "unrealized_pnl_mark_usd": -13.0,
+            "unrealized_pnl_oracle_usd": -7.0,
+            "mark_oracle_pnl_gap_pct": 0.6,
+            "max_mark_oracle_dev_pct": 29.7,
+            "orphan_positions": {"SKY": {"szi": -975.0}},
+            "orphan_notional_usd": 45.0,
+            "orphan_unrealized_pnl_usd": 0.03,
+            "per_coin": [{"coin": "SKY", "book": "ask_only", "notional_usd": -45.0, "unrealized_pnl_mark_usd": 0.03,
+                          "unrealized_pnl_oracle_usd": -0.1, "mark_oracle_dev_pct": -0.9, "orphan": True}],
+        },
         "hip3_paper": {
             "starting_capital_usd": 50000.0,
             "equity_usd": 50010.0,
@@ -188,8 +206,23 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
                 assert m in emitted, f"Prometheus alert '{rule['alert']}' references unknown metric '{m}'"
 
     graf = yaml.safe_load(GRAFANA_ALERTS_PATH.read_text(encoding="utf-8"))
-    g_rules = graf["groups"][0]["rules"]
-    assert len(g_rules) >= 9
+    assert len(graf["groups"][0]["rules"]) >= 9
+    g_rules = [r for grp in graf["groups"] for r in grp["rules"]]
+    uids = [r["uid"] for r in g_rules]
+    assert len(uids) == len(set(uids)), "Grafana alert rule uids must be unique"
+    for required in ("hl-crit-testnet-drawdown", "hl-warn-testnet-orphans", "hl-warn-testnet-risk-stale", "hl-warn-testnet-attr-stale"):
+        assert required in uids
+    prom_names = {r["alert"] for grp in groups for r in grp["rules"]}
+    for required in ("HLTestnetDrawdownNearKillSwitch", "HLTestnetOrphanPositions", "HLTestnetRiskProbeStale", "HLTestnetAttributionStale"):
+        assert required in prom_names
+    # Freshness alerts must also fire when the artifact was never written (no age sample at all).
+    by_uid = {r["uid"]: r for r in g_rules}
+    by_alert = {r["alert"]: r for grp in groups for r in grp["rules"]}
+    for uid, alert in (("hl-warn-testnet-risk-stale", "HLTestnetRiskProbeStale"), ("hl-warn-testnet-attr-stale", "HLTestnetAttributionStale")):
+        assert "hl_artifact_exists" in by_uid[uid]["data"][0]["model"]["expr"]
+        assert "hl_worker_job_enabled" in by_uid[uid]["data"][0]["model"]["expr"]
+        assert "hl_artifact_exists" in by_alert[alert]["expr"]
+        assert "hl_worker_job_enabled" in by_alert[alert]["expr"]
     for rule in g_rules:
         expr = str(rule["data"][0]["model"]["expr"])
         assert "bool(" not in expr, f"Invalid PromQL bool(...) function in '{rule['title']}'; use '< bool' / '> bool'"

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 import pandas as pd
+import pytest
 
 from hl_quant.api.app import create_app, sanitize_json
 
@@ -141,7 +142,12 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
         encoding="utf-8",
     )
     (tmp_path / "hl_testnet_audit.jsonl").write_text(
-        json.dumps({"ts_ms": 1_795_734_634_563, "status": "ok", "violations": [], "cancelled_count": 1, "placed_count": 7, "total_notional_usd": 380.34, "high_water_mark_usd": 999.0, "skipped_unquoted_coins": ["JUP", "PONS"]}) + "\n",
+        json.dumps({"ts_ms": 1_795_734_634_563, "status": "ok", "violations": [], "cancelled_count": 1, "placed_count": 7, "total_notional_usd": 380.34, "high_water_mark_usd": 999.0, "skipped_unquoted_coins": ["JUP", "PONS"], "equity_usd": 990.0, "drawdown_pct": 0.9009, "orphan_notional_usd": 21.0}) + "\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "hl_testnet_risk").mkdir()
+    (tmp_path / "hl_testnet_risk" / "latest.json").write_text(
+        json.dumps({"observed_at_ms": 1_795_806_081_453, "equity_usd": 992.76, "drawdown_pct": 1.37, "orphan_positions": {"SKY": {"szi": -975.0}}, "orphan_notional_usd": 45.5}),
         encoding="utf-8",
     )
 
@@ -186,6 +192,8 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert r_attr.json()["attribution"]["total_fills"] == 14
     assert r_attr.json()["testnet_audit_recent"][0]["placed_count"] == 7
     assert r_attr.json()["testnet_audit_recent"][0]["skipped_unquoted_coins"] == ["JUP", "PONS"]
+    assert r_attr.json()["testnet_audit_recent"][0]["drawdown_pct"] == pytest.approx(0.9009)
+    assert r_attr.json()["testnet_risk"]["orphan_notional_usd"] == 45.5
 
     r_pos = client.get("/api/v1/metamodel/positions")
     assert r_pos.status_code == 200
@@ -198,6 +206,7 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     assert sched_body["worker_status"]["service"] == "hl-worker"
     assert sched_body["artifact_freshness"]["frontier_history"]["exists"] is True
     assert sched_body["artifact_freshness"]["testnet_audit"]["exists"] is True
+    assert sched_body["artifact_freshness"]["testnet_risk"]["exists"] is True
     for expected_key in ("hip3_paper", "liq_funding_alpha", "mm_calibration", "settlement_study"):
         assert expected_key in sched_body["artifact_freshness"]
 
