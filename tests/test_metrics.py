@@ -88,6 +88,13 @@ def test_render_prometheus_metrics_emits_valid_exposition_lines():
     assert 'hl_cross_dex_paper_pair_live_apr_pct{coin="NEAR",other_dex="extended"} 37.77' in text
     assert "hl_hlp_tvl_usd 152279944.79" in text
     assert 'hl_mm_calibration_kappa{coin="ETH"} 0.562' in text
+    # Unified strategy leaderboard metrics emitted across all active strategies
+    assert 'hl_strategy_equity_usd{strategy="hip3_split_margin",category="Market Neutral",mode="paper"} 49996.135' in text
+    assert 'hl_strategy_equity_usd{strategy="cross_dex_v2",category="Market Neutral",mode="paper"} 49985.25' in text
+    assert 'hl_strategy_equity_usd{strategy="metamodel_5bps",category="Observation",mode="paper"} 99237.05' in text
+    assert 'hl_strategy_equity_usd{strategy="testnet_alo_live",category="Live Testnet",mode="testnet"} 1004.16' in text
+    assert "hl_desk_total_open_positions" in text
+    assert "hl_desk_nav_guard_triggers_total 0" in text
     # Every emitted sample value must be a finite number (never NaN/Inf)
     import math
 
