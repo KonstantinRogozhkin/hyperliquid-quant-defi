@@ -118,6 +118,8 @@ def build_coin_settlement_events(
             continue
 
         p_m15, p_m5, p_0, p_p5, p_p15 = b_m15[0], b_m5[0], b_0[0], b_0[1], b_p10[1]
+        if not all(math.isfinite(px) and px > 0 for px in (p_m15, p_m5, p_0, p_p5, p_p15)):
+            continue
         recv_sgn = -1.0 if prev_rate > 0 else 1.0
         fade_sgn = -recv_sgn
 
@@ -130,7 +132,8 @@ def build_coin_settlement_events(
         payout_bps = (-recv_sgn) * actual_fund_bps
         naive_harvest_5m = recv_sgn * (p_p5 - p_m5) / p_m5 * 1e4 + payout_bps
 
-        if max(abs(pre_5m_recv), abs(post_5m_fade), abs(post_15m_fade)) > 500.0:
+        # Reject only broken-feed >90% corrupt glitches; preserve genuine 5-20% :00 squeeze cascades.
+        if max(abs(pre_5m_recv), abs(pre_15m_recv), abs(post_5m_fade), abs(post_15m_fade)) > 9000.0:
             continue
 
         rows.append(
@@ -188,6 +191,8 @@ def build_coin_settlement_events_15m(
             continue
 
         p_m15, p_0, p_p15, p_p30 = b_m15[0], b_0[0], b_0[1], b_p15[1]
+        if not all(math.isfinite(px) and px > 0 for px in (p_m15, p_0, p_p15, p_p30)):
+            continue
         recv_sgn = -1.0 if prev_rate > 0 else 1.0
         fade_sgn = -recv_sgn
 
@@ -199,7 +204,8 @@ def build_coin_settlement_events_15m(
         payout_bps = (-recv_sgn) * actual_fund_bps
         naive_harvest_15m = recv_sgn * (p_p15 - p_m15) / p_m15 * 1e4 + payout_bps
 
-        if max(abs(pre_15m_recv), abs(post_15m_fade), abs(post_30m_fade)) > 800.0:
+        # Reject only broken-feed >90% corrupt glitches; preserve genuine 5-20% :00 squeeze cascades.
+        if max(abs(pre_15m_recv), abs(post_15m_fade), abs(post_30m_fade)) > 9000.0:
             continue
 
         rows.append(

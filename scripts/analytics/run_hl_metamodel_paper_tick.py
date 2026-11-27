@@ -213,9 +213,12 @@ def main(
             (ROOT / ".env",)
         )
         if token and chat_id:
-            rich_html = pt.format_telegram_rich_html(result, state, ticks_df=ticks_df)
-            tg = pt.send_telegram_rich_message(rich_html, bot_token=token, chat_id=chat_id, thread_id=thread_id)
-            result["telegram"] = tg
+            try:
+                rich_html = pt.format_telegram_rich_html(result, state, ticks_df=ticks_df)
+                tg = pt.send_telegram_rich_message(rich_html, bot_token=token, chat_id=chat_id, thread_id=thread_id)
+                result["telegram"] = tg
+            except Exception as exc:  # noqa: BLE001
+                result["telegram"] = {"ok": False, "error": str(exc)}
         else:
             result["telegram"] = {"ok": False, "reason": "missing_credentials"}
     typer.echo(json.dumps(result, default=str))

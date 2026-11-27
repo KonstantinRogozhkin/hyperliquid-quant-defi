@@ -259,7 +259,18 @@ def simulate_passive_alo_coin(
 ) -> CoinMicrostructureReport:
     """Simulate queue-aware passive ``ALO`` limit orders and measure +5s/+30s/+60s markout."""
     l2 = l2_coin.sort_values("recv_ms").reset_index(drop=True)
-    tr = trades_coin.sort_values("recv_ms").reset_index(drop=True) if not trades_coin.empty else pd.DataFrame()
+    first_book_recv_ms = int(l2["recv_ms"].iloc[0]) if not l2.empty else 0
+    first_book_time_ms = (
+        int(l2["book_time_ms"].min()) if ("book_time_ms" in l2.columns and not l2.empty) else first_book_recv_ms
+    )
+    if not trades_coin.empty:
+        tr = trades_coin.sort_values("recv_ms").reset_index(drop=True)
+        keep_tr = tr["recv_ms"] >= first_book_recv_ms
+        if "trade_time_ms" in tr.columns:
+            keep_tr = keep_tr & (tr["trade_time_ms"] >= first_book_time_ms - 1_000)
+        tr = tr[keep_tr].reset_index(drop=True)
+    else:
+        tr = pd.DataFrame()
     coin = str(l2["coin"].iloc[0])
 
     times = l2["recv_ms"].to_numpy(dtype="int64")
@@ -414,11 +425,14 @@ def analyze_recording(
             # the simulated limit price and queue several seconds stale.
             l2_c = l2_c[l2_c["source"] == "bbo"]
         tr_c = trades_df[trades_df["coin"] == coin] if not trades_df.empty and "coin" in trades_df.columns else pd.DataFrame()
-        if not tr_c.empty and "trade_time_ms" in tr_c.columns:
-            # The trades subscription replays recent history stamped with the subscribe-time recv_ms;
-            # those prints happened before the recording and must not count as fills.
-            ts_ref_col = "book_time_ms" if "book_time_ms" in l2_c.columns else "recv_ms"
-            tr_c = tr_c[tr_c["trade_time_ms"] >= int(l2_c[ts_ref_col].min()) - 1_000]
+        if not tr_c.empty:
+            # Drop WS trade replay prints received before the first book tick or stamped before recording start.
+            first_recv_ms = int(l2_c["recv_ms"].min())
+            keep_mask = tr_c["recv_ms"] >= first_recv_ms
+            if "trade_time_ms" in tr_c.columns:
+                ts_ref_col = "book_time_ms" if "book_time_ms" in l2_c.columns else "recv_ms"
+                keep_mask = keep_mask & (tr_c["trade_time_ms"] >= int(l2_c[ts_ref_col].min()) - 1_000)
+            tr_c = tr_c[keep_mask]
         reports.append(
             simulate_passive_alo_coin(
                 l2_c,

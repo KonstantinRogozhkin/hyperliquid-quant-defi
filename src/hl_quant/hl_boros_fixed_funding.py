@@ -39,18 +39,19 @@ class BorosActiveMarket:
     days_to_maturity: float
     mark_apr_pct: float
     mid_apr_pct: float
-    best_bid_apr_pct: float
-    best_ask_apr_pct: float
+    best_bid_apr_pct: float | None
+    best_ask_apr_pct: float | None
     floating_apr_pct: float
-    boros_bid_ask_apr_pct: float
-    maturity_spread_cost_bps: float  # (ask - bid) * (ttm / 365) * 1e4 / 100
-    fixed_minus_float_bid_pct: float  # best_bid - floating (positive = Boros pays MORE fixed than live float!)
-    float_minus_fixed_ask_pct: float  # floating - best_ask (positive = cheap to pay fixed & earn higher float!)
+    boros_bid_ask_apr_pct: float | None
+    maturity_spread_cost_bps: float | None  # (ask - bid) * (ttm / 365) * 1e4 / 100
+    fixed_minus_float_bid_pct: float | None  # best_bid - floating (positive = Boros pays MORE fixed than live float!)
+    float_minus_fixed_ask_pct: float | None  # floating - best_ask (positive = cheap to pay fixed & earn higher float!)
     notional_oi: float
     volume_24h: float
     recommended_action: str
     lighter_live_apr_pct: float | None = None
     locked_hl_minus_lt_apr_pct: float | None = None
+    is_actionable: bool = True
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -86,6 +87,16 @@ MIN_ACTIONABLE_VOLUME_24H_USD = 1.0  # strictly no trades in 24h -> stale quotes
 MIN_ACTIONABLE_OI_USD = 1_000.0  # dust OI (e.g. $1.50) -> not a market
 
 
+def _opt_pct(v: object) -> float | None:
+    if v is None:
+        return None
+    try:
+        x = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return x * 100.0 if math.isfinite(x) else None
+
+
 def parse_boros_market(
     raw: dict[str, Any],
     *,
@@ -105,30 +116,35 @@ def parse_boros_market(
     is_hl = "hyperliquid" in name.lower() or "hyperliquid" in str(md.get("fundingRateSymbol") or "").lower()
 
     days = ttm_sec / 86_400.0
-    mark_pct = _f(d.get("markApr")) * 100.0
-    mid_pct = _f(d.get("midApr"), mark_pct / 100.0) * 100.0
-    bid_pct = _f(d.get("bestBid"), mid_pct / 100.0) * 100.0
-    ask_pct = _f(d.get("bestAsk"), mid_pct / 100.0) * 100.0
-    float_pct = _f(d.get("floatingApr")) * 100.0
+    mark_opt = _opt_pct(d.get("markApr"))
+    mid_opt = _opt_pct(d.get("midApr"))
+    float_opt = _opt_pct(d.get("floatingApr"))
+    mark_pct = mark_opt if mark_opt is not None else (mid_opt if mid_opt is not None else 0.0)
+    mid_pct = mid_opt if mid_opt is not None else mark_pct
+    float_pct = float_opt if float_opt is not None else mid_pct
+    bid_pct = _opt_pct(d.get("bestBid"))
+    ask_pct = _opt_pct(d.get("bestAsk"))
 
-    ba_apr = max(0.0, ask_pct - bid_pct)
-    mat_cost_bps = ba_apr * (days / 365.0) * 100.0  # 1% APR over 1 year = 100 bps
-    fixed_minus_float = bid_pct - float_pct
-    float_minus_fixed = float_pct - ask_pct
+    ba_apr = max(0.0, ask_pct - bid_pct) if (bid_pct is not None and ask_pct is not None) else None
+    mat_cost_bps = (ba_apr * (days / 365.0) * 100.0) if ba_apr is not None else None  # 1% APR over 1 year = 100 bps
+    fixed_minus_float = (bid_pct - float_pct) if bid_pct is not None else None
+    float_minus_fixed = (float_pct - ask_pct) if ask_pct is not None else None
 
-    if is_spread:
-        if fixed_minus_float >= 2.0:
+    if bid_pct is None and ask_pct is None:
+        action = "No executable quotes (Monitor)"
+    elif is_spread:
+        if fixed_minus_float is not None and fixed_minus_float >= 2.0:
             action = "Short Boros Spread (Lock Fixed > Float)"
-        elif float_minus_fixed >= 2.0:
+        elif float_minus_fixed is not None and float_minus_fixed >= 2.0:
             action = "Long Boros Spread (Pay Cheap Fixed)"
         else:
             action = "Watch Spread"
     else:
-        if bid_pct >= 6.0 and days >= 7.0:
+        if bid_pct is not None and bid_pct >= 6.0 and days >= 7.0:
             action = f"Short Perp + Short Boros (Lock {bid_pct:+.2f}%)"
-        elif ask_pct <= -10.0 and days >= 7.0:
+        elif ask_pct is not None and ask_pct <= -10.0 and days >= 7.0:
             action = f"Long Perp + Long Boros (Lock {-ask_pct:+.2f}%)"
-        elif float_minus_fixed >= 3.0:
+        elif float_minus_fixed is not None and float_minus_fixed >= 3.0:
             action = "Long Boros YU (Float > Ask)"
         else:
             action = "Monitor"
@@ -138,7 +154,9 @@ def parse_boros_market(
     oi_usd = _f(d.get("notionalOI"))
     vol_usd = _f(d.get("volume24h"))
     has_liq_fields = "volume24h" in d or "notionalOI" in d  # absent fields are unknown, not zero
-    if has_liq_fields and (vol_usd < MIN_ACTIONABLE_VOLUME_24H_USD or oi_usd < MIN_ACTIONABLE_OI_USD):
+    illiquid = has_liq_fields and (vol_usd < MIN_ACTIONABLE_VOLUME_24H_USD or oi_usd < MIN_ACTIONABLE_OI_USD)
+    is_actionable = (not illiquid) and (bid_pct is not None or ask_pct is not None)
+    if illiquid:
         action = f"Illiquid (vol24h ${vol_usd:,.0f}, OI ${oi_usd:,.0f}) - no action"
 
     lt_apr: float | None = None
@@ -146,7 +164,8 @@ def parse_boros_market(
     if not is_spread and is_hl and lighter_quotes and under in lighter_quotes:
         lt_apr = round(lighter_quotes[under].funding_apr_pct, 2)
         # If Short HL Perp + Long Lighter + Short Boros HL Fixed -> receive Boros bid fixed, pay Lighter float
-        locked_vs_lt = round(bid_pct - lt_apr, 2)
+        if bid_pct is not None:
+            locked_vs_lt = round(bid_pct - lt_apr, 2)
 
     return BorosActiveMarket(
         market_id=int(raw.get("marketId") or 0),
@@ -159,18 +178,19 @@ def parse_boros_market(
         days_to_maturity=round(days, 1),
         mark_apr_pct=round(mark_pct, 2),
         mid_apr_pct=round(mid_pct, 2),
-        best_bid_apr_pct=round(bid_pct, 2),
-        best_ask_apr_pct=round(ask_pct, 2),
+        best_bid_apr_pct=round(bid_pct, 2) if bid_pct is not None else None,
+        best_ask_apr_pct=round(ask_pct, 2) if ask_pct is not None else None,
         floating_apr_pct=round(float_pct, 2),
-        boros_bid_ask_apr_pct=round(ba_apr, 2),
-        maturity_spread_cost_bps=round(mat_cost_bps, 2),
-        fixed_minus_float_bid_pct=round(fixed_minus_float, 2),
-        float_minus_fixed_ask_pct=round(float_minus_fixed, 2),
-        notional_oi=round(_f(d.get("notionalOI")), 2),
-        volume_24h=round(_f(d.get("volume24h")), 2),
+        boros_bid_ask_apr_pct=round(ba_apr, 2) if ba_apr is not None else None,
+        maturity_spread_cost_bps=round(mat_cost_bps, 2) if mat_cost_bps is not None else None,
+        fixed_minus_float_bid_pct=round(fixed_minus_float, 2) if fixed_minus_float is not None else None,
+        float_minus_fixed_ask_pct=round(float_minus_fixed, 2) if float_minus_fixed is not None else None,
+        notional_oi=round(oi_usd, 2),
+        volume_24h=round(vol_usd, 2),
         recommended_action=action,
         lighter_live_apr_pct=lt_apr,
         locked_hl_minus_lt_apr_pct=locked_vs_lt,
+        is_actionable=is_actionable,
     )
 
 
@@ -255,10 +275,14 @@ def format_boros_markdown(snap: BorosScannerSnapshot) -> str:
     ]
     for m in snap.markets:
         spr_tag = " `[SPREAD]`" if m.is_spread_market else ""
+        bid_s = f"**{m.best_bid_apr_pct:+.2f}%**" if m.best_bid_apr_pct is not None else "—"
+        ask_s = f"{m.best_ask_apr_pct:+.2f}%" if m.best_ask_apr_pct is not None else "—"
+        fmf_s = f"{m.fixed_minus_float_bid_pct:+.2f}%" if m.fixed_minus_float_bid_pct is not None else "—"
+        cost_s = f"{m.maturity_spread_cost_bps:.1f} б.п." if m.maturity_spread_cost_bps is not None else "—"
         lines.append(
             f"| `{m.market_id}` | **{m.name}**{spr_tag} | {m.days_to_maturity:.1f}д | "
-            f"**{m.best_bid_apr_pct:+.2f}%** / {m.best_ask_apr_pct:+.2f}% | {m.floating_apr_pct:+.2f}% | "
-            f"{m.fixed_minus_float_bid_pct:+.2f}% | {m.maturity_spread_cost_bps:.1f} б.п. | "
+            f"{bid_s} / {ask_s} | {m.floating_apr_pct:+.2f}% | "
+            f"{fmf_s} | {cost_s} | "
             f"{m.notional_oi:,.0f} | {m.recommended_action} |"
         )
     return "\n".join(lines) + "\n"
@@ -270,13 +294,15 @@ def format_boros_telegram_rich_html(snap: BorosScannerSnapshot) -> str:
         '<tr><th align="left">Рынок Boros</th><th align="right">Срок</th><th align="right">Fixed Bid</th><th align="right">Float</th><th align="right">Разрыв</th></tr>'
     ]
     for m in snap.markets[:6]:
+        bid_h = f"<b>{m.best_bid_apr_pct:+.2f}%</b>" if m.best_bid_apr_pct is not None else "—"
+        fmf_h = f"{m.fixed_minus_float_bid_pct:+.2f}%" if m.fixed_minus_float_bid_pct is not None else "—"
         rows.append(
             "<tr>"
             f'<td align="left"><b>{html.escape(m.name)}</b></td>'
             f'<td align="right">{m.days_to_maturity:.1f}д</td>'
-            f'<td align="right"><b>{m.best_bid_apr_pct:+.2f}%</b></td>'
+            f'<td align="right">{bid_h}</td>'
             f'<td align="right">{m.floating_apr_pct:+.2f}%</td>'
-            f'<td align="right">{m.fixed_minus_float_bid_pct:+.2f}%</td>'
+            f'<td align="right">{fmf_h}</td>'
             "</tr>"
         )
     return (

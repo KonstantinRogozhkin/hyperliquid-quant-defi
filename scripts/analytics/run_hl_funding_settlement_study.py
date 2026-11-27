@@ -58,7 +58,8 @@ def main(
     md = fss.format_settlement_study_markdown(stats_df, meta)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    degraded = bool(meta.get("degraded"))
+    degraded = bool(meta.get("degraded", False))
+    meta["degraded"] = degraded
     if degraded:
         # Keep the last representative events/stats; only publish meta + report flagged DEGRADED.
         typer.echo(
@@ -79,6 +80,8 @@ def main(
     tmp_meta = output_dir / f"{meta_name}.tmp"
     tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     tmp_meta.replace(output_dir / meta_name)
+    if not degraded:
+        (output_dir / "last_attempt.json").unlink(missing_ok=True)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_rep = report_path.with_suffix(".tmp.md")
     tmp_rep.write_text(md, encoding="utf-8")

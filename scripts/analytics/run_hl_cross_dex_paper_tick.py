@@ -35,6 +35,13 @@ def _load_dotenv(path: Path) -> None:
             os.environ[k] = v.strip().strip('"').strip("'")
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 @app.command()
 def main(
     state_dir: Path = typer.Option(ROOT / "data/paper/hl_cross_dex_paper", help="Append-only paper ledger directory"),
@@ -66,10 +73,9 @@ def main(
         res = cdp.run_cross_dex_paper_tick(client, state_dir=state_dir, cfg=cfg)
 
     md = cdp.format_cross_dex_paper_markdown(res)
-    (state_dir / "report.md").write_text(md)
+    _write_text_atomic(state_dir / "report.md", md)
     if report_path is not None:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(md)
+        _write_text_atomic(report_path, md)
 
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(

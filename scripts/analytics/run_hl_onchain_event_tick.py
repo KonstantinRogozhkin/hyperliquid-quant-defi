@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run one read-only H2 + H4 + H5 On-Chain Event Alpha tick and grade forward outcomes."""
+"""Run one read-only H2+H4+H5+H6 On-Chain Event Alpha tick and grade forward outcomes."""
 
 from __future__ import annotations
 
@@ -34,6 +34,13 @@ def _load_dotenv(path: Path) -> None:
             os.environ[k] = v.strip().strip('"').strip("'")
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 @app.command()
 def main(
     state_dir: Path = typer.Option(ROOT / "data/paper/hl_onchain_events", help="Append-only event ledger directory"),
@@ -46,10 +53,9 @@ def main(
     cfg = oea.OnChainEventConfig(top_whales=top_whales)
     res = oea.run_onchain_event_tick(state_dir=state_dir, cfg=cfg)
     md = oea.format_onchain_events_markdown(res)
-    (state_dir / "report.md").write_text(md, encoding="utf-8")
+    _write_text_atomic(state_dir / "report.md", md)
     if report_path is not None:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(md, encoding="utf-8")
+        _write_text_atomic(report_path, md)
 
     should_send = force_telegram or (telegram_on_alert and res.get("should_notify", res["any_alert"]))
     if res.get("suppressed_alert_keys"):

@@ -54,10 +54,33 @@ def _f(val: object, default: float = 0.0) -> float:
     return x if math.isfinite(x) else default
 
 
+K_PREFIX_BASES: frozenset[str] = frozenset({"PEPE", "BONK", "SHIB", "FLOKI", "DOGS", "NEIRO", "LUNC"})
+
+DEFAULT_VENUE_RT_FEE_BPS: dict[str, float] = {
+    "lighter": 9.0,  # 2 * (4.5 HL + 0.0 Lighter)
+    "extended": 13.0,  # 2 * (4.5 HL + 2.0 Extended)
+    "paradex": 15.0,  # 2 * (4.5 HL + 3.0 Paradex)
+    "dydx": 15.0,  # 2 * (4.5 HL + 3.0 dYdX)
+}
+
+
+def default_round_trip_fee_bps(other_dex: str, *, bridge_drag_bps: float = 0.0) -> float:
+    """Return conservative two-leg round-trip fee (plus optional bridge drag) for ``other_dex``."""
+    base = DEFAULT_VENUE_RT_FEE_BPS.get(str(other_dex or "").strip().lower(), 13.0)
+    return base + float(bridge_drag_bps)
+
+
 def _normalize_coin(raw_base: str) -> str:
-    s = raw_base.strip().upper()
+    raw = raw_base.strip()
+    if not raw:
+        return ""
+    if len(raw) > 1 and raw[0] == "k" and raw[1:] == raw[1:].upper() and any(ch.isalpha() for ch in raw[1:]):
+        return "k" + raw[1:].upper()
+    s = raw.upper()
     if s.startswith("1000") and len(s) > 4:
         return "k" + s[4:]
+    if s.startswith("K") and s[1:] in K_PREFIX_BASES:
+        return "k" + s[1:]
     return s
 
 
@@ -73,9 +96,10 @@ def fetch_hyperliquid_quotes(client: httpx.Client) -> dict[str, DexMarketQuote]:
     for asset, ctx in zip(universe, ctxs, strict=False):
         if asset.get("isDelisted"):
             continue
-        coin = str(asset.get("name") or "").strip()
-        if not coin:
+        raw_coin = str(asset.get("name") or "").strip()
+        if not raw_coin:
             continue
+        coin = _normalize_coin(raw_coin)
         mark = _f(ctx.get("markPx"))
         if mark <= 0:
             continue
@@ -91,7 +115,7 @@ def fetch_hyperliquid_quotes(client: httpx.Client) -> dict[str, DexMarketQuote]:
         out[coin] = DexMarketQuote(
             dex="hyperliquid",
             coin=coin,
-            raw_symbol=coin,
+            raw_symbol=raw_coin,
             mark_px=mark,
             funding_rate_h=rate_h,
             funding_apr_pct=rate_h * HOURS_PER_YEAR * 100.0,
@@ -456,7 +480,8 @@ def enrich_opportunities_with_l2_depth(
     df: pd.DataFrame,
     *,
     top_n: int = 12,
-    round_trip_fee_bps: float = 9.0,
+    round_trip_fee_bps: float | None = None,
+    bridge_drag_bps: float = 1.5,
 ) -> pd.DataFrame:
     """Fetch live L2 books on both venues for top-N rows and compute $10k/$50k executable entry & slippage."""
     if df.empty:
@@ -470,11 +495,13 @@ def enrich_opportunities_with_l2_depth(
     be_10k_h: list[float] = []
     book_mid: list[float | None] = []
     credited: list[float] = []
+    rt_cost_list: list[float] = []
 
     for r in sub.itertuples(index=False):
         coin = str(r.coin)
+        hl_sym = "k" + coin[1:] if coin.startswith("k") else coin
         if coin not in hl_cache:
-            hl_cache[coin] = fetch_dex_l2_book(client, "hyperliquid", coin)
+            hl_cache[coin] = fetch_dex_l2_book(client, "hyperliquid", hl_sym)
         hb, ha = hl_cache[coin]
         ob, oa = fetch_dex_l2_book(client, str(r.other_dex), str(r.other_raw_symbol))
         short_hl = str(r.direction).startswith("Short HL")
@@ -490,11 +517,18 @@ def enrich_opportunities_with_l2_depth(
         mark_b = float(r.favorable_basis_bps) if hasattr(r, "favorable_basis_bps") else None
         credit = credited_entry_basis_bps(eb10, mark_b)
         credited.append(round(credit, 2))
+        row_rt_bps = (
+            float(round_trip_fee_bps)
+            if round_trip_fee_bps is not None
+            else default_round_trip_fee_bps(str(r.other_dex), bridge_drag_bps=bridge_drag_bps)
+        )
+        rt_cost_list.append(round(row_rt_bps, 2))
         # Entry slippage is already inside the VWAP exec basis; sl10 is charged once more as the
         # symmetric exit-side slippage estimate.
-        eff_cost = round_trip_fee_bps + (sl10 if sl10 is not None else 0.0) - credit
+        eff_cost = row_rt_bps + (sl10 if sl10 is not None else 0.0) - credit
         be_10k_h.append(round(max(0.0, eff_cost) / hourly_bps, 1) if hourly_bps > 1e-9 else float("inf"))
 
+    sub["round_trip_fee_bps"] = rt_cost_list
     sub["exec_basis_10k_bps"] = exec_10k
     sub["l2_slip_10k_bps"] = slip_10k
     sub["l2_slip_50k_bps"] = slip_50k

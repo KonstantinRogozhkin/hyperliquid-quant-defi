@@ -1,17 +1,18 @@
-"""Read-only On-Chain Event Alpha Scanner & Forward-Outcome Logger for Hyperliquid (H2 + H4 + H5).
+"""Read-only On-Chain Event Alpha Scanner & Forward-Outcome Logger for Hyperliquid (H2+H4+H5+H6).
 
-Monitors and persists three structural Hyperliquid-native hypotheses in append-only Parquet ledgers:
+Monitors and persists four structural Hyperliquid-native hypotheses in append-only Parquet ledgers:
 - **H2 — L1 Whale Liquidation Wall Proximity**: flags coins where active leaderboard whales hold
-  concentrated liquidation walls near mark price (`< 2.5%` wall or `>= $2M` in `0-5%` or `>= $5M` in `0-10%`).
+  concentrated liquidation walls near mark price (`< 2.5%` wall or `>= $2M` in `0-5%` or `>= $5M` weighted).
 - **H4 — HyperEVM <-> HyperCore Impulse Dislocations**: logs peg-adjusted V3 pool spreads (`WHYPE/USDC`,
   `UBTC/USDT0`, `UETH/USDT0`, etc.) and `L1Read` precompile drift, alerting when `|peg_adj| >= 10 bps`
   or `net_arb_bps > 0`.
 - **H5 — HLP Inventory Skew**: reads live open positions of HLP child strategies (`Strategy A/B`,
-  `Liquidator`), aggregates net USD inventory skew per coin, and flags extreme concentrations
-  (`>= $3M` or `>= 2%` of HLP TVL).
+  `Liquidator`), aggregates net USD inventory skew per coin, and flags extreme concentrations.
+- **H6 — BookMid vs Mark vs Oracle Stress Dislocations**: detects acute book vacuums, oracle
+  decoupling, and crowded-funding basis across liquid HyperCore perps.
 
 Every tick automatically back-fills realized `+15m / +1h / +4h` mark-price returns onto prior
-H2 and H5 events (`grade_forward_outcomes`) so the 15-minute cron builds an unbiased live OOS dataset.
+H2, H5, and H6 events (`grade_forward_outcomes`) so the 15-minute cron builds an unbiased live OOS dataset.
 """
 
 from __future__ import annotations
@@ -454,17 +455,15 @@ def grade_forward_outcomes(
         ("ret_1h_bps", 55 * 60_000, 75 * 60_000),
         ("ret_4h_bps", 230 * 60_000, 260 * 60_000),
     )
+    ts_series = pd.to_numeric(df["ts_ms"], errors="coerce")
     updated = 0
     for col, min_dt, max_dt in horizons:
         if col not in df.columns:
             df[col] = np.nan
-        missing_mask = df[col].isna()
+        missing_mask = df[col].isna() & (ts_series >= (now_ms - max_dt)) & (ts_series <= (now_ms - min_dt))
         if not missing_mask.any():
             continue
         for idx in df.index[missing_mask]:
-            dt = now_ms - int(df.at[idx, "ts_ms"])
-            if not (min_dt <= dt <= max_dt):
-                continue
             coin = str(df.at[idx, "coin"])
             entry_px = _f(df.at[idx, "mark_px"])
             curr_px = _f(mark_prices.get(coin))
@@ -643,7 +642,7 @@ def run_onchain_event_tick(
     # 3. Alert deduplication / cooldown (prevents 15m cron from spamming persistent dislocations)
     active_alert_map: dict[str, float] = {}
     for r in alerts_h2:
-        active_alert_map[f"H2:{r['coin']}"] = float(r["total_0_10_usd"])
+        active_alert_map[f"H2:{r['coin']}"] = float(r.get("weighted_near_usd", r["total_0_10_usd"]))
     for r in alerts_h4:
         active_alert_map[f"H4:{r['pool']}"] = abs(float(r["peg_adjusted_spread_bps"]))
     l1_max_drift = max((abs(float(r.get("l1read_max_drift_bps", 0.0))) for r in h4_rows), default=0.0)

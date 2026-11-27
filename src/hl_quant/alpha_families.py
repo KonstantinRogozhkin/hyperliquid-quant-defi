@@ -399,6 +399,16 @@ def build_funding_carry_weights(market: WideMarket, params: dict[str, Any]) -> t
         okx_parity = np.log((hl_px / market.okx_close.shift(1)).clip(lower=1e-9)).abs() <= 0.10
         bn_ok = market.binance_close.shift(1).notna() & bn_spread.notna() & bn_parity
         okx_ok = market.okx_close.shift(1).notna() & okx_spread.notna() & okx_parity
+        vol_win = 30 * 24
+        vol_min_p = max(24, vol_win // 2)
+        if market.binance_notional.notna().any().any():
+            bn_daily = market.binance_notional.shift(1).rolling(vol_win, min_periods=vol_min_p).mean() * 24.0
+            bn_daily = bn_daily.fillna(market.binance_notional.shift(1).expanding(min_periods=1).mean() * 24.0)
+            bn_ok = bn_ok & (bn_daily >= min_vol)
+        if market.okx_notional.notna().any().any():
+            okx_daily = market.okx_notional.shift(1).rolling(vol_win, min_periods=vol_min_p).mean() * 24.0
+            okx_daily = okx_daily.fillna(market.okx_notional.shift(1).expanding(min_periods=1).mean() * 24.0)
+            okx_ok = okx_ok & (okx_daily >= min_vol)
 
         score = by_spread.copy()
         choice = pd.DataFrame("bybit", index=by_spread.index, columns=by_spread.columns, dtype=object)
@@ -489,8 +499,26 @@ def cross_sectional_weights(
     weights = np.zeros((t_len, n_coins), dtype=float)
     cur_w = np.zeros(n_coins, dtype=float)
 
+    idx_vals = score_df.index.to_numpy()
+    use_epoch_grid = (
+        rebalance_h > 1
+        and t_len > 0
+        and np.issubdtype(idx_vals.dtype, np.number)
+        and float(np.min(idx_vals)) >= 100_000_000_000.0
+    )
+
     for i in range(t_len):
-        if i % rebalance_h == 0:
+        if rebalance_h <= 1:
+            should_rebal = True
+        elif use_epoch_grid:
+            is_canonical = ((int(idx_vals[i]) // fa.HOUR_MS) % rebalance_h) == 0
+            # Seed i == 0 only for non-EMA series before the first canonical UTC boundary; once any
+            # canonical boundary hits, cur_w is 100% invariant to sliding-window start_ms shifts.
+            should_rebal = is_canonical or (i == 0 and ema_alpha >= 1.0)
+        else:
+            should_rebal = (i % rebalance_h) == 0
+
+        if should_rebal:
             row = scores[i]
             valid = [j for j in range(n_coins) if mask[i, j] and math.isfinite(row[j])]
             target = np.zeros(n_coins, dtype=float)

@@ -35,6 +35,13 @@ def _load_dotenv(path: Path) -> None:
             os.environ[k] = v.strip().strip('"').strip("'")
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 @app.command()
 def main(
     top_whales: int = typer.Option(lfa.DEFAULT_TOP_WHALES, help="Number of active top leaderboard whales to scan"),
@@ -57,11 +64,10 @@ def main(
     md = lfa.format_liq_funding_markdown(snap)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "snapshot.json").write_text(json.dumps(snap.to_dict(), indent=2))
-    (output_dir / "report.md").write_text(md)
+    _write_text_atomic(output_dir / "snapshot.json", json.dumps(snap.to_dict(), indent=2))
+    _write_text_atomic(output_dir / "report.md", md)
     if report_path is not None:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(md)
+        _write_text_atomic(report_path, md)
 
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(

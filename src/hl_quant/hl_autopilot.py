@@ -145,6 +145,29 @@ def _metamodel_position_gross(pos: dict[str, Any]) -> float:
 # --------------------------------------------------------------------------- Crisis-Alpha CTA Sleeve
 
 
+def _post_info_with_retry(
+    client: httpx.Client,
+    url: str,
+    payload: dict[str, Any],
+    *,
+    max_attempts: int = 3,
+    base_delay_s: float = 0.5,
+) -> httpx.Response | None:
+    """POST to Hyperliquid Info API with bounded retries on HTTP 429/5xx or transport errors."""
+    last_resp: httpx.Response | None = None
+    for attempt in range(max_attempts):
+        try:
+            resp = client.post(url, json=payload)
+            last_resp = resp
+            if resp.status_code not in (429, 500, 502, 503, 504):
+                return resp
+        except httpx.HTTPError:
+            pass
+        if attempt + 1 < max_attempts:
+            time.sleep(base_delay_s * (attempt + 1))
+    return last_resp
+
+
 def fetch_hypercore_daily_closes_with_dates(
     client: httpx.Client,
     coins: tuple[str, ...] = CTA_UNIVERSE,
@@ -159,14 +182,15 @@ def fetch_hypercore_daily_closes_with_dates(
     out: dict[str, list[dict[str, Any]]] = {}
     for coin in coins:
         try:
-            r = client.post(
+            r = _post_info_with_retry(
+                client,
                 info_url,
-                json={
+                {
                     "type": "candleSnapshot",
                     "req": {"coin": coin, "interval": "1d", "startTime": start_ms, "endTime": end_ms},
                 },
             )
-            if r.status_code != 200:
+            if r is None or r.status_code != 200:
                 continue
             bars = r.json() or []
             if not isinstance(bars, list):
@@ -256,7 +280,11 @@ def compute_crisis_cta_weights(
         }
         n_valid += 1
 
-    if n_valid == 0:
+    # Preserve any currently held CTA coin whose daily bars transiently failed to fetch
+    held_missing = sorted(c for c, pw in prev.items() if abs(float(pw)) > 1e-9 and c not in raw_weights)
+    n_valid_eff = max(n_valid, len(set(raw_weights) | set(held_missing)))
+
+    if n_valid_eff == 0:
         return {
             "weights": {},
             "gross_leverage": 0.0,
@@ -266,16 +294,19 @@ def compute_crisis_cta_weights(
         }
 
     # Normalize across universe so equal-risk sum targets cta_target_ann_vol, capped cleanly
-    scale = 1.0 / math.sqrt(float(n_valid))
+    scale = 1.0 / math.sqrt(float(n_valid_eff))
     target_w: dict[str, float] = {}
     for coin, rw in raw_weights.items():
         w = max(-cfg.cta_max_asset_weight, min(cfg.cta_max_asset_weight, rw * scale))
         target_w[coin] = w
 
-    gross = sum(abs(w) for w in target_w.values())
-    if gross > cfg.cta_max_leverage and gross > 0:
-        f = cfg.cta_max_leverage / gross
-        target_w = {c: w * f for c, w in target_w.items()}
+    gross = sum(abs(w) for w in target_w.values()) + sum(abs(float(prev[c])) for c in held_missing)
+    if gross > cfg.cta_max_leverage and gross > 0 and target_w:
+        avail_gross = max(0.0, cfg.cta_max_leverage - sum(abs(float(prev[c])) for c in held_missing))
+        cur_tw_gross = sum(abs(w) for w in target_w.values())
+        if cur_tw_gross > avail_gross and cur_tw_gross > 0:
+            f = avail_gross / cur_tw_gross
+            target_w = {c: w * f for c, w in target_w.items()}
 
     # Apply CTA deadband vs previous weights to suppress micro-churn
     final_w: dict[str, float] = {}
@@ -291,6 +322,17 @@ def compute_crisis_cta_weights(
         fw = round(fw, 4)
         final_w[coin] = fw
 
+    for coin in held_missing:
+        pw = round(float(prev[coin]), 4)
+        final_w[coin] = pw
+        target_w[coin] = pw
+        asset_details[coin] = {
+            "coin": coin,
+            "last_close": 0.0,
+            "tsmom_signal": 0.0,
+            "ann_vol_pct": 0.0,
+        }
+
     # Deadband can keep stale (larger) weights alongside new ones; re-enforce the leverage cap.
     gross_db = sum(abs(w) for w in final_w.values())
     if gross_db > cfg.cta_max_leverage + 1e-9:
@@ -302,11 +344,6 @@ def compute_crisis_cta_weights(
         turnover += abs(fw - pw)
         asset_details[coin]["weight"] = fw
         asset_details[coin]["target_weight"] = round(target_w[coin], 4)
-
-    # Account for any previously held asset that vanished from feed
-    for coin, pw in prev.items():
-        if coin not in final_w and abs(pw) > 1e-9:
-            turnover += abs(pw)
 
     gross_final = round(sum(abs(w) for w in final_w.values()), 4)
     net_final = round(sum(final_w.values()), 4)
@@ -329,13 +366,26 @@ def _read_sleeve_tick_returns(ticks_path: Path, eq_col: str = "equity_usd") -> l
         df = pd.read_parquet(ticks_path)
         if df.empty or eq_col not in df.columns:
             return []
-        eq = pd.to_numeric(df[eq_col], errors="coerce").dropna().to_numpy(dtype=float)
-        if len(eq) < 2:
+        work = df.copy()
+        if "nav_guard_triggered" in work.columns:
+            clamped = work["nav_guard_triggered"].fillna(False).astype(bool)
+            work = work[~clamped]
+        ts_col = next((c for c in ("tick_ms", "ts_ms", "tick_hour_ms") if c in work.columns), None)
+        if ts_col is not None:
+            work["_ts"] = pd.to_numeric(work[ts_col], errors="coerce")
+            work = work.dropna(subset=["_ts"]).sort_values("_ts", kind="stable")
+            work = work.drop_duplicates(subset=["_ts"], keep="last")
+        work["_eq"] = pd.to_numeric(work[eq_col], errors="coerce")
+        work = work.dropna(subset=["_eq"])
+        work = work[work["_eq"] > 0]
+        if len(work) < 2:
             return []
-        eq = eq[eq > 0]
-        if len(eq) < 2:
-            return []
+        eq = work["_eq"].to_numpy(dtype=float)
         rets = np.diff(eq) / eq[:-1]
+        if ts_col is not None:
+            ts_arr = work["_ts"].to_numpy(dtype=float)
+            dt_h = np.clip(np.diff(ts_arr) / 3_600_000.0, 0.5, 48.0)
+            rets = rets * (4.0 / dt_h)
         return [float(r) for r in rets if math.isfinite(r)]
     except Exception:
         return []
@@ -440,7 +490,7 @@ def _sleeve_sharpe_and_vol(rets: list[float], *, periods_per_year: float = 2190.
     vol = float(np.std(arr, ddof=1)) * math.sqrt(periods_per_year)
     mean = float(np.mean(arr)) * periods_per_year
     if vol <= 1e-8:
-        return (2.0 if mean > 0 else 0.0), 0.01
+        return 0.0, 0.05
     return mean / vol, max(vol, 0.01)
 
 
@@ -494,8 +544,9 @@ def compute_autopilot_target_weights(
     if len(with_hist) >= 2:
         for n in eligible_mn:
             prior = max(DEFAULT_BASE_WEIGHTS.get(n, 0.15), 0.05)
-            if n in with_hist:
-                inv_vol = 1.0 / max(vol_map[n], 0.02)
+            pos_cnt = int(sleeves[n].get("positions_count", 0) or 0)
+            if n in with_hist and pos_cnt > 0:
+                inv_vol = min(1.0 / max(vol_map[n], 0.02), 25.0)
                 # Positive Sharpe multiplier (0.25 floor if slightly negative so diversification survives noise)
                 tilt = max(0.25, min(2.5, 1.0 + 0.25 * sharpe_map[n]))
                 raw[n] = 0.5 * prior + 0.5 * (inv_vol * tilt / 20.0)
@@ -623,14 +674,22 @@ def run_autopilot_tick(
                 http_client, CTA_UNIVERSE, lookback_days=370, now_ms=ts_ms, info_url=info_url
             )
             if dated_bars:
+                bench_path = data_root / "hl_benchmarks" / "daily_closes.json"
+                existing_bench_doc = _read_json(bench_path) or {}
+                existing_benchmarks = (
+                    existing_bench_doc.get("benchmarks")
+                    if isinstance(existing_bench_doc.get("benchmarks"), dict)
+                    else {}
+                )
+                merged_benchmarks = {**existing_benchmarks, **dated_bars}
                 _write_json_atomic(
-                    data_root / "hl_benchmarks" / "daily_closes.json",
-                    {"updated_at_utc": obs_utc, "benchmarks": dated_bars},
+                    bench_path,
+                    {"updated_at_utc": obs_utc, "benchmarks": merged_benchmarks},
                 )
             closes_map = {c: [float(p["close"]) for p in pts[-60:]] for c, pts in dated_bars.items() if pts}
             try:
-                m_resp = http_client.post(info_url, json={"type": "allMids"})
-                if m_resp.status_code == 200 and isinstance(m_resp.json(), dict):
+                m_resp = _post_info_with_retry(http_client, info_url, {"type": "allMids"})
+                if m_resp is not None and m_resp.status_code == 200 and isinstance(m_resp.json(), dict):
                     for k, v in m_resp.json().items():
                         px = _f(v)
                         if px > 0:
@@ -662,6 +721,10 @@ def run_autopilot_tick(
         for c, vals in closes_map.items()
         if vals
     }
+    for coin, w in prev_cta_w.items():
+        if abs(float(w)) > 1e-9 and coin not in cta_mark_map and _f(live_marks.get(coin)) > 0:
+            cta_mark_map[coin] = float(live_marks[coin])
+
     cta_tick_ret = 0.0
     if prev_cta_w and prev_ms > 0:
         for coin, w in prev_cta_w.items():
@@ -678,6 +741,17 @@ def run_autopilot_tick(
     cta_cost_ret = cta_turnover_cost_ret + cta_funding_ret
     cta_net_ret = cta_tick_ret - cta_cost_ret
     new_last_closes = dict(cta_mark_map)
+    for coin, w in prev_cta_w.items():
+        if abs(float(w)) > 1e-9 and coin not in new_last_closes:
+            preserved_px = _f(live_marks.get(coin)) or _f(prev_cta_px.get(coin))
+            if preserved_px > 0:
+                new_last_closes[coin] = preserved_px
+    for coin, a_det in cta_snap["assets"].items():
+        sig_close = _f(a_det.get("last_close")) or _f(prev_cta_px.get(coin)) or _f(new_last_closes.get(coin))
+        if _f(a_det.get("last_close")) <= 0 and sig_close > 0:
+            a_det["last_close"] = round(sig_close, 6)
+        mark_val = _f(cta_mark_map.get(coin)) or _f(new_last_closes.get(coin)) or sig_close
+        a_det["mark_px"] = round(mark_val, 6)
 
     # 2. Compute target master weights
     target_weights = compute_autopilot_target_weights(

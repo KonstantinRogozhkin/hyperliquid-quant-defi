@@ -291,6 +291,10 @@ def run_paper_tick(
             "positions": {},
             "tick_count": 0,
             "nav_guard_triggers": 0,
+            "nav_guard_triggered": False,
+            "cum_funding_usd": 0.0,
+            "cum_price_pnl_usd": 0.0,
+            "cum_costs_usd": 0.0,
         }
 
     prev_hour_ms = state.get("last_tick_hour_ms")
@@ -301,17 +305,6 @@ def run_paper_tick(
     prev_pos: dict[str, dict[str, Any]] = state.get("positions", {})
     nav_guard_triggers = int(state.get("nav_guard_triggers", 0) or 0)
 
-    # A held coin missing from this tick's market data cannot be marked to market;
-    # treating it as closed would drop its PnL and charge exit costs. Skip the tick instead.
-    missing_held = sorted(c for c in prev_pos if c not in market.coins)
-    if missing_held:
-        return {
-            "status": "held_coins_missing",
-            "tick_hour_ms": tick_hour_ms,
-            "equity_usd": state["equity_usd"],
-            "missing_coins": missing_held,
-        }
-
     def _cur_cex_px(venue: str, coin_name: str) -> float:
         if cex_mid_prices:
             v_map = cex_mid_prices.get(venue.lower()) or cex_mid_prices.get(venue) or {}
@@ -319,6 +312,51 @@ def run_paper_tick(
             if live_px is not None and math.isfinite(float(live_px)) and float(live_px) > 0:
                 return float(live_px)
         return _last_known(_cex_frames(market, venue)[0], coin_name, tick_hour_ms)
+
+    # A held coin or held CEX leg missing a valid synchronous price/funding feed cannot be marked
+    # to market safely; skip the tick without mutating state.json rather than mixing asynchronous
+    # prices or dropping a leg as NaN.
+    missing_held_set: set[str] = {c for c in prev_pos if c not in market.coins}
+    if prev_hour_ms is not None and prev_pos:
+        for coin, p in prev_pos.items():
+            if coin in missing_held_set:
+                continue
+            cur_hl_px = quotes[coin].mid_px if coin in quotes else _last_known(market.hl_close, coin, tick_hour_ms)
+            if not (math.isfinite(cur_hl_px) and cur_hl_px > 0):
+                missing_held_set.add(coin)
+                continue
+            active_cex_legs = {v: cw for v, cw in _cex_legs(p).items() if abs(cw) > 1e-9}
+            if active_cex_legs and cex_mid_prices is not None and coin not in quotes:
+                missing_held_set.add(coin)
+                continue
+            for venue in active_cex_legs:
+                cex_close_df, cex_fund_df = _cex_frames(market, venue)
+                if cex_mid_prices is not None:
+                    v_map = cex_mid_prices.get(venue.lower()) or cex_mid_prices.get(venue) or {}
+                    live_c_px = v_map.get(coin)
+                    if live_c_px is None or not (math.isfinite(float(live_c_px)) and float(live_c_px) > 0):
+                        missing_held_set.add(coin)
+                        break
+                cur_cex_px = _cur_cex_px(venue, coin)
+                if not (math.isfinite(cur_cex_px) and cur_cex_px > 0):
+                    missing_held_set.add(coin)
+                    break
+                if (
+                    coin not in cex_fund_df.columns
+                    or cex_fund_df[coin].isna().all()
+                    or coin not in cex_close_df.columns
+                    or cex_close_df[coin].loc[:tick_hour_ms].dropna().empty
+                ):
+                    missing_held_set.add(coin)
+                    break
+
+    if missing_held_set:
+        return {
+            "status": "held_coins_missing",
+            "tick_hour_ms": tick_hour_ms,
+            "equity_usd": state["equity_usd"],
+            "missing_coins": sorted(missing_held_set),
+        }
 
     # 1. Mark-to-market PnL and funding accrual over (prev_hour_ms, tick_hour_ms]
     price_pnl_usd = 0.0
@@ -411,8 +449,10 @@ def run_paper_tick(
                 cand_hw = float(t.get("hl_weight", 0.0))
                 cand_legs = dict(t.get("cex_legs", {}))
                 same_hl_dir = old_hw != 0.0 and cand_hw != 0.0 and (old_hw * cand_hw > 0.0)
-                same_venues = bool(old_legs) and set(old_legs) == set(cand_legs) and all(
-                    old_legs[v] * cand_legs[v] > 0.0 for v in old_legs
+                same_venues = (not old_legs and not cand_legs) or (
+                    bool(old_legs)
+                    and set(old_legs) == set(cand_legs)
+                    and all(old_legs[v] * cand_legs[v] > 0.0 for v in old_legs)
                 )
                 if same_hl_dir and same_venues:
                     dhw_cand = abs(cand_hw - old_hw)
@@ -422,7 +462,7 @@ def run_paper_tick(
                             "hl_weight": old_hw,
                             "cex_legs": dict(old_legs),
                             "cex_weight": round(sum(old_legs.values()), 6),
-                            "cex_venue": old_p.get("cex_venue") or t.get("cex_venue"),
+                            "cex_venue": old_p.get("cex_venue") or t.get("cex_venue") or "",
                         }
                         continue
             targets[coin] = t
@@ -518,6 +558,31 @@ def run_paper_tick(
         "nav_guard_triggered": nav_guard_triggered,
     }
 
+    # Seed cumulative totals from prior state (or back-fill from prior non-clamped ticks when upgrading)
+    if (
+        "cum_funding_usd" in state
+        and "cum_price_pnl_usd" in state
+        and "cum_costs_usd" in state
+    ):
+        prev_cum_fund = float(state.get("cum_funding_usd") or 0.0)
+        prev_cum_px = float(state.get("cum_price_pnl_usd") or 0.0)
+        prev_cum_costs = float(state.get("cum_costs_usd") or 0.0)
+    elif ticks_path.exists():
+        old_t = pd.read_parquet(ticks_path)
+        if "tick_hour_ms" in old_t.columns:
+            old_t = old_t[old_t["tick_hour_ms"] < tick_hour_ms]
+        prev_cum_fund = float(old_t["fund_pnl_usd"].sum()) if "fund_pnl_usd" in old_t.columns else 0.0
+        prev_cum_px = float(old_t["price_pnl_usd"].sum()) if "price_pnl_usd" in old_t.columns else 0.0
+        prev_cum_costs = float((-old_t["cost_pnl_usd"]).clip(lower=0.0).sum()) if "cost_pnl_usd" in old_t.columns else 0.0
+    else:
+        prev_cum_fund = 0.0
+        prev_cum_px = 0.0
+        prev_cum_costs = 0.0
+
+    cum_funding_usd = round(prev_cum_fund + fund_pnl_usd, 4)
+    cum_price_pnl_usd = round(prev_cum_px + price_pnl_usd, 4)
+    cum_costs_usd = round(prev_cum_costs + abs(cost_pnl_usd), 4)
+
     _append_parquet(ticks_path, pd.DataFrame([tick_row]), dedup_subset=["tick_hour_ms"])
     if trade_rows:
         _append_parquet(trades_path, pd.DataFrame(trade_rows), dedup_subset=["tick_hour_ms", "coin"])
@@ -525,10 +590,14 @@ def run_paper_tick(
     state_out = {
         "starting_capital_usd": float(state["starting_capital_usd"]),
         "equity_usd": new_equity,
+        "cum_funding_usd": cum_funding_usd,
+        "cum_price_pnl_usd": cum_price_pnl_usd,
+        "cum_costs_usd": cum_costs_usd,
         # A clamped tick keeps the previous clock so the confirming tick covers the full interval.
         "last_tick_hour_ms": prev_hour_ms if nav_guard_triggered else tick_hour_ms,
         "tick_count": int(state.get("tick_count", 0)) + 1,
         "nav_guard_triggers": nav_guard_triggers,
+        "nav_guard_triggered": nav_guard_triggered,
         "nav_guard_reason": nav_guard_reason,
         "nav_guard_pending_tick_hour_ms": nav_guard_pending,
         "positions": new_positions,
