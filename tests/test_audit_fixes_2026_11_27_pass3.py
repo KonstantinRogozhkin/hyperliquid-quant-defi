@@ -278,3 +278,89 @@ def test_mm_calibration_uses_non_overlapping_windows_and_fee_aware_half_spread()
     assert cal.n_windows <= 20  # 100s / 5s non-overlapping (was ~39 with 50% overlap)
     assert cal.implied_min_half_spread_bps == pytest.approx(cal.adverse_term_bps + 1.5, abs=0.011)
     assert cal.calibration_ok is False  # far below min_windows_ok
+
+
+# --------------------------------------------------------------------------- PR #24 review follow-ups
+
+
+def _ap_with_cta(tmp_path: Path, weights: dict[str, float]) -> Path:
+    root = tmp_path / "root"
+    ap_dir = root / "hl_autopilot"
+    ap_dir.mkdir(parents=True)
+    (ap_dir / "state.json").write_text(
+        json.dumps({"sleeve_allocations_usd": {"crisis_cta": 10_000.0}, "cta_state": {"weights": weights}}),
+        encoding="utf-8",
+    )
+    return root
+
+
+def test_levered_cta_tier_mix_is_order_independent(tmp_path: Path):
+    w = {"BTC": 0.4, "ETH": 0.4, "HYPE": 0.3, "PAXG": -0.3}  # 1.4x gross
+    fwd = ar.build_consolidated_risk_exposure(_ap_with_cta(tmp_path / "a", w))
+    rev = ar.build_consolidated_risk_exposure(_ap_with_cta(tmp_path / "b", dict(reversed(list(w.items())))))
+    t_fwd = {r["label"]: r["usd"] for r in fwd["asset_tier_concentration"]}
+    t_rev = {r["label"]: r["usd"] for r in rev["asset_tier_concentration"]}
+    assert t_fwd == t_rev
+    assert t_fwd["Gold RWA"] == pytest.approx(10_000.0 * 0.3 / 1.4, abs=0.01)
+    assert sum(t_fwd.values()) == pytest.approx(10_000.0, abs=0.05)
+
+
+def test_metamodel_gross_uses_per_venue_legs_and_tick_history(tmp_path: Path):
+    pos = {"hl_weight": 0.1, "cex_weight": -0.1, "cex_legs": {"bybit": 0.2, "binance": -0.3}}
+    assert ar.metamodel_position_gross(pos) == pytest.approx(0.6)
+    assert ar.metamodel_position_gross({"hl_weight": 0.1, "cex_weight": -0.2}) == pytest.approx(0.3)
+
+    mm_dir = tmp_path / "hl_metamodel"
+    mm_dir.mkdir(parents=True)
+    (mm_dir / "state.json").write_text(json.dumps({"equity_usd": 100_000.0, "positions": {"BTC": pos}}), encoding="utf-8")
+    t0 = 1_796_300_000_000
+    pd.DataFrame(
+        {"tick_hour_ms": [t0, t0 + 3_600_000], "gross_hl": [0.9, 0.1], "gross_cex": [0.9, 0.5]}
+    ).to_parquet(mm_dir / "ticks.parquet", index=False)
+    row = next(
+        r for r in ar.build_consolidated_risk_exposure(tmp_path)["leverage_by_strategy"] if r["strategy"].startswith("Metamodel")
+    )
+    assert row["current_leverage"] == pytest.approx(0.6)
+    assert row["leverage_30d_max"] == pytest.approx(1.8)  # historical peak, not a copy of current
+
+
+def test_degraded_settlement_run_keeps_published_meta(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    import importlib.util
+
+    from typer.testing import CliRunner
+
+    spec = importlib.util.spec_from_file_location(
+        "run_settlement_study", Path(__file__).resolve().parents[1] / "scripts/analytics/run_hl_funding_settlement_study.py"
+    )
+    mod = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(mod)
+
+    out = tmp_path / "study"
+    out.mkdir()
+    published = {"coins_requested": 35, "coins_collected": 35, "total_settlement_events": 18_496, "observed_at_ms": 1}
+    (out / "meta.json").write_text(json.dumps(published), encoding="utf-8")
+    pd.DataFrame({"x": [1]}).to_parquet(out / "stats.parquet", index=False)
+    attempt = {
+        "observed_at_ms": 1_796_000_000_000,
+        "bar_interval": "5m",
+        "coins_requested": 35,
+        "coins_collected": 5,
+        "coins_failed": [],
+        "total_settlement_events": 900,
+        "span_days": 17.0,
+        "collection_ratio": 0.1429,
+        "degraded": True,
+    }
+
+    async def fake_fetch(**_kw):
+        return pd.DataFrame(), attempt
+
+    monkeypatch.setattr(mod.fss, "fetch_settlement_dataset", fake_fetch)
+    res = CliRunner().invoke(
+        mod.app, ["--output-dir", str(out), "--report-path", str(tmp_path / "r.md")], catch_exceptions=False
+    )
+    assert res.exit_code == 2
+    assert json.loads((out / "meta.json").read_text()) == published
+    assert json.loads((out / "last_attempt.json").read_text())["coins_collected"] == 5
+    assert (out / "stats.parquet").is_file()

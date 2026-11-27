@@ -720,18 +720,34 @@ def _autopilot_look_through_tiers(
             # Look through CTA weights (fractions of the CTA allocation): gold shorts are not crypto,
             # and the unlevered remainder of the sleeve is idle cash, not directional exposure.
             weights = ((ap.get("cta_state") or {}).get("weights") or {}) if isinstance(ap.get("cta_state"), dict) else {}
+            abs_w = {str(c).upper(): abs(_f(w)) for c, w in weights.items() if abs(_f(w)) > 0}
+            gross_w = sum(abs_w.values())
+            # Levered CTA (gross > 1x) cannot exceed the sleeve's NAV in a concentration table:
+            # scale the whole asset mix proportionally (order-independent), no residual cash.
+            scale = alloc * (1.0 / gross_w if gross_w > 1.0 else 1.0)
             used = 0.0
-            for coin, w_raw in weights.items():
-                exp = alloc * abs(_f(w_raw))
-                if exp <= 0:
-                    continue
-                exp = min(exp, max(0.0, alloc - used))
+            for coin, w in abs_w.items():
+                exp = w * scale
                 used += exp
-                _add(TIER_GOLD if str(coin).upper() in _GOLD_COINS else TIER_CTA_CRYPTO, exp)
+                _add(TIER_GOLD if coin in _GOLD_COINS else TIER_CTA_CRYPTO, exp)
             _add("Cash (CTA sleeve)", alloc - used)
             continue
         _add(_SLEEVE_TIER_LABEL.get(str(sleeve), str(sleeve)), alloc)
     return out
+
+
+def metamodel_position_gross(pos: dict[str, Any]) -> float:
+    """Gross weight of one metamodel position: |HL| + sum of |per-venue CEX legs|.
+
+    ``cex_weight`` is the *signed* sum of the venue legs, so opposing Bybit/Binance legs would
+    cancel; it is used only for legacy states without ``cex_legs``.
+    """
+    legs = pos.get("cex_legs")
+    if isinstance(legs, dict) and legs:
+        cex_gross = sum(abs(_f(w)) for w in legs.values())
+    else:
+        cex_gross = abs(_f(pos.get("cex_weight")))
+    return abs(_f(pos.get("hl_weight"))) + cex_gross
 
 
 def _leverage_history_stats(
@@ -743,7 +759,8 @@ def _leverage_history_stats(
 ) -> tuple[float, float]:
     """``(avg, max)`` gross leverage over the trailing window from a tick ledger.
 
-    Uses ``gross_leverage`` when the ledger records it, else ``gross_notional_usd / equity_usd``.
+    Uses ``gross_leverage`` when the ledger records it, ``gross_hl + gross_cex`` (metamodel), else
+    ``gross_notional_usd / equity_usd``.
     Falls back to the current leverage only when no history exists (never copies it silently
     when history is available).
     """
@@ -753,13 +770,17 @@ def _leverage_history_stats(
             df = pd.read_parquet(ticks_path)
         except Exception:
             df = pd.DataFrame()
-        ts_col = next((c for c in ("ts_ms", "tick_ms") if c in df.columns), None)
+        ts_col = next((c for c in ("ts_ms", "tick_ms", "tick_hour_ms") if c in df.columns), None)
         ts = pd.to_numeric(df[ts_col], errors="coerce") if (ts_col is not None and not df.empty) else None
         if ts is not None and ts.notna().any():
             ref_ms = int(now_ms) if now_ms is not None else int(ts.max())
             mask = ts >= ref_ms - int(window_days * 86_400_000)
             if "gross_leverage" in df.columns:
                 lev = pd.to_numeric(df.loc[mask, "gross_leverage"], errors="coerce")
+            elif {"gross_hl", "gross_cex"} <= set(df.columns):  # metamodel paper_tracker ledger
+                lev = pd.to_numeric(df.loc[mask, "gross_hl"], errors="coerce") + pd.to_numeric(
+                    df.loc[mask, "gross_cex"], errors="coerce"
+                )
             elif {"gross_notional_usd", "equity_usd"} <= set(df.columns):
                 ntl = pd.to_numeric(df.loc[mask, "gross_notional_usd"], errors="coerce")
                 eq = pd.to_numeric(df.loc[mask, "equity_usd"], errors="coerce")
@@ -864,10 +885,7 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
     if mm:
         mm_pos = mm.get("positions") or {}
         mm_eq = max(_f(mm.get("equity_usd"), 100_000.0), 1.0)
-        mm_lev = round(
-            sum(abs(_f(p.get("hl_weight"))) + abs(_f(p.get("cex_weight"))) for p in mm_pos.values() if isinstance(p, dict)),
-            3,
-        )
+        mm_lev = round(sum(metamodel_position_gross(p) for p in mm_pos.values() if isinstance(p, dict)), 3)
         mm_net = sum(_f(p.get("hl_weight")) + _f(p.get("cex_weight")) for p in mm_pos.values() if isinstance(p, dict))
         mm_avg, mm_max = _leverage_history_stats(data_root / "hl_metamodel" / "ticks.parquet", mm_lev)
         leverage_rows.append(

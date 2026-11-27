@@ -131,6 +131,16 @@ class AutopilotConfig:
         return asdict(self)
 
 
+def _metamodel_position_gross(pos: dict[str, Any]) -> float:
+    """|HL| + sum |per-venue CEX legs| (``cex_weight`` is a signed net; legacy fallback only)."""
+    legs = pos.get("cex_legs")
+    if isinstance(legs, dict) and legs:
+        cex_gross = sum(abs(_f(w)) for w in legs.values())
+    else:
+        cex_gross = abs(_f(pos.get("cex_weight")))
+    return abs(_f(pos.get("hl_weight"))) + cex_gross
+
+
 # --------------------------------------------------------------------------- Crisis-Alpha CTA Sleeve
 
 
@@ -384,9 +394,7 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
     mm_rets = _read_sleeve_tick_returns(data_root / "hl_metamodel" / "ticks.parquet")
     if mm_st:
         mm_pos = mm_st.get("positions") or {}
-        mm_lev = sum(
-            abs(_f(p.get("hl_weight"))) + abs(_f(p.get("cex_weight"))) for p in mm_pos.values() if isinstance(p, dict)
-        )
+        mm_lev = sum(_metamodel_position_gross(p) for p in mm_pos.values() if isinstance(p, dict))
         out["metamodel_paper"] = {
             "active": True,
             "equity_usd": _f(mm_st.get("equity_usd"), 100_000.0),

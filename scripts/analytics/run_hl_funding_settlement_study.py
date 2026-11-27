@@ -73,9 +73,12 @@ def main(
         tmp_st = output_dir / "stats.tmp.parquet"
         stats_df.to_parquet(tmp_st, index=False)
         tmp_st.replace(output_dir / "stats.parquet")
-    tmp_meta = output_dir / "meta.tmp.json"
+    # meta.json describes the PUBLISHED dataset (events/stats). A degraded attempt must not relabel
+    # the retained results, so its metadata goes to last_attempt.json instead.
+    meta_name = "last_attempt.json" if degraded else "meta.json"
+    tmp_meta = output_dir / f"{meta_name}.tmp"
     tmp_meta.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    tmp_meta.replace(output_dir / "meta.json")
+    tmp_meta.replace(output_dir / meta_name)
     report_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_rep = report_path.with_suffix(".tmp.md")
     tmp_rep.write_text(md, encoding="utf-8")
