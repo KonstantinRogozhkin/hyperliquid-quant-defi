@@ -64,9 +64,17 @@ def _num(value: Any) -> float | None:
 
 
 class _PromBuilder:
+    """Minimal Prometheus text-format builder.
+
+    Samples are grouped per metric family (insertion-ordered) and rendered with a single
+    ``# HELP``/``# TYPE`` header followed by all of that family's samples, so families are never
+    interleaved even when call sites emit them coin-by-coin in loops. Duplicate label sets within
+    a family are dropped (first sample wins) instead of producing an invalid exposition.
+    """
+
     def __init__(self) -> None:
-        self._declared: set[str] = set()
-        self._lines: list[str] = []
+        self._families: dict[str, dict[str, Any]] = {}
+        self.duplicates_dropped: int = 0
 
     def emit(
         self,
@@ -80,15 +88,27 @@ class _PromBuilder:
         num = float(value) if isinstance(value, bool) else _num(value)
         if num is None:
             return
-        if name not in self._declared:
-            self._declared.add(name)
-            if help_text:
-                self._lines.append(f"# HELP {name} {help_text}")
-            self._lines.append(f"# TYPE {name} {metric_type}")
-        self._lines.append(f"{name}{_fmt_labels(labels)} {_fmt_value(num)}")
+        fam = self._families.get(name)
+        if fam is None:
+            fam = {"help": help_text, "type": metric_type, "samples": [], "seen": set()}
+            self._families[name] = fam
+        elif help_text and not fam["help"]:
+            fam["help"] = help_text
+        label_str = _fmt_labels(labels)
+        if label_str in fam["seen"]:
+            self.duplicates_dropped += 1
+            return
+        fam["seen"].add(label_str)
+        fam["samples"].append(f"{name}{label_str} {_fmt_value(num)}")
 
     def render(self) -> str:
-        return ("\n".join(self._lines) + "\n") if self._lines else ""
+        lines: list[str] = []
+        for name, fam in self._families.items():
+            if fam["help"]:
+                lines.append(f"# HELP {name} {fam['help']}")
+            lines.append(f"# TYPE {name} {fam['type']}")
+            lines.extend(fam["samples"])
+        return ("\n".join(lines) + "\n") if lines else ""
 
 
 def _emit_strategy_row(
@@ -183,8 +203,8 @@ def render_prometheus_metrics(
         for job in jobs:
             jname = str(job["name"])
             state = str(job.get("state") or "idle")
-            # Emit both `worker_job` (immune to Prometheus scrape `job` label collision) and `job` (backwards-compat)
-            lbl = {"job": jname, "worker_job": jname}
+            # `job` is the Prometheus target label (renamed to `exported_job` on scrape); use `worker_job` only.
+            lbl = {"worker_job": jname}
             b.emit("hl_worker_job_enabled", bool(job.get("enabled")), help_text="1 if job is enabled", labels=lbl)
             b.emit("hl_worker_job_ok", state == "ok", help_text="1 if job last state is ok", labels=lbl)
             b.emit("hl_worker_job_failed", state == "failed", help_text="1 if job last state is failed", labels=lbl)
@@ -415,10 +435,16 @@ def render_prometheus_metrics(
     if isinstance(boros, dict):
         b.emit("hl_boros_active_markets", boros.get("active_markets_count"), help_text="Active Pendle Boros fixed-funding markets")
         b.emit("hl_boros_hl_spread_markets", boros.get("hl_and_spread_count"), help_text="Active Hyperliquid & Spread Boros markets")
-        for m in (boros.get("markets") or [])[:12]:
-            if not isinstance(m, dict) or not m.get("symbol"):
-                continue
-            blbl = {"symbol": str(m["symbol"]), "underlying": str(m.get("underlying") or "")}
+        boros_markets = [m for m in (boros.get("markets") or []) if isinstance(m, dict) and m.get("symbol")]
+        # Stable series set across scrapes: order by market_id before capping the cardinality.
+        boros_markets.sort(key=lambda m: (str(m.get("underlying") or ""), int(_num(m.get("market_id")) or 0)))
+        for m in boros_markets[:24]:
+            # Several Boros markets share `symbol` (e.g. different collateral); `market_id` keeps them distinct.
+            blbl = {
+                "market_id": str(int(_num(m.get("market_id")) or 0)),
+                "symbol": str(m["symbol"]),
+                "underlying": str(m.get("underlying") or ""),
+            }
             b.emit("hl_boros_fixed_bid_apr_pct", m.get("best_bid_apr_pct"), help_text="Pendle Boros fixed-funding bid APR %", labels=blbl)
             b.emit("hl_boros_fixed_minus_float_pct", m.get("fixed_minus_float_bid_pct"), help_text="Pendle Boros fixed minus floating APR spread %", labels=blbl)
             b.emit("hl_boros_days_to_maturity", m.get("days_to_maturity"), help_text="Pendle Boros days to maturity", labels=blbl)

@@ -254,7 +254,8 @@ def build_job_specs() -> list[JobSpec]:
             "--coins",
             os.environ.get("HL_MM_CALIBRATION_COINS", "BTC,ETH"),
             "--duration-sec",
-            os.environ.get("HL_MM_CALIBRATION_SEC", "45"),
+            # >= 300s: 45s gave ~9 independent 5s windows per side, too few for a stable kappa fit.
+            os.environ.get("HL_MM_CALIBRATION_SEC", "300"),
             "--ws-network",
             "mainnet",
             "--capture-dir",
@@ -455,7 +456,7 @@ def build_job_specs() -> list[JobSpec]:
             cron_expr="18 5 * * *",
             minutes=(18,),
             hours=(5,),
-            timeout_s=240,
+            timeout_s=480,
             readonly=True,
             bootstrap_eligible=True,
             build_command=_mm_calibration_cmd,

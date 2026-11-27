@@ -58,11 +58,18 @@ def main(
     md = fss.format_settlement_study_markdown(stats_df, meta)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    if not events_df.empty:
+    degraded = bool(meta.get("degraded"))
+    if degraded:
+        # Keep the last representative events/stats; only publish meta + report flagged DEGRADED.
+        typer.echo(
+            f"settlement_study_degraded coins={meta.get('coins_collected')}/{meta.get('coins_requested')}",
+            err=True,
+        )
+    if not events_df.empty and not degraded:
         tmp_ev = output_dir / "events.tmp.parquet"
         events_df.to_parquet(tmp_ev, index=False)
         tmp_ev.replace(output_dir / "events.parquet")
-    if not stats_df.empty:
+    if not stats_df.empty and not degraded:
         tmp_st = output_dir / "stats.tmp.parquet"
         stats_df.to_parquet(tmp_st, index=False)
         tmp_st.replace(output_dir / "stats.parquet")
@@ -87,6 +94,8 @@ def main(
                 typer.echo(f"telegram_warn={exc}", err=True)
 
     typer.echo(md)
+    if degraded:
+        raise typer.Exit(code=2)  # surfaces as a failed worker job instead of a silent "ok"
 
 
 if __name__ == "__main__":

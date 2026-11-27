@@ -79,8 +79,8 @@ def test_render_prometheus_metrics_emits_valid_exposition_lines():
     assert 'hl_build_info{service="hl-backend",sha="cc0dfbc08495"} 1' in text
     assert "hl_worker_heartbeat_age_seconds 30" in text
     assert "hl_worker_up 1" in text
-    assert 'hl_worker_job_ok{job="hip3_paper",worker_job="hip3_paper"} 1' in text
-    assert 'hl_worker_job_failed{job="onchain_events",worker_job="onchain_events"} 1' in text
+    assert 'hl_worker_job_ok{worker_job="hip3_paper"} 1' in text
+    assert 'hl_worker_job_failed{worker_job="onchain_events"} 1' in text
     assert "hl_testnet_equity_usd 1004.16" in text
     assert "hl_testnet_last_cycle_skipped_unquoted 2" in text
     assert "hl_hip3_paper_equity_usd 49996.135" in text

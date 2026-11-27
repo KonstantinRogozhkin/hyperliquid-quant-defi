@@ -49,6 +49,18 @@ function shortSha(sha?: string | null): string {
   return sha.length > 8 ? sha.slice(0, 8) : sha;
 }
 
+const CASCADE_BIAS_LABELS: Record<string, string> = {
+  downside_cascade: "Downside Cascade (лонг-ликвидации)",
+  upside_squeeze: "Upside Squeeze (шорт-ликвидации)",
+  balanced: "Сбалансировано",
+};
+
+function cascadeBiasLabel(bias: unknown): string {
+  if (bias === null || bias === undefined || bias === "") return "—";
+  const key = String(bias);
+  return CASCADE_BIAS_LABELS[key] ?? key;
+}
+
 export default function App() {
   const [tab, setTab] = useState<TabId>("overview");
   const [data, setData] = useState<OverviewPayload | null>(null);
@@ -884,7 +896,7 @@ export default function App() {
                             <td className="num">{fmtPct(c.nearest_long_dist_pct, 1, false)}</td>
                             <td className="num">{fmtPct(c.nearest_short_dist_pct, 1, false)}</td>
                             <td>
-                              <span className="badge">{String(c.cascade_bias ?? "—")}</span>
+                              <span className="badge">{cascadeBiasLabel(c.cascade_bias)}</span>
                             </td>
                           </tr>
                         ))}

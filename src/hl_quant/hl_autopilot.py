@@ -339,6 +339,7 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
             "equity_usd": _f(sp_st.get("equity_usd"), 100_000.0),
             "starting_capital_usd": _f(sp_st.get("starting_capital_usd"), 100_000.0),
             "leverage": _f(rt.get("gross_leverage"), 1.25),
+            "net_exposure_frac": _f(rt.get("net_delta_pct")) / 100.0,
             "positions_count": len(sp_st.get("positions") or {}),
             "returns": sp_rets,
             "venue": "HyperCore",
@@ -391,6 +392,9 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
             "equity_usd": _f(mm_st.get("equity_usd"), 100_000.0),
             "starting_capital_usd": _f(mm_st.get("starting_capital_usd"), 100_000.0),
             "leverage": round(mm_lev, 3),
+            "net_exposure_frac": round(
+                sum(_f(p.get("hl_weight")) + _f(p.get("cex_weight")) for p in mm_pos.values() if isinstance(p, dict)), 6
+            ),
             "positions_count": len(mm_pos),
             "returns": mm_rets,
             "venue": "HL x CEX",
@@ -735,7 +739,18 @@ def run_autopilot_tick(
     rebal_reason = ""
     if should_rebalance:
         rebal_turnover = 0.5 * sum(abs(target_weights[k] - actual_weights.get(k, 0.0)) for k in target_weights)
-        rebal_cost_usd = 0.0 if is_initial else round(gross_before_rebal * rebal_turnover * (cfg.rebalance_cost_bps / 1e4), 4)
+        if is_initial:
+            # Bootstrap = 100% turnover into the trading sleeves. Attaching to a sleeve's NAV is
+            # not free: replicating its open book costs at least the reallocation cost. HLP is a
+            # vault deposit; the CTA entry cost was already charged above.
+            fundable = sum(
+                gross_before_rebal * w
+                for k, w in target_weights.items()
+                if k not in ("hlp_savings_reserve", "crisis_cta")
+            )
+            rebal_cost_usd = round(fundable * (cfg.rebalance_cost_bps / 1e4), 4)
+        else:
+            rebal_cost_usd = round(gross_before_rebal * rebal_turnover * (cfg.rebalance_cost_bps / 1e4), 4)
         post_eq = max(gross_before_rebal - rebal_cost_usd, 1.0)
         alloc_usd = {k: round(post_eq * w, 2) for k, w in target_weights.items()}
         actual_weights = dict(target_weights)
@@ -812,7 +827,14 @@ def run_autopilot_tick(
 
     weighted_lev = round(weighted_lev, 3)
     lev_30d_avg, lev_30d_max = spa._compute_30d_leverage_stats(ticks_path, weighted_lev, ts_ms)
-    net_dir_pct = round(actual_weights.get("crisis_cta", 0.0) * float(cta_snap["net_exposure"]) * 100.0, 3)
+    cta_dir_pct = round(actual_weights.get("crisis_cta", 0.0) * float(cta_snap["net_exposure"]) * 100.0, 3)
+    # Residual delta of the "neutral" sleeves (e.g. spot_perp spot-vs-perp drift) is directional too.
+    sleeve_dir_pct = sum(
+        actual_weights.get(k, 0.0) * _f(sleeves[k].get("net_exposure_frac"))
+        for k in sleeves
+        if k not in ("crisis_cta", "hlp_savings_reserve")
+    ) * 100.0
+    net_dir_pct = round(cta_dir_pct + sleeve_dir_pct, 3)
 
     if not nav_guard_triggered:
         cta_state["weights"] = cta_snap["weights"]
@@ -865,6 +887,7 @@ def run_autopilot_tick(
                 "leverage_30d_avg": lev_30d_avg,
                 "leverage_30d_max": lev_30d_max,
                 "net_directional_exposure_pct": net_dir_pct,
+                "cta_directional_exposure_pct": cta_dir_pct,
                 "directional_sleeve_pct": round(actual_weights.get("crisis_cta", 0.0) * 100.0, 2),
                 "reserve_sleeve_pct": round(actual_weights.get("hlp_savings_reserve", 0.0) * 100.0, 2),
                 "max_weight_drift_pct": max_drift_pct,
@@ -892,6 +915,7 @@ def run_autopilot_tick(
                 "net_return_pct": net_ret_pct,
                 "gross_leverage": weighted_lev,
                 "net_directional_exposure_pct": net_dir_pct,
+                "cta_directional_exposure_pct": cta_dir_pct,
                 "max_weight_drift_pct": max_drift_pct,
                 "rebalanced": bool(should_rebalance and not is_initial),
                 "rebalance_cost_usd": rebal_cost_usd,

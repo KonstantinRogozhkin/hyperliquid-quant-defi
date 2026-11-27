@@ -18,6 +18,7 @@ from typing import Any
 import pandas as pd
 
 from hl_quant import hl_tear_sheet as ts
+from hl_quant.hl_liquidation_and_funding_alpha import cascade_bias_label
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
@@ -400,7 +401,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
                 f"<td class='num'>{_ni(r.get('whales_count'), 0)}</td>"
                 f"<td class='num'><b>${_nf(r.get('total_0_10_usd'), 0)/1e6:,.2f}M</b></td>"
                 f"<td class='num'>{_e(wall)}</td>"
-                f"<td>{_e(r.get('cascade_bias'))}</td>"
+                f"<td>{_e(cascade_bias_label(r.get('cascade_bias')))}</td>"
                 "</tr>"
             )
     else:
@@ -412,7 +413,7 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
                 f"<td class='num'>{_ni(c.get('whales_count'), 0)}</td>"
                 f"<td class='num'>${_nf(c.get('total_0_10_usd'), 0)/1e6:,.2f}M</td>"
                 f"<td class='num'>L −{_e(c.get('nearest_long_dist_pct', '—'))}% / S +{_e(c.get('nearest_short_dist_pct', '—'))}%</td>"
-                f"<td>{_e(c.get('cascade_bias'))}</td>"
+                f"<td>{_e(cascade_bias_label(c.get('cascade_bias')))}</td>"
                 "</tr>"
             )
     if not liq_rows:

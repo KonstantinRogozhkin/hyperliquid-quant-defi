@@ -78,8 +78,11 @@ def test_autopilot_deadband_rebalance_hwm_fees_and_nav_guard(tmp_path: Path):
     r1 = ap.run_autopilot_tick(data_root=tmp_path, cfg=cfg, now_ms=t0, daily_closes=closes_t0)
     # Bootstrap charges the CTA book's entry turnover cost (5% sleeve x gross lev x 5 bps)
     assert r1["state"]["cta_state"]["cum_cost_usd"] > 0.0
+    # ...plus the 5 bps reallocation cost on the trading sleeves it attaches to (no free entry).
+    boot_cost = r1["state"]["cum_rebalance_cost_usd"]
+    assert boot_cost > 0.0
     assert r1["state"]["gross_equity_usd"] == pytest.approx(
-        250_000.0 - r1["state"]["cta_state"]["cum_cost_usd"], abs=1.0
+        250_000.0 - r1["state"]["cta_state"]["cum_cost_usd"] - boot_cost, abs=1.0
     )
     assert r1["state"]["risk_telemetry"]["rebalanced_this_tick"] is False
 

@@ -323,7 +323,12 @@ export function AnalyticsRiskTab({
                     <td className="num">{fmtNum(sh, 2)}</td>
                     <td className="num">{fmtNum(so, 2)}</td>
                     <td className={`num ${dd > 5 ? "neg" : ""}`}>{fmtNum(dd, 2, "%")}</td>
-                    <td className="num">{r.dd_recovery_days}d</td>
+                    <td className="num">
+                      {r.dd_recovery_days !== null && r.dd_recovery_days !== undefined ? `${fmtNum(r.dd_recovery_days, 1)}d` : "—"}
+                      {(r.current_underwater_days ?? 0) > 0 ? (
+                        <div className="section-sub neg">под водой {fmtNum(r.current_underwater_days, 1)}d</div>
+                      ) : null}
+                    </td>
                     <td className="num">{fmtNum(r.positive_days_pct, 1, "%")}</td>
                     <td className="num">
                       {r.longest_win_streak}d / {r.longest_loss_streak}d

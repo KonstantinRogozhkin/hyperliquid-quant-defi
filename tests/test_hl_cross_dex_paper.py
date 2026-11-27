@@ -103,6 +103,7 @@ def test_cross_dex_paper_v2_persistence_gate_tight_l2_and_h1_basis_carry_combo(t
         enable_basis_carry_combo=True,
         combo_min_exec_basis_bps=8.0,
         combo_min_apr_pct=8.0,
+        combo_min_persistence_ticks=1,  # same-tick H1 entry under test
     )
     with httpx.Client() as client:
         # Tick 1: SOL has 20% carry on Lighter (streak=1 < 2 -> held back by Persistence Gate!),
@@ -171,7 +172,7 @@ def test_cross_dex_h1_combo_enforces_venue_fee_floor_and_exits_on_negative_fundi
         return ([(3.0060, 10_000.0)], [(3.0061, 10_000.0)])
 
     t0 = 1_795_900_000_000
-    cfg = cdp.CrossDexPaperConfig(combo_max_hold_hours=48.0)
+    cfg = cdp.CrossDexPaperConfig(combo_max_hold_hours=48.0, combo_min_persistence_ticks=1)
     with httpx.Client() as client:
         # Tick 1: ETH (13% APR, +11 bps basis < 14.5 bps Extended RT fee) must be blocked;
         # NEAR (20% APR, +20 bps basis >= 14.5 bps) opens via H1 combo.
@@ -215,7 +216,7 @@ def test_cross_dex_h1_combo_enforces_venue_fee_floor_and_exits_on_negative_fundi
         r_open = cdp.run_cross_dex_paper_tick(
             client,
             state_dir=dir2,
-            cfg=cdp.CrossDexPaperConfig(combo_max_hold_hours=8.0),
+            cfg=cdp.CrossDexPaperConfig(combo_max_hold_hours=8.0, combo_min_persistence_ticks=1),
             now_ms=t0,
             hl_quotes={"NEAR": _q("hyperliquid", "NEAR", 3.0000, -20.0)},
             lighter_quotes={},
@@ -227,7 +228,7 @@ def test_cross_dex_h1_combo_enforces_venue_fee_floor_and_exits_on_negative_fundi
         r_mid = cdp.run_cross_dex_paper_tick(
             client,
             state_dir=dir2,
-            cfg=cdp.CrossDexPaperConfig(combo_max_hold_hours=8.0),
+            cfg=cdp.CrossDexPaperConfig(combo_max_hold_hours=8.0, combo_min_persistence_ticks=1),
             now_ms=t0 + 4 * 3_600_000,
             hl_quotes={"NEAR": _q("hyperliquid", "NEAR", 3.0000, -3.0)},
             lighter_quotes={},
@@ -239,7 +240,7 @@ def test_cross_dex_h1_combo_enforces_venue_fee_floor_and_exits_on_negative_fundi
         r_stop = cdp.run_cross_dex_paper_tick(
             client,
             state_dir=dir2,
-            cfg=cdp.CrossDexPaperConfig(combo_max_hold_hours=8.0),
+            cfg=cdp.CrossDexPaperConfig(combo_max_hold_hours=8.0, combo_min_persistence_ticks=1),
             now_ms=t0 + 8 * 3_600_000,
             hl_quotes={"NEAR": _q("hyperliquid", "NEAR", 3.0000, -3.0)},
             lighter_quotes={},

@@ -715,7 +715,7 @@ def format_onchain_events_markdown(res: dict[str, Any]) -> str:
         al = "🚨 ALERT" if r["alert"] else "— "
         lines.append(
             f"| **{r['coin']}** | {r['mark_px']:,.5g} | {r['whales_count']} | "
-            f"${r['total_0_5_usd']/1e6:,.2f}M | **${r['total_0_10_usd']/1e6:,.2f}M** | {wall} | {r['cascade_bias']} | {al} |"
+            f"${r['total_0_5_usd']/1e6:,.2f}M | **${r['total_0_10_usd']/1e6:,.2f}M** | {wall} | {liq.cascade_bias_label(r['cascade_bias'])} | {al} |"
         )
     if not res["h2_events"]:
         lines.append("| — | — | 0 | $0M | $0M | — | Нет кластеров >= $0.5M | — |")
@@ -780,7 +780,7 @@ def format_onchain_events_telegram_rich_html(res: dict[str, Any]) -> str:
             rows.append(
                 "<tr>"
                 '<td align="left"><b>H2 Ликв.</b></td>'
-                f'<td align="left">{html.escape(str(r["coin"]))} ({html.escape(str(r["cascade_bias"]))})</td>'
+                f'<td align="left">{html.escape(str(r["coin"]))} ({html.escape(liq.cascade_bias_label(r["cascade_bias"]))})</td>'
                 f'<td align="right"><b>${r["total_0_10_usd"]/1e6:,.2f}M</b> · {wall}</td>'
                 "</tr>"
             )

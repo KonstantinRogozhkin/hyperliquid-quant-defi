@@ -3736,7 +3736,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (symbol, underlying) (hl_boros_fixed_bid_apr_pct)",
+          "expr": "max by (market_id, symbol, underlying) (hl_boros_fixed_bid_apr_pct)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -3747,7 +3747,7 @@
         },
         {
           "refId": "B",
-          "expr": "max by (symbol, underlying) (hl_boros_fixed_minus_float_pct)",
+          "expr": "max by (market_id, symbol, underlying) (hl_boros_fixed_minus_float_pct)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -3758,7 +3758,7 @@
         },
         {
           "refId": "C",
-          "expr": "max by (symbol, underlying) (hl_boros_days_to_maturity)",
+          "expr": "max by (market_id, symbol, underlying) (hl_boros_days_to_maturity)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"

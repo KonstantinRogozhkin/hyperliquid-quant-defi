@@ -473,7 +473,27 @@ def fetch_hypercore_markets(client: httpx.Client, *, info_url: str = HYPERCORE_I
     return perps, spots
 
 
-def compute_spot_perp_basis(perps: dict[str, dict[str, Any]], spots: dict[str, dict[str, Any]]) -> list[SpotPerpBasisRow]:
+HINT_CASH_CARRY = "cash_carry"
+HINT_REVERSE_CARRY = "reverse_carry"
+HINT_NEUTRAL = "neutral"
+_HINT_LABELS_RU = {
+    HINT_CASH_CARRY: "Cash&Carry (Лонг Spot + Шорт Perp)",
+    HINT_REVERSE_CARRY: "Reverse Carry (Лонг Perp при наличии займа Spot)",
+    HINT_NEUTRAL: "Нейтрально",
+}
+MIN_BASIS_SPOT_DAY_VOL_USD = 250_000.0
+
+
+def strategy_hint_label(hint: object) -> str:
+    return _HINT_LABELS_RU.get(str(hint), str(hint))
+
+
+def compute_spot_perp_basis(
+    perps: dict[str, dict[str, Any]],
+    spots: dict[str, dict[str, Any]],
+    *,
+    min_spot_day_vol_usd: float = MIN_BASIS_SPOT_DAY_VOL_USD,
+) -> list[SpotPerpBasisRow]:
     """Match HyperCore spot markets to their perpetuals and rank Cash-and-Carry opportunities."""
     out: list[SpotPerpBasisRow] = []
     for sp_sym, sp in spots.items():
@@ -487,15 +507,18 @@ def compute_spot_perp_basis(perps: dict[str, dict[str, Any]], spots: dict[str, d
             continue
         if not (0.5 <= perp_mark / spot_mid <= 2.0):
             continue
+        if float(sp["day_vol_usd"]) < min_spot_day_vol_usd:
+            # Illiquid spot books (e.g. AZTEC with $252/day) print meaningless 2,800+ bps "basis".
+            continue
         basis_bps = (perp_mark - spot_mid) / spot_mid * 1e4
         fund_h_bps = float(p["funding_hourly"]) * 1e4
         fund_apr = float(p["funding_hourly"]) * 24.0 * 365.0 * 100.0
         if fund_apr >= 12.0:
-            hint = "Cash&Carry (Лонг Spot + Шорт Perp)"
+            hint = HINT_CASH_CARRY
         elif fund_apr <= -12.0:
-            hint = "Reverse Carry (Лонг Perp при наличии займа Spot)"
+            hint = HINT_REVERSE_CARRY
         else:
-            hint = "Нейтрально"
+            hint = HINT_NEUTRAL
         out.append(
             SpotPerpBasisRow(
                 spot_token=sp_sym,
@@ -789,7 +812,7 @@ def format_hyperevm_defi_markdown(snap: HyperEVMDefiSnapshot) -> str:
     for b in snap.spot_perp_basis[:10]:
         lines.append(
             f"| **{b.spot_token}** | {b.perp_coin} | {b.spot_mid:,.5g} | {b.perp_mark:,.5g} | {b.basis_bps:+.2f} | "
-            f"**{b.funding_apr_pct:+.1f}%** | ${b.spot_day_vol_usd/1e6:,.2f}M | ${b.perp_oi_usd/1e6:,.1f}M | {b.strategy_hint} |"
+            f"**{b.funding_apr_pct:+.1f}%** | ${b.spot_day_vol_usd/1e6:,.2f}M | ${b.perp_oi_usd/1e6:,.1f}M | {strategy_hint_label(b.strategy_hint)} |"
         )
 
     lines += [

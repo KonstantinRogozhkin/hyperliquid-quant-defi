@@ -8,8 +8,10 @@ v2 Guardrails (derived from live Tick #2 diagnostics):
   collapsing +25% -> +0.4% in 1.7h) by requiring consecutive qualifying ticks before opening.
 - **Tight L2 & Basis Entry Gate** (`max_l2_slip_bps=5.0`, `min_exec_basis_bps=-3.0`): rejects
   thin books (`XMR` 11.6 bps slip / -$14.4 basis swing) and entries already underwater on L2.
-- **H1 Basis + Carry Combo** (`combo_min_exec_basis_bps=+8.0`, `combo_min_apr_pct=8.0`):
-  opens immediately when favorable L2 basis already pays for round-trip fees + slippage at 0h.
+- **H1 Basis + Carry Combo** (`combo_min_exec_basis_bps=+8.0`, `combo_min_apr_pct=12.0`):
+  lower carry threshold when the *mark-capped* favorable basis already pays round-trip fees +
+  slippage. The combo has its own persistence gate (`combo_min_persistence_ticks=2` spaced
+  ticks at `combo_min_apr_pct`); set it to 1 to restore same-tick entry.
 - **Multi-Venue** (`Lighter` + `Extended`): picks the best risk-adjusted venue per coin.
 """
 
@@ -52,6 +54,9 @@ class CrossDexPaperConfig:
     combo_min_exec_basis_bps: float = 8.0
     combo_min_apr_pct: float = 12.0  # avoid low-carry majors that churn fees if structural basis never converges
     combo_max_hold_hours: float = 48.0  # time-stop if basis never converges once carry decays below exit_apr_pct
+    # Spaced ticks (>= combo_min_apr_pct) required before an H1 combo entry. The combo must not
+    # bypass persistence: a one-tick basis/funding spike is exactly what the gate exists to filter.
+    combo_min_persistence_ticks: int = 2
     min_streak_spacing_hours: float = 3.5  # streaks advance at most once per ~4h cron window
     # Reject entries where the L2 book mid basis and the mark basis disagree by more than this:
     # the ledger marks on mark_px, so a book-only edge (stale/async snapshot) never realizes.
@@ -68,6 +73,7 @@ def _load_or_init_state(state_path: Path, cfg: CrossDexPaperConfig) -> dict[str,
     if state_path.is_file():
         st = json.loads(state_path.read_text(encoding="utf-8"))
         st.setdefault("spread_streaks", {})
+        st.setdefault("combo_streaks", {})
         return st
     return {
         "starting_capital_usd": cfg.starting_capital_usd,
@@ -78,6 +84,7 @@ def _load_or_init_state(state_path: Path, cfg: CrossDexPaperConfig) -> dict[str,
         "last_tick_ms": 0,
         "positions": {},  # coin -> position dict
         "spread_streaks": {},  # "COIN@dex:dir" -> consecutive qualifying ticks
+        "combo_streaks": {},  # same keys, threshold combo_min_apr_pct (H1 combo persistence)
         "closed_pairs_count": 0,
         "payback_achieved_count": 0,
     }
@@ -95,6 +102,23 @@ def _append_parquet(path: Path, rows: list[dict[str, Any]]) -> None:
     tmp = path.with_suffix(".tmp.parquet")
     combined.to_parquet(tmp, index=False)
     tmp.replace(path)
+
+
+def _estimate_exit_cost_usd(
+    cfg: CrossDexPaperConfig,
+    other_dex: str,
+    hl_notional_usd: float,
+    other_notional_usd: float,
+    pos: dict[str, Any],
+) -> float:
+    """Exit fees + L2 slip (entry-observed) for unwinding both legs at current notional.
+
+    ``entry_cost_usd`` / ``net_pnl_usd`` only include costs already paid; this estimates the second
+    half of the round trip so the liquidation view of an open pair is not overstated.
+    """
+    slip_bps = float(pos.get("entry_l2_slip_bps", 0.0) or 0.0)
+    exit_notional = 0.5 * (max(0.0, hl_notional_usd) + max(0.0, other_notional_usd))
+    return exit_notional * (cfg.hl_fee_bps + cfg.other_fee_bps(other_dex) + slip_bps) * 1e-4
 
 
 def run_cross_dex_paper_tick(
@@ -172,8 +196,12 @@ def run_cross_dex_paper_tick(
         pos["hl_notional_usd"] = round(hl_notional, 2)
         pos["other_notional_usd"] = round(oth_notional, 2)
         pos["last_hl_px"] = h.mark_px
-        pos["last_lt_px"] = oth.mark_px
         pos["last_other_px"] = oth.mark_px
+        if other_dex == "lighter":
+            pos["last_lt_px"] = oth.mark_px  # legacy alias kept only for Lighter legs
+        else:
+            pos.pop("last_lt_px", None)
+            pos.pop("entry_lt_px", None)
         pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + dt_hours, 2)
         pos["cum_funding_usd"] = round(float(pos.get("cum_funding_usd", 0.0)) + fund_pnl, 4)
         pos["cum_basis_mtm_usd"] = round(float(pos.get("cum_basis_mtm_usd", 0.0)) + basis_pnl, 4)
@@ -185,6 +213,10 @@ def run_cross_dex_paper_tick(
             4,
         )
         pos["payback_achieved"] = bool(pos["cum_funding_usd"] >= float(pos.get("entry_cost_usd", 0.0)))
+        # Liquidation view: net PnL if both legs were closed now (fees + entry-observed L2 slip).
+        est_exit_cost = _estimate_exit_cost_usd(cfg, other_dex, hl_notional, oth_notional, pos)
+        pos["est_exit_cost_usd"] = round(est_exit_cost, 4)
+        pos["liquidation_net_pnl_usd"] = round(pos["net_pnl_usd"] - est_exit_cost, 4)
 
         tick_funding_usd += fund_pnl
         tick_basis_mtm_usd += basis_pnl
@@ -299,6 +331,18 @@ def run_cross_dex_paper_tick(
         min_spacing_hours=cfg.min_streak_spacing_hours,
     )
     state["spread_streaks"] = new_streaks
+    combo_keys: list[str] = []
+    if cfg.enable_basis_carry_combo and not all_opps.empty:
+        for r in all_opps.itertuples(index=False):
+            if float(r.spread_apr_pct) >= cfg.combo_min_apr_pct:
+                combo_keys.append(f"{r.coin}@{r.other_dex}:{r.direction}")
+    combo_streaks = update_streak_map(
+        state.get("combo_streaks") or {},
+        combo_keys,
+        now_ms=ts_ms,
+        min_spacing_hours=cfg.min_streak_spacing_hours,
+    )
+    state["combo_streaks"] = combo_streaks
 
     # 4. Evaluate candidates with Persistence Gate, Tight-L2 + Basis Gate, and H1 Basis+Carry Combo
     opened_coins: list[str] = []
@@ -328,19 +372,24 @@ def run_cross_dex_paper_tick(
             short_hl = direction.startswith("Short HL")
             streak_key = f"{coin}@{other_dex}:{direction}"
             streak = streak_count(new_streaks.get(streak_key))
+            combo_streak = streak_count(combo_streaks.get(streak_key))
 
             # Quick mark-basis pre-filter before hitting L2 endpoints if persistence not yet met
             # Same directional denominator as cds.favorable_basis_bps / compute_book_mid_basis_bps
             # (other venue when short HL, HL when long HL) so the two bases are comparable.
             mark_basis_dir = (h.mark_px - oth.mark_px) / oth.mark_px * 1e4 if short_hl else (oth.mark_px - h.mark_px) / h.mark_px * 1e4
+            combo_persist_ok = combo_streak >= max(1, int(cfg.combo_min_persistence_ticks))
             could_be_combo = (
                 cfg.enable_basis_carry_combo
                 and spread_apr >= cfg.combo_min_apr_pct
+                and combo_persist_ok
                 and mark_basis_dir >= (cfg.combo_min_exec_basis_bps - 2.0)
             )
             passes_persist = spread_apr >= cfg.entry_apr_pct and streak >= cfg.min_persistence_ticks
             if not (passes_persist or could_be_combo):
-                if spread_apr >= cfg.entry_apr_pct:
+                if spread_apr >= cfg.entry_apr_pct or (
+                    cfg.enable_basis_carry_combo and spread_apr >= cfg.combo_min_apr_pct and not combo_persist_ok
+                ):
                     gated_stats["skipped_persistence"] += 1
                 continue
 
@@ -365,6 +414,7 @@ def run_cross_dex_paper_tick(
             is_h1_combo = (
                 cfg.enable_basis_carry_combo
                 and spread_apr >= cfg.combo_min_apr_pct
+                and combo_persist_ok
                 and credited_basis >= combo_basis_floor
             )
             if not is_h1_combo:
@@ -403,10 +453,8 @@ def run_cross_dex_paper_tick(
                 "opened_ms": ts_ms,
                 "hours_held": 0.0,
                 "entry_hl_px": h.mark_px,
-                "entry_lt_px": oth.mark_px,
                 "entry_other_px": oth.mark_px,
                 "last_hl_px": h.mark_px,
-                "last_lt_px": oth.mark_px,
                 "last_other_px": oth.mark_px,
                 "entry_spread_apr_pct": spread_apr,
                 "live_spread_apr_pct": spread_apr,
@@ -423,7 +471,16 @@ def run_cross_dex_paper_tick(
                 "net_pnl_usd": round(-entry_cost_usd, 4),
                 "payback_achieved": False,
                 "persistence_streak": streak,
+                "combo_persistence_streak": combo_streak,
             }
+            if other_dex == "lighter":
+                positions[coin]["entry_lt_px"] = oth.mark_px  # legacy alias (Lighter only)
+                positions[coin]["last_lt_px"] = oth.mark_px
+            est_exit = _estimate_exit_cost_usd(
+                cfg, other_dex, cfg.slot_notional_usd, cfg.slot_notional_usd, positions[coin]
+            )
+            positions[coin]["est_exit_cost_usd"] = round(est_exit, 4)
+            positions[coin]["liquidation_net_pnl_usd"] = round(-entry_cost_usd - est_exit, 4)
             opened_coins.append(f"{coin}@{other_dex}")
             trade_rows.append(
                 {
@@ -450,6 +507,10 @@ def run_cross_dex_paper_tick(
     state["cum_costs_usd"] = round(float(state["cum_costs_usd"]) + tick_costs_usd, 4)
     state["last_tick_ms"] = ts_ms
     state["positions"] = positions
+    # Mark-to-liquidation NAV: what the book is worth if every open pair were closed now.
+    est_exit_total = sum(float(p.get("est_exit_cost_usd", 0.0)) for p in positions.values())
+    state["est_exit_costs_usd"] = round(est_exit_total, 4)
+    state["liquidation_equity_usd"] = round(float(state["equity_usd"]) - est_exit_total, 4)
 
     tmp_st = state_path.with_suffix(".tmp.json")
     tmp_st.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -459,6 +520,7 @@ def run_cross_dex_paper_tick(
         "ts_ms": ts_ms,
         "dt_hours": round(dt_hours, 3),
         "equity_usd": state["equity_usd"],
+        "liquidation_equity_usd": state["liquidation_equity_usd"],
         "active_pairs": len(positions),
         "gross_notional_usd": round(sum(float(p["leg_notional_usd"]) * 2.0 for p in positions.values()), 2),
         "tick_funding_usd": round(tick_funding_usd, 4),

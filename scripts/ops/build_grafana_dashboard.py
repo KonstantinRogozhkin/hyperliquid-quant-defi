@@ -948,9 +948,9 @@ def build_dashboard() -> dict[str, Any]:
             "datasource": DS,
             "gridPos": {"h": 7, "w": 12, "x": 12, "y": 74},
             "targets": [
-                _target("A", "max by (symbol, underlying) (hl_boros_fixed_bid_apr_pct)", instant=True, table=True),
-                _target("B", "max by (symbol, underlying) (hl_boros_fixed_minus_float_pct)", instant=True, table=True),
-                _target("C", "max by (symbol, underlying) (hl_boros_days_to_maturity)", instant=True, table=True),
+                _target("A", "max by (market_id, symbol, underlying) (hl_boros_fixed_bid_apr_pct)", instant=True, table=True),
+                _target("B", "max by (market_id, symbol, underlying) (hl_boros_fixed_minus_float_pct)", instant=True, table=True),
+                _target("C", "max by (market_id, symbol, underlying) (hl_boros_days_to_maturity)", instant=True, table=True),
             ],
             "transformations": [
                 {"id": "merge", "options": {}},

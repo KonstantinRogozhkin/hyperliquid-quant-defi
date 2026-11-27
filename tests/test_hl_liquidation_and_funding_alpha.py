@@ -50,7 +50,7 @@ def test_liquidation_heatmap_extraction_bucketing_and_bias():
     assert btc.long_liq_0_2_usd == pytest.approx(3_000_000.0)
     assert btc.short_liq_2_5_usd == pytest.approx(600_000.0)
     assert btc.nearest_long_dist_pct == pytest.approx(1.5, abs=0.05)
-    assert "Downside Cascade" in btc.cascade_bias
+    assert btc.cascade_bias == "downside_cascade"
 
 
 def test_hourly_funding_settlement_microstructure_math():
@@ -79,7 +79,7 @@ def test_hourly_funding_settlement_microstructure_math():
     )
     assert row is not None
     assert row.settlements_measured == 3
-    assert row.receiver_side == "Шорт"
+    assert row.receiver_side == "short"
     assert row.funding_hourly_bps == pytest.approx(5.0)
     assert row.avg_post_1m_bps == pytest.approx(2.0, abs=0.05)
     assert row.avg_post_5m_bps == pytest.approx(4.0, abs=0.05)
