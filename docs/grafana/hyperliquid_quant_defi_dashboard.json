@@ -1,0 +1,349 @@
+{
+  "uid": "hl-quant-defi-overview",
+  "title": "Hyperliquid Quant DeFi — Live Telemetry",
+  "description": "24/7 Hyperliquid L1, Testnet ALO Execution, HIP-3 Split-Margin Paper, Cross-DEX Paper v2, On-Chain Alpha (H2/H4/H5/H6), HLP & Avellaneda-Stoikov MM Calibration.",
+  "tags": ["hyperliquid", "quant", "defi", "hip3", "testnet"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "1m",
+  "editable": true,
+  "time": { "from": "now-24h", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "label": "Prometheus / VictoriaMetrics",
+        "type": "datasource",
+        "query": "prometheus",
+        "refresh": 1,
+        "hide": 0
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Worker & System Health",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Worker Status",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "hl_worker_up", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "ONLINE", "color": "green" }, "0": { "text": "STALE / DOWN", "color": "red" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Heartbeat Age",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "hl_worker_heartbeat_age_seconds", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 120 }, { "color": "red", "value": 300 }] }
+        }
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Healthy Jobs",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "sum(hl_worker_job_ok)", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 10 }, { "color": "green", "value": 13 }] }
+        }
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Failed Jobs",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "sum(hl_worker_job_failed)", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+        }
+      }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Testnet Last Cycle",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "hl_testnet_last_cycle_ok", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            { "type": "value", "options": { "1": { "text": "OK", "color": "green" }, "0": { "text": "KILL-SWITCH", "color": "red" } } }
+          ],
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 1 }] }
+        }
+      }
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "HLP Vault TVL",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 1 },
+      "targets": [{ "refId": "A", "expr": "hl_hlp_tvl_usd", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Worker Job Duration (s)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 5 },
+      "targets": [
+        { "refId": "A", "expr": "hl_worker_job_last_duration_seconds", "legendFormat": "{{job}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "id": 9,
+      "type": "bargauge",
+      "title": "Artifact Freshness Age (min)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 5 },
+      "targets": [
+        { "refId": "A", "expr": "hl_artifact_age_minutes", "legendFormat": "{{artifact}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "m",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 300 }, { "color": "red", "value": 1500 }] }
+        }
+      }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "Testnet ALO Execution & Risk Hygiene",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 }
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Testnet Equity & High-Water Mark (USD)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 13 },
+      "targets": [
+        { "refId": "A", "expr": "hl_testnet_equity_usd", "legendFormat": "Equity USD", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "hl_testnet_hwm_usd", "legendFormat": "HWM USD", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 12,
+      "type": "stat",
+      "title": "Testnet Net PnL",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 3, "w": 3, "x": 12, "y": 13 },
+      "targets": [{ "refId": "A", "expr": "hl_testnet_net_pnl_usd", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 13,
+      "type": "stat",
+      "title": "ALO Fill Rate",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 3, "w": 3, "x": 15, "y": 13 },
+      "targets": [{ "refId": "A", "expr": "hl_testnet_alo_fill_rate_pct", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "yellow", "value": 70 }, { "color": "green", "value": 85 }] }
+        }
+      }
+    },
+    {
+      "id": 14,
+      "type": "stat",
+      "title": "Maker Share",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 3, "w": 3, "x": 18, "y": 13 },
+      "targets": [{ "refId": "A", "expr": "hl_testnet_maker_share_pct", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 15,
+      "type": "stat",
+      "title": "VW Markout (bps)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 3, "w": 3, "x": 21, "y": 13 },
+      "targets": [{ "refId": "A", "expr": "hl_testnet_vw_markout_bps", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "red", "value": null }, { "color": "green", "value": 0 }] }
+        }
+      }
+    },
+    {
+      "id": 16,
+      "type": "stat",
+      "title": "Min Liq Distance",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 16 },
+      "targets": [{ "refId": "A", "expr": "hl_testnet_min_liq_distance_pct", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 17,
+      "type": "stat",
+      "title": "API Reqs / $ Vol",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 16 },
+      "targets": [{ "refId": "A", "expr": "hl_testnet_api_reqs_per_usd_vol", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": {
+        "defaults": {
+          "decimals": 4,
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 0.5 }, { "color": "red", "value": 0.9 }] }
+        }
+      }
+    },
+    {
+      "id": 18,
+      "type": "stat",
+      "title": "Skipped Unquoted Coins",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 16 },
+      "targets": [{ "refId": "A", "expr": "hl_testnet_last_cycle_skipped_unquoted", "datasource": { "type": "prometheus", "uid": "${datasource}" } }],
+      "fieldConfig": { "defaults": { "decimals": 0 } }
+    },
+    {
+      "id": 19,
+      "type": "row",
+      "title": "HIP-3 Split-Margin, Cross-DEX v2 & Metamodel Paper",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 }
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "HIP-3 & Cross-DEX Paper Equity (USD)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 21 },
+      "targets": [
+        { "refId": "A", "expr": "hl_hip3_paper_equity_usd", "legendFormat": "HIP-3 Split-Margin Paper", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "hl_cross_dex_paper_equity_usd", "legendFormat": "Cross-DEX Paper v2", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "Active HIP-3 & Cross-DEX Live Spread APR (%)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 21 },
+      "targets": [
+        { "refId": "A", "expr": "hl_hip3_paper_pair_live_apr_pct", "legendFormat": "HIP-3 {{symbol}} ({{short_dex}}/{{long_dex}} {{margin_mode}})", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "hl_cross_dex_paper_pair_live_apr_pct", "legendFormat": "Cross-DEX {{coin}} ({{other_dex}})", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 22,
+      "type": "timeseries",
+      "title": "HIP-3 Cumulative Funding vs Basis MTM vs Costs (USD)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 28 },
+      "targets": [
+        { "refId": "A", "expr": "hl_hip3_paper_funding_usd", "legendFormat": "HIP-3 Funding", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "hl_hip3_paper_basis_mtm_usd", "legendFormat": "HIP-3 Basis MTM", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "C", "expr": "-hl_hip3_paper_costs_usd", "legendFormat": "HIP-3 Fees/Slip", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 23,
+      "type": "timeseries",
+      "title": "Metamodel Observation Paper Equity (5 bps HL Cost)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 28 },
+      "targets": [
+        { "refId": "A", "expr": "hl_metamodel_paper_equity_usd", "legendFormat": "Metamodel Paper (5 bps)", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 24,
+      "type": "row",
+      "title": "On-Chain Alpha (H2/H4/H5/H6), HLP & MM Calibration",
+      "collapsed": false,
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 35 }
+    },
+    {
+      "id": 25,
+      "type": "timeseries",
+      "title": "H2 Whale Liquidation Walls (0-5% from Mark, USD)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 36 },
+      "targets": [
+        { "refId": "A", "expr": "hl_onchain_h2_liq_0_5_usd", "legendFormat": "{{coin}} (0-5%)", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": { "defaults": { "unit": "currencyUSD" } }
+    },
+    {
+      "id": 26,
+      "type": "timeseries",
+      "title": "HLP APR vs Best HyperEVM Composable Yield Stack (%)",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 36 },
+      "targets": [
+        { "refId": "A", "expr": "hl_hlp_apr_pct", "legendFormat": "HLP Benchmark APR", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "hl_yield_stack_best_net_apr_pct", "legendFormat": "Best Composable Loop APR", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "id": 27,
+      "type": "timeseries",
+      "title": "Avellaneda-Stoikov Empirical Kappa (/bp) & R²",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 0, "y": 43 },
+      "targets": [
+        { "refId": "A", "expr": "hl_mm_calibration_kappa", "legendFormat": "{{coin}} kappa", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "hl_mm_calibration_r2", "legendFormat": "{{coin}} R²", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ]
+    },
+    {
+      "id": 28,
+      "type": "timeseries",
+      "title": "HIP-3 Oracle Divergence (bps) — Active Pairs",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 7, "w": 12, "x": 12, "y": 43 },
+      "targets": [
+        { "refId": "A", "expr": "hl_hip3_paper_pair_oracle_div_bps", "legendFormat": "Open {{symbol}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } },
+        { "refId": "B", "expr": "hl_hip3_persistence_oracle_div_bps", "legendFormat": "Watch {{symbol}}", "datasource": { "type": "prometheus", "uid": "${datasource}" } }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 15 }, { "color": "red", "value": 35 }] }
+        }
+      }
+    }
+  ]
+}
