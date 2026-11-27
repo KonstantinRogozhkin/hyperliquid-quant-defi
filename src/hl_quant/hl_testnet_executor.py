@@ -630,6 +630,38 @@ def plan_orphan_unwind_orders(
     return planned
 
 
+def orphan_residual_notional_usd(
+    account: AccountSnapshot,
+    meta: dict[str, AssetSpec],
+    bbo: dict[str, tuple[float, float, int]],
+    book_tops: dict[str, BookTop] | None,
+    reference_px: dict[str, float] | None,
+    *,
+    exclude_coins: set[str] | None = None,
+    target_weights: dict[str, float] | None = None,
+) -> dict[str, float]:
+    """Signed USD notional each unquoted position is intended to keep after this cycle's unwinds.
+
+    Mirrors :func:`plan_orphan_unwind_orders`, so dollar-neutralization of the quoted book offsets
+    the *residual* orphan exposure instead of exposure that is being closed in the same cycle.
+    """
+    planned = {
+        o.coin: o.sz
+        for o in plan_orphan_unwind_orders(
+            account, meta, bbo, book_tops, reference_px, exclude_coins=exclude_coins, target_weights=target_weights
+        )
+    }
+    out: dict[str, float] = {}
+    for coin, cur_sz in account.positions_sz.items():
+        cur = float(cur_sz or 0.0)
+        if abs(cur) <= 1e-12 or coin in bbo:
+            continue
+        ntl = float(account.position_notional_usd.get(coin, 0.0) or 0.0)
+        keep_frac = max(0.0, 1.0 - planned.get(coin, 0.0) / abs(cur))
+        out[coin] = ntl * keep_frac
+    return out
+
+
 def load_logged_order_oids(audit_log_path: Path | None) -> set[int]:
     """Collect every order id recorded in a JSONL audit log (MM ``mm_audit.jsonl`` or executor log).
 
@@ -1027,7 +1059,16 @@ def execute_rebalance_cycle(
             derisk_orders = list(orphan_unwinds)
         if derisk_allowed and account_risk:
             derisk_mode = "flatten" if flatten else "reduce_only"
-            plan_targets = {c: 0.0 for c in target_weights} if flatten else target_weights
+            if flatten:
+                plan_targets = {c: 0.0 for c in target_weights}
+            else:
+                # A reversal target (opposite sign to the held position) would plan one non-reduce-only
+                # order through zero and be filtered out entirely; clamp it to 0 so the closing part
+                # still executes without opening the new side.
+                plan_targets = {
+                    c: (0.0 if float(account.positions_sz.get(c, 0.0) or 0.0) * float(w) < 0 else float(w))
+                    for c, w in target_weights.items()
+                }
             derisk_orders = [
                 o
                 for o in plan_rebalance_orders(

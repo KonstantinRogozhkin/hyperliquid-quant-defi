@@ -144,14 +144,29 @@ def main(
             if neutralize_net:
                 orphan_net_w = 0.0
                 orphan_gross_w = 0.0
+                # Offset only the orphan exposure that survives this cycle's planned unwinds.
+                residual_ntl = (
+                    ex.orphan_residual_notional_usd(
+                        account,
+                        meta,
+                        bbo,
+                        book_tops,
+                        reference_px,
+                        exclude_coins=foreign_coin_set,
+                        target_weights=intended_targets,
+                    )
+                    if limits.unwind_unquoted_orphans
+                    else {}
+                )
                 if account.equity_usd > 0:
                     for c, sz in account.positions_sz.items():
                         if abs(sz) <= 1e-12 or c in valid_targets:
                             continue
                         ntl = float(account.position_notional_usd.get(c, 0.0) or 0.0)
                         if c not in bbo:
-                            orphan_net_w += ntl / account.equity_usd
-                            orphan_gross_w += abs(ntl) / account.equity_usd
+                            kept = residual_ntl.get(c, ntl)
+                            orphan_net_w += kept / account.equity_usd
+                            orphan_gross_w += abs(kept) / account.equity_usd
                         elif c in foreign_coin_set:
                             # MM inventory stays on the book: reserve its gross, leave its net to the MM.
                             orphan_gross_w += abs(ntl) / account.equity_usd

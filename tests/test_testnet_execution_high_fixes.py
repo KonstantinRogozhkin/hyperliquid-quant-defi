@@ -285,3 +285,27 @@ def test_orphan_unwind_trims_only_the_excess_over_target():
     assert orders[0].sz == pytest.approx(1.2)  # keep $20 (0.8 VVV), trim 1.2
     flipped = ex.plan_orphan_unwind_orders(acct, _meta("VVV"), {}, tops, {"VVV": 25.0}, target_weights={"VVV": -0.02})
     assert flipped[0].sz == pytest.approx(2.0)  # opposite-sign intent -> close fully (never flip)
+
+
+def test_reduce_only_derisk_closes_position_when_target_flips_sign():
+    # Review (PR #28): $1,000 account, $100 free, 2 SOL long, SOL target -0.10 -> the closing part
+    # must still execute (clamped to 0) instead of the whole reversal order being dropped.
+    acct = _acct(free=100.0, positions={"SOL": 2.0}, notional={"SOL": 200.0})
+    adapter = ex.DryRunAdapter()
+    res = ex.execute_rebalance_cycle(
+        acct, {"SOL": -0.10}, _meta("SOL"), {"SOL": (100.0, 100.1, NOW)}, adapter,
+        high_water_mark_usd=1_000.0, now_ms=NOW,
+    )
+    assert res["derisk_mode"] == "reduce_only"
+    assert [(o["coin"], o["side"], o["reduce_only"]) for o in adapter.placed] == [("SOL", "sell", True)]
+    assert sum(o["sz"] for o in adapter.placed) == pytest.approx(2.0)
+
+
+def test_orphan_residual_notional_reflects_planned_unwinds():
+    acct = _acct(positions={"GRAM": -30.0, "VVV": 2.0}, notional={"GRAM": -29.7, "VVV": 50.0})
+    tops = {"GRAM": (None, None, NOW), "VVV": (24.0, None, NOW)}
+    resid = ex.orphan_residual_notional_usd(
+        acct, _meta("GRAM", "VVV"), {}, tops, {"GRAM": 0.99, "VVV": 25.0}, target_weights={"VVV": 0.02}
+    )
+    assert resid["GRAM"] == pytest.approx(0.0)  # untargeted orphan fully unwound
+    assert resid["VVV"] == pytest.approx(50.0 * 0.8 / 2.0)  # keeps 0.8 of 2.0 VVV (= $20 target)

@@ -72,6 +72,8 @@ class CutoverPlan:
     changed_count: int
     affected_labels: list[str]
     preserved_testnet_local: bool
+    # True when an actual testnet-executor schedule (managed block or stray command) was disabled.
+    disabled_testnet_executor: bool = False
 
 
 def _parse_iso_utc(raw: str) -> datetime:
@@ -223,6 +225,7 @@ def transform_crontab(
     changed_count = 0
     affected_labels: list[str] = []
     preserved_testnet_local = False
+    disabled_testnet_executor = False
 
     def _record_label(label: str) -> None:
         if label not in affected_labels:
@@ -243,6 +246,8 @@ def transform_crontab(
             else:
                 changed_count += 1
                 _record_label(current_label)
+                if TESTNET_MARKER_RE.search(current_label):
+                    disabled_testnet_executor = True
             continue
 
         if in_hl_block:
@@ -260,6 +265,8 @@ def transform_crontab(
                 continue
 
             if mode == "remove":
+                if stripped and not stripped.startswith("#") and TESTNET_MARKER_RE.search(stripped):
+                    disabled_testnet_executor = True
                 continue
 
             # mode == "comment": comment out active non-empty, non-comment lines idempotently
@@ -267,6 +274,8 @@ def transform_crontab(
                 out.append(f"{disable_prefix}{line}")
                 changed_count += 1
                 _record_label(current_label or "hyperliquid-quant-defi")
+                if TESTNET_MARKER_RE.search(current_label) or TESTNET_MARKER_RE.search(stripped):
+                    disabled_testnet_executor = True
             else:
                 out.append(line)
             continue
@@ -279,6 +288,8 @@ def transform_crontab(
                 continue
             changed_count += 1
             _record_label("stray hyperliquid-quant-defi cron")
+            if TESTNET_MARKER_RE.search(stripped):
+                disabled_testnet_executor = True
             if mode == "comment":
                 out.append(f"{disable_prefix}{line}")
             continue
@@ -296,6 +307,7 @@ def transform_crontab(
         changed_count=changed_count,
         affected_labels=affected_labels,
         preserved_testnet_local=preserved_testnet_local,
+        disabled_testnet_executor=disabled_testnet_executor,
     )
 
 
@@ -523,8 +535,7 @@ def main(
         print("[cutover] No active local hyperliquid-quant-defi cron entries to change.")
         return 0
 
-    disables_local_testnet = any(TESTNET_MARKER_RE.search(label) for label in plan.affected_labels)
-    if disables_local_testnet and remote_testnet_enabled is False and not args.allow_no_testnet_executor:
+    if plan.disabled_testnet_executor and remote_testnet_enabled is False and not args.allow_no_testnet_executor:
         print(
             "[cutover] REFUSED: this would disable the local testnet executor while the Dokploy worker is "
             "read-only, leaving NO executor (and no alert for it). Pass --keep-local-testnet, enable "

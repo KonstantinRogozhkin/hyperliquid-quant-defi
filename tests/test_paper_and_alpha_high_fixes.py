@@ -264,3 +264,36 @@ def test_spot_perp_nav_guard_confirms_and_keeps_funding_clock(tmp_path: Path) ->
     # The persistent +$15k basis move is accepted and 8h (not 4h) of HLP yield accrued.
     assert st2["cum_basis_mtm_usd"] > 10_000.0
     assert st2["cum_hlp_yield_usd"] == pytest.approx(10_000.0 * 0.12 / 8760.0 * 8.0, rel=0.02)
+
+
+def test_cutover_detects_standalone_executor_command_outside_managed_blocks(tmp_path: Path):
+    import importlib.util
+    from datetime import datetime, timezone
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location("cutover_mod2", root / "scripts/ops/cutover_local_crons_to_dokploy.py")
+    assert spec is not None and spec.loader is not None
+    cutover = importlib.util.module_from_spec(spec)
+    sys.modules["cutover_mod2"] = cutover
+    spec.loader.exec_module(cutover)
+    sys.path.insert(0, str(root / "tests"))
+    try:
+        from test_cutover_local_crons import _make_fetcher
+    finally:
+        sys.path.pop(0)
+
+    stray = "10 */4 * * * zsh /x/hyperliquid-quant-defi/scripts/ops/run_hl_testnet_executor_tick.sh\n"
+    plan = cutover.transform_crontab(stray, mode="comment")
+    assert plan.disabled_testnet_executor is True
+    assert cutover.transform_crontab("50 * * * * zsh /x/hyperliquid-quant-defi/scripts/ops/run_hyperliquid_snapshot_tick.sh\n").disabled_testnet_executor is False
+
+    state = {"crontab": stray}
+    fetcher, _ = _make_fetcher(testnet_enabled=False, now_utc=datetime.now(timezone.utc))
+    rc = cutover.main(
+        ["--public-url", "https://hl.example.com", "--backup-dir", str(tmp_path), "--apply"],
+        crontab_reader=lambda: state["crontab"],
+        crontab_writer=lambda t: state.__setitem__("crontab", t),
+        fetcher=fetcher,
+    )
+    assert rc == 2 and state["crontab"] == stray
