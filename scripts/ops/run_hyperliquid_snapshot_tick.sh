@@ -33,7 +33,7 @@ else
 fi
 
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
-LOCK_FILE="${HL_LOCK_FILE:-${TMPDIR:-/tmp}/hyperliquid_snapshot_tick.flock}"
+LOCK_FILE="${HL_LOCK_FILE:-${ROOT_DIR}/.neira/state/locks/hyperliquid_snapshot_tick.flock}"
 
 if [[ "${HL_OPS_LOCK_HELD:-0}" != "1" ]]; then
   cd "${ROOT_DIR}"
