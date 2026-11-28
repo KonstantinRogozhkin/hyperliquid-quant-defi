@@ -302,3 +302,114 @@ def test_cutover_requires_testnet_executor_and_risk_probe_when_testnet_enabled()
         "https://hl.example.com", fetcher=fetcher_for([], testnet_enabled=False), now_utc=now
     )
     assert res_ro.testnet_execution_enabled is False
+
+
+# --------------------------------------------------------------------------- 17. Boros liquidity + lock vs float
+
+
+def _boros_raw(*, bid: float, ask: float, floating: float, oi: float, vol: float, days: float = 28.0) -> dict:
+    return {
+        "marketId": 7,
+        "imData": {"name": "Hyperliquid BTC 25 Dec 2026", "symbol": "HL-BTC", "maturity": 1798156800},
+        "metadata": {"underlyingSymbol": "BTC", "fundingRateSymbol": "hyperliquid-btc", "isSpreadMarket": False},
+        "data": {
+            "timeToMaturity": days * 86400,
+            "markApr": (bid + ask) / 2,
+            "midApr": (bid + ask) / 2,
+            "bestBid": bid,
+            "bestAsk": ask,
+            "floatingApr": floating,
+            "notionalOI": oi,
+            "volume24h": vol,
+        },
+    }
+
+
+def test_boros_illiquid_thresholds_raised_and_configurable() -> None:
+    from hl_quant import hl_boros_fixed_funding as boros
+
+    assert boros.MIN_ACTIONABLE_OI_USD == 100_000.0
+    assert boros.MIN_ACTIONABLE_VOLUME_24H_USD == 10_000.0
+    thin = boros.parse_boros_market(_boros_raw(bid=0.09, ask=0.095, floating=0.05, oi=50_000.0, vol=50_000.0))
+    assert thin is not None and thin.is_actionable is False and thin.recommended_action.startswith("Illiquid")
+    low_vol = boros.parse_boros_market(_boros_raw(bid=0.09, ask=0.095, floating=0.05, oi=500_000.0, vol=5_000.0))
+    assert low_vol is not None and low_vol.is_actionable is False
+    relaxed = boros.parse_boros_market(
+        _boros_raw(bid=0.09, ask=0.095, floating=0.05, oi=50_000.0, vol=5_000.0), min_oi_usd=10_000.0, min_volume_24h_usd=1_000.0
+    )
+    assert relaxed is not None and relaxed.is_actionable is True
+
+
+def test_boros_lock_requires_fixed_bid_to_beat_floating_net_of_costs() -> None:
+    from hl_quant import hl_boros_fixed_funding as boros
+
+    liquid = {"oi": 1_000_000.0, "vol": 200_000.0}
+    # Fixed bid 8.94% < floating 10.95%: locking would give up carry -> no Lock
+    worse = boros.parse_boros_market(_boros_raw(bid=0.0894, ask=0.0937, floating=0.1095, **liquid))
+    assert worse is not None and "Lock" not in worse.recommended_action
+    # Fixed beats float by 0.5% but the amortized hedge round trip over 28d is ~1.17% APR -> no Lock
+    thin_edge = boros.parse_boros_market(_boros_raw(bid=0.0894, ask=0.0937, floating=0.0844, **liquid))
+    assert thin_edge is not None and "Lock" not in thin_edge.recommended_action
+    # Fixed beats float by ~1.94% > hedge cost -> Lock
+    good = boros.parse_boros_market(_boros_raw(bid=0.0894, ask=0.0937, floating=0.0700, **liquid))
+    assert good is not None and "Short Perp + Short Boros (Lock +8.94%)" == good.recommended_action
+
+
+# --------------------------------------------------------------------------- 18. cross-DEX breakeven fee table
+
+
+def test_cross_dex_breakeven_hours_uses_per_venue_fee_table() -> None:
+    from hl_quant import cross_dex_scanner as cds
+
+    def q(dex: str, rate_h: float) -> cds.DexMarketQuote:
+        return cds.DexMarketQuote(dex, "BTC", "BTC", 60_000.0, rate_h, rate_h * 8760 * 100, 5e7, 1e7, 1.0)
+
+    hl = {"BTC": q("hyperliquid", 0.0002)}
+    spread_bps_h = 1.0  # 0.0001/h difference
+    for dex in ("lighter", "extended", "paradex", "dydx"):
+        df = cds.scan_cross_dex_opportunities(hl, {"BTC": q(dex, 0.0001)}, min_day_vol_usd=1.0)
+        expected = cds.default_round_trip_fee_bps(dex, bridge_drag_bps=2.0) / spread_bps_h
+        assert df.iloc[0]["breakeven_hours"] == round(expected, 1), dex
+    # Explicit override keeps the flat model for callers that pass their own fee
+    df_o = cds.scan_cross_dex_opportunities(hl, {"BTC": q("extended", 0.0001)}, min_day_vol_usd=1.0, round_trip_fee_bps=7.0)
+    assert df_o.iloc[0]["breakeven_hours"] == 9.0
+
+
+# --------------------------------------------------------------------------- 19. UniV3 buy-side impact
+
+
+def test_univ3_impact_buy_branch_and_drain_guard() -> None:
+    import math
+
+    from hl_quant import hl_hyperevm_defi as defi
+
+    sqrt_x96 = int(math.sqrt(60.0 * 1e6 / 1e18) * (1 << 96))
+    sqrt_p = float(sqrt_x96) / float(1 << 96)
+    liq_raw = int((1_000_000.0 / 60.0) * (10**18) * sqrt_p)  # $1M virtual token0 depth
+    clips = (5_000.0, 250_000.0, 500_000.0, 1_000_000.0, 2_000_000.0)
+    v_sell, sell = defi.compute_v3_virtual_depth_and_slippage(liq_raw, sqrt_x96, dec0=18, token0_usd=60.0, clips_usd=clips)
+    v_buy, buy = defi.compute_v3_virtual_depth_and_slippage(
+        liq_raw, sqrt_x96, dec0=18, token0_usd=60.0, clips_usd=clips, side="buy"
+    )
+    assert v_sell == v_buy and abs(v_buy - 1_000_000.0) / 1_000_000.0 < 1e-3
+    assert sell[500_000.0] == pytest.approx(500_000.0 / (v_sell + 500_000.0) * 1e4, abs=0.05)  # ~3333 bps
+    assert buy[250_000.0] == pytest.approx(250_000.0 / (v_buy - 250_000.0) * 1e4, abs=0.05)  # ~3333 bps
+    assert buy[250_000.0] > sell[250_000.0]  # ~2000 bps on the sell side
+    assert buy[500_000.0] == 9999.0  # 10000 bps uncapped -> capped at 9999
+    assert buy[5_000.0] > sell[5_000.0]
+    assert buy[5_000.0] == pytest.approx(5_000.0 / (v_buy - 5_000.0) * 1e4, abs=0.05)
+    assert buy[1_000_000.0] == 9999.0 and buy[2_000_000.0] == 9999.0  # dV >= V drains the tick
+    with pytest.raises(ValueError):
+        defi.compute_v3_virtual_depth_and_slippage(liq_raw, sqrt_x96, dec0=18, token0_usd=60.0, side="long")
+
+
+# --------------------------------------------------------------------------- 20. pct_change fill_method
+
+
+def test_alpha_families_pct_change_never_forward_fills() -> None:
+    import re
+
+    src = (ROOT / "src/hl_quant/alpha_families.py").read_text(encoding="utf-8")
+    calls = re.findall(r"pct_change\(([^)]*)\)", src)
+    assert calls, "expected pct_change calls"
+    assert all("fill_method=None" in args for args in calls), calls
