@@ -312,13 +312,17 @@ def run_cross_dex_paper_tick(
             if not venue_online:
                 # Venue feed outage: hold position untouched rather than force-closing on synthetic slippage.
                 continue
-            missing_n = int(pos.get("missing_quote_ticks", 0)) + 1
+            # Count missing observations in wall-clock ticks (>= 3.5 h apart), not invocations: manual
+            # re-runs during a partial outage must not force-close a pair on synthetic slippage.
+            pos["missing_streak"] = pc.advance_streak(pos.get("missing_streak"), qualifies=True, now_ms=ts_ms)
+            missing_n = streak_count(pos["missing_streak"])
             pos["missing_quote_ticks"] = missing_n
             if missing_n < cfg.max_missing_ticks:
                 continue
             should_exit = True
         else:
             pos["missing_quote_ticks"] = 0
+            pos.pop("missing_streak", None)
             live_dir_apr = float(pos.get("live_spread_apr_pct", 0.0))
             live_basis = float(pos.get("live_mark_basis_bps", 0.0))
             hours_held = float(pos.get("hours_held", 0.0))
@@ -523,7 +527,8 @@ def run_cross_dex_paper_tick(
             # Credit only conservative 50% convergence for positive cross-DEX basis (persistent
             # venue oracle/mark offsets do not guarantee 100% reversion at exit); charge full adverse basis.
             basis_credit_bps = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
-            est_rt_cost_bps = max(0.0, venue_rt_fee_bps + l2_slip - basis_credit_bps)
+            # Exit crosses the book again: charge the L2 slip twice (as spot_perp does).
+            est_rt_cost_bps = max(0.0, venue_rt_fee_bps + 2.0 * l2_slip - basis_credit_bps)
             hourly_bps = spread_apr / (cds.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
             if be_hours > cfg.max_breakeven_hours:

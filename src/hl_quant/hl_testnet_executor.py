@@ -1496,14 +1496,6 @@ def neutralize_target_weights(
     return out
 
 
-def update_high_water_mark(hwm_path: Path, equity_usd: float) -> float:
-    """Persist and return peak Testnet equity for cross-run drawdown kill-switch."""
-    prev = load_high_water_mark(hwm_path)
-    hwm = max(prev, float(equity_usd) if math.isfinite(equity_usd) and equity_usd > 0 else 0.0)
-    save_high_water_mark(hwm_path, hwm)
-    return hwm
-
-
 def format_testnet_telegram_rich_html(
     account: AccountSnapshot,
     result: dict[str, Any],

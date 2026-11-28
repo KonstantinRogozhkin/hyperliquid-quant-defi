@@ -28,8 +28,8 @@ class CoinAttribution:
     coin: str
     position_sz: float
     position_usd: float
-    entry_px: float
-    current_mid: float
+    entry_px: float | None  # None for flat coins (no open position)
+    current_mid: float | None  # None when allMids has no price for the coin
     leverage_mode: str
     liq_px: float | None
     liq_distance_pct: float | None
@@ -806,7 +806,6 @@ def compute_post_trade_attribution(
         lev_mode = f"{lev_info.get('type', 'none')}:{lev_info.get('value', '')}" if lev_info else "flat"
         liq_raw = p.get("liquidationPx")
         liq_px = _f(liq_raw) if liq_raw is not None and _f(liq_raw) > 0 else None
-        cur_mid = mids.get(coin, entry_px)
         mark_px = mark_prices.get(coin) or mids.get(coin) or entry_px
 
         liq_dist: float | None = None
@@ -861,8 +860,8 @@ def compute_post_trade_attribution(
                 coin=coin,
                 position_sz=szi,
                 position_usd=round(pos_usd, 2),
-                entry_px=entry_px,
-                current_mid=cur_mid,
+                entry_px=entry_px if (abs(szi) > 1e-12 and entry_px > 0) else None,
+                current_mid=mids.get(coin),
                 leverage_mode=lev_mode,
                 liq_px=liq_px,
                 liq_distance_pct=round(liq_dist, 2) if liq_dist is not None else None,

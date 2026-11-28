@@ -332,12 +332,15 @@ def run_hip3_paper_tick(
             if not (s_mkt and l_mkt):
                 if not hip3_online:
                     continue
-                miss = int(pos.get("missing_quote_ticks", 0)) + 1
+                # Wall-clock ticks, not invocations (see cross_dex_paper).
+                pos["missing_streak"] = pc.advance_streak(pos.get("missing_streak"), qualifies=True, now_ms=ts_ms)
+                miss = streak_count(pos["missing_streak"])
                 pos["missing_quote_ticks"] = miss
                 if miss >= cfg.max_missing_ticks:
                     exit_reason = "delisted_or_missing"
             else:
                 pos["missing_quote_ticks"] = 0
+                pos.pop("missing_streak", None)
                 live_apr = float(pos.get("live_spread_apr_pct", 0.0))
                 live_ora = float(pos.get("live_oracle_div_bps", 0.0))
                 if live_ora > cfg.exit_oracle_div_bps:
@@ -506,7 +509,8 @@ def run_hip3_paper_tick(
             rt_fee_bps = 2.0 * entry_fee_bps
             # Conservative 50% credit on positive entry basis (same policy as cross_dex_paper)
             basis_credit = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
-            est_rt_cost_bps = max(0.0, rt_fee_bps + l2_slip - basis_credit)
+            # Exit crosses the book again: charge the L2 slip twice (as spot_perp does).
+            est_rt_cost_bps = max(0.0, rt_fee_bps + 2.0 * l2_slip - basis_credit)
             hourly_bps = opp.spread_apr_pct / (hip3.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
             if be_hours > cfg.max_payback_hours:
@@ -543,9 +547,8 @@ def run_hip3_paper_tick(
                 "last_long_px": l_mkt.mark_px,
                 "entry_spread_apr_pct": opp.spread_apr_pct,
                 "live_spread_apr_pct": opp.spread_apr_pct,
-                "net_apr_split_margin_pct": round(opp.spread_apr_pct * (cfg.per_leg_leverage / 2.0) * 0.5, 2)
-                if cfg.per_leg_leverage != 2.0
-                else round(opp.spread_apr_pct * 0.5, 2),
+                # Return on the 2 * N / L margin locked across both DEXs: spread * L / 2.
+                "net_apr_split_margin_pct": round(opp.spread_apr_pct * cfg.per_leg_leverage / 2.0, 2),
                 "entry_oracle_div_bps": opp.oracle_divergence_bps,
                 "live_oracle_div_bps": opp.oracle_divergence_bps,
                 "entry_fee_bps": round(entry_fee_bps, 2),

@@ -167,7 +167,8 @@ def test_hip3_growth_mode_fee_schedule_and_oracle_divergence_guard():
     assert opp.oracle_risk_warning is True
     assert opp.payback_hours_5k_taker is not None and opp.payback_hours_5k_taker > 0.0
     assert opp.independent_dex_margin is True
-    assert opp.net_apr_split_margin_pct == pytest.approx(17.5)
+    # Return on split margin at 2x per leg = spread * 2 / 2 (was understated 2x as spread * 0.5).
+    assert opp.net_apr_split_margin_pct == pytest.approx(35.0)
 
     # 30-day Growth Mode cooldown parser handles nanosecond ISO timestamps cleanly
     now_ms = int(datetime(2026, 11, 26, 12, 0, tzinfo=timezone.utc).timestamp() * 1000)

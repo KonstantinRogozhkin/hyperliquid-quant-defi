@@ -49,10 +49,11 @@ def test_kill_switch_trips_on_non_finite_snapshot() -> None:
     assert reasons == ["non_finite_account_snapshot"]
 
 
-def test_update_high_water_mark_tolerates_null_json(tmp_path: Path) -> None:
+def test_load_high_water_mark_tolerates_null_json(tmp_path: Path) -> None:
     p = tmp_path / "hwm.json"
     p.write_text("null")
-    assert hte.update_high_water_mark(p, 123.0) == 123.0
+    assert hte.load_high_water_mark(p) == 0.0
+    hte.save_high_water_mark(p, 123.0)
     assert json.loads(p.read_text())["high_water_mark_usd"] == 123.0
 
 
@@ -517,7 +518,10 @@ def test_cross_dex_and_hip3_paper_mtm_uses_fixed_coin_qty_round_trip(tmp_path: P
         )
 
     h3_dir = tmp_path / "h3"
-    cfg_h3 = hp.Hip3PaperConfig(slot_notional_usd=5_000.0, min_clean_streak=1, entry_apr_pct=15.0, exit_oracle_div_bps=5000.0)
+    cfg_h3 = hp.Hip3PaperConfig(
+        slot_notional_usd=5_000.0, min_clean_streak=1, entry_apr_pct=15.0, exit_oracle_div_bps=5000.0,
+        max_payback_hours=48.0,  # exit slip is charged twice in payback since 2026-11-28
+    )
     hp.run_hip3_paper_tick(
         state_dir=h3_dir,
         cfg=cfg_h3,

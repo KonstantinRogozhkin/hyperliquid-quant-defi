@@ -390,7 +390,9 @@ def _read_sleeve_tick_returns(ticks_path: Path, eq_col: str = "equity_usd") -> l
         if ts_col is not None:
             ts_arr = work["_ts"].to_numpy(dtype=float)
             dt_h = np.clip(np.diff(ts_arr) / 3_600_000.0, 0.5, 48.0)
-            rets = rets * (4.0 / dt_h)
+            # Normalize irregular intervals to a 4h-equivalent for volatility: variance scales with
+            # time, so returns scale with sqrt(4 / dt) (linear scaling inflated short-interval vol).
+            rets = rets * np.sqrt(4.0 / dt_h)
         return [float(r) for r in rets if math.isfinite(r)]
     except Exception:
         return []
@@ -740,8 +742,11 @@ def run_autopilot_tick(
     prev_cta_w: dict[str, float] = dict(cta_state.get("weights") or {})
     prev_cta_px: dict[str, float] = dict(cta_state.get("last_closes") or {})
 
+    # Mark with the live mid; if it is unavailable this tick, hold the previous mark (zero return)
+    # instead of falling back to a daily close that differs from the live mark the last tick used
+    # (which booked a phantom PnL that reversed on the next tick).
     cta_mark_map = {
-        c: float(live_marks.get(c) or vals[-1])
+        c: float(live_marks.get(c) or (_f(prev_cta_px.get(c)) if _f(prev_cta_px.get(c)) > 0 else vals[-1]))
         for c, vals in closes_map.items()
         if vals
     }

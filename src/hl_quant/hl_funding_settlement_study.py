@@ -615,6 +615,9 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
         ex_t = float(h.get("ex_top1_t_stat", h["t_stat"]))
         top_c = str(h.get("top1_coin", ""))
         h_t_cl = float(h.get("t_stat_clustered", h["t_stat"]))
+        if not math.isfinite(h_t_cl):
+            # min(t, NaN) silently returns t; an unavailable clustered t-stat must fail the gate.
+            h_t_cl = -math.inf
         go = (
             (float(d["net_maker_bps"]) > 0.0)
             and (float(h["net_maker_bps"]) > 0.0)
