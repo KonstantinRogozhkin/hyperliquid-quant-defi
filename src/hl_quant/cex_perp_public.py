@@ -367,10 +367,29 @@ def _okx_funding(client, symbol, start_ms, end_ms, max_pages):
     return pages, events
 
 
+OKX_KILO_BASES: set[str] = {"PEPE", "SHIB", "BONK", "FLOKI", "LUNC", "DOGS", "NEIRO", "MOG", "CAT", "SATS", "RATS", "XEC", "BTT"}
+
+
+def is_hl_kilo_coin(coin: str) -> bool:
+    """True for Hyperliquid 1,000-unit perp symbols such as ``kPEPE`` or ``kFloki``."""
+    return len(coin) > 1 and coin.startswith("k") and coin[1].isupper()
+
+
+def okx_price_scale(symbol: str) -> float:
+    """Price multiplier aligning OKX 1-token swaps (``PEPE-USDT-SWAP``) to HL 1,000-token ``k*`` perps."""
+    sym_u = str(symbol or "").upper()
+    if sym_u.endswith("-USDT-SWAP"):
+        base = sym_u[: -len("-USDT-SWAP")]
+        if base in OKX_KILO_BASES:
+            return 1_000.0
+    return 1.0
+
+
 def _okx_klines(client, symbol, start_ms, end_ms, max_pages):
     pages: list[Any] = []
     bars: dict[int, dict[str, Any]] = {}
     after_cursor: int | None = end_ms + 1
+    px_scale = okx_price_scale(symbol)
     while True:
         _page_guard(pages, max_pages, symbol)
         params: dict[str, Any] = {"instId": symbol, "bar": "1H", "limit": OKX_KLINE_LIMIT}
@@ -386,8 +405,15 @@ def _okx_klines(client, symbol, start_ms, end_ms, max_pages):
             t = int(k[0])
             # OKX candle: [ts, o, h, l, c, vol_contracts, volCcy, volCcyQuote, confirm]
             if start_ms <= t <= end_ms:
-                vol_ccy = float(k[6]) if len(k) > 6 and k[6] else float(k[5])
-                bars[t] = _bar(t, k[1], k[2], k[3], k[4], vol_ccy)
+                vol_ccy = (float(k[6]) if len(k) > 6 and k[6] else float(k[5])) / px_scale
+                bars[t] = _bar(
+                    t,
+                    float(k[1]) * px_scale,
+                    float(k[2]) * px_scale,
+                    float(k[3]) * px_scale,
+                    float(k[4]) * px_scale,
+                    vol_ccy,
+                )
             oldest = t if oldest is None else min(oldest, t)
         if oldest is None or oldest <= start_ms or len(page) < OKX_KLINE_LIMIT:
             break
@@ -399,7 +425,11 @@ def _okx_klines(client, symbol, start_ms, end_ms, max_pages):
 
 def okx_symbol(coin: str) -> str:
     """Map Hyperliquid perp coin name to OKX USDT linear swap ``instId``."""
-    base = coin[1:] if coin.startswith("k") and coin[1:].isupper() else coin
+    if is_hl_kilo_coin(coin):
+        base = coin[1:].upper()
+        OKX_KILO_BASES.add(base)
+    else:
+        base = coin.upper()
     return f"{base}-USDT-SWAP"
 
 
@@ -435,7 +465,7 @@ def fetch_live_mid_prices(
                 continue
             bid = _pos_float(item.get("bidPrice"))
             ask = _pos_float(item.get("askPrice"))
-            if bid > 0.0 and ask > 0.0:
+            if ask >= bid > 0.0:
                 out[sym] = 0.5 * (bid + ask)
     elif v == "bybit":
         body = client.get("/v5/market/tickers", {"category": "linear"})
@@ -447,9 +477,10 @@ def fetch_live_mid_prices(
                 continue
             bid = _pos_float(item.get("bid1Price"))
             ask = _pos_float(item.get("ask1Price"))
-            mid = (0.5 * (bid + ask)) if (bid > 0.0 and ask > 0.0) else (
-                _pos_float(item.get("markPrice")) or _pos_float(item.get("lastPrice"))
-            )
+            if bid > 0.0 and ask > 0.0:
+                mid = 0.5 * (bid + ask) if ask >= bid else 0.0
+            else:
+                mid = _pos_float(item.get("markPrice")) or _pos_float(item.get("lastPrice"))
             if mid > 0.0:
                 out[sym] = mid
     elif v == "okx":
@@ -460,9 +491,13 @@ def fetch_live_mid_prices(
             sym = str(item.get("instId") or "")
             if not sym or (want is not None and sym not in want):
                 continue
+            px_scale = okx_price_scale(sym)
             bid = _pos_float(item.get("bidPx"))
             ask = _pos_float(item.get("askPx"))
-            mid = (0.5 * (bid + ask)) if (bid > 0.0 and ask > 0.0) else _pos_float(item.get("last"))
+            if bid > 0.0 and ask > 0.0:
+                mid = (0.5 * (bid + ask) * px_scale) if ask >= bid else 0.0
+            else:
+                mid = _pos_float(item.get("last")) * px_scale
             if mid > 0.0:
                 out[sym] = mid
     else:

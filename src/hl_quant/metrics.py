@@ -206,6 +206,7 @@ def render_prometheus_metrics(
 
     # 1. Worker scheduler health & jobs
     ws = overview.get("worker_status")
+    testnet_frozen_disabled = False
     if isinstance(ws, dict):
         hb_dt = _parse_utc_timestamp(ws.get("heartbeat_utc"))
         if hb_dt is not None:
@@ -213,20 +214,27 @@ def render_prometheus_metrics(
             b.emit("hl_worker_heartbeat_age_seconds", hb_age, help_text="Seconds since last hl-worker heartbeat")
             b.emit("hl_worker_up", 1.0 if hb_age <= 300.0 else 0.0, help_text="1 if hl-worker heartbeat <= 300s")
         b.emit("hl_worker_telegram_enabled", bool(ws.get("telegram_enabled")), help_text="1 if worker Telegram alerts enabled")
+        testnet_exec_enabled = bool(ws.get("testnet_execution_enabled"))
         b.emit(
             "hl_worker_testnet_execution_enabled",
-            bool(ws.get("testnet_execution_enabled")),
+            testnet_exec_enabled,
             help_text="1 if live Testnet ALO execution enabled in worker",
         )
         jobs = [j for j in (ws.get("jobs") or []) if isinstance(j, dict) and j.get("name")]
+        if not testnet_exec_enabled:
+            probe_job = next((j for j in jobs if str(j.get("name") or "") == "testnet_risk_probe"), None)
+            if probe_job is None or not bool(probe_job.get("enabled")):
+                testnet_frozen_disabled = True
         enabled_jobs = [j for j in jobs if bool(j.get("enabled"))]
-        ok_jobs = [j for j in enabled_jobs if str(j.get("state") or "") == "ok"]
+        healthy_jobs = [
+            j for j in enabled_jobs if str(j.get("state") or "idle") not in {"failed", "interrupted"}
+        ]
         b.emit("hl_worker_jobs_configured", len(jobs), help_text="Configured scheduled worker jobs")
         if enabled_jobs:
             b.emit(
                 "hl_worker_jobs_healthy_ratio",
-                round(len(ok_jobs) / len(enabled_jobs), 4),
-                help_text="Fraction of enabled worker jobs in ok state",
+                round(len(healthy_jobs) / len(enabled_jobs), 4),
+                help_text="Fraction of enabled worker jobs not in failed or interrupted state",
             )
         for job in jobs:
             jname = str(job["name"])
@@ -236,6 +244,7 @@ def render_prometheus_metrics(
             b.emit("hl_worker_job_enabled", bool(job.get("enabled")), help_text="1 if job is enabled", labels=lbl)
             b.emit("hl_worker_job_ok", state == "ok", help_text="1 if job last state is ok", labels=lbl)
             b.emit("hl_worker_job_failed", state == "failed", help_text="1 if job last state is failed", labels=lbl)
+            b.emit("hl_worker_job_interrupted", state == "interrupted", help_text="1 if job last state is interrupted", labels=lbl)
             b.emit(
                 "hl_worker_job_runs_ok_total",
                 job.get("runs_ok"),
@@ -282,7 +291,7 @@ def render_prometheus_metrics(
         # Hyperliquid `userFills` is a rolling <=2,000-fill window, so count/volume can decrease as old fills age out -> gauge.
         b.emit("hl_testnet_total_fills", attr.get("total_fills"), help_text="Tracked Testnet fills in active userFills window")
         b.emit("hl_testnet_volume_usd", attr.get("total_volume_usd"), help_text="Tracked Testnet fill volume USD in active userFills window")
-        b.emit("hl_testnet_perps_withdrawable_usd", attr.get("withdrawable_usd"), help_text="Testnet Perps withdrawable margin USD")
+        b.emit("hl_testnet_perps_withdrawable_usd", attr.get("withdrawable_usd"), help_text="Testnet account withdrawable USDC")
         b.emit("hl_testnet_maker_share_pct", attr.get("maker_volume_share_pct"), help_text="Maker volume share percentage")
         b.emit("hl_testnet_alo_fill_rate_pct", attr.get("real_alo_fill_rate_pct"), help_text="Real ALO post-only fill rate percentage")
         b.emit("hl_testnet_effective_fee_bps", attr.get("effective_fee_bps"), help_text="Effective fee in bps")
@@ -316,15 +325,17 @@ def render_prometheus_metrics(
         if isinstance(latest_audit, dict):
             raw_status = str(latest_audit.get("status") or "")
             testnet_last_ok = raw_status == "ok"
+            testnet_hwm_val = _num(latest_audit.get("high_water_mark_usd"))
             if not testnet_last_ok and raw_status == "kill_switch_triggered":
                 viols = [str(v) for v in (latest_audit.get("violations") or [])]
                 only_missing_quote = bool(viols) and all(v.startswith("missing_quote:") for v in viols)
+                derisk_mode = str(latest_audit.get("derisk_mode") or "")
                 risk_snap = overview.get("testnet_risk")
                 audit_ms = _num(latest_audit.get("ts_ms")) or 0.0
                 probe_ms = _obs_ms(risk_snap) if isinstance(risk_snap, dict) else None
                 if (
                     only_missing_quote
-                    and str(latest_audit.get("derisk_mode") or "") == "orphan_unwind_only"
+                    and derisk_mode == "orphan_unwind_only"
                     and isinstance(risk_snap, dict)
                     and probe_ms is not None
                     and probe_ms > audit_ms
@@ -334,7 +345,27 @@ def render_prometheus_metrics(
                     < (_num(risk_snap.get("kill_switch_drawdown_pct")) or 5.0)
                 ):
                     testnet_last_ok = True
-            testnet_hwm_val = _num(latest_audit.get("high_water_mark_usd"))
+                elif (
+                    derisk_mode == "flatten"
+                    and isinstance(risk_snap, dict)
+                    and probe_ms is not None
+                    and probe_ms > audit_ms
+                    and _num(risk_snap.get("gross_leverage")) is not None
+                    and (_num(risk_snap.get("gross_leverage")) or 0.0) <= 0.01
+                    and int(_num(risk_snap.get("unmanaged_orphan_positions")) or 0) == 0
+                    and (_num(risk_snap.get("drawdown_pct")) or 0.0)
+                    < (_num(risk_snap.get("kill_switch_drawdown_pct")) or 5.0)
+                    and (
+                        (_num(risk_snap.get("hwm_reanchored_at_ms")) or 0.0) > audit_ms
+                        or (
+                            _num(risk_snap.get("high_water_mark_usd")) is not None
+                            and testnet_hwm_val is not None
+                            and (_num(risk_snap.get("high_water_mark_usd")) or 0.0) < testnet_hwm_val - 1e-6
+                        )
+                    )
+                ):
+                    testnet_last_ok = True
+                    testnet_hwm_val = _num(risk_snap.get("high_water_mark_usd")) or testnet_hwm_val
             b.emit("hl_testnet_hwm_usd", testnet_hwm_val, help_text="Testnet equity high-water mark USD")
             b.emit(
                 "hl_testnet_last_cycle_ok",
@@ -452,6 +483,16 @@ def render_prometheus_metrics(
         positions = hp.get("positions") or {}
         if isinstance(positions, dict):
             b.emit("hl_hip3_paper_open_pairs", len(positions), help_text="Active HIP-3 paper pairs")
+            hp_pair_aprs = [
+                _num(p.get("live_spread_apr_pct"))
+                for p in positions.values()
+                if isinstance(p, dict) and _num(p.get("live_spread_apr_pct")) is not None
+            ]
+            b.emit(
+                "hl_hip3_paper_avg_pair_apr_pct",
+                round(sum(x for x in hp_pair_aprs if x is not None) / len(hp_pair_aprs), 2) if hp_pair_aprs else 0.0,
+                help_text="Unweighted average live spread APR % across open HIP-3 pairs",
+            )
             for sym, pos in positions.items():
                 if not isinstance(pos, dict):
                     continue
@@ -514,6 +555,16 @@ def render_prometheus_metrics(
         cpos = cdp.get("positions") or {}
         if isinstance(cpos, dict):
             b.emit("hl_cross_dex_paper_open_pairs", len(cpos), help_text="Active Cross-DEX paper pairs")
+            cd_pair_aprs = [
+                _num(p.get("live_spread_apr_pct"))
+                for p in cpos.values()
+                if isinstance(p, dict) and _num(p.get("live_spread_apr_pct")) is not None
+            ]
+            b.emit(
+                "hl_cross_dex_paper_avg_pair_apr_pct",
+                round(sum(x for x in cd_pair_aprs if x is not None) / len(cd_pair_aprs), 2) if cd_pair_aprs else 0.0,
+                help_text="Unweighted average live spread APR % across open Cross-DEX pairs",
+            )
             for coin, pos in cpos.items():
                 if not isinstance(pos, dict):
                     continue
@@ -1110,7 +1161,7 @@ def render_prometheus_metrics(
             leverage=lev_val,
             max_dd_pct=testnet_dd,
             share_price=round(eq / sc, 6) if sc > 0 else 1.0,
-            current_dd_pct=testnet_dd,
+            current_dd_pct=0.0 if testnet_frozen_disabled else testnet_dd,
         )
 
     if hlp_apr_val is not None or hlp_tvl_val is not None:

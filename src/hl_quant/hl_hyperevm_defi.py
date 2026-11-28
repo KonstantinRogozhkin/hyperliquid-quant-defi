@@ -444,6 +444,8 @@ def fetch_hypercore_markets(client: httpx.Client, *, info_url: str = HYPERCORE_I
     p_meta, p_ctxs = perp_raw.json()
     perps: dict[str, dict[str, Any]] = {}
     for idx, (u, ctx) in enumerate(zip(p_meta.get("universe") or [], p_ctxs or [], strict=False)):
+        if u.get("isDelisted"):
+            continue
         coin = str(u.get("name") or "").strip()
         if not coin:
             continue
@@ -560,8 +562,14 @@ def scan_hyperevm_vs_hypercore_arb(
     pools: tuple[PoolSpec, ...] = DEFAULT_HYPEREVM_POOLS,
     core_fee_bps: float = 4.5,
     core_spot_fee_bps: float | None = None,
+    core_hedge_slip_5k_bps: float = 1.0,
+    core_hedge_slip_25k_bps: float = 2.5,
+    core_hedge_slip_100k_bps: float = 6.0,
     usdt0_per_usdc: float = 1.0,
     stable_leg_fee_bps: float = 1.0,
+    stable_leg_slip_5k_bps: float = 0.2,
+    stable_leg_slip_25k_bps: float = 0.5,
+    stable_leg_slip_100k_bps: float = 1.5,
     rpc_url: str = HYPEREVM_RPC_URL,
 ) -> list[EvmPoolArbOpportunity]:
     """Compare live HyperEVM V3 pool prices against HyperCore with peg normalization & V3 slippage."""
@@ -623,9 +631,16 @@ def scan_hyperevm_vs_hypercore_arb(
             token0_usd=token0_usd,
             side=token0_side,
         )
+        core_legs = 2.0 if pool.core_quote_perp is not None else 1.0
+        stable_legs = 1.0 if pool.quote_symbol == "USDT0" else 0.0
+        tot_slip_5k = round(slips[5_000.0] + core_legs * core_hedge_slip_5k_bps + stable_legs * stable_leg_slip_5k_bps, 2)
+        tot_slip_25k = round(slips[25_000.0] + core_legs * core_hedge_slip_25k_bps + stable_legs * stable_leg_slip_25k_bps, 2)
+        tot_slip_100k = round(
+            slips[100_000.0] + core_legs * core_hedge_slip_100k_bps + stable_legs * stable_leg_slip_100k_bps, 2
+        )
         net_bps = abs(peg_adj_bps) - pool.fee_bps - eff_core_fee_bps - extra_stable_fee
-        net_5k = net_bps - slips[5_000.0]
-        net_25k = net_bps - slips[25_000.0]
+        net_5k = net_bps - tot_slip_5k
+        net_25k = net_bps - tot_slip_25k
         direction = "Buy Core → Sell EVM" if peg_adj_bps > 0 else "Buy EVM → Sell Core"
 
         results.append(
@@ -644,9 +659,9 @@ def scan_hyperevm_vs_hypercore_arb(
                 direction=direction,
                 active_liquidity_raw=liq,
                 virtual_depth_usd=v_depth_usd,
-                slippage_5k_bps=slips[5_000.0],
-                slippage_25k_bps=slips[25_000.0],
-                slippage_100k_bps=slips[100_000.0],
+                slippage_5k_bps=tot_slip_5k,
+                slippage_25k_bps=tot_slip_25k,
+                slippage_100k_bps=tot_slip_100k,
                 net_arb_25k_bps=round(net_25k, 2),
                 executable=(net_5k > 0.0) and (liq > 0),
             )

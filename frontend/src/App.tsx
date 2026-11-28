@@ -3,7 +3,7 @@ import { AnalyticsRiskTab } from "./components/AnalyticsRiskTab";
 import { EquityCurveChart, KappaCalibrationChart } from "./components/Charts";
 import { KpiLabel, SectionTitle, Th, Tip } from "./components/Tooltip";
 import { LangProvider, LangToggle, useLang, type Lang } from "./i18n";
-import type { AnalyticsPayload, BuildInfo, CoinAttributionRow, OverviewPayload } from "./types";
+import type { AnalyticsPayload, BuildInfo, CoinAttributionRow, OverviewPayload, SettlementStat } from "./types";
 
 type TabId = "overview" | "analytics" | "frontier" | "crossdex" | "onchain" | "execution" | "ops";
 
@@ -120,6 +120,16 @@ function normalizeSplitLabel(split: unknown): { label: string; isOos: boolean } 
   if (sp === "OOS" || sp === "HOLDOUT") return { label: "OOS", isOos: true };
   if (sp === "IS" || sp === "DEV") return { label: "IS", isOos: false };
   return { label: sp || "—", isOos: false };
+}
+
+function settlementEffectiveTStat(r: SettlementStat): number {
+  return (
+    num(r.net_t_stat_clustered) ??
+    num(r.t_stat_clustered) ??
+    num(r.net_t_stat) ??
+    num(r.t_stat) ??
+    -Infinity
+  );
 }
 
 export default function App() {
@@ -292,7 +302,14 @@ function Desk() {
 
   const settlementFiltered = useMemo(() => {
     const rows = data?.settlement_stats ?? [];
-    const filtered =
+    const devByKey = new Map<string, SettlementStat>();
+    for (const r of rows) {
+      const sp = String(r.split ?? "").trim().toUpperCase();
+      if (sp === "IS" || sp === "DEV") {
+        devByKey.set(`${r.bucket}::${r.strategy}`, r);
+      }
+    }
+    const splitFiltered =
       settlementSplit === "ALL"
         ? rows
         : rows.filter((r) => {
@@ -301,14 +318,33 @@ function Desk() {
             if (settlementSplit === "IS") return sp === "IS" || sp === "DEV";
             return sp === settlementSplit;
           });
+    const hasMinSample = splitFiltered.some((r) => (num(r.events) ?? 0) >= 10);
+    const filtered = hasMinSample
+      ? splitFiltered.filter((r) => (num(r.events) ?? 0) >= 10)
+      : splitFiltered;
+    const isVerified = (r: SettlementStat): boolean => {
+      if ((num(r.net_maker_bps) ?? -Infinity) <= 0) return false;
+      if (r.fdr_pass === false) return false;
+      if (settlementEffectiveTStat(r) < 2.0) return false;
+      const devRow = devByKey.get(`${r.bucket}::${r.strategy}`);
+      if (devRow && (num(devRow.net_maker_bps) ?? -Infinity) <= 0) return false;
+      return true;
+    };
     return [...filtered]
       .sort(
         (a, b) =>
+          Number(isVerified(b)) - Number(isVerified(a)) ||
           (num(b.net_maker_bps) ?? -Infinity) - (num(a.net_maker_bps) ?? -Infinity) ||
-          (num(b.t_stat) ?? -Infinity) - (num(a.t_stat) ?? -Infinity),
+          settlementEffectiveTStat(b) - settlementEffectiveTStat(a),
       )
       .slice(0, 16);
   }, [data, settlementSplit]);
+
+  const settlementDegradedMeta = data?.settlement_last_attempt?.degraded
+    ? data.settlement_last_attempt
+    : data?.settlement_meta?.degraded
+      ? data.settlement_meta
+      : null;
 
   const beSha = data?.build_info?.sha ?? "dev";
   const feSha = feBuild?.sha ?? "dev";
@@ -477,7 +513,11 @@ function Desk() {
                       )}
                     </span>
                   </div>
-                  <EquityCurveChart values={paperValues} initialValue={data?.paper?.starting_capital_usd} />
+                  <EquityCurveChart
+                    values={paperValues}
+                    initialValue={data?.paper?.starting_capital_usd}
+                    totalTicks={data?.paper?.ticks}
+                  />
                 </section>
 
                 <section className="card">
@@ -501,6 +541,23 @@ function Desk() {
                       </select>
                     </div>
                   </div>
+                  {settlementDegradedMeta && (
+                    <div className="alert-banner" role="status" style={{ marginBottom: 10 }}>
+                      <span className="badge badge-warn" style={{ marginRight: 8 }}>
+                        {t("Degraded collection", "Неполный сбор")}
+                      </span>
+                      {num(settlementDegradedMeta.coins_collected) !== null &&
+                      num(settlementDegradedMeta.coins_requested) !== null
+                        ? t(
+                            `Last run collected ${settlementDegradedMeta.coins_collected}/${settlementDegradedMeta.coins_requested} coins (<80%); retaining last complete OOS snapshot.`,
+                            `Последний запуск собрал ${settlementDegradedMeta.coins_collected}/${settlementDegradedMeta.coins_requested} монет (<80%); сохранён последний полный OOS-снимок.`,
+                          )
+                        : t(
+                            "Last settlement collection was incomplete (<80% universe); retaining last complete OOS snapshot.",
+                            "Последний сбор данных расчётов был неполным (<80% выборки); сохранён последний полный OOS-снимок.",
+                          )}
+                    </div>
+                  )}
                   <div className="table-wrap">
                     <table>
                       <thead>
@@ -517,6 +574,14 @@ function Desk() {
                       <tbody>
                         {settlementFiltered.map((row, idx) => {
                           const sp = normalizeSplitLabel(row.split);
+                          const clusteredT = num(row.net_t_stat_clustered) ?? num(row.t_stat_clustered);
+                          const rawNetCls = signCls(row.net_maker_bps);
+                          const netMakerCls =
+                            rawNetCls === "pos" && (row.fdr_pass === false || (clusteredT !== null && clusteredT < 2.0))
+                              ? ""
+                              : rawNetCls;
+                          const displayT =
+                            row.net_t_stat_clustered ?? row.t_stat_clustered ?? row.net_t_stat ?? row.t_stat;
                           return (
                             <tr key={idx}>
                               <td>{row.strategy}</td>
@@ -528,8 +593,8 @@ function Desk() {
                               <td className={`num ${signCls(row.mean_gross_bps)}`}>
                                 {fmtBps(row.mean_gross_bps, 2)}
                               </td>
-                              <td className="num">{fx(row.t_stat, 2)}</td>
-                              <td className={`num ${signCls(row.net_maker_bps)}`}>
+                              <td className="num">{fx(displayT, 2)}</td>
+                              <td className={`num ${netMakerCls}`.trim()}>
                                 {fmtBps(row.net_maker_bps, 2)}
                               </td>
                             </tr>
@@ -965,7 +1030,11 @@ function Desk() {
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiExecCosts" />
-                  <div className="kpi-value warn">{fmtUsd(data?.cross_dex_paper?.cum_costs_usd)}</div>
+                  <div className="kpi-value warn">
+                    {num(data?.cross_dex_paper?.cum_costs_usd) !== null
+                      ? fmtUsd(-Math.abs(data!.cross_dex_paper!.cum_costs_usd))
+                      : "—"}
+                  </div>
                   <div className="kpi-sub">
                     {t("Closed", "Закрыто")} {data?.cross_dex_paper?.closed_pairs_count ?? 0} · {t("Payback", "Окупилось")}{" "}
                     {data?.cross_dex_paper?.payback_achieved_count ?? 0}
@@ -1244,7 +1313,11 @@ function Desk() {
                             </td>
                             <td className="num">{fmtUsd(o.l1read_mark_px)}</td>
                             <td className="num">{fmtUsd(o.rest_mark_px)}</td>
-                            <td className={`num ${Math.abs(num(o.drift_bps) ?? 0) > 15 ? "warn" : "pos"}`}>
+                            <td
+                              className={`num ${
+                                num(o.drift_bps) === null ? "" : Math.abs(num(o.drift_bps)!) > 15 ? "warn" : "pos"
+                              }`.trim()}
+                            >
                               {fmtBps(o.drift_bps, 2)}
                             </td>
                           </tr>
@@ -1446,9 +1519,15 @@ function Desk() {
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiMakerAlo" />
-                  <div className="kpi-value pos">
-                    {fmtPct(data?.attribution?.maker_volume_share_pct, 1, false)}
-                  </div>
+                  {(() => {
+                    const makerPct = num(data?.attribution?.maker_volume_share_pct);
+                    const makerCls = makerPct === null ? "" : makerPct >= 80 ? "pos" : makerPct < 50 ? "warn" : "";
+                    return (
+                      <div className={`kpi-value ${makerCls}`.trim()}>
+                        {fmtPct(data?.attribution?.maker_volume_share_pct, 1, false)}
+                      </div>
+                    );
+                  })()}
                   <div className="kpi-sub">
                     {t("ALO fill", "Исп. ALO")} {fmtPct(data?.attribution?.real_alo_fill_rate_pct, 1, false)} ·{" "}
                     {t("Fee", "Комиссия")} {fmtBps(data?.attribution?.effective_fee_bps, 2)}
@@ -1496,7 +1575,7 @@ function Desk() {
                   </div>
                   <div className="card">
                     <KpiLabel k="kpiTnOrphanRisk" />
-                    <div className={`kpi-value ${(num(tnRisk.orphan_notional_usd) ?? 0) > 0 ? "warn" : ""}`}>
+                    <div className={`kpi-value ${(tnRisk.unmanaged_orphan_positions ?? 0) > 0 ? "warn" : ""}`.trim()}>
                       {fmtUsd(tnRisk.orphan_notional_usd)}
                     </div>
                     <div className="kpi-sub">

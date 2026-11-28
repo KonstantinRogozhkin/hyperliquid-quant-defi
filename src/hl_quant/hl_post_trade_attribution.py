@@ -107,6 +107,11 @@ MARKOUT_HORIZON_MS = 60_000
 MARKOUT_LOOKBACK_MS = 24 * 3_600_000
 
 
+def _is_spot_fill_coin(coin: str) -> bool:
+    """True for Hyperliquid Spot fill symbols (e.g. ``@107`` or ``PURR/USDC``)."""
+    return coin.startswith("@") or ("/" in coin)
+
+
 def fetch_markout_series(
     client: httpx.Client,
     fills: list[dict[str, Any]],
@@ -122,7 +127,7 @@ def fetch_markout_series(
     for fl in fills:
         coin = str(fl.get("coin") or "").strip()
         t = int(_f(fl.get("time")))
-        if coin and t >= start_floor:
+        if coin and not _is_spot_fill_coin(coin) and t >= start_floor:
             first_by_coin[coin] = min(first_by_coin.get(coin, t), t)
     out: dict[str, list[tuple[int, float]]] = {}
     for coin, t0 in first_by_coin.items():
@@ -207,6 +212,7 @@ def _f(v: object, default: float = 0.0) -> float:
 USER_FUNDING_PAGE_CAP = 500
 USER_LEDGER_PAGE_CAP = 500
 USER_FILLS_PAGE_CAP = 2_000
+USER_FILLS_RETENTION_CAP = 9_950
 
 
 def _post_info_with_retry(
@@ -263,6 +269,7 @@ def fetch_all_user_funding(
         if not isinstance(page, list) or not page:
             break
         max_time = cursor_ms
+        new_in_page = 0
         for item in page:
             if not isinstance(item, dict):
                 continue
@@ -277,11 +284,17 @@ def fetch_all_user_funding(
             if dedup_key not in seen_keys:
                 seen_keys.add(dedup_key)
                 all_rows.append(item)
+                new_in_page += 1
             if t > max_time:
                 max_time = t
-        if len(page) < page_cap or max_time <= cursor_ms:
+        if len(page) < page_cap or max_time < cursor_ms:
             break
-        cursor_ms = max_time + 1
+        if max_time > cursor_ms:
+            cursor_ms = max_time
+        elif new_in_page > 0:
+            cursor_ms = max_time + 1
+        else:
+            break
     return all_rows
 
 
@@ -308,6 +321,7 @@ def fetch_all_user_ledger_updates(
         if not isinstance(page, list) or not page:
             break
         max_time = cursor_ms
+        new_in_page = 0
         for item in page:
             if not isinstance(item, dict):
                 continue
@@ -322,11 +336,17 @@ def fetch_all_user_ledger_updates(
             if dedup_key not in seen_keys:
                 seen_keys.add(dedup_key)
                 all_rows.append(item)
+                new_in_page += 1
             if t > max_time:
                 max_time = t
-        if len(page) < page_cap or max_time <= cursor_ms:
+        if len(page) < page_cap or max_time < cursor_ms:
             break
-        cursor_ms = max_time + 1
+        if max_time > cursor_ms:
+            cursor_ms = max_time
+        elif new_in_page > 0:
+            cursor_ms = max_time + 1
+        else:
+            break
     return all_rows
 
 
@@ -359,8 +379,18 @@ def fetch_all_user_fills(
     raw = _post_info_with_retry(client, info_url, {"type": "userFills", "user": account_address}).json()
     initial = [r for r in raw if isinstance(r, dict)] if isinstance(raw, list) else []
     if len(initial) < page_cap:
-        return initial, True
+        filtered_init = (
+            [r for r in initial if int(_f(r.get("time"))) >= start_time_ms]
+            if start_time_ms > 0
+            else initial
+        )
+        return filtered_init, (start_time_ms == 0)
 
+    filtered_fallback = (
+        [r for r in initial if int(_f(r.get("time"))) >= start_time_ms]
+        if start_time_ms > 0
+        else initial
+    )
     try:
         all_rows: list[dict[str, Any]] = []
         seen_keys: set[tuple[Any, ...]] = set()
@@ -378,24 +408,33 @@ def fetch_all_user_fills(
                     completed_all_pages = True
                 break
             max_time = cursor_ms
+            new_in_page = 0
             for item in page:
                 if not isinstance(item, dict):
                     continue
                 t = int(_f(item.get("time")))
+                if t < start_time_ms:
+                    continue
                 key = _fill_row_key(item)
                 if key not in seen_keys:
                     seen_keys.add(key)
                     all_rows.append(item)
+                    new_in_page += 1
                 if t > max_time:
                     max_time = t
             if len(page) < page_cap:
                 completed_all_pages = True
                 break
-            if max_time <= cursor_ms:
+            if max_time < cursor_ms:
                 break
-            cursor_ms = max_time + 1
+            if max_time > cursor_ms:
+                cursor_ms = max_time
+            elif new_in_page > 0:
+                cursor_ms = max_time + 1
+            else:
+                break
         if not all_rows:
-            return initial, False
+            return filtered_fallback, False
         for item in initial:
             t = int(_f(item.get("time")))
             if t < start_time_ms:
@@ -405,9 +444,14 @@ def fetch_all_user_fills(
                 seen_keys.add(key)
                 all_rows.append(item)
         all_rows.sort(key=lambda r: int(_f(r.get("time"))))
-        return all_rows, (completed_all_pages and start_time_ms == 0)
+        fills_complete = bool(
+            completed_all_pages
+            and start_time_ms == 0
+            and len(all_rows) < USER_FILLS_RETENTION_CAP
+        )
+        return all_rows, fills_complete
     except Exception:
-        return initial, False
+        return filtered_fallback, False
 
 
 def fetch_post_trade_snapshot(
@@ -556,15 +600,55 @@ def compute_net_deposited_capital_usd(
     return net_flow
 
 
+def compute_gross_deposited_capital_usd(
+    ledger_updates: list[dict[str, Any]] | None,
+    account_address: str,
+) -> float | None:
+    """Cumulative positive external USDC inflows (deposits, incoming transfers, vault withdrawals)."""
+    if not ledger_updates:
+        return None
+    me = account_address.strip().lower()
+    gross_in = 0.0
+    found = False
+    for row in ledger_updates:
+        if not isinstance(row, dict):
+            continue
+        delta = row.get("delta") if isinstance(row.get("delta"), dict) else row
+        dtype = str(delta.get("type") or "").strip()
+        if dtype == "deposit":
+            amt = abs(_f(delta.get("usdc")))
+            if amt > 0:
+                gross_in += amt
+                found = True
+        elif dtype in {"vaultWithdraw", "vaultDistribution"}:
+            amt = abs(_f(delta.get("netWithdrawnUsd"), _f(delta.get("usdc"))))
+            if amt > 0:
+                gross_in += amt
+                found = True
+        elif dtype in {"internalTransfer", "subAccountTransfer", "spotTransfer", "send"}:
+            tok = str(delta.get("token") or "USDC").strip().upper()
+            if tok != "USDC":
+                continue
+            amt = abs(_f(delta.get("usdc"), _f(delta.get("amount"))))
+            src = str(delta.get("user") or "").strip().lower()
+            dst = str(delta.get("destination") or "").strip().lower()
+            if amt > 0 and me and dst == me and src != me:
+                gross_in += amt
+                found = True
+    if not found or gross_in <= 0.0:
+        return None
+    return round(gross_in, 4)
+
+
 def net_external_usdc_flow_usd(
     ledger_updates: list[dict[str, Any]] | None,
     account_address: str,
 ) -> float | None:
     """Signed cumulative external USDC flow (deposits/incoming minus withdrawals/outgoing + fees).
 
-    ``None`` when the ledger holds no external USDC flow at all. Unlike
-    :func:`compute_net_deposited_capital_usd` this may be zero or negative, which the drawdown
-    high-water mark needs to offset withdrawals.
+    Includes ``vaultDeposit`` (USDC leaving Perp clearinghouse into a Hyperliquid Vault) and
+    ``vaultWithdraw`` / ``vaultDistribution`` (USDC returning from a Vault to Perp clearinghouse).
+    ``None`` when the ledger holds no external USDC flow at all.
     """
     if not ledger_updates:
         return None
@@ -588,6 +672,16 @@ def net_external_usdc_flow_usd(
             fee = abs(_f(delta.get("fee")))
             if amt > 0 or fee > 0:
                 net_flow -= amt + fee
+                found = True
+        elif dtype == "vaultDeposit":
+            amt = abs(_f(delta.get("usdc")))
+            if amt > 0:
+                net_flow -= amt
+                found = True
+        elif dtype in {"vaultWithdraw", "vaultDistribution"}:
+            amt = abs(_f(delta.get("netWithdrawnUsd"), _f(delta.get("usdc"))))
+            if amt > 0:
+                net_flow += amt
                 found = True
         elif dtype in {"internalTransfer", "subAccountTransfer", "spotTransfer", "send"}:
             tok = str(delta.get("token") or "USDC").strip().upper()
@@ -616,6 +710,8 @@ def load_paper_comparison(
     testnet_equity_usd: float,
     *,
     deposited_capital_usd: float | None = None,
+    gross_deposited_usd: float | None = None,
+    net_flow_usd: float | None = None,
 ) -> dict[str, Any] | None:
     """Compare live Testnet cumulative return against the parallel Paper L2 ledger."""
     if paper_dir is None:
@@ -635,8 +731,13 @@ def load_paper_comparison(
         testnet_start = float(deposited_capital_usd)
         attributed_ret_pct = (testnet_net_pnl_usd / testnet_start) * 100.0
         testnet_ret_pct = (testnet_equity_usd - testnet_start) / testnet_start * 100.0
+    elif net_flow_usd is not None and net_flow_usd <= 0.0 and gross_deposited_usd is not None and gross_deposited_usd > 0.0:
+        testnet_start = float(gross_deposited_usd)
+        attributed_ret_pct = (testnet_net_pnl_usd / testnet_start) * 100.0
+        testnet_ret_pct = (testnet_equity_usd - net_flow_usd) / testnet_start * 100.0
     else:
-        testnet_start = max(1.0, testnet_equity_usd - testnet_net_pnl_usd)
+        implied_start = testnet_equity_usd - testnet_net_pnl_usd
+        testnet_start = implied_start if implied_start > 1.0 else max(1.0, abs(testnet_equity_usd))
         attributed_ret_pct = (testnet_net_pnl_usd / testnet_start) * 100.0
         testnet_ret_pct = attributed_ret_pct
     return {
@@ -718,16 +819,28 @@ def compute_post_trade_attribution(
     tot_dr_num = 0.0
     tot_dr_den = 0.0
     mk_fills_used = 0
+    perp_fills_count = 0
     fill_by_oid_vol: dict[int, float] = {}
+    usd_fee_tokens = {"", "USDC", "USD", "USDT", "USDT0", "USDH", "USDE"}
 
     for fl in fills:
         coin = str(fl.get("coin") or "").strip()
-        if not coin:
+        if not coin or _is_spot_fill_coin(coin):
             continue
+        perp_fills_count += 1
         px = _f(fl.get("px"))
         sz = abs(_f(fl.get("sz")))
         notional = px * sz
-        fee = _f(fl.get("fee"))
+        raw_fee = _f(fl.get("fee"))
+        fee_tok = str(fl.get("feeToken") or "USDC").strip().upper()
+        if fee_tok in usd_fee_tokens:
+            fee = raw_fee
+        elif fee_tok == coin.upper() and px > 0:
+            fee = raw_fee * px
+        elif mids.get(fee_tok, 0.0) > 0:
+            fee = raw_fee * mids[fee_tok]
+        else:
+            fee = 0.0
         closed_pnl = _f(fl.get("closedPnl"))
         crossed = bool(fl.get("crossed", False))
         if "oid" in fl and fl["oid"] is not None:
@@ -788,10 +901,14 @@ def compute_post_trade_attribution(
             fund_by_coin[coin] = fund_by_coin.get(coin, 0.0) + usdc
         tot_funding += usdc
 
-    # Audit ALO order fill rate against local executor audit trail (window-aligned when userFills hits 2000 cap)
+    # Audit ALO order fill rate against local executor audit trail (window-aligned when userFills is truncated)
     audit_min_ts_ms: int | None = None
-    if len(fills) >= 1900 and not snapshot.get("fills_complete"):
-        fill_times = [int(fl["time"]) for fl in fills if fl.get("time") is not None]
+    if (len(fills) >= 1900 or snapshot.get("fills_complete") is False) and not snapshot.get("fills_complete"):
+        fill_times = [
+            int(fl["time"])
+            for fl in fills
+            if fl.get("time") is not None and not _is_spot_fill_coin(str(fl.get("coin") or "").strip())
+        ]
         if fill_times:
             audit_min_ts_ms = min(fill_times)
     audit_oids = extract_audit_oids(audit_log_path, min_ts_ms=audit_min_ts_ms)
@@ -853,7 +970,14 @@ def compute_post_trade_attribution(
                 eff_lev = pos_usd / denom
                 adl_rank = round(max(1.0, pnl_ratio) * eff_lev, 3)
                 upnl_pct = unreal / max(pos_usd, 1.0) * 100.0
-                if adl_rank >= adl_warn_threshold or (szi < 0 and upnl_pct >= 10.0 and eff_lev >= 1.0):
+                if lev_type == "isolated":
+                    # Low-leverage isolated positions (e.g. 2x) start at adl_rank ~= 2.0 on $0.01 gain;
+                    # require > 1.25 * lev_val (capped at 5.0 so high-leverage >=5x isolated still warns).
+                    eff_adl_thr = max(adl_warn_threshold, min(lev_val * 1.25, 5.0))
+                    adl_triggered = adl_rank > eff_adl_thr
+                else:
+                    adl_triggered = adl_rank >= adl_warn_threshold or (szi < 0 and upnl_pct >= 10.0 and eff_lev >= 1.0)
+                if adl_triggered:
                     side_lbl = "SHORT" if szi < 0 else "LONG"
                     scope_lbl = "isolated margin" if lev_type == "isolated" else "cross equity"
                     adl_warnings.append(
@@ -898,13 +1022,38 @@ def compute_post_trade_attribution(
 
     per_coin.sort(key=lambda c: (-c.position_usd, -c.fill_volume_usd, c.coin))
     net_attr = tot_realized + tot_unrealized + tot_funding - tot_fees
-    dep_cap = compute_net_deposited_capital_usd(
-        snapshot.get("ledger_updates"),
-        str(snapshot.get("account_address", "")),
+    acct_addr_str = str(snapshot.get("account_address", ""))
+    ledger_rows = snapshot.get("ledger_updates")
+    net_flow = net_external_usdc_flow_usd(ledger_rows, acct_addr_str)
+    dep_cap = compute_net_deposited_capital_usd(ledger_rows, acct_addr_str)
+    gross_dep = compute_gross_deposited_capital_usd(ledger_rows, acct_addr_str)
+    if dep_cap is not None and dep_cap > 0.0:
+        eff_dep_cap = dep_cap
+        acct_ret_pct = (total_eq - eff_dep_cap) / eff_dep_cap * 100.0
+    elif net_flow is not None and net_flow <= 0.0 and gross_dep is not None and gross_dep > 0.0:
+        # House-money account (withdrawals >= deposits): anchor return denominator to gross deposits
+        # instead of max(1.0, total_eq - net_attr) which exploded to +50,000%+.
+        eff_dep_cap = gross_dep
+        acct_ret_pct = ((total_eq - net_flow) / gross_dep) * 100.0
+    else:
+        implied_cap = total_eq - net_attr
+        if implied_cap > 1.0:
+            eff_dep_cap = implied_cap
+            acct_ret_pct = (net_attr / eff_dep_cap) * 100.0
+        elif total_eq > 0.0:
+            eff_dep_cap = total_eq
+            acct_ret_pct = 0.0
+        else:
+            eff_dep_cap = 1.0
+            acct_ret_pct = 0.0
+    paper_cmp = load_paper_comparison(
+        paper_dir,
+        net_attr,
+        total_eq,
+        deposited_capital_usd=dep_cap,
+        gross_deposited_usd=gross_dep,
+        net_flow_usd=net_flow,
     )
-    eff_dep_cap = dep_cap if (dep_cap is not None and dep_cap > 0.0) else max(1.0, total_eq - net_attr)
-    acct_ret_pct = ((total_eq - eff_dep_cap) / eff_dep_cap * 100.0) if dep_cap is not None else (net_attr / eff_dep_cap * 100.0)
-    paper_cmp = load_paper_comparison(paper_dir, net_attr, total_eq, deposited_capital_usd=dep_cap)
 
     # Address API Rate-Limit Health:
     # Standard HyperCore grants 1 request per 1 USDC traded (+10k initial buffer).
@@ -921,7 +1070,7 @@ def compute_post_trade_attribution(
         vol_weight = 0.1 if is_growth_mode else 1.0
         eff_vol = max(audit_vol * vol_weight, 1.0)
         api_reqs_per_usd = round(max(audit_actions, len(audit_oids)) / eff_vol, 4)
-        avg_order_usd = (tot_vol / max(len(fills), 1)) if tot_vol > 0 else 100.0
+        avg_order_usd = (tot_vol / max(perp_fills_count, 1)) if tot_vol > 0 else 100.0
         safe_fill_pct = min(100.0, (100.0 / max(avg_order_usd * vol_weight, 1.0)))
         low_fill_risk = (
             real_alo_fill_rate is not None
@@ -944,6 +1093,9 @@ def compute_post_trade_attribution(
     window_exec_vol = 0.0
     window_mm_vol = 0.0
     for fl in fills:
+        fl_coin = str(fl.get("coin") or "").strip()
+        if not fl_coin or _is_spot_fill_coin(fl_coin):
+            continue
         px = _f(fl.get("px"))
         sz = abs(_f(fl.get("sz")))
         ntl = px * sz
@@ -986,7 +1138,7 @@ def compute_post_trade_attribution(
         spot_usdc_usd=round(spot_usdc, 4),
         open_positions_count=len(pos_map),
         open_orders_count=len(open_orders),
-        total_fills=len(fills),
+        total_fills=perp_fills_count,
         total_volume_usd=round(tot_vol, 2),
         maker_volume_share_pct=round((maker_vol / tot_vol * 100.0) if tot_vol > 0 else 0.0, 2),
         effective_fee_bps=round((tot_fees / tot_vol * 1e4) if tot_vol > 0 else 0.0, 3),

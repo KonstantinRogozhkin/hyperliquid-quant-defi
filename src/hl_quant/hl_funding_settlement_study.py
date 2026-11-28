@@ -52,6 +52,8 @@ class StrategyBucketStats:
     # Settlements at the same :00 timestamp across correlated coins are not independent draws:
     # t-stat on per-timestamp cross-sectional means (cluster-robust by settlement hour).
     t_stat_clustered: float = 0.0
+    net_t_stat: float = 0.0
+    net_t_stat_clustered: float = 0.0
     clusters: int = 0
     maker_rt_bps: float = 3.0
     # Net after a stressed passive-execution cost (live alt fills measured ~5 bps one-way).
@@ -88,6 +90,7 @@ def build_coin_settlement_events(
     *,
     day_vol_usd: float = 0.0,
     oi_usd: float = 0.0,
+    now_ms: int | None = None,
 ) -> pd.DataFrame:
     """Align 5-minute OHLC bars with causal prior-hour funding ``f(T0 - 1h)`` and settled ``f(T0)``."""
     if not candles_5m or not funding_history:
@@ -96,6 +99,9 @@ def build_coin_settlement_events(
     bars: dict[int, tuple[float, float]] = {}
     ntl_by_ts: list[tuple[int, float]] = []
     for c in candles_5m:
+        close_ms = int(_f(c.get("T"), 0))
+        if now_ms is not None and close_ms > int(now_ms):
+            continue
         t = int(c.get("t", 0))
         o, cl = _f(c.get("o")), _f(c.get("c"))
         if t > 0 and o > 0 and cl > 0:
@@ -115,7 +121,7 @@ def build_coin_settlement_events(
             continue
         prev_rate = fund_by_hour.get(t0 - HOUR_MS)
         curr_rate = fund_by_hour.get(t0)
-        if prev_rate is None or abs(prev_rate) < 1e-9:
+        if prev_rate is None or abs(prev_rate) < 1e-9 or curr_rate is None:
             continue
 
         b_m15 = bars.get(t0 - 3 * FIVE_MIN_MS)
@@ -136,7 +142,7 @@ def build_coin_settlement_events(
         post_5m_fade = fade_sgn * (p_p5 - p_0) / p_0 * 1e4
         post_15m_fade = fade_sgn * (p_p15 - p_0) / p_0 * 1e4
 
-        actual_fund_bps = (curr_rate if curr_rate is not None else prev_rate) * 1e4
+        actual_fund_bps = curr_rate * 1e4
         payout_bps = (-recv_sgn) * actual_fund_bps
         naive_harvest_5m = recv_sgn * (p_p5 - p_m5) / p_m5 * 1e4 + payout_bps
 
@@ -177,6 +183,7 @@ def build_coin_settlement_events_15m(
     *,
     day_vol_usd: float = 0.0,
     oi_usd: float = 0.0,
+    now_ms: int | None = None,
 ) -> pd.DataFrame:
     """Align 15-minute OHLC bars (~52.1 days) with causal prior-hour funding ``f(T0 - 1h)``."""
     if not candles_15m or not funding_history:
@@ -185,6 +192,9 @@ def build_coin_settlement_events_15m(
     bars: dict[int, tuple[float, float]] = {}
     ntl_by_ts: list[tuple[int, float]] = []
     for c in candles_15m:
+        close_ms = int(_f(c.get("T"), 0))
+        if now_ms is not None and close_ms > int(now_ms):
+            continue
         t = int(c.get("t", 0))
         o, cl = _f(c.get("o")), _f(c.get("c"))
         if t > 0 and o > 0 and cl > 0:
@@ -204,7 +214,7 @@ def build_coin_settlement_events_15m(
             continue
         prev_rate = fund_by_hour.get(t0 - HOUR_MS)
         curr_rate = fund_by_hour.get(t0)
-        if prev_rate is None or abs(prev_rate) < 1e-9:
+        if prev_rate is None or abs(prev_rate) < 1e-9 or curr_rate is None:
             continue
 
         b_m15 = bars.get(t0 - FIFTEEN_MIN_MS)
@@ -223,7 +233,7 @@ def build_coin_settlement_events_15m(
         post_15m_fade = fade_sgn * (p_p15 - p_0) / p_0 * 1e4
         post_30m_fade = fade_sgn * (p_p30 - p_0) / p_0 * 1e4
 
-        actual_fund_bps = (curr_rate if curr_rate is not None else prev_rate) * 1e4
+        actual_fund_bps = curr_rate * 1e4
         payout_bps = (-recv_sgn) * actual_fund_bps
         naive_harvest_15m = recv_sgn * (p_p15 - p_m15) / p_m15 * 1e4 + payout_bps
 
@@ -274,15 +284,24 @@ def one_sided_p_value(t_stat: float, df: float | None = None) -> float:
 def conservative_holdout_p_value(row: Any) -> float:
     """Larger of the naive (df = events - 1) and clustered (df = clusters - 1) Student-t p-values.
 
-    A clustered t of 4.5 from 3 timestamp clusters has p ~ 0.023, not the ~3e-6 a normal tail
-    gives, so sparse buckets cannot sail through the BH FDR gate.
+    Tests H0: net_maker_mean <= 0 via ``net_t_stat`` / ``net_t_stat_clustered`` when present,
+    falling back to ``t_stat`` / ``t_stat_clustered`` for legacy rows.
     """
-    t_naive = float(row.get("t_stat", float("nan")))
-    t_cl = float(row.get("t_stat_clustered", t_naive))
+    t_naive_raw = row.get("net_t_stat") if row.get("net_t_stat") is not None else row.get("t_stat", float("nan"))
+    t_naive = float(t_naive_raw)
+    t_cl_raw = (
+        row.get("net_t_stat_clustered")
+        if row.get("net_t_stat_clustered") is not None
+        else row.get("t_stat_clustered", t_naive)
+    )
+    t_cl = float(t_cl_raw)
     events = float(row.get("events", 0) or 0)
     clusters = float(row.get("clusters", 0) or 0)
     p_naive = one_sided_p_value(t_naive, events - 1 if events >= 2 else None)
-    p_cl = one_sided_p_value(t_cl if math.isfinite(t_cl) else -math.inf, clusters - 1 if clusters >= 2 else (events - 1 if events >= 2 else None))
+    p_cl = one_sided_p_value(
+        t_cl if math.isfinite(t_cl) else -math.inf,
+        clusters - 1 if clusters >= 2 else (events - 1 if events >= 2 else None),
+    )
     return max(p_naive, p_cl)
 
 
@@ -306,8 +325,8 @@ def benjamini_hochberg(p_values: list[float], q: float = 0.10) -> list[bool]:
 SETTLEMENT_FDR_Q = 0.10
 
 
-def _clustered_t_stat(sub: pd.DataFrame, strat: str) -> tuple[float, int]:
-    """t-stat of the mean using one observation per settlement timestamp (cross-sectional mean)."""
+def _clustered_t_stat(sub: pd.DataFrame, strat: str, *, cost_bps: float = 0.0) -> tuple[float, int]:
+    """t-stat of ``mean - cost_bps`` using one observation per settlement timestamp (cross-sectional mean)."""
     if "t0_ms" not in sub.columns or sub.empty:
         return 0.0, 0
     g = sub.groupby("t0_ms")[strat].mean().to_numpy(dtype=np.float64)
@@ -315,7 +334,7 @@ def _clustered_t_stat(sub: pd.DataFrame, strat: str) -> tuple[float, int]:
     if n < 2:
         return 0.0, n
     sd = float(np.std(g, ddof=1))
-    return ((float(np.mean(g)) / (sd / math.sqrt(n))) if sd > 1e-9 else 0.0), n
+    return ((float(np.mean(g) - cost_bps) / (sd / math.sqrt(n))) if sd > 1e-9 else 0.0), n
 
 
 MIN_COLLECTION_RATIO = 0.8
@@ -388,11 +407,13 @@ def evaluate_settlement_strategies(
                 mu = float(np.mean(vals))
                 sd = float(np.std(vals, ddof=1)) if n > 1 else 0.0
                 t_stat = (mu / (sd / math.sqrt(n))) if sd > 1e-9 else 0.0
-                win_pct = float(np.mean(vals > 0.0) * 100.0)
                 net_m = mu - maker_rt_bps
                 net_t = mu - taker_rt_bps
+                net_t_stat = (net_m / (sd / math.sqrt(n))) if sd > 1e-9 else 0.0
+                win_pct = float(np.mean(vals > 0.0) * 100.0)
                 sh_ev = (net_m / sd) if sd > 1e-9 else 0.0
-                t_cl, n_cl = _clustered_t_stat(sub, strat)
+                t_cl, n_cl = _clustered_t_stat(sub, strat, cost_bps=0.0)
+                net_t_cl, _ = _clustered_t_stat(sub, strat, cost_bps=maker_rt_bps)
 
                 # Ex-Top1-Coin robustness audit (protects against single-coin outliers like INIT)
                 top1_coin = ""
@@ -424,6 +445,8 @@ def evaluate_settlement_strategies(
                         ex_top1_gross_bps=round(ex_mu, 3),
                         ex_top1_t_stat=round(ex_t, 2),
                         t_stat_clustered=round(t_cl, 2),
+                        net_t_stat=round(net_t_stat, 2),
+                        net_t_stat_clustered=round(net_t_cl, 2),
                         clusters=n_cl,
                         maker_rt_bps=float(maker_rt_bps),
                         net_maker_stress_bps=round(mu - stress_rt_bps, 3),
@@ -561,10 +584,10 @@ async def fetch_settlement_dataset(
                         return coin, pd.DataFrame()
                     if iv == "15m":
                         return coin, build_coin_settlement_events_15m(
-                            coin, candles, f_hist, day_vol_usd=item["vol_usd"], oi_usd=item["oi_usd"]
+                            coin, candles, f_hist, day_vol_usd=item["vol_usd"], oi_usd=item["oi_usd"], now_ms=now_ms
                         )
                     return coin, build_coin_settlement_events(
-                        coin, candles, f_hist, day_vol_usd=item["vol_usd"], oi_usd=item["oi_usd"]
+                        coin, candles, f_hist, day_vol_usd=item["vol_usd"], oi_usd=item["oi_usd"], now_ms=now_ms
                     )
                 except Exception:
                     return coin, pd.DataFrame()
@@ -616,6 +639,29 @@ async def fetch_17d_settlement_dataset(
 
 
 # --------------------------------------------------------------------------- Reporting
+
+
+def _is_go_maker(d: Any, h: Any, *, maker_rt: float, fdr_ok: bool) -> bool:
+    if d is None:
+        return False
+    ex_g = float(h.get("ex_top1_gross_bps", h["mean_gross_bps"]))
+    h_net_t_raw = h.get("net_t_stat") if h.get("net_t_stat") is not None else h["t_stat"]
+    h_net_t = float(h_net_t_raw)
+    h_net_t_cl_raw = (
+        h.get("net_t_stat_clustered")
+        if h.get("net_t_stat_clustered") is not None
+        else h.get("t_stat_clustered", h_net_t)
+    )
+    h_net_t_cl = float(h_net_t_cl_raw)
+    if not math.isfinite(h_net_t_cl):
+        h_net_t_cl = -math.inf
+    return bool(
+        (float(d["net_maker_bps"]) > 0.0)
+        and (float(h["net_maker_bps"]) > 0.0)
+        and (min(h_net_t, h_net_t_cl) >= 2.0)
+        and ((ex_g - maker_rt) > 0.0)
+        and fdr_ok
+    )
 
 
 def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any]) -> str:
@@ -673,24 +719,15 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
         ex_g = float(h.get("ex_top1_gross_bps", h["mean_gross_bps"]))
         ex_t = float(h.get("ex_top1_t_stat", h["t_stat"]))
         top_c = str(h.get("top1_coin", ""))
-        h_t_cl = float(h.get("t_stat_clustered", h["t_stat"]))
-        if not math.isfinite(h_t_cl):
-            # min(t, NaN) silently returns t; an unavailable clustered t-stat must fail the gate.
-            h_t_cl = -math.inf
-        go = (
-            (float(d["net_maker_bps"]) > 0.0)
-            and (float(h["net_maker_bps"]) > 0.0)
-            and (min(float(h["t_stat"]), h_t_cl) >= 2.0)
-            and ((ex_g - maker_rt) > 0.0)
-            and fdr_pass.get((b_name, strat), False)
-        )
+        h_net_t = float(h.get("net_t_stat") if h.get("net_t_stat") is not None else h["t_stat"])
+        go = _is_go_maker(d, h, maker_rt=maker_rt, fdr_ok=fdr_pass.get((b_name, strat), False))
         verdict = (
             "🟢 **GO (Maker)**"
             if go
             else ("🟡 Gross/Overlay" if float(d["mean_gross_bps"]) > 1.0 and float(h["mean_gross_bps"]) > 1.0 and float(h["t_stat"]) >= 2.0 else "🔴 NO-GO")
         )
         if go:
-            winners.append((b_name, strat, float(h["net_maker_bps"]), float(h["t_stat"]), int(h["events"]), ex_g - maker_rt))
+            winners.append((b_name, strat, float(h["net_maker_bps"]), h_net_t, int(h["events"]), ex_g - maker_rt))
         ex_txt = f"{ex_g:+.2f} ({ex_t:+.1f}) ex-{top_c}" if top_c else f"{ex_g:+.2f}"
         lines.append(
             f"| `{b_name}` | `{strat}` | {int(d['events'])} | {d['mean_gross_bps']:+.2f} ({d['t_stat']:+.1f}) | "
@@ -737,24 +774,28 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
 
 
 def format_settlement_study_telegram_rich_html(stats_df: pd.DataFrame, meta: dict[str, Any]) -> str:
+    maker_rt = (
+        float(stats_df["maker_rt_bps"].iloc[0]) if (not stats_df.empty and "maker_rt_bps" in stats_df.columns) else 3.0
+    )
     dev = stats_df[stats_df["split"] == "dev"].set_index(["bucket", "strategy"]) if not stats_df.empty else pd.DataFrame()
     hld = stats_df[stats_df["split"] == "holdout"].set_index(["bucket", "strategy"]) if not stats_df.empty else pd.DataFrame()
     rows = [
         '<tr><th align="left">Бакет / Стратегия</th><th align="right">Dev Gross</th><th align="right">Holdout Gross (t)</th><th align="right">Net Maker</th></tr>'
     ]
     if not hld.empty:
-        keys = list(hld.index)
+        common_idx = [k for k in dev.index if k in hld.index] if not dev.empty else list(hld.index)
         fdr_ok = dict(
-            zip(keys, benjamini_hochberg([conservative_holdout_p_value(hld.loc[k]) for k in keys], SETTLEMENT_FDR_Q))
+            zip(
+                common_idx,
+                benjamini_hochberg([conservative_holdout_p_value(hld.loc[k]) for k in common_idx], SETTLEMENT_FDR_Q),
+            )
         )
         top_h = hld.sort_values("mean_gross_bps", ascending=False).head(6)
         for (b_name, strat), h in top_h.iterrows():
-            d_g = f"{dev.loc[(b_name, strat), 'mean_gross_bps']:+.2f}" if (b_name, strat) in dev.index else "—"
-            dot = (
-                "🟢"
-                if (float(h["net_maker_bps"]) > 0 and float(h["t_stat"]) >= 2.0 and fdr_ok.get((b_name, strat), False))
-                else "⚪"
-            )
+            d_row = dev.loc[(b_name, strat)] if (not dev.empty and (b_name, strat) in dev.index) else None
+            d_g = f"{d_row['mean_gross_bps']:+.2f}" if d_row is not None else "—"
+            is_go = _is_go_maker(d_row, h, maker_rt=maker_rt, fdr_ok=fdr_ok.get((b_name, strat), False))
+            dot = "🟢" if is_go else "⚪"
             rows.append(
                 "<tr>"
                 f'<td align="left"><b>{html.escape(str(strat))}</b> ({html.escape(str(b_name))})</td>'

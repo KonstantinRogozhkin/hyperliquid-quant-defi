@@ -74,7 +74,9 @@ def main(
     lines = [
         f"# Кросс-DEX арбитраж v2 с L2-глубиной: Hyperliquid × Lighter × Extended × dYdX v4 × Paradex ({ts})",
         "",
-        "- Охват живых перпов: " + ", ".join(f"**{k}** `{v}`" for k, v in counts.items()) + f" · фильтр объёма `>= ${min_day_vol_usd/1e6:.1f}M/24ч` · комиссии+мост `9.0 б.п.`",
+        "- Охват живых перпов: "
+        + ", ".join(f"**{k}** `{v}`" for k, v in counts.items())
+        + f" · фильтр объёма `>= ${min_day_vol_usd/1e6:.1f}M/24ч` · комиссии RT `9–15 б.п.` по площадке + мост",
         "",
     ]
     if top_df.empty:

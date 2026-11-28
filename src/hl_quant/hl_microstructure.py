@@ -320,6 +320,7 @@ def simulate_passive_alo_coin(
 
     fill_times_sec: list[float] = []
     mk5, mk30, mk60 = [], [], []
+    timeout_drifts: list[float] = []
     trials = 0
     fills = 0
 
@@ -332,32 +333,35 @@ def simulate_passive_alo_coin(
         t_end = t_cursor + int(timeout_sec * 1000)
         tr_lo = int(np.searchsorted(tr_times, t_cursor, side="left"))
         tr_hi = int(np.searchsorted(tr_times, t_end, side="right"))
+        m_start = float(mids[l2_idx])
 
         # Test both a passive buy at best_bid and a passive sell at best_ask
         for side in ("buy", "sell"):
             trials += 1
             limit_px = float(bids[l2_idx]) if side == "buy" else float(asks[l2_idx])
+            tol = max(1e-12, 1e-9 * abs(limit_px))
             queue_ahead_usd = float(bid_usd1[l2_idx]) if side == "buy" else float(ask_usd1[l2_idx])
             needed_usd = queue_ahead_usd + order_usd
             consumed_usd = 0.0
             fill_ms: int | None = None
+            sgn = 1.0 if side == "buy" else -1.0
 
             for k in range(tr_lo, tr_hi):
                 px = float(tr_px[k])
                 if side == "buy":
-                    if px < limit_px - 1e-12:
+                    if px < limit_px - tol:
                         fill_ms = int(tr_times[k])
                         break
-                    if abs(px - limit_px) <= 1e-12 and tr_side[k] == "sell":
+                    if abs(px - limit_px) <= tol and tr_side[k] == "sell":
                         consumed_usd += float(tr_usd[k])
                         if consumed_usd >= needed_usd:
                             fill_ms = int(tr_times[k])
                             break
                 else:
-                    if px > limit_px + 1e-12:
+                    if px > limit_px + tol:
                         fill_ms = int(tr_times[k])
                         break
-                    if abs(px - limit_px) <= 1e-12 and tr_side[k] == "buy":
+                    if abs(px - limit_px) <= tol and tr_side[k] == "buy":
                         consumed_usd += float(tr_usd[k])
                         if consumed_usd >= needed_usd:
                             fill_ms = int(tr_times[k])
@@ -366,12 +370,17 @@ def simulate_passive_alo_coin(
             if fill_ms is not None:
                 fills += 1
                 fill_times_sec.append((fill_ms - t_cursor) / 1000.0)
-                sgn = 1.0 if side == "buy" else -1.0
                 for horizon_ms, bucket in ((5_000, mk5), (30_000, mk30), (max_markout_ms, mk60)):
                     if fill_ms + horizon_ms <= int(times[-1]):
                         m_after = _lookup_mid_at(times, mids, fill_ms + horizon_ms)
                         if math.isfinite(m_after):
                             bucket.append(sgn * (m_after - limit_px) / limit_px * 1e4)
+            elif m_start > 0:
+                m_timeout = _lookup_mid_at(times, mids, min(t_end, int(times[-1])))
+                if math.isfinite(m_timeout):
+                    # Unfilled ALO order must chase as taker at t_end: if price ran away in sgn direction,
+                    # -sgn * (m_timeout - m_start) / m_start * 1e4 < 0 is adverse chase drift vs arrival mid.
+                    timeout_drifts.append(-sgn * (m_timeout - m_start) / m_start * 1e4)
 
         t_cursor += step_ms
 
@@ -387,10 +396,11 @@ def simulate_passive_alo_coin(
     m60 = float(np.mean(mk60)) if mk60 else float("nan")
 
     # Effective execution PnL vs arrival mid (negative = cost):
-    # Filled ALO orders earn 30s markout minus maker fee; unfilled orders cross spread as taker after timeout.
+    # Filled ALO orders earn 30s markout minus maker fee; unfilled orders suffer timeout chase drift + cross spread as taker.
     taker_cost = -0.5 * med_sp - hl_taker_fee_bps
     mk_ref = m30 if math.isfinite(m30) else (m5 if math.isfinite(m5) else 0.0)
-    maker_eff = fill_rate * (mk_ref - hl_maker_fee_bps) + (1.0 - fill_rate) * taker_cost
+    timeout_drift_pnl = float(np.mean(timeout_drifts)) if timeout_drifts else 0.0
+    maker_eff = fill_rate * (mk_ref - hl_maker_fee_bps) + (1.0 - fill_rate) * (taker_cost + timeout_drift_pnl)
     savings = maker_eff - taker_cost
 
     return CoinMicrostructureReport(

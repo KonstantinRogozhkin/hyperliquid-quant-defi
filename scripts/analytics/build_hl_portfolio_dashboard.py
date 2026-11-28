@@ -30,7 +30,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
 def main(
     data_root: Path = typer.Option(ROOT / "data/paper", help="Directory containing live Hyperliquid module outputs"),
     output_html: Path = typer.Option(
-        ROOT / "docs/reports/2026-11-26/hl_desk_dashboard.html",
+        ROOT / "data/reports/hl_desk_dashboard.html",
         help="Output standalone interactive HTML dashboard path",
     ),
 ) -> None:

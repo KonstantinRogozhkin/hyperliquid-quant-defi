@@ -395,26 +395,12 @@ def compute_series_performance(
     win_streak = loss_streak = win_streak_net = loss_streak_net = 0
     unique_cal_days = len({d.astimezone(timezone.utc).strftime("%Y-%m-%d") for d in dates_dt})
 
-    def _with_daily_inception(daily_ser: pd.Series) -> pd.Series:
-        if daily_ser.empty or inception_share is None or inception_share <= 0:
-            return daily_ser
-        first_dt = pd.to_datetime(str(daily_ser.index[0]), utc=True, errors="coerce")
-        if pd.isna(first_dt):
-            return daily_ser
-        prev_day = (first_dt - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-        anchor = pd.Series([float(inception_share)], index=[prev_day], dtype=float)
-        return pd.concat([anchor, daily_ser])
-
     def _ratios(series: list[float]) -> tuple[float | None, float | None]:
         if unique_cal_days < 5 or len(series) < 5:
             return None, None
-        # Always resample to UTC calendar-day closes (never raw 4h intraday ticks), prepend
-        # `inception_share` when inside the trailing 90d window, and drop non-consecutive day gaps.
-        daily_ser = _daily_close_series(dates_dt, series)
-        if inception_share is not None and inception_share > 0 and len(daily_ser) <= 90:
-            daily_ser = _with_daily_inception(daily_ser)
-        else:
-            daily_ser = daily_ser.iloc[-91:]
+        # Always resample to real observed UTC calendar-day closes (never raw 4h intraday ticks or
+        # synthetic pre-inception days), slice the trailing 90d window, and drop non-consecutive gaps.
+        daily_ser = _daily_close_series(dates_dt, series).iloc[-91:]
         lr_ser = _consecutive_daily_log_returns(daily_ser)
         lr = lr_ser.to_numpy(dtype=float)
         if len(lr) < 2:
@@ -431,14 +417,14 @@ def compute_series_performance(
             so = None
         return sh, so
 
-    # Positive-days % and win/loss streaks are computed on consecutive UTC calendar-day closes
-    # (never on raw intraday ticks or multi-day outage jumps) and only once >= 2 calendar days exist.
+    # Positive-days % and win/loss streaks are computed strictly on consecutive real observed UTC
+    # calendar-day closes (never on synthetic pre-inception anchors, intraday ticks, or outage jumps).
     if unique_cal_days >= 2:
-        daily_g = _with_daily_inception(_daily_close_series(dates_dt, gross_shares))
+        daily_g = _daily_close_series(dates_dt, gross_shares)
         lr_g = _consecutive_daily_log_returns(daily_g).to_numpy(dtype=float)
         if len(lr_g) >= 1:
             pos_days_pct, win_streak, loss_streak = _compute_streaks(lr_g)
-        daily_n = _with_daily_inception(_daily_close_series(dates_dt, net_s))
+        daily_n = _daily_close_series(dates_dt, net_s)
         lr_n = _consecutive_daily_log_returns(daily_n).to_numpy(dtype=float)
         if len(lr_n) >= 1:
             pos_days_net_pct, win_streak_net, loss_streak_net = _compute_streaks(lr_n)
@@ -771,22 +757,72 @@ def _load_daily_share_series_from_ticks(
     return iso_ts, gross_s, net_s, float(work["_eq"].iloc[-1])
 
 
-def _load_benchmarks(data_root: Path) -> dict[str, tuple[list[str], list[float]]]:
-    """Load cached daily benchmark closes from ``hl_benchmarks/daily_closes.json``."""
+def _live_cta_benchmark_price(ap_state: dict[str, Any] | None, sym: str) -> float:
+    """Extract live mark/close price for ``sym`` from ``hl_autopilot/state.json`` CTA state if available."""
+    if not isinstance(ap_state, dict):
+        return 0.0
+    cta = ap_state.get("cta_state")
+    if not isinstance(cta, dict):
+        return 0.0
+    assets = cta.get("assets")
+    if isinstance(assets, dict):
+        ainfo = assets.get(sym) or assets.get(sym.upper())
+        if isinstance(ainfo, dict):
+            px = _f(ainfo.get("mark_px")) or _f(ainfo.get("last_close"))
+            if px > 0:
+                return px
+    last_closes = cta.get("last_closes")
+    if isinstance(last_closes, dict):
+        px = _f(last_closes.get(sym)) or _f(last_closes.get(sym.upper()))
+        if px > 0:
+            return px
+    return 0.0
+
+
+def _load_benchmarks(
+    data_root: Path,
+    *,
+    latest_strat_day: str | None = None,
+) -> dict[str, tuple[list[str], list[float]]]:
+    """Load cached daily benchmark closes from ``hl_benchmarks/daily_closes.json``.
+
+    When strategies already have observations on a newer UTC calendar day ``latest_strat_day``
+    than the last completed 1d candle in ``daily_closes.json`` (today's 1d bar is dropped until
+    00:00 UTC), extend the benchmark series with ``(latest_strat_day, live_px)`` from
+    ``hl_autopilot/state.json`` (``cta_state.assets[sym].mark_px`` or ``last_close``) so
+    benchmark curves and OLS daily log-return windows end on the exact same date as strategies.
+    """
     raw = _read_json(data_root / "hl_benchmarks" / "daily_closes.json")
     if not raw:
         return {}
-    out: dict[str, tuple[list[str], list[float]]] = {}
     series = raw.get("benchmarks") or {}
     if not isinstance(series, dict):
         return {}
+    ap_state = _read_json(data_root / "hl_autopilot" / "state.json")
+    eff_latest_day = latest_strat_day[:10] if isinstance(latest_strat_day, str) and len(latest_strat_day) >= 10 else None
+    if eff_latest_day is None and isinstance(ap_state, dict):
+        last_ms = int(_f(ap_state.get("last_tick_ms")))
+        if last_ms > 0:
+            eff_latest_day = datetime.fromtimestamp(last_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+        else:
+            obs_raw = str(ap_state.get("observed_at_utc") or "").strip()
+            if len(obs_raw) >= 10 and obs_raw[4:5] == "-" and obs_raw[7:8] == "-":
+                eff_latest_day = obs_raw[:10]
+
+    out: dict[str, tuple[list[str], list[float]]] = {}
     for sym, pts in series.items():
-        if not isinstance(pts, list) or len(pts) < 2:
+        if not isinstance(pts, list) or not pts:
             continue
+        sym_up = str(sym).upper()
         dates = [str(p["date"]) for p in pts if isinstance(p, dict) and p.get("date") and _f(p.get("close")) > 0]
         closes = [_f(p["close"]) for p in pts if isinstance(p, dict) and p.get("date") and _f(p.get("close")) > 0]
+        if dates and eff_latest_day and eff_latest_day > dates[-1][:10]:
+            live_px = _live_cta_benchmark_price(ap_state, sym_up)
+            if live_px > 0:
+                dates.append(eff_latest_day)
+                closes.append(live_px)
         if len(dates) >= 2 and closes[0] > 0:
-            out[str(sym).upper()] = (dates, closes)
+            out[sym_up] = (dates, closes)
     return out
 
 
@@ -1401,8 +1437,12 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
         corr_inputs[spec["id"]] = ser
         ols_strat_inputs[spec["id"]] = (spec["name"], ser)
 
-    # Buy & Hold benchmarks (no fees)
-    benchmarks = _load_benchmarks(data_root)
+    # Buy & Hold benchmarks (no fees), aligned to latest observed strategy UTC calendar day
+    latest_strat_day = max(
+        (str(ser.index[-1]) for ser in corr_inputs.values() if not ser.empty),
+        default=None,
+    )
+    benchmarks = _load_benchmarks(data_root, latest_strat_day=latest_strat_day)
     market_exposure: dict[str, Any] = {}
     for sym, (b_dates, b_closes) in benchmarks.items():
         b_id = f"bench_{sym.lower()}"

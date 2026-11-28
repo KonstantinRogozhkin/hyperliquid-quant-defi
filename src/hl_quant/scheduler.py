@@ -63,6 +63,7 @@ class JobSpec:
     build_command: Callable[[Path, Path, bool], list[str]]
     is_enabled: Callable[[], tuple[bool, str]]
     has_required_credentials: Callable[[], tuple[bool, str]]
+    retries: int | None = None
 
     def should_run_at(self, dt_utc: datetime) -> bool:
         if dt_utc.minute not in self.minutes:
@@ -311,9 +312,17 @@ def build_job_specs() -> list[JobSpec]:
             str(root / "scripts/analytics/run_hl_testnet_risk_probe.py"),
             "--hwm-state",
             str(data_dir / "paper/hl_testnet_hwm.json"),
+            "--metamodel-state",
+            str(data_dir / "paper/hl_metamodel/state.json"),
             "--output-json",
             str(data_dir / "paper/hl_testnet_risk/latest.json"),
         ]
+
+    try:
+        cal_sec = int(float(os.environ.get("HL_MM_CALIBRATION_SEC", "300").strip() or "300"))
+    except ValueError:
+        cal_sec = 300
+    mm_cal_timeout_s = max(480, cal_sec + 180)
 
     four_hour = (0, 4, 8, 12, 16, 20)
     return [
@@ -479,7 +488,7 @@ def build_job_specs() -> list[JobSpec]:
             cron_expr="18 5 * * *",
             minutes=(18,),
             hours=(5,),
-            timeout_s=480,
+            timeout_s=mm_cal_timeout_s,
             readonly=True,
             bootstrap_eligible=True,
             build_command=_mm_calibration_cmd,
@@ -500,6 +509,7 @@ def build_job_specs() -> list[JobSpec]:
             build_command=_settlement_study_cmd,
             is_enabled=_default_enabled,
             has_required_credentials=_default_enabled,
+            retries=0,
         ),
         JobSpec(
             name="testnet_attribution",
@@ -532,9 +542,31 @@ def build_job_specs() -> list[JobSpec]:
 
 def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp.json")
-    tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, default=str), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+
+
+def _parse_status_utc(raw: object) -> datetime | None:
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    s = raw.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%d %H:%M UTC"):
+        try:
+            return datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except ValueError:
+        return None
 
 
 def format_worker_alert_rich_html(
@@ -570,9 +602,10 @@ def format_worker_alert_rich_html(
 class WorkerScheduler:
     """UTC scheduler executing isolated subprocess ticks with non-overlapping per-job concurrency."""
 
-    DEFAULT_JOB_DEPENDENCIES: dict[str, tuple[str, float]] = {
+    DEFAULT_JOB_DEPENDENCIES: dict[str, tuple[str | tuple[str, ...], float]] = {
         "testnet_executor": ("metamodel_paper", 750.0),
         "hip3_paper": ("frontier_persistence", 510.0),
+        "autopilot_allocator": (("spot_perp_paper", "cross_dex_paper", "hip3_paper", "metamodel_paper"), 750.0),
     }
 
     def __init__(
@@ -583,14 +616,15 @@ class WorkerScheduler:
         jobs: list[JobSpec] | None = None,
         telegram_enabled: bool | None = None,
         runner: Callable[[list[str], dict[str, str], int], int] | None = None,
-        max_workers: int = 6,
+        max_workers: int = 8,
         readonly_retries: int = 1,
         readonly_retry_delay_s: float = 15.0,
         alert_cooldown_s: float = 3600.0,
         alert_sender: Callable[[str], Any] | None = None,
-        dependency_wait_s: dict[str, tuple[str, float]] | None = None,
+        dependency_wait_s: dict[str, Any] | None = None,
         dependency_poll_s: float = 0.25,
         startup_catchup_minutes: int | None = None,
+        single_job_mode: str | None = None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.data_dir = Path(
@@ -598,6 +632,7 @@ class WorkerScheduler:
         )
         self.paper_dir = self.data_dir / "paper"
         self.status_path = self.paper_dir / "hl_worker_status.json"
+        self.status_lock_path = self.paper_dir / "hl_worker_status.lock"
         self.jobs = jobs if jobs is not None else build_job_specs()
         self.max_workers = max(1, int(max_workers))
         self.readonly_retries = max(0, int(readonly_retries))
@@ -608,6 +643,7 @@ class WorkerScheduler:
             dict(dependency_wait_s) if dependency_wait_s is not None else dict(self.DEFAULT_JOB_DEPENDENCIES)
         )
         self._dependency_poll_s = max(0.01, float(dependency_poll_s))
+        self._single_job_mode = single_job_mode
         # On (re)start, run each job's latest slot from the last N minutes that it has not started
         # yet, so a deploy at e.g. :37 does not silently skip a 4-hourly paper/autopilot tick.
         self.startup_catchup_minutes = max(
@@ -620,7 +656,9 @@ class WorkerScheduler:
         )
         self._last_started_dt: dict[str, datetime] = {}
         self._last_failure_alert_mono: dict[str, float] = {}
+        self._last_failure_alert_dt: dict[str, datetime] = {}
         self._alerted_failed_jobs: set[str] = set()
+        self._queued_or_running: dict[str, int] = {}
         self._thread_local = threading.local()
         has_tg_token = bool(
             os.environ.get("TELEGRAM_SIGNAL_BOT_TOKEN", "").strip()
@@ -665,6 +703,10 @@ class WorkerScheduler:
             prev_rc = prev.get("last_exit_code")
             if not enabled:
                 restored_state = "disabled"
+            elif prev_state == "running":
+                # A job persisted as "running" was SIGKILLed / crashed before finishing its slot:
+                # restore as "interrupted" (never "ok") so startup catch-up re-runs read-only jobs.
+                restored_state = "interrupted"
             elif prev_state in {"ok", "failed", "interrupted"}:
                 restored_state = prev_state
             elif prev_rc == 0:
@@ -692,6 +734,10 @@ class WorkerScheduler:
             prior_alerted = bool(prev.get("alerted_failed")) or restored_state == "failed"
             if prior_alerted and enabled:
                 self._alerted_failed_jobs.add(job.name)
+            prev_alert_utc = prev.get("last_failure_alert_utc")
+            parsed_alert_dt = _parse_status_utc(prev_alert_utc)
+            if parsed_alert_dt is not None:
+                self._last_failure_alert_dt[job.name] = parsed_alert_dt
             self._state[job.name] = {
                 "name": job.name,
                 "description": job.description,
@@ -708,6 +754,7 @@ class WorkerScheduler:
                 "runs_ok": int(prev.get("runs_ok", 0)),
                 "runs_failed": int(prev.get("runs_failed", 0)),
                 "alerted_failed": job.name in self._alerted_failed_jobs,
+                "last_failure_alert_utc": prev_alert_utc if isinstance(prev_alert_utc, str) else None,
                 "next_run_utc": job.next_run_utc(now).strftime("%Y-%m-%d %H:%M UTC"),
             }
 
@@ -811,8 +858,29 @@ class WorkerScheduler:
                 err_file.close()
         return rc_final
 
-    def publish_status(self, now_utc: datetime | None = None) -> dict[str, Any]:
+    def _acquire_status_file_lock(self) -> int:
+        try:
+            import fcntl
+
+            self.status_lock_path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(self.status_lock_path, os.O_RDWR | os.O_CREAT, 0o644)
+        except (ImportError, OSError):
+            return -1
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            return fd
+        except OSError:
+            os.close(fd)
+            return -1
+
+    def publish_status(
+        self,
+        now_utc: datetime | None = None,
+        *,
+        only_job: str | None = None,
+    ) -> dict[str, Any]:
         now = now_utc or datetime.now(tz=timezone.utc)
+        target_only = only_job if only_job is not None else self._single_job_mode
         with self._status_lock:
             for job in self.jobs:
                 enabled, reason = job.is_enabled()
@@ -822,39 +890,152 @@ class WorkerScheduler:
                 if not enabled and entry["state"] != "running":
                     entry["state"] = "disabled"
                 entry["next_run_utc"] = job.next_run_utc(now).strftime("%Y-%m-%d %H:%M UTC")
-            payload = {
-                "service": "hl-worker",
-                "build_sha": os.environ.get("HL_BUILD_SHA", "dev"),
-                "started_at_utc": self.started_at_utc.strftime("%Y-%m-%d %H:%M UTC"),
-                "heartbeat_utc": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
-                "telegram_enabled": self.telegram_enabled,
-                "testnet_execution_enabled": _testnet_exec_enabled()[0],
-                "jobs": [dict(self._state[j.name]) for j in self.jobs],
-            }
-            _write_json_atomic(self.status_path, payload)
-            return payload
+
+            lock_fd = self._acquire_status_file_lock()
+            try:
+                disk_doc: dict[str, Any] | None = None
+                if self.status_path.is_file():
+                    try:
+                        parsed = json.loads(self.status_path.read_text(encoding="utf-8"))
+                        if isinstance(parsed, dict):
+                            disk_doc = parsed
+                    except Exception:
+                        disk_doc = None
+
+                if target_only and disk_doc is not None:
+                    # `--run-once` mode: merge ONLY `target_only`'s updated entry into the live status file
+                    # without clobbering the other 15 jobs' counters/states or the daemon's `heartbeat_utc`.
+                    disk_jobs_raw = disk_doc.get("jobs")
+                    disk_by_name = (
+                        {str(it["name"]): dict(it) for it in disk_jobs_raw if isinstance(it, dict) and it.get("name")}
+                        if isinstance(disk_jobs_raw, list)
+                        else {}
+                    )
+                    merged_jobs: list[dict[str, Any]] = []
+                    seen_names: set[str] = set()
+                    for j in self.jobs:
+                        seen_names.add(j.name)
+                        if j.name == target_only or j.name not in disk_by_name:
+                            merged_jobs.append(dict(self._state[j.name]))
+                        else:
+                            merged_jobs.append(disk_by_name[j.name])
+                    for extra_name, extra_entry in disk_by_name.items():
+                        if extra_name not in seen_names:
+                            merged_jobs.append(extra_entry)
+                    payload = {
+                        **disk_doc,
+                        "service": str(disk_doc.get("service") or "hl-worker"),
+                        "build_sha": str(disk_doc.get("build_sha") or os.environ.get("HL_BUILD_SHA", "dev")),
+                        "started_at_utc": str(
+                            disk_doc.get("started_at_utc") or self.started_at_utc.strftime("%Y-%m-%d %H:%M UTC")
+                        ),
+                        "heartbeat_utc": str(disk_doc.get("heartbeat_utc") or now.strftime("%Y-%m-%d %H:%M:%S UTC")),
+                        "jobs": merged_jobs,
+                    }
+                else:
+                    if disk_doc is not None and not target_only:
+                        # Absorb newer external `--run-once` completions for jobs not currently running in-process.
+                        disk_jobs_raw = disk_doc.get("jobs")
+                        if isinstance(disk_jobs_raw, list):
+                            for ditem in disk_jobs_raw:
+                                if not isinstance(ditem, dict) or not ditem.get("name"):
+                                    continue
+                                jn = str(ditem["name"])
+                                if jn not in self._state:
+                                    continue
+                                j_lock = self._job_locks.get(jn)
+                                if j_lock is not None and j_lock.locked():
+                                    continue
+                                mem_entry = self._state[jn]
+                                if mem_entry.get("state") == "running":
+                                    continue
+                                disk_total = int(ditem.get("runs_ok", 0)) + int(ditem.get("runs_failed", 0))
+                                mem_total = int(mem_entry.get("runs_ok", 0)) + int(mem_entry.get("runs_failed", 0))
+                                if disk_total > mem_total:
+                                    for k in (
+                                        "state",
+                                        "last_started_at_utc",
+                                        "last_finished_at_utc",
+                                        "last_exit_code",
+                                        "last_duration_s",
+                                        "last_error",
+                                        "runs_ok",
+                                        "runs_failed",
+                                        "alerted_failed",
+                                        "last_failure_alert_utc",
+                                    ):
+                                        if k in ditem:
+                                            mem_entry[k] = ditem[k]
+                    payload = {
+                        "service": "hl-worker",
+                        "build_sha": os.environ.get("HL_BUILD_SHA", "dev"),
+                        "started_at_utc": self.started_at_utc.strftime("%Y-%m-%d %H:%M UTC"),
+                        "heartbeat_utc": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                        "telegram_enabled": self.telegram_enabled,
+                        "testnet_execution_enabled": _testnet_exec_enabled()[0],
+                        "jobs": [dict(self._state[j.name]) for j in self.jobs],
+                    }
+                _write_json_atomic(self.status_path, payload)
+                return payload
+            finally:
+                self._release_process_lock(lock_fd)
+
+    def _mark_job_queued(self, job_name: str) -> None:
+        with self._status_lock:
+            self._queued_or_running[job_name] = self._queued_or_running.get(job_name, 0) + 1
+
+    def _unmark_job_queued(self, job_name: str) -> None:
+        with self._status_lock:
+            cur = self._queued_or_running.get(job_name, 0) - 1
+            if cur > 0:
+                self._queued_or_running[job_name] = cur
+            else:
+                self._queued_or_running.pop(job_name, None)
+
+    def _run_queued_job(self, job: JobSpec) -> int:
+        try:
+            return self.run_job(job)
+        finally:
+            self._unmark_job_queued(job.name)
 
     def _is_job_running(self, dep_name: str) -> bool:
         dep_lock = self._job_locks.get(dep_name)
         if dep_lock is not None and dep_lock.locked():
             return True
         with self._status_lock:
+            if self._queued_or_running.get(dep_name, 0) > 0:
+                return True
             return str((self._state.get(dep_name) or {}).get("state") or "") == "running"
 
     def _wait_for_dependency(self, job_name: str) -> None:
         dep = self._job_dependencies.get(job_name)
         if dep is None:
             return
-        dep_name, max_wait_s = dep
-        if max_wait_s <= 0 or not self._is_job_running(dep_name):
+        if (
+            isinstance(dep, tuple)
+            and len(dep) == 2
+            and isinstance(dep[1], (int, float))
+            and not isinstance(dep[1], bool)
+        ):
+            raw_names, max_wait_s = dep[0], float(dep[1])
+            dep_names = (raw_names,) if isinstance(raw_names, str) else tuple(str(x) for x in raw_names)
+        elif isinstance(dep, (tuple, list)):
+            dep_names = tuple(str(x) for x in dep)
+            max_wait_s = 750.0
+        else:
+            return
+        if max_wait_s <= 0 or not dep_names:
+            return
+        running = [d for d in dep_names if self._is_job_running(d)]
+        if not running:
             return
         print(
-            f"[hl-worker] {job_name} waiting up to {max_wait_s:.0f}s for upstream {dep_name} to finish...",
+            f"[hl-worker] {job_name} waiting up to {max_wait_s:.0f}s for upstream {', '.join(running)} to finish...",
             flush=True,
         )
         deadline = time.monotonic() + float(max_wait_s)
         while time.monotonic() < deadline and not self._stop_event.is_set():
-            if not self._is_job_running(dep_name):
+            if not any(self._is_job_running(d) for d in dep_names):
                 break
             self._stop_event.wait(timeout=min(self._dependency_poll_s, max(0.01, deadline - time.monotonic())))
 
@@ -902,7 +1083,8 @@ class WorkerScheduler:
             env["PYTHONUNBUFFERED"] = "1"
 
             print(f"[hl-worker] starting {job.name} ({job.cron_expr})", flush=True)
-            max_attempts = (1 + self.readonly_retries) if job.readonly else 1
+            job_retries = job.retries if job.retries is not None else (self.readonly_retries if job.readonly else 0)
+            max_attempts = 1 + max(0, int(job_retries))
             exit_code = 1
             attempts_used = 0
             last_err: str | None = None
@@ -912,6 +1094,8 @@ class WorkerScheduler:
                 exit_code = self._runner(cmd, env, job.timeout_s)
                 last_err = getattr(self._thread_local, "last_stderr", None)
                 if exit_code == 0 or attempt >= max_attempts or self._stop_event.is_set():
+                    break
+                if job.name == "settlement_study" and exit_code == 2:
                     break
                 print(
                     f"[hl-worker] readonly job {job.name} failed (rc={exit_code}); "
@@ -927,26 +1111,35 @@ class WorkerScheduler:
             # A child killed by our own shutdown (SIGTERM on deploy) did not fail: record it as
             # ``interrupted`` so HLWorkerJobFailed does not fire on every deploy.
             interrupted = exit_code != 0 and self._stop_event.is_set()
+            # Exit code 2 from `settlement_study` means degraded coin collection (<80%, e.g. HTTP 429)
+            # with prior `stats.parquet` preserved: surface WARNING `HLSettlementStudyDegraded`, not CRITICAL `HLWorkerJobFailed`.
+            degraded_retained = job.name == "settlement_study" and exit_code == 2 and not interrupted
+            healthy_finish = exit_code == 0 or degraded_retained
             with self._status_lock:
                 entry = self._state[job.name]
                 was_failed = prev_failed or (job.name in self._alerted_failed_jobs)
-                entry["state"] = "ok" if exit_code == 0 else ("interrupted" if interrupted else "failed")
+                entry["state"] = "ok" if healthy_finish else ("interrupted" if interrupted else "failed")
                 entry["last_finished_at_utc"] = end_utc_str
                 entry["last_exit_code"] = exit_code
                 entry["last_duration_s"] = duration
                 if exit_code == 0:
                     entry["last_error"] = None
+                elif degraded_retained:
+                    entry["last_error"] = "degraded_retained_prev"
                 elif interrupted:
                     entry["last_error"] = "interrupted_by_worker_shutdown"
                 else:
                     entry["last_error"] = last_err or f"exit_code={exit_code}"
-                if exit_code == 0:
+                if healthy_finish:
                     entry["runs_ok"] = int(entry["runs_ok"]) + 1
-                    entry["alerted_failed"] = False
+                    if not self.telegram_enabled:
+                        self._alerted_failed_jobs.discard(job.name)
+                        entry["alerted_failed"] = False
                 elif not interrupted:
                     entry["runs_failed"] = int(entry["runs_failed"]) + 1
-                    self._alerted_failed_jobs.add(job.name)
-                    entry["alerted_failed"] = True
+                    if not self.telegram_enabled:
+                        self._alerted_failed_jobs.add(job.name)
+                        entry["alerted_failed"] = True
                 else:
                     # Preserve prior failure memory across a shutdown interruption so the next ok run sends recovery.
                     if prev_failed:
@@ -954,16 +1147,18 @@ class WorkerScheduler:
                     entry["alerted_failed"] = job.name in self._alerted_failed_jobs
                 final_err = entry["last_error"]
             print(f"[hl-worker] finished {job.name} rc={exit_code} in {duration:.1f}s", flush=True)
+            if not interrupted:
+                self._maybe_send_job_alert(
+                    job=job,
+                    exit_code=0 if healthy_finish else exit_code,
+                    was_failed=was_failed,
+                    duration_s=duration,
+                    attempts=attempts_used,
+                    last_error=final_err,
+                    observed_at_utc=end_utc_str,
+                    now_utc=end_dt,
+                )
             self.publish_status(end_dt)
-            self._maybe_send_job_alert(
-                job=job,
-                exit_code=exit_code,
-                was_failed=was_failed,
-                duration_s=duration,
-                attempts=attempts_used,
-                last_error=final_err,
-                observed_at_utc=end_utc_str,
-            )
             return exit_code
         finally:
             self._release_process_lock(proc_lock_fd)
@@ -1004,13 +1199,15 @@ class WorkerScheduler:
         except OSError:
             pass
 
-    def _dispatch_alert_html(self, rich_html: str) -> None:
+    def _dispatch_alert_html(self, rich_html: str) -> bool:
         if self._alert_sender is not None:
             self._alert_sender(rich_html)
-            return
+            return True
         token, chat_id, thread_id = pt.load_telegram_credentials((self.root_dir / ".env",))
         if token and chat_id:
             pt.send_telegram_rich_message(rich_html, bot_token=token, chat_id=chat_id, thread_id=thread_id)
+            return True
+        return False
 
     def _maybe_send_job_alert(
         self,
@@ -1022,22 +1219,23 @@ class WorkerScheduler:
         attempts: int,
         last_error: str | None,
         observed_at_utc: str,
+        now_utc: datetime | None = None,
     ) -> None:
         if not self.telegram_enabled or self._stop_event.is_set():
             return
         now_mono = time.monotonic()
+        now_dt = now_utc or _parse_status_utc(observed_at_utc) or datetime.now(tz=timezone.utc)
         should_send = False
         recovered = False
         with self._status_lock:
             if exit_code != 0:
-                last_sent = self._last_failure_alert_mono.get(job.name)
-                if last_sent is None or (now_mono - last_sent) >= self.alert_cooldown_s:
-                    self._last_failure_alert_mono[job.name] = now_mono
-                    self._alerted_failed_jobs.add(job.name)
+                last_mono = self._last_failure_alert_mono.get(job.name)
+                last_dt = self._last_failure_alert_dt.get(job.name)
+                mono_ok = last_mono is None or (now_mono - last_mono) >= self.alert_cooldown_s
+                wall_ok = last_dt is None or (now_dt - last_dt).total_seconds() >= self.alert_cooldown_s
+                if mono_ok and wall_ok:
                     should_send = True
             elif was_failed:
-                self._alerted_failed_jobs.discard(job.name)
-                self._last_failure_alert_mono.pop(job.name, None)
                 should_send = True
                 recovered = True
         if not should_send:
@@ -1053,9 +1251,29 @@ class WorkerScheduler:
                 build_sha=os.environ.get("HL_BUILD_SHA", "dev"),
                 observed_at_utc=observed_at_utc,
             )
-            self._dispatch_alert_html(rich)
+            dispatched = self._dispatch_alert_html(rich)
         except Exception as exc:
             print(f"[hl-worker] failed to send Telegram alert for {job.name}: {exc}", file=sys.stderr, flush=True)
+            return
+        if not dispatched:
+            return
+        # Mutate alert state ONLY after _dispatch_alert_html succeeds so failed deliveries retry cleanly!
+        with self._status_lock:
+            entry = self._state.get(job.name)
+            if not recovered:
+                self._last_failure_alert_mono[job.name] = now_mono
+                self._last_failure_alert_dt[job.name] = now_dt
+                self._alerted_failed_jobs.add(job.name)
+                if entry is not None:
+                    entry["alerted_failed"] = True
+                    entry["last_failure_alert_utc"] = now_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+            else:
+                self._alerted_failed_jobs.discard(job.name)
+                self._last_failure_alert_mono.pop(job.name, None)
+                self._last_failure_alert_dt.pop(job.name, None)
+                if entry is not None:
+                    entry["alerted_failed"] = False
+                    entry["last_failure_alert_utc"] = None
 
     def _bootstrap_sentinel_for(self, job_name: str) -> Path | None:
         sentinels = {
@@ -1080,6 +1298,15 @@ class WorkerScheduler:
         """Return True when an existing read-only artifact is degraded or missing current schema fields."""
         try:
             if job_name == "settlement_study":
+                attempt_path = sentinel.parent / "last_attempt.json"
+                if attempt_path.is_file():
+                    attempt = json.loads(attempt_path.read_text(encoding="utf-8"))
+                    if not isinstance(attempt, dict) or bool(attempt.get("degraded")):
+                        return True
+                    req_a = int(attempt.get("coins_requested") or 0)
+                    col_a = int(attempt.get("coins_collected") or 0)
+                    if req_a > 0 and col_a < int(math.ceil(0.8 * req_a)):
+                        return True
                 meta_path = sentinel.parent / "meta.json"
                 if not meta_path.is_file():
                     return True
@@ -1218,11 +1445,21 @@ class WorkerScheduler:
             try:
                 while not self._stop_event.is_set():
                     now_utc = datetime.now(tz=timezone.utc)
-                    for job, _slot_key in self.collect_due_jobs(now_utc):
+                    due_pairs = self.collect_due_jobs(now_utc)
+                    due_jobs = [job for job, _slot_key in due_pairs]
+                    for job in due_jobs:
+                        self._mark_job_queued(job.name)
+                    for idx, job in enumerate(due_jobs):
                         if self._stop_event.is_set():
+                            for rem in due_jobs[idx:]:
+                                self._unmark_job_queued(rem.name)
                             break
-                        fut = pool.submit(self.run_job, job)
-                        futures.add(fut)
+                        try:
+                            fut = pool.submit(self._run_queued_job, job)
+                            futures.add(fut)
+                        except Exception:
+                            self._unmark_job_queued(job.name)
+                            raise
                     futures = {f for f in futures if not f.done()}
                     self.publish_status(now_utc)
                     self._stop_event.wait(timeout=poll_seconds)
@@ -1250,7 +1487,7 @@ def main(
     bootstrap_only: bool = typer.Option(False, "--bootstrap-only", help="Run read-only bootstrap jobs and exit"),
     no_bootstrap: bool = typer.Option(False, "--no-bootstrap", help="Skip fresh-volume bootstrap on startup"),
 ) -> None:
-    sched = WorkerScheduler(data_dir=data_dir)
+    sched = WorkerScheduler(data_dir=data_dir, single_job_mode=run_once)
     if list_jobs:
         for job in sched.jobs:
             enabled, reason = job.is_enabled()

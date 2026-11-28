@@ -182,10 +182,16 @@ def format_tear_sheet_markdown(d: dict[str, Any]) -> str:
         a = d["attribution"]
         fr = f"{float(a['real_alo_fill_rate_pct']):.1f}% ({a.get('audit_orders_filled', 0)}/{a.get('audit_orders_placed', 0)})" if a.get("real_alo_fill_rate_pct") is not None else "—"
         mk = f"{float(a['vw_markout_bps']):+.2f} б.п." if a.get("vw_markout_bps") is not None else "—"
+        maker_txt = (
+            f"Maker {float(a['maker_volume_share_pct']):.1f}%"
+            if a.get("maker_volume_share_pct") is not None
+            else "Maker —"
+        )
+        fee_txt = f"{float(a['effective_fee_bps']):.2f} б.п." if a.get("effective_fee_bps") is not None else "—"
         lines.append(
             f"| **Live Testnet ALO Execution & Attribution** | ✅ Cron 4h + Daily 09:00 UTC | "
             f"Баланс **${float(a.get('equity_usd') or 0):,.2f}**, сделок {int(a.get('total_fills') or 0)}, оборот ${float(a.get('total_volume_usd') or 0):,.1f}, "
-            f"**Maker {float(a.get('maker_volume_share_pct') if a.get('maker_volume_share_pct') is not None else 100):.1f}%**, fee **{float(a.get('effective_fee_bps') or 0):.2f} б.п.**, ALO Fill **{fr}**, Markout {mk}, Liq warnings: `{len(a.get('liq_warnings') or [])}` |"
+            f"**{maker_txt}**, fee **{fee_txt}**, ALO Fill **{fr}**, Markout {mk}, Liq warnings: `{len(a.get('liq_warnings') or [])}` |"
         )
 
     if d.get("paper"):
@@ -269,10 +275,16 @@ def format_tear_sheet_telegram_rich_html(d: dict[str, Any]) -> str:
     evm = d.get("hyperevm") or {}
     lat = d.get("latency_bench") or {}
     hlp = ((evm.get("vaults") or [{}])[0])
+    maker_tg = (
+        f"Maker {float(attr['maker_volume_share_pct']):.0f}%"
+        if attr.get("maker_volume_share_pct") is not None
+        else "Maker —"
+    )
+    fee_tg = f"{float(attr['effective_fee_bps']):.2f} б.п." if attr.get("effective_fee_bps") is not None else "—"
     rows = [
         '<tr><th align="left">Контур</th><th align="right">Подтверждённый статус</th></tr>',
         '<tr><td align="left">Метамодель (PR #16–#19)</td><td align="right"><b>5.0 б.п. BBO audit</b> · Ex-INIT −0.37% (Obs-Only)</td></tr>',
-        f'<tr><td align="left">Testnet ALO экзекутор</td><td align="right"><b>Maker {float(attr.get("maker_volume_share_pct") if attr.get("maker_volume_share_pct") is not None else 100):.0f}%</b> · {float(attr.get("effective_fee_bps") if attr.get("effective_fee_bps") is not None else 1.5):.2f} б.п. · ${float(attr.get("equity_usd") or 0):,.2f}</td></tr>',
+        f'<tr><td align="left">Testnet ALO экзекутор</td><td align="right"><b>{maker_tg}</b> · {fee_tg} · ${float(attr.get("equity_usd") or 0):,.2f}</td></tr>',
         f'<tr><td align="left">A–S MM v2 (bbo + Lead-Lag)</td><td align="right">p50 <b>{float(lat.get("p50_us") or 0):.1f} мкс</b> · {int(lat.get("throughput_ticks_per_sec") or 0):,} тик/с</td></tr>',
         f'<tr><td align="left">HyperEVM Chain 999 &amp; HLP</td><td align="right">HLP <b>${float(hlp.get("tvl_usd") or 0)/1e6:,.1f}M</b> ({float(hlp.get("apr_pct") or 0):+.1f}% APR) · L1Read OK</td></tr>',
     ]

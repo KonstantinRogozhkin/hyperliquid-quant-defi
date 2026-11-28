@@ -200,7 +200,7 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
     crit_rules = groups[0]["rules"]
     warn_rules = groups[1]["rules"]
     assert len(crit_rules) == 11
-    assert len(warn_rules) == 11
+    assert len(warn_rules) == 12
     for grp in groups:
         for rule in grp["rules"]:
             assert rule.get("alert") and rule.get("expr")
@@ -209,13 +209,14 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
 
     graf = yaml.safe_load(GRAFANA_ALERTS_PATH.read_text(encoding="utf-8"))
     assert len(graf["groups"][0]["rules"]) == 11
-    assert len(graf["groups"][1]["rules"]) == 11
+    assert len(graf["groups"][1]["rules"]) == 12
     g_rules = [r for grp in graf["groups"] for r in grp["rules"]]
     uids = [r["uid"] for r in g_rules]
     assert len(uids) == len(set(uids)), "Grafana alert rule uids must be unique"
     for required in (
         "hl-crit-testnet-drawdown",
         "hl-warn-artifact-stale",
+        "hl-warn-daily-artifact-stale",
         "hl-warn-settlement-degraded",
         "hl-warn-alo-fill-low",
         "hl-warn-testnet-orphans",
@@ -229,6 +230,7 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
     prom_names = {r["alert"] for grp in groups for r in grp["rules"]}
     for required in (
         "HLTestnetDrawdownNearKillSwitch",
+        "HLDailyArtifactStale",
         "HLTestnetOrphanPositions",
         "HLTestnetCoinMarkOracleDislocation",
         "HLTestnetRiskProbeStale",

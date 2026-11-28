@@ -30,24 +30,29 @@ def test_hyperevm_delta_neutral_yield_stack_math_and_reporting():
     strats = hys.build_hyperevm_yield_strategies(inp, perp_leverage=2.0, loop_ltv=0.50, assumed_stable_borrow_apr_pct=3.5)
     by_name = {s.name: s for s in strats}
 
-    # Check fixed-rate Boros delta-neutral math: (1.88 + 8.94) * (2/3) = 7.21% net on total deposit
-    fix = next(s for s in strats if s.name.startswith("kHYPE + Short HYPE + Boros Fix"))
-    assert fix.gross_stacked_apr_pct == pytest.approx(10.82)
-    assert fix.capital_efficiency_pct == pytest.approx(66.7, abs=0.1)
-    assert fix.net_deposit_apr_pct == pytest.approx(7.21, abs=0.05)
+    assert hys._perp_liq_buffer_pct(2.0, 0.05) == pytest.approx(42.9, abs=0.1)
 
-    # Composable loop: borrow cost is floored by the live stable supply APY / utilization
-    # (5.20 / 0.80 = 6.50% > the 3.5% assumption): 1.88 + 8.94 - 0.50 * 6.50 = 7.57% net.
+    # Check fixed-rate Boros delta-neutral math with 10% Boros margin share + 10 bps amortized fee drag:
+    # fee_apr = 0.10 * (365 / 28.2) = 1.294%; gross = 1.88 + (8.94 - 1.294) = 9.53%; cap_eff = 1 / 1.6 = 62.5%; net = 5.95%
+    fix = next(s for s in strats if s.name.startswith("kHYPE + Short HYPE + Boros Fix"))
+    assert fix.gross_stacked_apr_pct == pytest.approx(9.53, abs=0.05)
+    assert fix.capital_efficiency_pct == pytest.approx(62.5, abs=0.1)
+    assert fix.net_deposit_apr_pct == pytest.approx(5.95, abs=0.05)
+    assert fix.liq_buffer_pct == pytest.approx(42.9, abs=0.1)
+
+    # Composable loop keeps superior floating carry (10.95% > 8.94% Boros) and floors borrow cost by
+    # live stable supply APY / utilization (5.20 / 0.80 = 6.50% > 3.5%): 1.88 + 10.95 - 0.50 * 6.50 = 9.58% net.
     loop = next(s for s in strats if s.name.startswith("Composable Loop:"))
+    assert loop.rate_type == "Floating"
     assert loop.capital_efficiency_pct == pytest.approx(100.0)
-    assert loop.net_deposit_apr_pct == pytest.approx(7.57, abs=0.05)
-    # With no live supply rate the explicit assumption still applies.
+    assert loop.net_deposit_apr_pct == pytest.approx(9.58, abs=0.05)
+    # With no live supply rate the explicit assumption still applies: 1.88 + 10.95 - 0.50 * 3.50 = 11.08%.
     no_supply = hys.build_hyperevm_yield_strategies(
         dataclasses.replace(inp, morpho_feusd_apy_pct=0.0),
         perp_leverage=2.0, loop_ltv=0.50, assumed_stable_borrow_apr_pct=3.5,
     )
     loop0 = next(s for s in no_supply if s.name.startswith("Composable Loop:"))
-    assert loop0.net_deposit_apr_pct == pytest.approx(9.07, abs=0.05)
+    assert loop0.net_deposit_apr_pct == pytest.approx(11.08, abs=0.05)
 
     assert "Benchmark: HLP Vault (Hyperliquidity Provider)" in by_name
     snap = hys.HyperEvmYieldSnapshot(inputs=inp, strategies=strats)

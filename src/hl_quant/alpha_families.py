@@ -100,16 +100,22 @@ def build_wide_market(bundle: pd.DataFrame) -> WideMarket:
             return pd.DataFrame(np.nan, index=hours, columns=coins)
         return bundle.pivot(index="hour_ms", columns="coin", values=col).reindex(index=hours, columns=coins).astype(float)
 
-    hl_close = piv("hl_close")
-    by_close = piv("bybit_close")
-    bn_close = piv("binance_close")
-    okx_close = piv("okx_close")
+    hl_close = piv("hl_close").replace(0.0, np.nan)
+    by_close = piv("bybit_close").replace(0.0, np.nan)
+    bn_close = piv("binance_close").replace(0.0, np.nan)
+    okx_close = piv("okx_close").replace(0.0, np.nan)
+
+    # Forward-fill short 1-2h candle gaps before computing close-to-close returns so resumption moves are not deleted.
+    hl_close_ff = hl_close.ffill(limit=2)
+    by_close_ff = by_close.ffill(limit=2)
+    bn_close_ff = bn_close.ffill(limit=2)
+    okx_close_ff = okx_close.ffill(limit=2)
 
     # Close of bar opening at h_t is price at h_{t+1}; return over (h_t, h_{t+1}] is close_t / close_{t-1} - 1.
-    hl_ret_next = (hl_close / hl_close.shift(1) - 1.0).fillna(0.0)
-    by_ret_next = (by_close / by_close.shift(1) - 1.0).fillna(0.0)
-    bn_ret_next = (bn_close / bn_close.shift(1) - 1.0).fillna(0.0)
-    okx_ret_next = (okx_close / okx_close.shift(1) - 1.0).fillna(0.0)
+    hl_ret_next = (hl_close_ff / hl_close_ff.shift(1) - 1.0).fillna(0.0)
+    by_ret_next = (by_close_ff / by_close_ff.shift(1) - 1.0).fillna(0.0)
+    bn_ret_next = (bn_close_ff / bn_close_ff.shift(1) - 1.0).fillna(0.0)
+    okx_ret_next = (okx_close_ff / okx_close_ff.shift(1) - 1.0).fillna(0.0)
 
     return WideMarket(
         hours=hours,
@@ -286,9 +292,23 @@ def series_metrics(ret: pd.Series, sim_df: pd.DataFrame | None = None) -> dict[s
     r = ret.to_numpy(dtype=float)
     n = len(r)
     if n == 0:
-        return {"hours": 0, "apr": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
+        out_empty: dict[str, float] = {
+            "hours": 0,
+            "total_return": 0.0,
+            "apr": 0.0,
+            "vol_annual": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+        }
+        if sim_df is not None:
+            out_empty.update(
+                {"avg_gross": 0.0, "total_turnover": 0.0, "funding_pnl": 0.0, "price_or_basis_pnl": 0.0, "cost_pnl": 0.0}
+            )
+        return out_empty
     eq = np.cumsum(r)
-    dd = eq - np.maximum.accumulate(np.concatenate([[0.0], eq]))[1:]
+    wealth = np.cumprod(np.maximum(1.0 + r, 1e-6))
+    peak = np.maximum.accumulate(np.concatenate([[1.0], wealth]))[1:]
+    dd = wealth / peak - 1.0
     std = float(r.std(ddof=1)) if n > 1 else 0.0
     out = {
         "hours": int(n),
@@ -387,16 +407,23 @@ def build_funding_carry_weights(market: WideMarket, params: dict[str, Any]) -> t
     mode = str(params.get("mode", "bybit"))  # "bybit" or "best_cex"
     min_basis_z = params.get("min_basis_z")
 
-    mask = causal_liquid_mask(market, min_daily_vol_usd=min_vol, require_bybit=True)
+    mask = causal_liquid_mask(market, min_daily_vol_usd=min_vol, require_bybit=(mode == "bybit"))
     by_spread = (market.hl_rate_h - market.bybit_rate_h).shift(1).rolling(lb, min_periods=lb).mean() * HOURS_PER_YEAR
     venue_choice: pd.DataFrame | None = None
 
     if mode == "best_cex":
+        by_ok = causal_liquid_mask(market, min_daily_vol_usd=min_vol, require_bybit=True)
         bn_spread = (market.hl_rate_h - market.binance_rate_h).shift(1).rolling(lb, min_periods=lb).mean() * HOURS_PER_YEAR
         okx_spread = (market.hl_rate_h - market.okx_rate_h).shift(1).rolling(lb, min_periods=lb).mean() * HOURS_PER_YEAR
         hl_px = market.hl_close.shift(1)
         bn_px = market.binance_close.ffill(limit=2).shift(1)
-        okx_px = market.okx_close.ffill(limit=2).shift(1)
+        okx_px = market.okx_close.ffill(limit=2).shift(1).copy()
+        k_cols = [c for c in okx_px.columns if len(c) > 1 and c.startswith("k") and c[1].isupper()]
+        if k_cols:
+            okx_k = okx_px[k_cols]
+            ratio_k = hl_px[k_cols] / okx_k.replace(0.0, np.nan)
+            unscaled_k = (ratio_k >= 900.0) & (ratio_k <= 1100.0)
+            okx_px[k_cols] = okx_k.where(~unscaled_k, okx_k * 1000.0)
         bn_parity = np.log((hl_px / bn_px).clip(lower=1e-9)).abs() <= 0.10
         okx_parity = np.log((hl_px / okx_px).clip(lower=1e-9)).abs() <= 0.10
         bn_ok = bn_px.notna() & bn_spread.notna() & bn_parity
@@ -412,7 +439,7 @@ def build_funding_carry_weights(market: WideMarket, params: dict[str, Any]) -> t
             okx_daily = okx_daily.fillna(market.okx_notional.shift(1).expanding(min_periods=1).mean() * 24.0)
             okx_ok = okx_ok & (okx_daily >= min_vol)
 
-        score = by_spread.copy()
+        score = by_spread.where(by_ok)
         choice = pd.DataFrame("bybit", index=by_spread.index, columns=by_spread.columns, dtype=object)
 
         use_bn = bn_ok & (bn_spread.abs() > score.abs().fillna(-1.0))
@@ -588,8 +615,8 @@ def build_xs_price_weights(market: WideMarket, params: dict[str, Any]) -> pd.Dat
     score = sign * (past_ret / (vol * math.sqrt(lb)))
 
     if blend_funding != 0.0:
-        f_rank = (-market.hl_rate_h.shift(1).rolling(24, min_periods=12).mean()).rank(axis=1, pct=True)
-        p_rank = score.rank(axis=1, pct=True)
+        f_rank = (-market.hl_rate_h.shift(1).rolling(24, min_periods=12).mean()).where(mask).rank(axis=1, pct=True)
+        p_rank = score.where(mask).rank(axis=1, pct=True)
         score = (1.0 - abs(blend_funding)) * p_rank + blend_funding * f_rank
 
     ema_alpha = float(params.get("ema_alpha", 1.0))
@@ -617,7 +644,7 @@ def build_xs_velocity_divergence_weights(market: WideMarket, params: dict[str, A
         v_fast = market.hl_notional.shift(1).rolling(12, min_periods=6).mean()
         v_slow = market.hl_notional.shift(1).rolling(168, min_periods=48).mean().replace(0.0, np.nan)
         v_ratio = np.log((v_fast / v_slow).clip(lower=1e-3))
-        f24 = market.hl_rate_h.shift(1).rolling(24, min_periods=12).mean()
+        f24 = market.hl_rate_h.shift(1).rolling(24, min_periods=12).mean().where(mask)
         score = sign * (f24.rank(axis=1, pct=True) - 0.5) * v_ratio.clip(lower=0.0)
     else:
         raise ValueError(f"unknown variant {variant!r}")
@@ -628,8 +655,18 @@ def build_xs_velocity_divergence_weights(market: WideMarket, params: dict[str, A
 # --------------------------------------------------------------------------- Family 6: Walk-Forward ML Ranker
 
 
-def build_ml_feature_panel(market: WideMarket) -> dict[str, pd.DataFrame]:
+def build_ml_feature_panel(
+    market: WideMarket,
+    *,
+    min_vol_usd: float = 2_000_000.0,
+    liquid_mask: pd.DataFrame | None = None,
+) -> dict[str, pd.DataFrame]:
     """Build strictly causal ``(T x N)`` feature matrices (all inputs ``shift(1)``)."""
+    mask = (
+        liquid_mask
+        if liquid_mask is not None
+        else causal_liquid_mask(market, min_daily_vol_usd=min_vol_usd, require_bybit=False)
+    )
     px = market.hl_close.shift(1)
     r1 = px.pct_change(fill_method=None)
     vol24 = r1.rolling(24, min_periods=12).std().replace(0.0, np.nan)
@@ -657,8 +694,8 @@ def build_ml_feature_panel(market: WideMarket) -> dict[str, pd.DataFrame]:
         "basis_z72": b_z,
         "notional_ratio": np.log((v_fast / v_slow).clip(lower=1e-3)),
     }
-    # Cross-sectional rank-normalize each feature to [-0.5, +0.5] per hour (robust to crypto outliers!)
-    return {k: df.rank(axis=1, pct=True) - 0.5 for k, df in raw_feats.items()}
+    # Mask illiquid coins before cross-sectional rank normalization to [-0.5, +0.5] per hour.
+    return {k: df.where(mask).rank(axis=1, pct=True) - 0.5 for k, df in raw_feats.items()}
 
 
 def build_ml_walkforward_weights(
@@ -676,9 +713,13 @@ def build_ml_walkforward_weights(
     min_vol = float(params.get("min_vol_usd", 2_000_000.0))
     alpha = float(params.get("alpha", 100.0))
 
-    feats = feature_cache if feature_cache is not None else build_ml_feature_panel(market)
-    feat_names = sorted(feats.keys())
     mask = causal_liquid_mask(market, min_daily_vol_usd=min_vol, require_bybit=False)
+    feats = (
+        feature_cache
+        if feature_cache is not None
+        else build_ml_feature_panel(market, min_vol_usd=min_vol, liquid_mask=mask)
+    )
+    feat_names = sorted(feats.keys())
     vol = market.hl_close.pct_change(fill_method=None).shift(1).rolling(72, min_periods=24).std().replace(0.0, np.nan)
 
     # Forward total return (price + funding) over (h_t, h_{t+horizon_h}]
@@ -688,8 +729,9 @@ def build_ml_walkforward_weights(
     fwd_px = np.log(market.hl_close.shift(-(horizon_h - 1)) / market.hl_close.shift(1))
     fwd_fund = -market.hl_fund_next.rolling(horizon_h).sum().shift(-(horizon_h - 1))
     fwd_total = fwd_px + fwd_fund
-    # Cross-sectional demeaned target
-    target_df = fwd_total.sub(fwd_total.mean(axis=1), axis=0)
+    # Cross-sectional demeaned target strictly across liquid universe
+    fwd_liquid = fwd_total.where(mask)
+    target_df = fwd_liquid.sub(fwd_liquid.mean(axis=1), axis=0)
 
     # Stack feature cube (T, N, F)
     cube = np.stack([feats[k].to_numpy(dtype=float) for k in feat_names], axis=-1)

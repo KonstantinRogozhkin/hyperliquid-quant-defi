@@ -433,7 +433,7 @@ def test_dashboard_and_tear_sheet_tolerate_null_fields() -> None:
     html_out = dash.render_portfolio_dashboard_html(payload)
     assert "nan,nan" not in html_out.lower()
     tg_out = ts.format_tear_sheet_telegram_rich_html(payload)
-    assert "Maker 100%" in tg_out
+    assert "Maker —" in tg_out
     md_out = ts.format_tear_sheet_markdown(payload)
     assert "κ=0.000" in md_out
 

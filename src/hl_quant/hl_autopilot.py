@@ -315,22 +315,23 @@ def compute_crisis_cta_weights(
 
     # Apply CTA deadband vs previous weights to suppress micro-churn
     final_w: dict[str, float] = {}
+    unchanged_coins: set[str] = set()
     turnover = 0.0
     for coin, tw in target_w.items():
         pw = float(prev.get(coin, 0.0))
         opens_flat = abs(pw) < 1e-9 and abs(tw) >= cfg.cta_min_open_weight
         flips_sign = pw * tw < 0.0
         if abs(tw - pw) < cfg.cta_weight_deadband and not opens_flat and not flips_sign:
-            fw = pw
+            final_w[coin] = pw
+            unchanged_coins.add(coin)
         else:
-            fw = tw
-        fw = round(fw, 4)
-        final_w[coin] = fw
+            final_w[coin] = round(tw, 4)
 
     for coin in held_missing:
-        pw = round(float(prev[coin]), 4)
+        pw = float(prev[coin])
         final_w[coin] = pw
-        target_w[coin] = pw
+        unchanged_coins.add(coin)
+        target_w[coin] = round(pw, 4)
         asset_details[coin] = {
             "coin": coin,
             "last_close": 0.0,
@@ -343,17 +344,21 @@ def compute_crisis_cta_weights(
     if gross_db > cfg.cta_max_leverage + 1e-9:
         f = cfg.cta_max_leverage / gross_db
         final_w = {c: round(w * f, 4) for c, w in final_w.items()}
+        unchanged_coins.clear()
 
     for coin, fw in final_w.items():
         pw = float(prev.get(coin, 0.0))
-        turnover += abs(fw - pw)
-        asset_details[coin]["weight"] = fw
+        if coin not in unchanged_coins:
+            turnover += abs(fw - pw)
+        asset_details[coin]["weight"] = round(fw, 4)
         asset_details[coin]["target_weight"] = round(target_w[coin], 4)
 
-    gross_final = round(sum(abs(w) for w in final_w.values()), 4)
-    net_final = round(sum(final_w.values()), 4)
+    out_weights = {c: (pw if c in unchanged_coins else fw) for c, fw in final_w.items() for pw in [float(prev.get(c, 0.0))]}
+    gross_final = round(sum(abs(w) for w in out_weights.values()), 4)
+    net_final = round(sum(out_weights.values()), 4)
     return {
-        "weights": final_w,
+        "weights": {c: round(w, 6) if c in unchanged_coins else w for c, w in out_weights.items()},
+        "unchanged_coins": sorted(unchanged_coins),
         "gross_leverage": gross_final,
         "net_exposure": net_final,
         "turnover": round(turnover, 4),
@@ -439,7 +444,15 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
     if cd_st:
         cd_pos = cd_st.get("positions") or {}
         cd_eq = max(_f(cd_st.get("equity_usd"), 100_000.0), 1.0)
-        cd_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in cd_pos.values() if isinstance(p, dict))
+        cd_gross = sum(
+            (
+                max(0.0, _f(p.get("hl_notional_usd"))) + max(0.0, _f(p.get("other_notional_usd")))
+                if p.get("hl_notional_usd") is not None and p.get("other_notional_usd") is not None
+                else 2.0 * max(0.0, _f(p.get("leg_notional_usd")))
+            )
+            for p in cd_pos.values()
+            if isinstance(p, dict)
+        )
         cd_locked = sum(
             _f(p.get("margin_locked_usd"))
             if p.get("margin_locked_usd") is not None
@@ -465,7 +478,15 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
     if h3_st:
         h3_pos = h3_st.get("positions") or {}
         h3_eq = max(_f(h3_st.get("equity_usd"), 50_000.0), 1.0)
-        h3_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in h3_pos.values() if isinstance(p, dict))
+        h3_gross = sum(
+            (
+                max(0.0, _f(p.get("short_notional_usd"))) + max(0.0, _f(p.get("long_notional_usd")))
+                if p.get("short_notional_usd") is not None and p.get("long_notional_usd") is not None
+                else 2.0 * max(0.0, _f(p.get("leg_notional_usd")))
+            )
+            for p in h3_pos.values()
+            if isinstance(p, dict)
+        )
         h3_locked = sum(_f(p.get("margin_locked_usd")) for p in h3_pos.values() if isinstance(p, dict))
         out["hip3_paper"] = {
             "active": True,
@@ -535,10 +556,12 @@ def _sleeve_sharpe_and_vol(
         return 0.0, 0.05
     arr = np.asarray(rets, dtype=float)
     if dt_hours is not None and len(dt_hours) == len(rets):
-        dts = np.asarray(dt_hours, dtype=float)
+        dts = np.maximum(np.asarray(dt_hours, dtype=float), 1e-6)
         hours_per_year = 8760.0
-        vol = float(np.std(arr / np.sqrt(dts), ddof=1)) * math.sqrt(hours_per_year)
-        mean = float(arr.sum() / dts.sum()) * hours_per_year
+        mean_h = float(arr.sum() / dts.sum())
+        resid = (arr - mean_h * dts) / np.sqrt(dts)
+        vol = float(np.std(resid, ddof=1)) * math.sqrt(hours_per_year)
+        mean = mean_h * hours_per_year
         if vol <= 1e-8:
             return 0.0, 0.05
         return mean / vol, max(vol, 0.01)
@@ -717,7 +740,14 @@ def run_autopilot_tick(
 
     state = _load_or_init_autopilot_state(state_path, cfg)
     last_ms = int(state.get("last_tick_ms", 0) or 0)
+    last_clamped_ms = int(state.get("last_clamped_ms", 0) or 0)
     if last_ms > 0 and cfg.min_tick_spacing_min > 0 and 0 <= ts_ms - last_ms < cfg.min_tick_spacing_min * 60_000:
+        return {"state": state, "status": "duplicate_tick_skipped"}
+    if (
+        bool(state.get("nav_guard_pending_ms"))
+        and last_clamped_ms > 0
+        and (ts_ms // 3_600_000) <= (last_clamped_ms // 3_600_000)
+    ):
         return {"state": state, "status": "duplicate_tick_skipped"}
     sleeves = collect_desk_sleeve_metrics(data_root, default_hlp_apr_pct=cfg.default_hlp_apr_pct)
 
@@ -762,10 +792,11 @@ def run_autopilot_tick(
             http_client.close()
 
     prev_ms = int(state.get("last_tick_ms", 0))
+    prior_deferred_hours = max(0.0, _f(state.get("nav_guard_deferred_hours")))
     dt_hours = max(0.0, min(cfg.max_accrual_hours, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
-    # Time-based accruals (HLP reserve yield, CTA perp carry) skipped by a NAV-guard clamp are
-    # carried forward and applied on the next accepted tick instead of being lost.
-    accrual_hours = min(cfg.max_accrual_hours, dt_hours + max(0.0, _f(state.get("nav_guard_deferred_hours"))))
+    # Time-based accruals (HLP reserve yield, CTA perp carry, mgmt fee) skipped by a NAV-guard clamp
+    # are carried forward and applied on the next accepted tick instead of being lost.
+    accrual_hours = min(cfg.max_accrual_hours, dt_hours + prior_deferred_hours)
     prev_gross = float(state.get("gross_equity_usd", cfg.starting_capital_usd))
     prev_net = float(state.get("net_equity_usd", cfg.starting_capital_usd))
     start_cap = float(state.get("starting_capital_usd", cfg.starting_capital_usd))
@@ -774,6 +805,11 @@ def run_autopilot_tick(
     cta_state = dict(state.get("cta_state") or {})
     prev_cta_w: dict[str, float] = dict(cta_state.get("weights") or {})
     prev_cta_px: dict[str, float] = dict(cta_state.get("last_closes") or {})
+    raw_prev_qty = cta_state.get("positions_qty")
+    prev_cta_qty: dict[str, float] = (
+        {str(k): _f(v) for k, v in raw_prev_qty.items()} if isinstance(raw_prev_qty, dict) else {}
+    )
+    cta_alloc_prev = max(0.0, _f((state.get("sleeve_allocations_usd") or {}).get("crisis_cta")))
 
     # Mark with the live mid; if it is unavailable this tick, hold the previous mark (zero return)
     # instead of falling back to a daily close that differs from the live mark the last tick used
@@ -788,22 +824,51 @@ def run_autopilot_tick(
         for c, vals in closes_map.items()
         if vals
     }
-    for coin, w in prev_cta_w.items():
-        if abs(float(w)) > 1e-9 and coin not in cta_mark_map and _f(live_marks.get(coin)) > 0:
-            cta_mark_map[coin] = float(live_marks[coin])
+    for coin in set(prev_cta_w) | set(prev_cta_qty):
+        if coin not in cta_mark_map:
+            px_live = _f(live_marks.get(coin)) or _f(prev_cta_px.get(coin))
+            if px_live > 0:
+                cta_mark_map[coin] = float(px_live)
 
     cta_tick_ret = 0.0
-    if prev_cta_w and prev_ms > 0:
-        for coin, w in prev_cta_w.items():
-            p1 = cta_mark_map.get(coin, 0.0)
+    cta_px_pnl_usd = 0.0
+    eff_prev_cta_qty: dict[str, float] = {}
+    drifted_cta_w: dict[str, float] = {}
+    if prev_ms > 0 and (prev_cta_w or prev_cta_qty):
+        for coin in sorted(set(prev_cta_w) | set(prev_cta_qty)):
             p0 = _f(prev_cta_px.get(coin))
-            if p1 > 0 and p0 > 0:
-                cta_tick_ret += w * ((p1 - p0) / p0)
+            p1 = _f(cta_mark_map.get(coin)) or p0
+            if coin in prev_cta_qty:
+                q_c = prev_cta_qty[coin]
+            elif cta_alloc_prev > 0 and p0 > 0:
+                q_c = (cta_alloc_prev * _f(prev_cta_w.get(coin))) / p0
+            else:
+                q_c = 0.0
+            eff_prev_cta_qty[coin] = q_c
+            if cta_alloc_prev > 0 and p1 > 0 and p0 > 0:
+                cta_px_pnl_usd += q_c * (p1 - p0)
+        if cta_alloc_prev > 0:
+            cta_tick_ret = cta_px_pnl_usd / cta_alloc_prev
+            cta_mtm_val = max(cta_alloc_prev + cta_px_pnl_usd, 1e-9)
+            for coin, q_c in eff_prev_cta_qty.items():
+                p1 = _f(cta_mark_map.get(coin)) or _f(prev_cta_px.get(coin))
+                if abs(q_c) > 1e-12 and p1 > 0:
+                    drifted_cta_w[coin] = (q_c * p1) / cta_mtm_val
+        else:
+            for coin, w in prev_cta_w.items():
+                p1 = cta_mark_map.get(coin, 0.0)
+                p0 = _f(prev_cta_px.get(coin))
+                if p1 > 0 and p0 > 0:
+                    cta_tick_ret += float(w) * ((p1 - p0) / p0)
 
-    cta_snap = compute_crisis_cta_weights(closes_map, prev_weights=prev_cta_w, cfg=cfg)
+    cta_prev_ref = drifted_cta_w if (prev_ms > 0 and drifted_cta_w) else prev_cta_w
+    cta_snap = compute_crisis_cta_weights(closes_map, prev_weights=cta_prev_ref, cfg=cfg)
     cta_turnover_cost_ret = cta_snap["turnover"] * (cfg.cta_turnover_cost_bps / 1e4)
-    # Perp carry on the exposure held over the elapsed interval (previous weights)
-    prev_cta_gross = sum(abs(float(w)) for w in prev_cta_w.values())
+    # Perp carry on the exposure held over the elapsed interval
+    if eff_prev_cta_qty and cta_alloc_prev > 0:
+        prev_cta_gross = sum(abs(q * _f(prev_cta_px.get(c))) for c, q in eff_prev_cta_qty.items()) / cta_alloc_prev
+    else:
+        prev_cta_gross = sum(abs(float(w)) for w in prev_cta_w.values())
     cta_funding_ret = prev_cta_gross * (cfg.cta_funding_cost_apr_pct / 100.0 / HOURS_PER_YEAR) * accrual_hours
     cta_cost_ret = cta_turnover_cost_ret + cta_funding_ret
     cta_net_ret = cta_tick_ret - cta_cost_ret
@@ -880,24 +945,43 @@ def run_autopilot_tick(
         # credits the full move; without confirmation a genuine jump froze NAV and rebalancing forever.
         pending_raw = state.get("nav_guard_pending_ms")
         nav_guard_pending: int | None = int(pending_raw) if pending_raw else None
-        jump_exceeded = prev_gross > 0 and abs(raw_pnl_total) / prev_gross * 100.0 > cfg.max_tick_nav_jump_pct
+        pending_ret_raw = state.get("nav_guard_pending_ret_pct")
+        nav_guard_pending_ret: float | None = float(pending_ret_raw) if pending_ret_raw is not None else None
+        raw_ret_pct = (raw_pnl_total / prev_gross * 100.0) if prev_gross > 0 else 0.0
+        jump_exceeded = prev_gross > 0 and abs(raw_ret_pct) > cfg.max_tick_nav_jump_pct
         if jump_exceeded and nav_guard_pending is not None and ts_ms - nav_guard_pending >= NAV_GUARD_CONFIRM_MS:
-            nav_guard_reason = (
-                f"Master NAV jump {raw_pnl_total / prev_gross * 100.0:+.2f}% persisted since the clamped tick; "
-                "accepted as genuine"
+            confirmed = nav_guard_pending_ret is None or (
+                (raw_ret_pct * nav_guard_pending_ret) > 0.0
+                and abs(raw_ret_pct - nav_guard_pending_ret)
+                <= max(cfg.max_tick_nav_jump_pct, 0.5 * abs(nav_guard_pending_ret))
             )
-            jump_exceeded = False
-            nav_guard_pending = None
+            if confirmed:
+                nav_guard_reason = (
+                    f"Master NAV jump {raw_ret_pct:+.2f}% persisted since the clamped tick; "
+                    "accepted as genuine"
+                )
+                jump_exceeded = False
+                nav_guard_pending = None
+                nav_guard_pending_ret = None
+            else:
+                nav_guard_pending = ts_ms
+                nav_guard_pending_ret = round(raw_ret_pct, 6)
         elif not jump_exceeded:
             nav_guard_pending = None
-        state["nav_guard_pending_ms"] = (
-            (nav_guard_pending if nav_guard_pending is not None else ts_ms) if jump_exceeded else None
-        )
+            nav_guard_pending_ret = None
+        if jump_exceeded:
+            if nav_guard_pending is None:
+                nav_guard_pending = ts_ms
+            if nav_guard_pending_ret is None:
+                nav_guard_pending_ret = round(raw_ret_pct, 6)
+        state["nav_guard_pending_ms"] = nav_guard_pending if jump_exceeded else None
+        state["nav_guard_pending_ret_pct"] = nav_guard_pending_ret if jump_exceeded else None
+        state["last_clamped_ms"] = ts_ms if jump_exceeded else 0
         state["nav_guard_deferred_hours"] = round(accrual_hours, 6) if jump_exceeded else 0.0
         if jump_exceeded:
             nav_guard_triggered = True
             nav_guard_reason = (
-                f"Master NAV jump {raw_pnl_total / prev_gross * 100.0:+.2f}% exceeded "
+                f"Master NAV jump {raw_ret_pct:+.2f}% exceeded "
                 f"+/-{cfg.max_tick_nav_jump_pct:.1f}% guard; skipping MTM & rebalance"
             )
             state["nav_guard_triggers"] = int(state.get("nav_guard_triggers", 0)) + 1
@@ -905,7 +989,6 @@ def run_autopilot_tick(
         else:
             alloc_usd = provisional_alloc
             last_eq_map = provisional_last_eq_map
-            cta_alloc_prev = float(state.get("sleeve_allocations_usd", {}).get("crisis_cta", 0.0))
             cta_state["cum_pnl_usd"] = round(float(cta_state.get("cum_pnl_usd", 0.0)) + cta_alloc_prev * cta_tick_ret, 4)
             cta_state["cum_cost_usd"] = round(float(cta_state.get("cum_cost_usd", 0.0)) + cta_alloc_prev * cta_cost_ret, 4)
 
@@ -976,32 +1059,96 @@ def run_autopilot_tick(
     # 4. Gross vs Net-of-Fee HWM Share Price Accounting
     # ``pre_perf_net`` = net NAV after management fees but before the (accrued) performance fee.
     # The perf fee accrues as a reversible liability each tick and is crystallized (paid, HWM reset)
-    # only at the first tick of a new fee period, using the previous period-end accrual.
+    # only at the first tick of a new fee period. If the prior tick was NAV-guard clamped
+    # (``prior_deferred_hours > 0``), apply the confirmed ``tick_gross_ret`` BEFORE crystallizing!
     tick_gross_ret = (gross_equity / prev_gross - 1.0) if prev_gross > 0 else 0.0
     hwm_share = float(state.get("hwm_net_share_price", 1.0))
     prev_accrued = float(state.get("accrued_perf_fee_usd", 0.0))
     prev_pre_perf = float(state.get("pre_perf_net_equity_usd", prev_net + prev_accrued))
     period_key = _fee_period_key(ts_ms, cfg.perf_fee_crystallization)
     prev_period = str(state.get("perf_fee_period") or period_key)
+    eff_period_key = prev_period if nav_guard_triggered else period_key
     perf_fee_usd = 0.0  # crystallized this tick
-    if prev_period != period_key and prev_accrued > 0 and start_cap > 0:
-        perf_fee_usd = round(prev_accrued, 4)
-        prev_pre_perf = prev_pre_perf - perf_fee_usd
-        hwm_share = max(hwm_share, round(prev_pre_perf / start_cap, 6))
+    mgmt_hours = 0.0 if nav_guard_triggered else accrual_hours
 
-    pre_fee = prev_pre_perf * (1.0 + tick_gross_ret)
-    mgmt_fee_usd = round(pre_fee * (cfg.mgmt_fee_annual_pct / 100.0 / HOURS_PER_YEAR) * dt_hours, 4) if dt_hours > 0 else 0.0
-    pre_perf_net = max(pre_fee - mgmt_fee_usd, 1.0)
+    if nav_guard_triggered:
+        mgmt_fee_usd = 0.0
+        pre_perf_net = max(prev_pre_perf, 1.0)
+        accrued_perf_fee_usd = round(prev_accrued, 4)
+    elif prev_period != period_key and prior_deferred_hours > 0.0:
+        # Prior tick in the old period was NAV-guard clamped: apply confirmed return BEFORE crystallizing!
+        pre_fee = prev_pre_perf * (1.0 + tick_gross_ret)
+        mgmt_fee_usd = (
+            round(pre_fee * (cfg.mgmt_fee_annual_pct / 100.0 / HOURS_PER_YEAR) * mgmt_hours, 4)
+            if mgmt_hours > 0
+            else 0.0
+        )
+        pre_perf_after_move = max(pre_fee - mgmt_fee_usd, 1.0)
+        if cfg.perf_fee_pct > 0 and start_cap > 0:
+            cand_share_cryst = pre_perf_after_move / start_cap
+            if cand_share_cryst > hwm_share:
+                perf_fee_usd = round((cand_share_cryst - hwm_share) * start_cap * (cfg.perf_fee_pct / 100.0), 4)
+        pre_perf_net = max(pre_perf_after_move - perf_fee_usd, 1.0)
+        if perf_fee_usd > 0 and start_cap > 0:
+            hwm_share = max(hwm_share, round(pre_perf_net / start_cap, 6))
+        accrued_perf_fee_usd = 0.0
+    else:
+        if prev_period != period_key and prev_accrued > 0 and start_cap > 0:
+            perf_fee_usd = round(prev_accrued, 4)
+            prev_pre_perf = prev_pre_perf - perf_fee_usd
+            hwm_share = max(hwm_share, round(prev_pre_perf / start_cap, 6))
+        pre_fee = prev_pre_perf * (1.0 + tick_gross_ret)
+        mgmt_fee_usd = (
+            round(pre_fee * (cfg.mgmt_fee_annual_pct / 100.0 / HOURS_PER_YEAR) * mgmt_hours, 4)
+            if mgmt_hours > 0
+            else 0.0
+        )
+        pre_perf_net = max(pre_fee - mgmt_fee_usd, 1.0)
+        accrued_perf_fee_usd = 0.0
+        if cfg.perf_fee_pct > 0 and start_cap > 0:
+            cand_share = pre_perf_net / start_cap
+            if cand_share > hwm_share:
+                accrued_perf_fee_usd = round((cand_share - hwm_share) * start_cap * (cfg.perf_fee_pct / 100.0), 4)
 
-    accrued_perf_fee_usd = 0.0
-    if cfg.perf_fee_pct > 0 and start_cap > 0:
-        cand_share = pre_perf_net / start_cap
-        if cand_share > hwm_share:
-            accrued_perf_fee_usd = round((cand_share - hwm_share) * start_cap * (cfg.perf_fee_pct / 100.0), 4)
     net_equity = round(pre_perf_net - accrued_perf_fee_usd, 2)
-
     net_share = round(net_equity / start_cap, 6) if start_cap > 0 else 1.0
     net_ret_pct = round((net_share - 1.0) * 100.0, 4)
+
+    # Update live CTA coin quantities & drifted MTM weights when not clamped
+    unchanged_cta_set = set(cta_snap.get("unchanged_coins") or [])
+    final_cta_usd = max(0.0, _f(alloc_usd.get("crisis_cta")))
+    live_cta_gross_lev = float(cta_snap["gross_leverage"])
+    live_cta_net_exp = float(cta_snap["net_exposure"])
+    if not nav_guard_triggered:
+        new_cta_qty: dict[str, float] = {}
+        new_cta_weights: dict[str, float] = {}
+        for coin, fw in cta_snap["weights"].items():
+            px_c = _f(new_last_closes.get(coin)) or _f(prev_cta_px.get(coin))
+            if abs(float(fw)) <= 1e-12 or px_c <= 0 or final_cta_usd <= 0:
+                continue
+            if not is_initial and not should_rebalance and coin in unchanged_cta_set and coin in eff_prev_cta_qty:
+                q_c = eff_prev_cta_qty[coin]
+            else:
+                q_c = (final_cta_usd * float(fw)) / px_c
+            new_cta_qty[coin] = q_c
+            new_cta_weights[coin] = round((q_c * px_c) / final_cta_usd, 6)
+        if final_cta_usd > 0 and new_cta_qty:
+            live_cta_gross_lev = round(
+                sum(abs(q * (_f(new_last_closes.get(c)) or _f(prev_cta_px.get(c)))) for c, q in new_cta_qty.items())
+                / final_cta_usd,
+                4,
+            )
+            live_cta_net_exp = round(
+                sum(q * (_f(new_last_closes.get(c)) or _f(prev_cta_px.get(c))) for c, q in new_cta_qty.items())
+                / final_cta_usd,
+                4,
+            )
+        cta_state["positions_qty"] = {c: round(q, 10) for c, q in new_cta_qty.items()}
+        cta_state["weights"] = new_cta_weights
+        cta_state["last_closes"] = new_last_closes
+        cta_state["gross_leverage"] = live_cta_gross_lev
+        cta_state["net_exposure"] = live_cta_net_exp
+        cta_state["assets"] = cta_snap["assets"]
 
     # 5. Consolidated Risk Telemetry (weighted leverage, 30D avg/max, look-through venue breakdown)
     weighted_lev = 0.0
@@ -1018,7 +1165,7 @@ def run_autopilot_tick(
             continue
         w = usd / max(gross_equity, 1.0)
         if k == "crisis_cta":
-            lev_k = float(cta_snap["gross_leverage"])
+            lev_k = float(cta_state.get("gross_leverage", live_cta_gross_lev))
             dep_frac = min(1.0, max(0.0, lev_k))
             _add_venue("HyperCore Perp (CTA)", usd * dep_frac)
             _add_venue("Cash / USDC", usd * (1.0 - dep_frac))
@@ -1047,7 +1194,8 @@ def run_autopilot_tick(
 
     weighted_lev = round(weighted_lev, 3)
     lev_30d_avg, lev_30d_max = spa._compute_30d_leverage_stats(ticks_path, weighted_lev, ts_ms)
-    cta_dir_pct = round(actual_weights.get("crisis_cta", 0.0) * float(cta_snap["net_exposure"]) * 100.0, 3)
+    cta_net_for_dir = float(cta_state.get("net_exposure", live_cta_net_exp))
+    cta_dir_pct = round(actual_weights.get("crisis_cta", 0.0) * cta_net_for_dir * 100.0, 3)
     # Residual delta of the "neutral" sleeves (e.g. spot_perp spot-vs-perp drift) is directional too.
     sleeve_dir_pct = sum(
         actual_weights.get(k, 0.0) * _f(sleeves[k].get("net_exposure_frac"))
@@ -1055,13 +1203,6 @@ def run_autopilot_tick(
         if k not in ("crisis_cta", "hlp_savings_reserve")
     ) * 100.0
     net_dir_pct = round(cta_dir_pct + sleeve_dir_pct, 3)
-
-    if not nav_guard_triggered:
-        cta_state["weights"] = cta_snap["weights"]
-        cta_state["last_closes"] = new_last_closes
-        cta_state["gross_leverage"] = cta_snap["gross_leverage"]
-        cta_state["net_exposure"] = cta_snap["net_exposure"]
-        cta_state["assets"] = cta_snap["assets"]
 
     sleeve_summary = []
     for k in target_weights:
@@ -1087,7 +1228,7 @@ def run_autopilot_tick(
             "hwm_net_share_price": hwm_share,
             "pre_perf_net_equity_usd": round(pre_perf_net, 4),
             "accrued_perf_fee_usd": accrued_perf_fee_usd,
-            "perf_fee_period": period_key,
+            "perf_fee_period": eff_period_key,
             "perf_fee_crystallization": cfg.perf_fee_crystallization,
             "gross_return_pct": gross_ret_pct,
             "net_return_pct": net_ret_pct,

@@ -300,7 +300,7 @@ def test_worker_preserves_last_known_job_state_across_restarts(tmp_path: Path, m
     by_name = {j["name"]: j for j in published["jobs"]}
     assert by_name["market_snapshot"]["state"] == "ok"
     assert by_name["onchain_events"]["state"] == "failed"
-    assert by_name["metamodel_paper"]["state"] == "ok"
+    assert by_name["metamodel_paper"]["state"] == "interrupted"
     assert by_name["cross_dex_paper"]["state"] == "idle"
     assert by_name["testnet_executor"]["state"] == "disabled"
 

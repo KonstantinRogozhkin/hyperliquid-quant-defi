@@ -36,7 +36,7 @@ def _load_dotenv(path: Path) -> None:
 
 def _write_text_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
 
@@ -46,7 +46,7 @@ def main(
     min_leg_vol_usd: float = typer.Option(200_000.0, help="Min 24h volume per HIP-3 leg USD"),
     min_spread_apr_pct: float = typer.Option(10.0, help="Min cross-builder funding spread APR (%)"),
     output_dir: Path = typer.Option(ROOT / "data/paper/hl_hip3_arb"),
-    report_path: Path | None = typer.Option(ROOT / "docs/reports/2026-11-26/hl_hip3_builder_arb_live.md"),
+    report_path: Path | None = typer.Option(ROOT / "data/reports/hl_hip3_builder_arb_live.md"),
     telegram: bool = typer.Option(False, help="Send Rich HTML summary to Telegram"),
 ) -> None:
     _load_dotenv(ROOT / ".env")

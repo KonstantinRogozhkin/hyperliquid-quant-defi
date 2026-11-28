@@ -31,6 +31,27 @@ describe("Charts", () => {
     expect(Number(circles[0].getAttribute("cy"))).toBeCloseTo(65, 1);
   });
 
+  it("computes trailing-slice EquityCurveChart % from window start, shows slice / totalTicks, and caps circles above 48 points", () => {
+    const trailing720 = Array.from({ length: 720 }, (_, i) => 12000 + (300 * i) / 719);
+    const { container, rerender } = render(
+      <EquityCurveChart values={trailing720} initialValue={10000} totalTicks={1500} />,
+    );
+    // 720 > 48 -> only first and last endpoint circles rendered (never 720 overlapping circles)
+    expect(container.querySelectorAll("circle")).toHaveLength(2);
+    // Trailing slice (totalTicks 1500 > 720) computes +2.500% from values[0]=12000, not +23.000% from initialValue=10000
+    expect(screen.getByText("+2.500% (720 / 1500 ticks)")).toBeInTheDocument();
+
+    // Boundary check: 48 points keeps all 48 circles; 49 points caps at 2 endpoint circles
+    const pts48 = Array.from({ length: 48 }, (_, i) => 10000 + i);
+    rerender(<EquityCurveChart values={pts48} initialValue={10000} totalTicks={48} />);
+    expect(container.querySelectorAll("circle")).toHaveLength(48);
+    expect(screen.getByText(/\+0\.470% \(48 ticks\)/)).toBeInTheDocument();
+
+    const pts49 = Array.from({ length: 49 }, (_, i) => 10000 + i);
+    rerender(<EquityCurveChart values={pts49} initialValue={10000} totalTicks={49} />);
+    expect(container.querySelectorAll("circle")).toHaveLength(2);
+  });
+
   it("shows empty placeholder for KappaCalibrationChart with no points", () => {
     const emptyCal: CoinCalibration = {
       coin: "ETH",

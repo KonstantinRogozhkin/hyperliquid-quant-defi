@@ -304,8 +304,19 @@ def test_reduce_only_derisk_closes_position_when_target_flips_sign():
 def test_orphan_residual_notional_reflects_planned_unwinds():
     acct = _acct(positions={"GRAM": -30.0, "VVV": 2.0}, notional={"GRAM": -29.7, "VVV": 50.0})
     tops = {"GRAM": (None, None, NOW), "VVV": (24.0, None, NOW)}
-    resid = ex.orphan_residual_notional_usd(
+    resid_conservative = ex.orphan_residual_notional_usd(
         acct, _meta("GRAM", "VVV"), {}, tops, {"GRAM": 0.99, "VVV": 25.0}, target_weights={"VVV": 0.02}
     )
-    assert resid["GRAM"] == pytest.approx(0.0)  # untargeted orphan fully unwound
+    assert resid_conservative["GRAM"] == pytest.approx(-29.7)
+    assert resid_conservative["VVV"] == pytest.approx(50.0)
+    resid = ex.orphan_residual_notional_usd(
+        acct,
+        _meta("GRAM", "VVV"),
+        {},
+        tops,
+        {"GRAM": 0.99, "VVV": 25.0},
+        target_weights={"VVV": 0.02},
+        assume_unwinds_fill=True,
+    )
+    assert resid["GRAM"] == pytest.approx(0.0)  # untargeted orphan fully unwound once filled
     assert resid["VVV"] == pytest.approx(50.0 * 0.8 / 2.0)  # keeps 0.8 of 2.0 VVV (= $20 target)

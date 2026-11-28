@@ -562,8 +562,8 @@
     {
       "id": 11,
       "type": "table",
-      "title": "All Strategies — Live Results, Carry APR, Leverage & Risk Leaderboard",
-      "description": "Unified live ledger across Neutral Autopilot, HyperCore Spot+Perp (+10% HLP), Cross-DEX v2, HIP-3 Split-Margin, Metamodel (Obs), Live Testnet ALO, and HLP Benchmark.",
+      "title": "All Strategies — Live Results, Capital-Weighted Live Carry APR %, Leverage & Risk Leaderboard",
+      "description": "Unified live ledger across Neutral Autopilot, HyperCore Spot+Perp (+10% HLP), Cross-DEX v2, HIP-3 Split-Margin, Metamodel (Obs), Live Testnet ALO, and HLP Benchmark. Capital-Weighted Live Carry APR % scales active pair spread APR by deployed leg notional / strategy equity (see hl_hip3_paper_avg_pair_apr_pct & hl_cross_dex_paper_avg_pair_apr_pct for unweighted open-pair averages).",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -730,7 +730,7 @@
               "Value #E": "Net PnL ($)",
               "Value #F": "Funding/Yield ($)",
               "Value #G": "Costs ($)",
-              "Value #H": "Live APR %",
+              "Value #H": "Capital-Weighted Live Carry APR %",
               "Value #I": "Positions",
               "Value #J": "Leverage",
               "Value #K": "Max DD %",
@@ -743,7 +743,7 @@
         "showHeader": true,
         "sortBy": [
           {
-            "displayName": "Live APR %",
+            "displayName": "Capital-Weighted Live Carry APR %",
             "desc": true
           }
         ]
@@ -971,7 +971,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Live APR %"
+              "options": "Capital-Weighted Live Carry APR %"
             },
             "properties": [
               {
@@ -2221,7 +2221,7 @@
     {
       "id": 30,
       "type": "timeseries",
-      "title": "Active Carry Pair Live APR (%) — Spot+Perp, HIP-3 & Cross-DEX",
+      "title": "Capital-Weighted Live Carry APR % vs Open-Pair Spread APR — Spot+Perp, HIP-3 & Cross-DEX",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -2235,6 +2235,33 @@
       "targets": [
         {
           "refId": "A",
+          "expr": "hl_strategy_live_apr_pct{strategy=~\"spot_perp_hlp|hip3_split_margin|cross_dex_v2\"}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "Capital-Weighted {{strategy}}"
+        },
+        {
+          "refId": "B",
+          "expr": "hl_hip3_paper_avg_pair_apr_pct",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "HIP-3 Avg Open Pair APR"
+        },
+        {
+          "refId": "C",
+          "expr": "hl_cross_dex_paper_avg_pair_apr_pct",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "legendFormat": "Cross-DEX Avg Open Pair APR"
+        },
+        {
+          "refId": "D",
           "expr": "hl_spot_perp_position_live_apr_pct",
           "datasource": {
             "type": "prometheus",
@@ -2243,7 +2270,7 @@
           "legendFormat": "Spot+Perp {{symbol}}"
         },
         {
-          "refId": "B",
+          "refId": "E",
           "expr": "hl_hip3_paper_pair_live_apr_pct",
           "datasource": {
             "type": "prometheus",
@@ -2252,7 +2279,7 @@
           "legendFormat": "HIP-3 {{symbol}} ({{short_dex}}/{{long_dex}})"
         },
         {
-          "refId": "C",
+          "refId": "F",
           "expr": "hl_cross_dex_paper_pair_live_apr_pct",
           "datasource": {
             "type": "prometheus",
@@ -2289,7 +2316,8 @@
           "unit": "percent"
         },
         "overrides": []
-      }
+      },
+      "description": "Compares Capital-Weighted Live Carry APR % (deployed leg notional * spread APR / strategy equity, accounting for idle cash buffers) against unweighted open-pair average APR (hl_hip3_paper_avg_pair_apr_pct, hl_cross_dex_paper_avg_pair_apr_pct) and per-pair spread APRs."
     },
     {
       "id": 31,
@@ -2308,7 +2336,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "hl_spot_perp_funding_usd + hl_spot_perp_hlp_yield_usd",
+          "expr": "(hl_spot_perp_funding_usd or vector(0)) + (hl_spot_perp_hlp_yield_usd or vector(0))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -2335,7 +2363,7 @@
         },
         {
           "refId": "D",
-          "expr": "-(hl_spot_perp_costs_usd + hl_hip3_paper_costs_usd + hl_cross_dex_paper_costs_usd)",
+          "expr": "-((hl_spot_perp_costs_usd or vector(0)) + (hl_hip3_paper_costs_usd or vector(0)) + (hl_cross_dex_paper_costs_usd or vector(0)))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4442,7 +4470,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (worker_job) (hl_worker_job_enabled * (1 + hl_worker_job_ok + 2 * hl_worker_job_failed))",
+          "expr": "max by (worker_job) (hl_worker_job_enabled * (1 + hl_worker_job_ok + 2 * hl_worker_job_interrupted + 3 * hl_worker_job_failed))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4546,6 +4574,10 @@
                         "color": "green"
                       },
                       "3": {
+                        "text": "INTERRUPTED",
+                        "color": "yellow"
+                      },
+                      "4": {
                         "text": "FAIL",
                         "color": "red"
                       }
@@ -4577,8 +4609,12 @@
                       "value": 2
                     },
                     {
-                      "color": "red",
+                      "color": "yellow",
                       "value": 3
+                    },
+                    {
+                      "color": "red",
+                      "value": 4
                     }
                   ]
                 }

@@ -87,8 +87,12 @@ def _normalize_coin(raw_base: str) -> str:
 # --------------------------------------------------------------------------- 5-DEX Public Readers
 
 
-def fetch_hyperliquid_quotes(client: httpx.Client) -> dict[str, DexMarketQuote]:
-    resp = client.post(HL_INFO_URL, json={"type": "metaAndAssetCtxs"})
+def fetch_hyperliquid_quotes(
+    client: httpx.Client,
+    *,
+    info_url: str = HL_INFO_URL,
+) -> dict[str, DexMarketQuote]:
+    resp = client.post(info_url, json={"type": "metaAndAssetCtxs"})
     resp.raise_for_status()
     payload = resp.json()
     universe, ctxs = payload[0]["universe"], payload[1]
@@ -172,7 +176,8 @@ def fetch_paradex_quotes(client: httpx.Client) -> dict[str, DexMarketQuote]:
         px = _f(item.get("mark_price"))
         if px <= 0:
             continue
-        interval_min = _f(item.get("funding_interval_minutes"), default=480.0)
+        raw_iv = _f(item.get("funding_interval_minutes"), default=480.0)
+        interval_min = raw_iv if raw_iv > 0 else 480.0
         interval_h = max(1.0, interval_min / 60.0)
         rate_h = _f(item.get("funding_rate")) / interval_h
         vol_usd = _f(item.get("volume_24h"))
@@ -214,7 +219,27 @@ def fetch_lighter_quotes(client: httpx.Client) -> dict[str, DexMarketQuote]:
         mid = item.get("market_id")
         if not sym or mid is None or int(mid) not in fund_by_mid:
             continue
-        px = _f(item.get("last_trade_price"))
+        bid = _f(
+            item.get("best_bid_price")
+            or item.get("best_bid")
+            or item.get("bid_price")
+            or item.get("bid")
+        )
+        ask = _f(
+            item.get("best_ask_price")
+            or item.get("best_ask")
+            or item.get("ask_price")
+            or item.get("ask")
+        )
+        mark_cand = _f(item.get("mark_price") or item.get("index_price"))
+        sp_bps: float | None = None
+        if bid > 0 and ask >= bid and (ask - bid) / (0.5 * (ask + bid)) <= 0.20:
+            px = 0.5 * (bid + ask)
+            sp_bps = (ask - bid) / px * 1e4
+        elif mark_cand > 0:
+            px = mark_cand
+        else:
+            px = _f(item.get("last_trade_price"))
         if px <= 0:
             continue
         coin = _normalize_coin(sym)
@@ -230,7 +255,7 @@ def fetch_lighter_quotes(client: httpx.Client) -> dict[str, DexMarketQuote]:
             funding_apr_pct=rate_h * HOURS_PER_YEAR * 100.0,
             day_vol_usd=vol_usd,
             oi_usd=oi_usd,
-            spread_bps=None,
+            spread_bps=sp_bps,
         )
     return out
 
@@ -300,11 +325,13 @@ def fetch_dex_l2_book(
     client: httpx.Client,
     dex: str,
     raw_symbol: str,
+    *,
+    info_url: str = HL_INFO_URL,
 ) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
     """Fetch normalized ``(bids_desc, asks_asc)`` L2 orderbook levels ``[(px, base_sz), ...]``."""
     try:
         if dex == "hyperliquid":
-            r = client.post(HL_INFO_URL, json={"type": "l2Book", "coin": raw_symbol})
+            r = client.post(info_url, json={"type": "l2Book", "coin": raw_symbol})
             r.raise_for_status()
             lv = (r.json() or {}).get("levels") or [[], []]
             bids = sorted([(_f(x["px"]), _f(x["sz"])) for x in lv[0]], key=lambda t: -t[0])
@@ -463,6 +490,7 @@ def scan_cross_dex_opportunities(
         rows.append(
             {
                 "coin": coin,
+                "hl_raw_symbol": h.raw_symbol,
                 "other_dex": o.dex,
                 "other_raw_symbol": o.raw_symbol,
                 "direction": direction,
@@ -490,6 +518,7 @@ def enrich_opportunities_with_l2_depth(
     top_n: int = 12,
     round_trip_fee_bps: float | None = None,
     bridge_drag_bps: float = 1.5,
+    info_url: str = HL_INFO_URL,
 ) -> pd.DataFrame:
     """Fetch live L2 books on both venues for top-N rows and compute $10k/$50k executable entry & slippage."""
     if df.empty:
@@ -507,11 +536,12 @@ def enrich_opportunities_with_l2_depth(
 
     for r in sub.itertuples(index=False):
         coin = str(r.coin)
-        hl_sym = "k" + coin[1:] if coin.startswith("k") else coin
-        if coin not in hl_cache:
-            hl_cache[coin] = fetch_dex_l2_book(client, "hyperliquid", hl_sym)
-        hb, ha = hl_cache[coin]
-        ob, oa = fetch_dex_l2_book(client, str(r.other_dex), str(r.other_raw_symbol))
+        raw_hl = str(getattr(r, "hl_raw_symbol", "") or "")
+        hl_sym = raw_hl or ("k" + coin[1:] if coin.startswith("k") else coin)
+        if hl_sym not in hl_cache:
+            hl_cache[hl_sym] = fetch_dex_l2_book(client, "hyperliquid", hl_sym, info_url=info_url)
+        hb, ha = hl_cache[hl_sym]
+        ob, oa = fetch_dex_l2_book(client, str(r.other_dex), str(r.other_raw_symbol), info_url=info_url)
         short_hl = str(r.direction).startswith("Short HL")
         eb10, sl10, _ = compute_executable_cross_dex_entry_bps(hb, ha, ob, oa, short_hl=short_hl, clip_usd=10_000.0)
         _, sl50, ok50 = compute_executable_cross_dex_entry_bps(hb, ha, ob, oa, short_hl=short_hl, clip_usd=50_000.0)

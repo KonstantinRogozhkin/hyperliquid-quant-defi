@@ -105,9 +105,10 @@ def test_metamodel_stream_matches_sleeve_simulators_and_scales_cross_venue_turno
     _, turn_c, _, delay_c = es.metamodel_stream(market, {spec.name: 1.0})
     sim_c = af.simulate_cross_venue(market, af.build_funding_carry_weights(market, spec.params)[0], one_way_cost_bps=3.5)
     assert sim_c["turnover"].sum() > 0
-    # A cross-venue change dw trades dw * C / 2 on each of two legs -> dw units of capital.
+    # A cross-venue change dw trades dw * C / 2 on each of two legs -> dw units of capital;
+    # one delayed entry leg exposes 0.25 * cex_turnover of total capital.
     np.testing.assert_allclose(turn_c.to_numpy(), sim_c["turnover"].to_numpy())
-    np.testing.assert_allclose(delay_c.to_numpy(), 0.5 * sim_c["turnover"].to_numpy())
+    np.testing.assert_allclose(delay_c.to_numpy(), 0.25 * sim_c["turnover"].to_numpy())
 
 
 def test_leg_delay_shock_only_hits_cross_venue_exposure():

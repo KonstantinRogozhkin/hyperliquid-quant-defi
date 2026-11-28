@@ -88,6 +88,13 @@ def _f(v: object, default: float = 0.0) -> float:
     return x if math.isfinite(x) else default
 
 
+def _perp_liq_buffer_pct(lev: float, mmr: float = 0.05) -> float:
+    """Exact short-perp upward move (%) before maintenance margin ``mmr`` is breached: ``(1/L - mmr) / (1 + mmr)``."""
+    eff_lev = max(1.0, float(lev))
+    eff_mmr = max(0.0, float(mmr))
+    return round(max(0.0, (1.0 / eff_lev - eff_mmr) / (1.0 + eff_mmr) * 100.0), 1)
+
+
 def build_hyperevm_yield_strategies(
     inp: HyperEvmYieldInputs,
     *,
@@ -95,37 +102,53 @@ def build_hyperevm_yield_strategies(
     loop_ltv: float = 0.50,
     assumed_stable_borrow_apr_pct: float = 3.5,
     stable_market_utilization: float = 0.80,
+    boros_margin_share: float = 0.10,
+    boros_fee_drag_bps: float = 10.0,
+    perp_mmr: float = 0.05,
 ) -> list[YieldStackStrategyRow]:
     """Compute realistic capital-adjusted net APRs and liquidation buffers for 5 HyperEVM stacks.
 
     Borrow cost for the loop is never below what the live stable market implies: lenders earn
     ``supply = borrow * utilization`` (before reserve fees), so ``borrow >= supply / utilization``.
-    A hard-coded 3.5% borrow under a 5.38% Morpho feUSD supply APY made the loop look best.
+    Boros fixed-rate stacks account for separate Boros margin collateral and amortized fee drag, and
+    never overwrite a superior or positive floating perp funding rate with an inferior/negative Boros rate.
     """
     # Split-capital delta-neutral: 1 unit spot LST + (1 / perp_leverage) unit USDC perp margin
     # -> hedged notional as share of total deposit = 1 / (1 + 1/L) = L / (L + 1)
     lev = max(1.0, float(perp_leverage))
     cap_eff = lev / (lev + 1.0)
-    # Approximate upward move on short HYPE before maintenance margin (~10% buffer) is breached
-    liq_buf_pct = round((1.0 / lev - 0.08) * 100.0, 1)
+    liq_buf_pct = _perp_liq_buffer_pct(lev, perp_mmr)
+
+    has_boros = (
+        inp.boros_hype_fixed_bid_apr_pct is not None
+        and inp.boros_hype_fixed_bid_apr_pct > 0.0
+        and inp.boros_hype_days_to_maturity >= 7.0
+    )
+    boros_fee_apr = (
+        (max(0.0, float(boros_fee_drag_bps)) / 100.0) * (365.0 / max(float(inp.boros_hype_days_to_maturity), 7.0))
+        if has_boros
+        else 0.0
+    )
+    net_boros_leg_apr = (float(inp.boros_hype_fixed_bid_apr_pct) - boros_fee_apr) if has_boros else None
+    boros_cap_eff = 1.0 / (1.0 + 1.0 / lev + max(0.0, float(boros_margin_share)))
 
     rows: list[YieldStackStrategyRow] = []
 
     # 1. Fixed-Rate Locked Delta-Neutral: kHYPE + Short HYPE Perp + Short Boros HYPE Fixed
-    if inp.boros_hype_fixed_bid_apr_pct is not None:
-        gross_fix = inp.khype_apy_pct + inp.boros_hype_fixed_bid_apr_pct
-        net_fix = gross_fix * cap_eff
+    if net_boros_leg_apr is not None and net_boros_leg_apr > 0.0:
+        gross_fix = inp.khype_apy_pct + net_boros_leg_apr
+        net_fix = gross_fix * boros_cap_eff
         rows.append(
             YieldStackStrategyRow(
                 name=f"kHYPE + Short HYPE + Boros Fix ({inp.boros_hype_days_to_maturity:.0f}d)",
                 rate_type="Fixed (Boros)",
                 gross_stacked_apr_pct=round(gross_fix, 2),
-                capital_efficiency_pct=round(cap_eff * 100.0, 1),
+                capital_efficiency_pct=round(boros_cap_eff * 100.0, 1),
                 net_deposit_apr_pct=round(net_fix, 2),
                 spread_vs_hlp_pct=round(net_fix - inp.hlp_apr_pct, 2),
                 perp_leverage=lev,
                 liq_buffer_pct=liq_buf_pct,
-                key_risks="kHYPE депег, контракт Boros/Kinetiq, доливка маржи при ралли HYPE",
+                key_risks="kHYPE депег, контракт Boros/Kinetiq, раздельная маржа Boros + перпа при ралли HYPE",
             )
         )
 
@@ -146,43 +169,58 @@ def build_hyperevm_yield_strategies(
         )
     )
 
-    # 3. Composable Loop: kHYPE collateral on HyperLend/Felix (LTV 50%) -> borrow feUSD/USDC -> perp margin + Morpho yield
-    # Here 100% of deposit buys kHYPE; borrowing 50% LTV funds the 2x short HYPE perp margin!
-    # Net = kHYPE_APY + HYPE_funding_or_Boros - LTV * borrow_apr + idle_stable_carry
-    ref_fund = inp.boros_hype_fixed_bid_apr_pct if inp.boros_hype_fixed_bid_apr_pct is not None else inp.hype_funding_apr_pct
+    # 3. Composable Loop: kHYPE collateral on HyperLend/Felix (LTV 50%) -> borrow feUSD/USDC -> perp margin
+    # Only lock Boros on the loop if net Boros carry (after Boros margin & fee drag) strictly beats floating!
     util = min(max(float(stable_market_utilization), 0.05), 1.0)
     implied_borrow_apr = (inp.morpho_feusd_apy_pct / util) if inp.morpho_feusd_apy_pct > 0 else 0.0
     borrow_apr = max(float(assumed_stable_borrow_apr_pct), implied_borrow_apr)
     borrow_drag = loop_ltv * borrow_apr
-    # Excess borrowed stables (if any) earn Morpho FEUSDCV2 APY; at LTV=50% and 2x perp, 100% of borrow funds perp margin
-    gross_loop = inp.khype_apy_pct + ref_fund
-    net_loop = gross_loop - borrow_drag
+    loop_boros_eff = 1.0 / (1.0 + max(0.0, float(boros_margin_share)))
+    loop_flt_net = inp.khype_apy_pct + inp.hype_funding_apr_pct - borrow_drag
+    loop_fix_net = (
+        (inp.khype_apy_pct + net_boros_leg_apr - borrow_drag) * loop_boros_eff
+        if (net_boros_leg_apr is not None and net_boros_leg_apr > 0.0)
+        else -math.inf
+    )
+    use_boros_loop = loop_fix_net > loop_flt_net
+    gross_loop = inp.khype_apy_pct + (float(net_boros_leg_apr) if use_boros_loop and net_boros_leg_apr is not None else inp.hype_funding_apr_pct)
+    net_loop = loop_fix_net if use_boros_loop else loop_flt_net
+    loop_cap_eff = round(loop_boros_eff * 100.0, 1) if use_boros_loop else 100.0
+    loop_lev = round(1.0 / max(loop_ltv, 0.1), 1)
+    loop_liq_buf = round(
+        max(0.0, min(_perp_liq_buffer_pct(loop_lev, perp_mmr), (1.0 - loop_ltv / 0.78) * 100.0)), 1
+    )
     rows.append(
         YieldStackStrategyRow(
             name=f"Composable Loop: kHYPE -> Felix/HyperLend ({int(loop_ltv*100)}% LTV) -> Short HYPE",
-            rate_type="Fixed (Boros)" if inp.boros_hype_fixed_bid_apr_pct is not None else "Floating",
+            rate_type="Fixed (Boros)" if use_boros_loop else "Floating",
             gross_stacked_apr_pct=round(gross_loop, 2),
-            capital_efficiency_pct=100.0,
+            capital_efficiency_pct=loop_cap_eff,
             net_deposit_apr_pct=round(net_loop, 2),
             spread_vs_hlp_pct=round(net_loop - inp.hlp_apr_pct, 2),
-            perp_leverage=round(1.0 / max(loop_ltv, 0.1), 1),
-            # Short-perp buffer must use the loop's own leverage (1 / LTV), not the caller's perp_leverage.
-            liq_buffer_pct=round(
-                max(0.0, min((max(loop_ltv, 0.1) - 0.08) * 100.0, (1.0 - loop_ltv / 0.78) * 100.0)), 1
-            ),
+            perp_leverage=loop_lev,
+            liq_buffer_pct=loop_liq_buf,
             key_risks="Двусторонний риск ликвидации (обвал HYPE на CDP + ралли HYPE на перпе), рост borrow rate",
         )
     )
 
-    # 4. Alternative LST: stHYPE + Short HYPE (+ Boros Fixed if available)
-    gross_st = inp.sthype_apy_pct + ref_fund
-    net_st = gross_st * cap_eff
+    # 4. Alternative LST: stHYPE + Short HYPE (+ Boros Fixed ONLY when net Boros beats floating)
+    st_flt_net = (inp.sthype_apy_pct + inp.hype_funding_apr_pct) * cap_eff
+    st_fix_net = (
+        (inp.sthype_apy_pct + net_boros_leg_apr) * boros_cap_eff
+        if (net_boros_leg_apr is not None and net_boros_leg_apr > 0.0)
+        else -math.inf
+    )
+    use_boros_st = st_fix_net > st_flt_net
+    gross_st = inp.sthype_apy_pct + (float(net_boros_leg_apr) if use_boros_st and net_boros_leg_apr is not None else inp.hype_funding_apr_pct)
+    net_st = st_fix_net if use_boros_st else st_flt_net
+    st_cap_eff = boros_cap_eff if use_boros_st else cap_eff
     rows.append(
         YieldStackStrategyRow(
-            name="stHYPE + Short HYPE Perp" + (" + Boros Fix" if inp.boros_hype_fixed_bid_apr_pct is not None else ""),
-            rate_type="Fixed (Boros)" if inp.boros_hype_fixed_bid_apr_pct is not None else "Floating",
+            name="stHYPE + Short HYPE Perp" + (" + Boros Fix" if use_boros_st else ""),
+            rate_type="Fixed (Boros)" if use_boros_st else "Floating",
             gross_stacked_apr_pct=round(gross_st, 2),
-            capital_efficiency_pct=round(cap_eff * 100.0, 1),
+            capital_efficiency_pct=round(st_cap_eff * 100.0, 1),
             net_deposit_apr_pct=round(net_st, 2),
             spread_vs_hlp_pct=round(net_st - inp.hlp_apr_pct, 2),
             perp_leverage=lev,
@@ -249,9 +287,10 @@ def fetch_hyperevm_yield_inputs(
             if m.is_hyperliquid
             and not m.is_spread_market
             and m.underlying == "HYPE"
-            and m.days_to_maturity >= 5.0
+            and m.days_to_maturity >= 7.0
             and m.is_actionable
             and m.best_bid_apr_pct is not None
+            and m.best_bid_apr_pct > 0.0
         ]
         if hype_mkts:
             best = max(hype_mkts, key=lambda m: m.notional_oi)

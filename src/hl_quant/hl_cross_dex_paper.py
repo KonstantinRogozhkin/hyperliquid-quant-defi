@@ -83,6 +83,8 @@ def _load_or_init_state(state_path: Path, cfg: CrossDexPaperConfig) -> dict[str,
         st.setdefault("nav_guard_triggered", False)
         st.setdefault("nav_guard_reason", "")
         st.setdefault("nav_guard_pending_ms", None)
+        st.setdefault("nav_guard_pending_ret_pct", None)
+        st.setdefault("last_clamped_ms", 0)
         return st
     return {
         "starting_capital_usd": cfg.starting_capital_usd,
@@ -91,6 +93,7 @@ def _load_or_init_state(state_path: Path, cfg: CrossDexPaperConfig) -> dict[str,
         "cum_basis_mtm_usd": 0.0,
         "cum_costs_usd": 0.0,
         "last_tick_ms": 0,
+        "last_clamped_ms": 0,
         "positions": {},  # coin -> position dict
         "spread_streaks": {},  # "COIN@dex:dir" -> consecutive qualifying ticks
         "combo_streaks": {},  # same keys, threshold combo_min_apr_pct (H1 combo persistence)
@@ -100,6 +103,7 @@ def _load_or_init_state(state_path: Path, cfg: CrossDexPaperConfig) -> dict[str,
         "nav_guard_triggered": False,
         "nav_guard_reason": "",
         "nav_guard_pending_ms": None,
+        "nav_guard_pending_ret_pct": None,
     }
 
 
@@ -134,6 +138,14 @@ def _estimate_exit_cost_usd(
     return exit_notional * (cfg.hl_fee_bps + cfg.other_fee_bps(other_dex) + slip_bps) * 1e-4
 
 
+def _pair_gross_notional_usd(pos: dict[str, Any]) -> float:
+    hl_n = pos.get("hl_notional_usd")
+    oth_n = pos.get("other_notional_usd")
+    if hl_n is not None and oth_n is not None:
+        return max(0.0, float(hl_n)) + max(0.0, float(oth_n))
+    return 2.0 * max(0.0, float(pos.get("leg_notional_usd", 0.0)))
+
+
 def settled_funding_by_position(
     client: Any,
     positions: dict[str, dict[str, Any]],
@@ -142,8 +154,9 @@ def settled_funding_by_position(
     ts_ms: int,
     *,
     cap_hours: float | None = None,
-) -> dict[str, float]:
-    """Realized ``fundingHistory`` rate sums per symbol, each over its position's own accrual window.
+    info_url: str = cds.HL_INFO_URL,
+) -> dict[Any, float]:
+    """Realized ``fundingHistory`` rate sums per ``(start, symbol)`` and ``symbol``.
 
     ``symbols_of(pos)`` yields the HL symbols to fetch for a position. Symbols missing from the
     result (no history / unsupported) fall back to the snapshot rate in the caller.
@@ -161,10 +174,13 @@ def settled_funding_by_position(
             start = max(start, ts_ms - int(cap_hours * 3_600_000))
         if start > 0 and (ts_ms // 3_600_000) - (start // 3_600_000) > 0:
             by_start.setdefault(start, set()).update(str(s) for s in symbols_of(pos) if s)
-    out: dict[str, float] = {}
+    out: dict[Any, float] = {}
     for start, syms in by_start.items():
         try:
-            out.update(fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms))
+            fetched = fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms, info_url=info_url)
+            for sym, val in fetched.items():
+                out[sym] = val
+                out[(start, sym)] = val
         except Exception:  # noqa: BLE001 - fall back to snapshot-rate accrual
             continue
     return out
@@ -180,6 +196,7 @@ def run_cross_dex_paper_tick(
     lighter_quotes: dict[str, cds.DexMarketQuote] | None = None,
     extended_quotes: dict[str, cds.DexMarketQuote] | None = None,
     book_fetcher: Any = None,
+    info_url: str = cds.HL_INFO_URL,
 ) -> dict[str, Any]:
     """Run one idempotent Hyperliquid × Lighter × Extended L2 paper tick and update the ledger."""
     ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
@@ -188,8 +205,17 @@ def run_cross_dex_paper_tick(
     state = _load_or_init_state(state_path, cfg)
 
     prev_ms = int(state.get("last_tick_ms", 0))
-    if prev_ms > 0 and (ts_ms // 3_600_000) <= (prev_ms // 3_600_000):
+    last_clamped_ms = int(state.get("last_clamped_ms", 0) or 0)
+    same_prev_hour = prev_ms > 0 and (ts_ms // 3_600_000) <= (prev_ms // 3_600_000)
+    same_clamped_hour = (
+        bool(state.get("nav_guard_pending_ms"))
+        and last_clamped_ms > 0
+        and (ts_ms // 3_600_000) <= (last_clamped_ms // 3_600_000)
+    )
+    if same_prev_hour or same_clamped_hour:
         pos_snap = state.get("positions") or {}
+        gross_snap = round(sum(_pair_gross_notional_usd(p) for p in pos_snap.values()), 2)
+        eq_snap = max(float(state["equity_usd"]), 1.0)
         return {
             "status": "duplicate_hour_skipped",
             "tick": {
@@ -198,7 +224,8 @@ def run_cross_dex_paper_tick(
                 "equity_usd": state["equity_usd"],
                 "liquidation_equity_usd": state.get("liquidation_equity_usd", state["equity_usd"]),
                 "active_pairs": len(pos_snap),
-                "gross_notional_usd": round(sum(float(p["leg_notional_usd"]) * 2.0 for p in pos_snap.values()), 2),
+                "gross_notional_usd": gross_snap,
+                "gross_leverage": round(gross_snap / eq_snap, 3),
                 "tick_funding_usd": 0.0,
                 "tick_basis_mtm_usd": 0.0,
                 "tick_costs_usd": 0.0,
@@ -213,7 +240,7 @@ def run_cross_dex_paper_tick(
             "markets_scanned": {},
         }
 
-    hl_q = hl_quotes if hl_quotes is not None else cds.fetch_hyperliquid_quotes(client)
+    hl_q = hl_quotes if hl_quotes is not None else cds.fetch_hyperliquid_quotes(client, info_url=info_url)
     lt_q = lighter_quotes if lighter_quotes is not None else cds.fetch_lighter_quotes(client)
     if extended_quotes is not None:
         ext_q = extended_quotes
@@ -229,7 +256,7 @@ def run_cross_dex_paper_tick(
     if ext_q:
         venue_quotes["extended"] = ext_q
 
-    get_book = book_fetcher or (lambda dex, sym: cds.fetch_dex_l2_book(client, dex, sym))
+    get_book = book_fetcher or (lambda dex, sym: cds.fetch_dex_l2_book(client, dex, sym, info_url=info_url))
 
     dt_cap_h = 168.0 if state.get("nav_guard_pending_ms") else 24.0
     dt_hours = max(0.0, min(dt_cap_h, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
@@ -246,7 +273,15 @@ def run_cross_dex_paper_tick(
     # (offline quotes, other venues, missing history) — a spike at tick time no longer stretches
     # over the whole 4h window.
     settled_hl = (
-        settled_funding_by_position(client, positions, lambda p: [p.get("coin")], prev_ms, ts_ms, cap_hours=dt_cap_h)
+        settled_funding_by_position(
+            client,
+            positions,
+            lambda p: [p.get("raw_hl_symbol") or p.get("coin")],
+            prev_ms,
+            ts_ms,
+            cap_hours=dt_cap_h,
+            info_url=info_url,
+        )
         if hl_quotes is None
         else {}
     )
@@ -271,14 +306,18 @@ def run_cross_dex_paper_tick(
         # Accrue from this position's own clock: a tick skipped for a missing quote must not drop
         # the funding of that interval (the global clock already advanced past it).
         pos_prev_ms = pc.position_accrual_start_ms(pos, prev_ms)
+        eff_start = max(pos_prev_ms, ts_ms - int(dt_cap_h * 3_600_000)) if dt_cap_h > 0 else pos_prev_ms
         pos_settled_hours = pc.settled_hours_between(pos_prev_ms, ts_ms, cap_hours=dt_cap_h) if prev_ms > 0 else 0.0
         pos_dt_hours = max(0.0, min(dt_cap_h, (ts_ms - pos_prev_ms) / 3_600_000.0)) if pos_prev_ms > 0 else dt_hours
         pos["last_accrual_ms"] = ts_ms
+        pos["raw_hl_symbol"] = str(pos.get("raw_hl_symbol") or h.raw_symbol or coin)
+        raw_hl_sym = pos["raw_hl_symbol"]
         hl_notional = hl_qty * h.mark_px
         oth_notional = oth_qty * oth.mark_px
+        settled_val = settled_hl.get((eff_start, raw_hl_sym), settled_hl.get(raw_hl_sym))
         hl_fund_pnl = (
-            hl_notional * (-hl_sgn) * settled_hl[coin]
-            if coin in settled_hl
+            hl_notional * (-hl_sgn) * float(settled_val)
+            if settled_val is not None
             else hl_notional * (-hl_sgn) * h.funding_rate_h * pos_settled_hours
         )
         oth_fund_pnl = oth_notional * (-oth_sgn) * oth.funding_rate_h * pos_settled_hours
@@ -318,30 +357,47 @@ def run_cross_dex_paper_tick(
     # 1b. Bounded NAV Sanity Guard (clamp anomalous single-tick MTM jump until >= 1h confirmation)
     prev_equity = float(state.get("equity_usd", cfg.starting_capital_usd))
     raw_tick_pnl = tick_funding_usd + tick_basis_mtm_usd
+    raw_ret_pct = (raw_tick_pnl / prev_equity * 100.0) if prev_equity > 0 else 0.0
     pending_raw = state.get("nav_guard_pending_ms")
     nav_guard_pending: int | None = int(pending_raw) if pending_raw else None
+    pending_ret_raw = state.get("nav_guard_pending_ret_pct")
+    nav_guard_pending_ret: float | None = float(pending_ret_raw) if pending_ret_raw is not None else None
     jump_exceeded = (
         prev_ms > 0
         and prev_equity > 0
         and cfg.max_tick_nav_jump_pct > 0.0
-        and abs(raw_tick_pnl) / prev_equity * 100.0 > cfg.max_tick_nav_jump_pct
+        and abs(raw_ret_pct) > cfg.max_tick_nav_jump_pct
     )
     nav_guard_triggered = False
     nav_guard_reason = ""
     if jump_exceeded and nav_guard_pending is not None and ts_ms - nav_guard_pending >= NAV_GUARD_CONFIRM_MS:
-        nav_guard_reason = (
-            f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% persisted since the clamped tick; "
-            "accepted as genuine"
+        confirmed = nav_guard_pending_ret is None or (
+            (raw_ret_pct * nav_guard_pending_ret) > 0.0
+            and abs(raw_ret_pct - nav_guard_pending_ret)
+            <= max(cfg.max_tick_nav_jump_pct, 0.5 * abs(nav_guard_pending_ret))
         )
-        nav_guard_pending = None
-        jump_exceeded = False
+        if confirmed:
+            nav_guard_reason = (
+                f"Tick NAV jump {raw_ret_pct:+.2f}% persisted since the clamped tick; "
+                "accepted as genuine"
+            )
+            nav_guard_pending = None
+            nav_guard_pending_ret = None
+            jump_exceeded = False
+        else:
+            nav_guard_pending = ts_ms
+            nav_guard_pending_ret = round(raw_ret_pct, 6)
     elif not jump_exceeded:
         nav_guard_pending = None
+        nav_guard_pending_ret = None
     if jump_exceeded:
-        nav_guard_pending = nav_guard_pending if nav_guard_pending is not None else ts_ms
+        if nav_guard_pending is None:
+            nav_guard_pending = ts_ms
+        if nav_guard_pending_ret is None:
+            nav_guard_pending_ret = round(raw_ret_pct, 6)
         nav_guard_triggered = True
         nav_guard_reason = (
-            f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% exceeded "
+            f"Tick NAV jump {raw_ret_pct:+.2f}% exceeded "
             f"+/-{cfg.max_tick_nav_jump_pct:.1f}% guard; clamping MTM & freezing rebalance"
         )
         state["nav_guard_triggers"] = int(state.get("nav_guard_triggers", 0)) + 1
@@ -350,6 +406,7 @@ def run_cross_dex_paper_tick(
         tick_basis_mtm_usd = 0.0
 
     # 2. Exit pairs whose spread decayed below exit_apr_pct (or H1 combo once basis converged & carry low)
+    closed_this_tick: set[str] = set()
     for coin in (list(positions.keys()) if not nav_guard_triggered else []):
         pos = positions[coin]
         other_dex = str(pos.get("other_dex") or "lighter")
@@ -397,13 +454,13 @@ def run_cross_dex_paper_tick(
             short_hl_exit = float(pos["hl_sign"]) > 0
             l2_slip = 2.0
             if h and oth:
-                hb, ha = get_book("hyperliquid", h.raw_symbol)
+                hl_book_sym = str(pos.get("raw_hl_symbol") or h.raw_symbol)
+                hb, ha = get_book("hyperliquid", hl_book_sym)
                 ob, oa = get_book(other_dex, oth.raw_symbol)
-                _, sl, _ = cds.compute_executable_cross_dex_entry_bps(
+                _, sl, full_ok = cds.compute_executable_cross_dex_entry_bps(
                     hb, ha, ob, oa, short_hl=short_hl_exit, clip_usd=exit_notional
                 )
-                if sl is not None:
-                    l2_slip = sl
+                l2_slip = sl if (sl is not None and full_ok) else max(float(sl or 0.0), 2.0)
             exit_cost_bps = cfg.hl_fee_bps + cfg.other_fee_bps(other_dex) + l2_slip
             exit_cost_usd = exit_notional * exit_cost_bps * 1e-4
             tick_costs_usd += exit_cost_usd
@@ -429,6 +486,7 @@ def run_cross_dex_paper_tick(
                 }
             )
             positions.pop(coin, None)
+            closed_this_tick.add(coin)
 
     # 3. Scan multi-venue opportunities (Lighter + Extended) and update persistence streaks
     cand_frames: list[pd.DataFrame] = []
@@ -510,7 +568,7 @@ def run_cross_dex_paper_tick(
             other_dex = str(r.other_dex)
             direction = str(r.direction)
             spread_apr = float(r.spread_apr_pct)
-            if coin in positions:
+            if coin in positions or coin in closed_this_tick:
                 continue
 
             h = hl_q[coin]
@@ -571,12 +629,14 @@ def run_cross_dex_paper_tick(
                     gated_stats["skipped_basis"] += 1
                     continue
 
-            entry_cost_bps = cfg.hl_fee_bps + oth_fee + cfg.bridge_drag_bps + l2_slip
+            one_way_fee = cfg.hl_fee_bps + oth_fee
+            entry_cost_bps = one_way_fee + cfg.bridge_drag_bps + l2_slip
             # Credit only conservative 50% convergence for positive cross-DEX basis (persistent
             # venue oracle/mark offsets do not guarantee 100% reversion at exit); charge full adverse basis.
-            basis_credit_bps = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
-            # Exit crosses the book again: charge the L2 slip twice (as spot_perp does).
-            est_rt_cost_bps = max(0.0, venue_rt_fee_bps + 2.0 * l2_slip - basis_credit_bps)
+            eff_exec_basis = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
+            basis_credit_bps = min(max(float(eff_exec_basis), -50.0), one_way_fee)
+            # exec_basis ALREADY subtracts 1x entry L2 slip from mid basis; add 1x l2_slip for the exit leg.
+            est_rt_cost_bps = max(1.0, venue_rt_fee_bps + 1.0 * l2_slip - basis_credit_bps)
             hourly_bps = spread_apr / (cds.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
             if be_hours > cfg.max_breakeven_hours:
@@ -588,6 +648,7 @@ def run_cross_dex_paper_tick(
             tick_costs_usd += entry_cost_usd
             positions[coin] = {
                 "coin": coin,
+                "raw_hl_symbol": h.raw_symbol,
                 "other_dex": other_dex,
                 "entry_type": entry_type,
                 "direction": direction,
@@ -598,6 +659,7 @@ def run_cross_dex_paper_tick(
                 "hl_notional_usd": round(cfg.slot_notional_usd, 2),
                 "other_notional_usd": round(cfg.slot_notional_usd, 2),
                 "opened_ms": ts_ms,
+                "last_accrual_ms": ts_ms,
                 "hours_held": 0.0,
                 "entry_hl_px": h.mark_px,
                 "entry_other_px": oth.mark_px,
@@ -653,14 +715,20 @@ def run_cross_dex_paper_tick(
     state["cum_basis_mtm_usd"] = round(float(state["cum_basis_mtm_usd"]) + tick_basis_mtm_usd, 4)
     state["cum_costs_usd"] = round(float(state["cum_costs_usd"]) + tick_costs_usd, 4)
     state["last_tick_ms"] = prev_ms if nav_guard_triggered else ts_ms
+    state["last_clamped_ms"] = ts_ms if nav_guard_triggered else 0
     state["nav_guard_triggered"] = nav_guard_triggered
     state["nav_guard_reason"] = nav_guard_reason
     state["nav_guard_pending_ms"] = nav_guard_pending
+    state["nav_guard_pending_ret_pct"] = nav_guard_pending_ret
     state["positions"] = positions
     # Mark-to-liquidation NAV: what the book is worth if every open pair were closed now.
     est_exit_total = sum(float(p.get("est_exit_cost_usd", 0.0)) for p in positions.values())
     state["est_exit_costs_usd"] = round(est_exit_total, 4)
     state["liquidation_equity_usd"] = round(float(state["equity_usd"]) - est_exit_total, 4)
+    gross_notional_usd = round(sum(_pair_gross_notional_usd(p) for p in positions.values()), 2)
+    gross_leverage = round(gross_notional_usd / max(float(state["equity_usd"]), 1.0), 3)
+    state["gross_notional_usd"] = gross_notional_usd
+    state["gross_leverage"] = gross_leverage
 
     tmp_st = state_path.with_suffix(".tmp.json")
     tmp_st.write_text(json.dumps(state, indent=2), encoding="utf-8")
@@ -672,7 +740,8 @@ def run_cross_dex_paper_tick(
         "equity_usd": state["equity_usd"],
         "liquidation_equity_usd": state["liquidation_equity_usd"],
         "active_pairs": len(positions),
-        "gross_notional_usd": round(sum(float(p["leg_notional_usd"]) * 2.0 for p in positions.values()), 2),
+        "gross_notional_usd": gross_notional_usd,
+        "gross_leverage": gross_leverage,
         "tick_funding_usd": round(tick_funding_usd, 4),
         "tick_basis_mtm_usd": round(tick_basis_mtm_usd, 4),
         "tick_costs_usd": round(tick_costs_usd, 4),

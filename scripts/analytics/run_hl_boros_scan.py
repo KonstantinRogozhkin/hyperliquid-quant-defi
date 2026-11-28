@@ -36,7 +36,7 @@ def _load_dotenv(path: Path) -> None:
 
 def _write_text_atomic(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f"{path.name}.tmp")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(path)
 
@@ -44,7 +44,7 @@ def _write_text_atomic(path: Path, text: str) -> None:
 @app.command()
 def main(
     output_dir: Path = typer.Option(ROOT / "data/paper/hl_boros"),
-    report_path: Path | None = typer.Option(ROOT / "docs/reports/2026-11-26/hl_boros_fixed_funding_live.md"),
+    report_path: Path | None = typer.Option(ROOT / "data/reports/hl_boros_fixed_funding_live.md"),
     telegram: bool = typer.Option(False, help="Send Rich HTML summary to Telegram"),
 ) -> None:
     _load_dotenv(ROOT / ".env")

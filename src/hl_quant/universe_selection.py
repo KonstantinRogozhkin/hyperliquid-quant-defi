@@ -23,9 +23,9 @@ RankMetric = Literal["best_sharpe", "mean_sharpe", "mean_apr"]
 
 
 def cex_symbol(coin: str) -> str:
-    """HL ``kPEPE``-style thousand-unit coins trade as ``1000PEPEUSDT`` on CEXs."""
-    if coin.startswith("k") and coin[1:].isupper():
-        return f"1000{coin[1:]}USDT"
+    """HL ``kPEPE`` / ``kFloki`` thousand-unit coins trade as ``1000PEPEUSDT`` / ``1000FLOKIUSDT`` on CEXs."""
+    if len(coin) > 1 and coin.startswith("k") and coin[1].isupper():
+        return f"1000{coin[1:].upper()}USDT"
     return f"{coin}USDT"
 
 
@@ -84,45 +84,70 @@ def _f(value: object) -> float:
     return out if math.isfinite(out) else 0.0
 
 
-def _binance_perp_symbols(client: cex.PublicGetClient, *, include_inactive: bool = False) -> set[str]:
+def _binance_perp_symbol_sets(client: cex.PublicGetClient, *, include_inactive: bool = False) -> tuple[set[str], set[str]]:
     payload = client.get("/fapi/v1/exchangeInfo", {})
     symbols = payload.get("symbols") if isinstance(payload, dict) else None
     if not isinstance(symbols, list):
         raise cex.CexDataError("binance exchangeInfo missing symbols list")
-    return {
-        str(item["symbol"])
-        for item in symbols
-        if isinstance(item, dict)
-        and (include_inactive or item.get("status") == "TRADING")
-        and item.get("contractType") == "PERPETUAL"
-        and item.get("quoteAsset") == "USDT"
-    }
+    active: set[str] = set()
+    inactive: set[str] = set()
+    for item in symbols:
+        if not (isinstance(item, dict) and item.get("contractType") == "PERPETUAL" and item.get("quoteAsset") == "USDT"):
+            continue
+        sym = str(item["symbol"])
+        if item.get("status") == "TRADING":
+            active.add(sym)
+        elif include_inactive:
+            inactive.add(sym)
+    return active, inactive - active
+
+
+def _binance_perp_symbols(client: cex.PublicGetClient, *, include_inactive: bool = False) -> set[str]:
+    active, inactive = _binance_perp_symbol_sets(client, include_inactive=include_inactive)
+    return active | inactive
+
+
+def _bybit_perp_symbol_sets(client: cex.PublicGetClient, *, include_inactive: bool = False) -> tuple[set[str], set[str]]:
+    active: set[str] = set()
+    inactive: set[str] = set()
+
+    def _scan_status(status_filter: str | None) -> None:
+        cursor = ""
+        for _ in range(20):
+            params: dict[str, object] = {"category": "linear", "limit": 1000}
+            if status_filter:
+                params["status"] = status_filter
+            if cursor:
+                params["cursor"] = cursor
+            payload = client.get("/v5/market/instruments-info", params)
+            result = payload.get("result") if isinstance(payload, dict) else None
+            rows = result.get("list") if isinstance(result, dict) else None
+            if not isinstance(rows, list):
+                raise cex.CexDataError("bybit instruments-info missing result.list")
+            for item in rows:
+                if not (isinstance(item, dict) and item.get("contractType") == "LinearPerpetual" and item.get("quoteCoin") == "USDT"):
+                    continue
+                sym = str(item["symbol"])
+                if item.get("status") == "Trading":
+                    active.add(sym)
+                elif include_inactive:
+                    inactive.add(sym)
+            cursor = str(result.get("nextPageCursor") or "")
+            if not cursor:
+                break
+
+    _scan_status(None)
+    if include_inactive:
+        try:
+            _scan_status("Closed")
+        except Exception:  # noqa: BLE001
+            pass
+    return active, inactive - active
 
 
 def _bybit_perp_symbols(client: cex.PublicGetClient, *, include_inactive: bool = False) -> set[str]:
-    found: set[str] = set()
-    cursor = ""
-    for _ in range(20):
-        params: dict[str, object] = {"category": "linear", "limit": 1000}
-        if cursor:
-            params["cursor"] = cursor
-        payload = client.get("/v5/market/instruments-info", params)
-        result = payload.get("result") if isinstance(payload, dict) else None
-        rows = result.get("list") if isinstance(result, dict) else None
-        if not isinstance(rows, list):
-            raise cex.CexDataError("bybit instruments-info missing result.list")
-        for item in rows:
-            if (
-                isinstance(item, dict)
-                and (include_inactive or item.get("status") == "Trading")
-                and item.get("contractType") == "LinearPerpetual"
-                and item.get("quoteCoin") == "USDT"
-            ):
-                found.add(str(item["symbol"]))
-        cursor = str(result.get("nextPageCursor") or "")
-        if not cursor:
-            break
-    return found
+    active, inactive = _bybit_perp_symbol_sets(client, include_inactive=include_inactive)
+    return active | inactive
 
 
 def discover_common_coins(
@@ -157,28 +182,37 @@ def discover_common_coins(
     if len(universe) != len(ctxs):
         raise hl.HyperliquidError("metaAndAssetCtxs universe/context length mismatch")
 
-    cex_symbols = (
-        _binance_perp_symbols(cex_client, include_inactive=include_delisted)
+    active_cex_symbols, inactive_cex_symbols = (
+        _binance_perp_symbol_sets(cex_client, include_inactive=include_delisted)
         if venue == "binance"
-        else _bybit_perp_symbols(cex_client, include_inactive=include_delisted)
+        else _bybit_perp_symbol_sets(cex_client, include_inactive=include_delisted)
     )
+    all_cex_symbols = active_cex_symbols | inactive_cex_symbols
 
     candidates: list[CoinCandidate] = []
     delisted: list[CoinCandidate] = []
     for asset, ctx in zip(universe, ctxs):
-        if asset.get("isDelisted"):
-            if not include_delisted:
-                continue
-            coin_d = str(asset.get("name") or "").strip()
-            sym_d = cex_symbol(coin_d) if coin_d else ""
-            if coin_d and sym_d in cex_symbols:
-                delisted.append(CoinCandidate(coin=coin_d, cex_symbol=sym_d, hl_day_notional_usd=0.0, hl_oi_usd=0.0, is_delisted=True))
-            continue
         coin = str(asset.get("name") or "").strip()
         if not coin:
             continue
         sym = cex_symbol(coin)
-        if sym not in cex_symbols:
+        hl_delisted = bool(asset.get("isDelisted"))
+        cex_inactive = sym in inactive_cex_symbols
+        if hl_delisted or cex_inactive:
+            if include_delisted and sym in all_cex_symbols:
+                day_vol_d = 0.0 if hl_delisted else _f(ctx.get("dayNtlVlm"))
+                oi_d = 0.0 if hl_delisted else _f(ctx.get("openInterest")) * _f(ctx.get("markPx"))
+                delisted.append(
+                    CoinCandidate(
+                        coin=coin,
+                        cex_symbol=sym,
+                        hl_day_notional_usd=day_vol_d,
+                        hl_oi_usd=oi_d,
+                        is_delisted=True,
+                    )
+                )
+            continue
+        if sym not in active_cex_symbols:
             continue
         day_vol = _f(ctx.get("dayNtlVlm"))
         if day_vol < min_prefilter_vol_usd:

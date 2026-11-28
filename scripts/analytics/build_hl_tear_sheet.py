@@ -37,7 +37,7 @@ def _load_dotenv(path: Path) -> None:
 @app.command()
 def main(
     data_root: Path = typer.Option(ROOT / "data/paper", help="Root folder containing live HL module outputs"),
-    report_path: Path = typer.Option(ROOT / "docs/reports/2026-11-26/hl_trading_tear_sheet.md", help="Markdown tear-sheet output"),
+    report_path: Path = typer.Option(ROOT / "data/reports/hl_trading_tear_sheet.md", help="Markdown tear-sheet output"),
     telegram: bool = typer.Option(False, help="Send executive Rich HTML card to Telegram"),
 ) -> None:
     _load_dotenv(ROOT / ".env")

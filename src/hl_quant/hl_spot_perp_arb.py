@@ -198,6 +198,7 @@ class SpotPerpPaperConfig:
     hlp_hurdle_mult: float = 1.0
     max_l2_slip_bps: float = 10.0
     min_exec_basis_bps: float = -12.0
+    max_book_mark_divergence_bps: float = 15.0
     max_proxy_basis_bps: float = 120.0
     max_payback_hours: float = 168.0  # Max 7 days round-trip payback
     use_maker_fees: bool = True  # Realistic ALO execution (spot 4.0 + perp 1.5 = 5.5 bps one-way)
@@ -256,7 +257,7 @@ def fetch_boros_hl_fixed_rates(client: httpx.Client) -> dict[str, float]:
             if not (
                 m.is_hyperliquid
                 and not m.is_spread_market
-                and m.days_to_maturity >= 5.0
+                and m.days_to_maturity >= 7.0
                 and m.is_actionable
             ):
                 continue
@@ -430,7 +431,7 @@ def scan_spot_perp_opportunities(
 
         def _default_book(coin_key: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
             assert http_client is not None
-            return cds.fetch_dex_l2_book(http_client, "hyperliquid", coin_key)
+            return cds.fetch_dex_l2_book(http_client, "hyperliquid", coin_key, info_url=info_url)
 
         get_book = book_fetcher or _default_book
         one_way_fee = cfg.one_way_fee_bps
@@ -455,6 +456,7 @@ def scan_spot_perp_opportunities(
 
             entry_slip: float | None = None
             exec_basis: float | None = None
+            book_mid_basis: float | None = None
             full_ok = False
             if fetch_l2 and (base in held_bases or spot_vol >= min(50_000.0, cfg.min_spot_vol_usd)):
                 sb, sa = get_book(spot_pair)
@@ -463,17 +465,22 @@ def scan_spot_perp_opportunities(
                 exec_basis, entry_slip, full_ok = cds.compute_executable_cross_dex_entry_bps(
                     pb, pa, sb, sa, short_hl=True, clip_usd=target_clip
                 )
+                book_mid_basis = cds.compute_book_mid_basis_bps(pb, pa, sb, sa, short_hl=True)
 
-            # Effective round-trip hurdle (bps) = RT fee + 2x entry L2 slip (conservative exit) - favorable entry basis
-            # Cap basis credit at min(exec_basis, mark_basis_bps) and one_way_fee + entry_slip so async L2 spikes never fake payback.
+            # Effective round-trip hurdle (bps):
+            # When exec_basis is observed, it ALREADY subtracts 1x entry_slip from mid basis, so add 1x eff_slip
+            # for the exit leg and cap basis_credit at one_way_fee (<= 0 for proxy hedges).
             eff_exec_basis = cds.credited_entry_basis_bps(exec_basis, mark_basis_bps) if exec_basis is not None else None
             eff_slip = float(entry_slip) if entry_slip is not None else 4.0
-            basis_credit = min(max(float(eff_exec_basis or 0.0), -50.0), one_way_fee + eff_slip)
-            if is_proxy:
-                # Proxy hedge (e.g. XAUT0 spot vs PAXG perp): the cross-issuer basis is structural
-                # and does not converge, so a favorable entry basis is never credited to payback.
-                basis_credit = min(basis_credit, 0.0)
-            net_hurdle_bps = max(rt_fee_bps + 2.0 * eff_slip - basis_credit, 1.0)
+            if exec_basis is not None and eff_exec_basis is not None:
+                basis_credit = min(max(float(eff_exec_basis), -50.0), one_way_fee)
+                if is_proxy:
+                    # Proxy hedge (e.g. XAUT0 spot vs PAXG perp): the cross-issuer basis is structural
+                    # and does not converge, so a favorable entry basis is never credited to payback.
+                    basis_credit = min(basis_credit, 0.0)
+                net_hurdle_bps = max(rt_fee_bps + 1.0 * eff_slip - basis_credit, 1.0)
+            else:
+                net_hurdle_bps = max(rt_fee_bps + 2.0 * eff_slip, 1.0)
             hourly_bps = fund_h * 1e4
             payback_h = round(net_hurdle_bps / hourly_bps, 1) if hourly_bps > 1e-6 else None
 
@@ -497,6 +504,11 @@ def scan_spot_perp_opportunities(
                     reasons.append(f"l2_slip>{cfg.max_l2_slip_bps:.1f}bps")
                 if eff_exec_basis is not None and eff_exec_basis < cfg.min_exec_basis_bps:
                     reasons.append(f"neg_basis<{cfg.min_exec_basis_bps:.0f}bps")
+                if (
+                    book_mid_basis is not None
+                    and abs(book_mid_basis - mark_basis_bps) > cfg.max_book_mark_divergence_bps
+                ):
+                    reasons.append(f"book_mark_div>{cfg.max_book_mark_divergence_bps:.0f}bps")
             if payback_h is None or payback_h > cfg.max_payback_hours:
                 reasons.append(f"payback>{cfg.max_payback_hours:.0f}h")
 
@@ -611,25 +623,38 @@ def fetch_settled_funding_sum(
     end_ms: int,
     *,
     info_url: str = HL_INFO_URL,
+    max_window_hours: float | None = 24.0,
 ) -> dict[str, float]:
-    """Sum realized hourly ``fundingHistory`` rates over ``[start_ms, end_ms]`` per perp coin."""
+    """Sum realized hourly ``fundingHistory`` rates over ``[start_ms, end_ms]`` per perp coin.
+
+    Capped at ``max_window_hours`` (default 24h) and fails closed (omits coin) if any pagination
+    request fails HTTP != 200 so partial page-1 sums are never mistaken for complete windows.
+    """
     out: dict[str, float] = {}
-    if end_ms < start_ms:
+    eff_start = int(start_ms)
+    if max_window_hours is not None and max_window_hours > 0:
+        eff_start = max(eff_start, int(end_ms) - int(max_window_hours * 3_600_000) + 1)
+    if end_ms < eff_start:
         return out
     for coin in sorted({str(c) for c in coins if c}):
         try:
-            cursor = int(start_ms)
+            cursor = eff_start
             total_rate = 0.0
             valid = 0
+            fetch_failed = False
             for _ in range(10):
                 resp = client.post(
                     info_url,
                     json={"type": "fundingHistory", "coin": coin, "startTime": cursor, "endTime": int(end_ms)},
                 )
                 if resp.status_code != 200:
+                    fetch_failed = True
                     break
                 rows = resp.json()
-                if not isinstance(rows, list) or not rows:
+                if not isinstance(rows, list):
+                    fetch_failed = True
+                    break
+                if not rows:
                     break
                 max_t = cursor
                 for item in rows:
@@ -644,7 +669,7 @@ def fetch_settled_funding_sum(
                 if len(rows) < 500 or max_t <= cursor or max_t >= end_ms:
                     break
                 cursor = max_t + 1
-            if valid > 0:
+            if valid > 0 and not fetch_failed:
                 out[coin] = total_rate
         except Exception:
             continue
@@ -688,6 +713,30 @@ def run_spot_perp_paper_tick(
     trades_path = state_dir / "trades.parquet"
     state = _load_or_init_state(state_path, cfg)
 
+    prev_ms = int(state.get("last_tick_ms", 0) or 0)
+    last_clamped_ms = int(state.get("last_clamped_ms", 0) or 0)
+    same_prev_hour = prev_ms > 0 and (
+        ts_ms <= prev_ms
+        or (ts_ms // 3_600_000) == (prev_ms // 3_600_000)
+        or (ts_ms - prev_ms) < 60_000
+    )
+    same_clamped_hour = (
+        bool(state.get("nav_guard_pending_ms"))
+        and last_clamped_ms > 0
+        and (
+            ts_ms <= last_clamped_ms
+            or (ts_ms // 3_600_000) == (last_clamped_ms // 3_600_000)
+            or (ts_ms - last_clamped_ms) < 60_000
+        )
+    )
+    if same_prev_hour or same_clamped_hour:
+        return {
+            "status": "duplicate_hour_skipped",
+            "state": state,
+            "scan": {},
+            "trades_this_tick": [],
+        }
+
     own_client = client is None and (markets is None or book_fetcher is None or hlp_summary is None)
     http_client = client or (httpx.Client(timeout=20.0) if own_client else None)
     try:
@@ -707,7 +756,7 @@ def run_spot_perp_paper_tick(
 
         def _default_book(coin_key: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
             assert http_client is not None
-            return cds.fetch_dex_l2_book(http_client, "hyperliquid", coin_key)
+            return cds.fetch_dex_l2_book(http_client, "hyperliquid", coin_key, info_url=info_url)
 
         get_book = book_fetcher or _default_book
         by_base: dict[str, SpotPerpOpportunity] = {o.base_symbol: o for o in scan.opportunities}
@@ -739,16 +788,20 @@ def run_spot_perp_paper_tick(
         # Per-position accrual clock: a position skipped on an earlier tick (missing quote) keeps its
         # own ``last_accrual_ms``, so its settled-funding window starts where it last accrued.
         pos_start_ms = {base: pc.position_accrual_start_ms(pos, prev_ms) for base, pos in positions.items()}
-        settled_rates: dict[str, float] = {}
+        settled_rates: dict[Any, float] = {}
         if prev_ms > 0 and positions and markets is None and http_client is not None:
             by_start: dict[int, list[str]] = {}
             for base, start in pos_start_ms.items():
-                if start > 0 and (ts_ms // 3_600_000) - (start // 3_600_000) > 0:
-                    by_start.setdefault(start, []).append(base)
+                eff_s = max(start, ts_ms - 24 * 3_600_000)
+                if eff_s > 0 and (ts_ms // 3_600_000) - (eff_s // 3_600_000) > 0:
+                    by_start.setdefault(eff_s, []).append(base)
             for start, bases in by_start.items():
-                settled_rates.update(
-                    fetch_settled_funding_sum(http_client, bases, start + 1, ts_ms, info_url=info_url)
+                fetched = fetch_settled_funding_sum(
+                    http_client, bases, start + 1, ts_ms, info_url=info_url, max_window_hours=24.0
                 )
+                for b_sym, r_val in fetched.items():
+                    settled_rates[(start, b_sym)] = r_val
+                    settled_rates[b_sym] = r_val
 
         for base, pos in list(positions.items()):
             opp = by_base.get(base)
@@ -767,20 +820,29 @@ def run_spot_perp_paper_tick(
             perp_notional = qty * cur_perp
             spot_notional = qty * cur_spot
             p_start = pos_start_ms.get(base, prev_ms)
+            eff_p_start = max(p_start, ts_ms - 24 * 3_600_000)
             # Same cap as the global clock (168h while a NAV-guard confirmation is pending).
             pos_dt_hours = max(0.0, min(dt_cap_h, (ts_ms - p_start) / 3_600_000.0)) if p_start > 0 else dt_hours
             pos_settlements = (ts_ms // 3_600_000) - (p_start // 3_600_000) if p_start > 0 else 0
             pos["last_accrual_ms"] = ts_ms
+            settled_r = settled_rates.get((eff_p_start, base), settled_rates.get(base))
             if prev_ms > 0 and markets is None and pos_settlements == 0:
                 # Sub-hour re-run with zero `:00` settlements crossed accrues zero settled funding.
                 fund_pnl = 0.0
-            elif base in settled_rates:
-                fund_pnl = perp_notional * settled_rates[base]
+            elif settled_r is not None:
+                fund_pnl = perp_notional * float(settled_r)
             else:
                 fund_pnl = perp_notional * opp.funding_rate_h * pos_dt_hours
 
             # Update perp margin with unrealized perp PnL + funding accrued on perp account
-            perp_margin = float(pos["perp_margin_usd"]) + perp_pnl + fund_pnl
+            raw_perp_margin = float(pos["perp_margin_usd"]) + perp_pnl + fund_pnl
+            if bool(pos.get("only_isolated", False)) and raw_perp_margin < 0.0:
+                # Isolated perp limited liability: loss on the isolated perp leg cannot exceed posted margin.
+                perp_pnl = -float(pos["perp_margin_usd"]) - fund_pnl
+                basis_pnl = spot_pnl + perp_pnl
+                perp_margin = 0.0
+            else:
+                perp_margin = raw_perp_margin
             max_lev = int(pos.get("max_leverage") or opp.max_leverage or 10)
             pos["max_leverage"] = max_lev
             mmr = _PerpMMR(max_lev)
@@ -813,23 +875,40 @@ def run_spot_perp_paper_tick(
         # tick keeps ``last_tick_ms`` so the confirming tick re-accrues funding/HLP/basis over the
         # whole interval (nothing is lost and the ledger cannot freeze forever).
         raw_tick_pnl = tick_funding_usd + tick_basis_mtm_usd + tick_hlp_usd
+        raw_ret_pct = (raw_tick_pnl / prev_equity * 100.0) if prev_equity > 0 else 0.0
         pending_raw = state.get("nav_guard_pending_ms")
         nav_guard_pending: int | None = int(pending_raw) if pending_raw else None
-        jump_exceeded = prev_equity > 0 and abs(raw_tick_pnl) / prev_equity * 100.0 > cfg.max_tick_nav_jump_pct
+        pending_ret_raw = state.get("nav_guard_pending_ret_pct")
+        nav_guard_pending_ret: float | None = float(pending_ret_raw) if pending_ret_raw is not None else None
+        jump_exceeded = prev_equity > 0 and abs(raw_ret_pct) > cfg.max_tick_nav_jump_pct
         if jump_exceeded and nav_guard_pending is not None and ts_ms - nav_guard_pending >= NAV_GUARD_CONFIRM_MS:
-            nav_guard_reason = (
-                f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% persisted since the clamped tick; "
-                "accepted as genuine"
+            confirmed = nav_guard_pending_ret is None or (
+                (raw_ret_pct * nav_guard_pending_ret) > 0.0
+                and abs(raw_ret_pct - nav_guard_pending_ret)
+                <= max(cfg.max_tick_nav_jump_pct, 0.5 * abs(nav_guard_pending_ret))
             )
-            nav_guard_pending = None
-            jump_exceeded = False
+            if confirmed:
+                nav_guard_reason = (
+                    f"Tick NAV jump {raw_ret_pct:+.2f}% persisted since the clamped tick; "
+                    "accepted as genuine"
+                )
+                nav_guard_pending = None
+                nav_guard_pending_ret = None
+                jump_exceeded = False
+            else:
+                nav_guard_pending = ts_ms
+                nav_guard_pending_ret = round(raw_ret_pct, 6)
         elif not jump_exceeded:
             nav_guard_pending = None
+            nav_guard_pending_ret = None
         if jump_exceeded:
-            nav_guard_pending = nav_guard_pending if nav_guard_pending is not None else ts_ms
+            if nav_guard_pending is None:
+                nav_guard_pending = ts_ms
+            if nav_guard_pending_ret is None:
+                nav_guard_pending_ret = round(raw_ret_pct, 6)
             nav_guard_triggered = True
             nav_guard_reason = (
-                f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% exceeded "
+                f"Tick NAV jump {raw_ret_pct:+.2f}% exceeded "
                 f"+/-{cfg.max_tick_nav_jump_pct:.1f}% guard; pausing entries & clamping MTM"
             )
             state["nav_guard_triggers"] = int(state.get("nav_guard_triggers", 0)) + 1
@@ -840,10 +919,20 @@ def run_spot_perp_paper_tick(
             tick_basis_mtm_usd = 0.0
             tick_hlp_usd = 0.0
 
-        # 3. Auto-rebalance perp margin if a sharp rally erodes short-perp margin beyond max_perp_leverage
+        _write_json_atomic(state_dir / "snapshot.json", scan.to_dict())
+
+        # 3. Auto-rebalance perp margin if a sharp rally erodes short-perp margin beyond max_perp_leverage,
+        # but NEVER resurrect an already-liquidated position (check maintenance margin BEFORE MARGIN_TOPUP).
         free_cash = float(state.get("free_cash_usd", 0.0))
         if not nav_guard_triggered:
             for base, pos in list(positions.items()):
+                mmr_pre = _PerpMMR(pos.get("max_leverage", 10))
+                if (
+                    float(pos.get("perp_margin_usd", 0.0)) <= float(pos.get("perp_notional_usd", 0.0)) * mmr_pre
+                    or float(pos.get("perp_liq_distance_pct", 100.0)) <= 0.0
+                ):
+                    # Already breached maintenance margin -> let Step 4 liquidate rather than rescuing post-hoc.
+                    continue
                 eff_lev = float(pos.get("effective_perp_leverage", 0.0))
                 if eff_lev > cfg.max_perp_leverage:
                     perp_ntl = float(pos["perp_notional_usd"])
@@ -876,7 +965,6 @@ def run_spot_perp_paper_tick(
         # 4. Evaluate exits: short-perp liquidation, funding flip/decay, proxy basis dislocation, or missing market
         closed_this_tick: set[str] = set()
         if not nav_guard_triggered:
-            _write_json_atomic(state_dir / "snapshot.json", scan.to_dict())
             market_online = bool(by_base)
             for base in list(positions.keys()):
                 pos = positions[base]
@@ -891,12 +979,19 @@ def run_spot_perp_paper_tick(
                 elif opp is None:
                     if not market_online:
                         continue
-                    miss = int(pos.get("missing_quote_ticks", 0)) + 1
+                    pos["missing_streak"] = advance_streak(
+                        pos.get("missing_streak", pos.get("missing_quote_ticks", 0)),
+                        qualifies=True,
+                        now_ms=ts_ms,
+                        min_spacing_hours=cfg.min_streak_spacing_hours,
+                    )
+                    miss = streak_count(pos["missing_streak"])
                     pos["missing_quote_ticks"] = miss
                     if miss >= cfg.max_missing_ticks:
                         exit_reason = "missing_market"
                 else:
                     pos["missing_quote_ticks"] = 0
+                    pos.pop("missing_streak", None)
                     if opp.funding_apr_pct <= cfg.hard_flip_apr_pct:
                         exit_reason = f"hard_funding_flip({opp.funding_apr_pct:+.1f}%)"
                     elif opp.is_proxy_hedge and abs(opp.mark_basis_bps) > cfg.max_proxy_basis_bps * 1.5:
@@ -938,15 +1033,19 @@ def run_spot_perp_paper_tick(
                         sb, sa = get_book(opp.spot_pair)
                         pb, pa = get_book(base)
                         # Closing: buy back perp (ask) + sell spot (bid) -> short_hl=False
-                        _, sl, _ = cds.compute_executable_cross_dex_entry_bps(
+                        _, sl, full_ok = cds.compute_executable_cross_dex_entry_bps(
                             pb, pa, sb, sa, short_hl=False, clip_usd=notional
                         )
-                        if sl is not None:
-                            exit_slip = sl
+                        exit_slip = sl if (sl is not None and full_ok) else max(float(sl or 0.0), 3.0)
                     exit_cost = notional * (cfg.one_way_fee_bps + exit_slip) / 1e4
                     tick_costs_usd += exit_cost
                     # Release spot value + perp margin back to free cash (minus exit cost)
-                    released_usd = float(pos["spot_notional_usd"]) + float(pos["perp_margin_usd"]) - exit_cost
+                    perp_rem = (
+                        max(0.0, float(pos["perp_margin_usd"]))
+                        if bool(pos.get("only_isolated", False))
+                        else float(pos["perp_margin_usd"])
+                    )
+                    released_usd = float(pos["spot_notional_usd"]) + perp_rem - exit_cost
                     free_cash = round(free_cash + released_usd, 2)
                     state["closed_positions_count"] = int(state.get("closed_positions_count", 0)) + 1
                     trade_rows.append(
@@ -1062,6 +1161,7 @@ def run_spot_perp_paper_tick(
                     "cum_basis_mtm_usd": 0.0,
                     "net_pnl_usd": round(-entry_cost, 4),
                     "hours_held": 0.0,
+                    "last_accrual_ms": ts_ms,
                     "payback_achieved": False,
                     "opened_at_utc": obs_utc,
                 }
@@ -1148,7 +1248,9 @@ def run_spot_perp_paper_tick(
                 "cum_basis_mtm_usd": round(float(state.get("cum_basis_mtm_usd", 0.0)) + tick_basis_mtm_usd, 4),
                 "cum_costs_usd": round(float(state.get("cum_costs_usd", 0.0)) + tick_costs_usd, 4),
                 "last_tick_ms": prev_ms if nav_guard_triggered else ts_ms,
+                "last_clamped_ms": ts_ms if nav_guard_triggered else 0,
                 "nav_guard_pending_ms": nav_guard_pending,
+                "nav_guard_pending_ret_pct": nav_guard_pending_ret,
                 "observed_at_utc": obs_utc,
                 "positions": positions,
                 "clean_streaks": clean_streaks,
@@ -1196,6 +1298,7 @@ def run_spot_perp_paper_tick(
         _append_parquet(trades_path, trade_rows)
 
         return {
+            "status": "ok",
             "state": state,
             "scan": scan.to_dict(),
             "trades_this_tick": trade_rows,

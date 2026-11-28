@@ -45,6 +45,61 @@ def _load_dotenv(path: Path) -> None:
             os.environ[k] = v.strip().strip('"').strip("'")
 
 
+_DEFAULT_SZ_DECIMALS: dict[str, int] = {
+    "BTC": 5,
+    "ETH": 4,
+    "BNB": 3,
+    "SOL": 2,
+    "HYPE": 2,
+    "AVAX": 2,
+    "TAO": 2,
+    "AAVE": 2,
+    "LTC": 2,
+    "APT": 2,
+    "LINK": 1,
+    "SUI": 1,
+    "NEAR": 1,
+    "ARB": 1,
+    "OP": 1,
+    "TIA": 1,
+    "UNI": 1,
+    "DOGE": 0,
+    "XRP": 0,
+    "ADA": 0,
+    "TRX": 0,
+    "ENA": 0,
+    "WIF": 0,
+    "ONDO": 0,
+    "JUP": 0,
+    "PENDLE": 0,
+    "SEI": 0,
+    "FET": 0,
+}
+
+
+def _replay_sz_decimals(coin: str, l2_df: pd.DataFrame) -> int:
+    if "sz_decimals" in l2_df.columns and not l2_df["sz_decimals"].dropna().empty:
+        return int(l2_df["sz_decimals"].dropna().iloc[0])
+    if coin in _DEFAULT_SZ_DECIMALS:
+        return _DEFAULT_SZ_DECIMALS[coin]
+    if len(coin) > 1 and coin.startswith("k") and coin[1].isupper():
+        return 0
+    mid = (
+        float(l2_df["mid_px"].median())
+        if "mid_px" in l2_df.columns
+        else 0.5 * float((l2_df["best_bid"] + l2_df["best_ask"]).median())
+    )
+    if mid >= 10_000.0:
+        return 5
+    if mid >= 1_000.0:
+        return 4
+    if mid >= 10.0:
+        return 2
+    if mid >= 1.0:
+        return 1
+    return 0
+
+
 def _atomic_write_text(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(f".tmp{path.suffix}")
@@ -100,7 +155,7 @@ def main(
             l2_df = l2_all[l2_all["coin"] == target_coin].copy() if "coin" in l2_all.columns else l2_all.copy()
             if l2_df.empty:
                 continue
-            spec = ex.AssetSpec(coin=target_coin, sz_decimals=4 if target_coin == "ETH" else 5, max_leverage=25)
+            spec = ex.AssetSpec(coin=target_coin, sz_decimals=_replay_sz_decimals(target_coin, l2_df), max_leverage=25)
             s_one, f_one, q_one = mm.simulate_avellaneda_stoikov_on_l2(l2_df, spec, params=params)
             summaries[target_coin] = s_one
             if not f_one.empty:

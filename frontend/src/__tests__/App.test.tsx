@@ -1622,3 +1622,383 @@ describe("Audit 2026-11-28 regressions", () => {
     expect(errEl).not.toHaveClass("neg");
   });
 });
+
+describe("Wave 4 UI-01..UI-04 regressions", () => {
+  it("UI-01: filters <10-event outliers, ranks verified rows first, suppresses .pos on failed FDR/clustered t, and shows bilingual degraded notice", async () => {
+    window.localStorage.setItem("hl_desk_lang", "en");
+    mockFetch(
+      makeOverview({
+        settlement_last_attempt: {
+          observed_at_ms: 1795800000000,
+          bar_interval: "15m",
+          coins_requested: 35,
+          coins_collected: 12,
+          collection_ratio: 0.3429,
+          degraded: true,
+        },
+        settlement_stats: [
+          // Tiny-sample outlier (events < 10) -> must be dropped because >=10-event rows exist
+          {
+            strategy: "tiny_outlier_15m",
+            bucket: "APR>=+50% (pos)",
+            split: "holdout",
+            events: 5,
+            mean_gross_bps: 120.0,
+            t_stat: 6.5,
+            t_stat_clustered: 5.0,
+            fdr_pass: true,
+            win_rate_pct: 100,
+            net_maker_bps: 117.0,
+            net_taker_bps: 111.0,
+          },
+          // Unverified row 1: high bps, but fdr_pass === false
+          {
+            strategy: "fdr_fail_15m",
+            bucket: "|APR|>=50% (all)",
+            split: "holdout",
+            events: 40,
+            mean_gross_bps: 35.0,
+            t_stat: 2.8,
+            t_stat_clustered: 2.3,
+            net_t_stat_clustered: 2.1,
+            fdr_pass: false,
+            win_rate_pct: 60,
+            net_maker_bps: 32.0,
+            net_taker_bps: 26.0,
+          },
+          // Unverified row 2: clustered t-stat < 2.0
+          {
+            strategy: "low_cluster_t_15m",
+            bucket: "APR>=+25% (pos)",
+            split: "holdout",
+            events: 55,
+            mean_gross_bps: 24.0,
+            t_stat: 3.1,
+            t_stat_clustered: 1.45,
+            net_t_stat_clustered: 1.2,
+            fdr_pass: true,
+            win_rate_pct: 58,
+            net_maker_bps: 21.0,
+            net_taker_bps: 15.0,
+          },
+          // Unverified row 3: Dev split has negative net_maker_bps
+          {
+            strategy: "dev_loser_15m",
+            bucket: "APR<=-25% (neg)",
+            split: "dev",
+            events: 120,
+            mean_gross_bps: 1.5,
+            t_stat: 1.2,
+            win_rate_pct: 51,
+            net_maker_bps: -1.5,
+            net_taker_bps: -7.5,
+          },
+          {
+            strategy: "dev_loser_15m",
+            bucket: "APR<=-25% (neg)",
+            split: "holdout",
+            events: 65,
+            mean_gross_bps: 28.0,
+            t_stat: 3.0,
+            t_stat_clustered: 2.5,
+            net_t_stat_clustered: 2.3,
+            fdr_pass: true,
+            win_rate_pct: 62,
+            net_maker_bps: 25.0,
+            net_taker_bps: 19.0,
+          },
+          // Statistically verified row: Dev net_maker_bps > 0, clustered net t >= 2.0, fdr_pass !== false
+          {
+            strategy: "verified_edge_15m",
+            bucket: "APR>=+50% (pos)",
+            split: "dev",
+            events: 180,
+            mean_gross_bps: 18.0,
+            t_stat: 3.6,
+            t_stat_clustered: 2.9,
+            net_t_stat_clustered: 2.5,
+            win_rate_pct: 64,
+            net_maker_bps: 15.0,
+            net_taker_bps: 9.0,
+          },
+          {
+            strategy: "verified_edge_15m",
+            bucket: "APR>=+50% (pos)",
+            split: "holdout",
+            events: 95,
+            mean_gross_bps: 19.5,
+            t_stat: 3.4,
+            t_stat_clustered: 2.7,
+            net_t_stat_clustered: 2.35,
+            fdr_pass: true,
+            win_rate_pct: 63,
+            net_maker_bps: 16.5,
+            net_taker_bps: 10.5,
+          },
+        ],
+      }),
+    );
+
+    const user = userEvent.setup();
+    const { unmount } = render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    const settleSection = screen.getByText(":00 Funding Settlement OOS Study").closest("section")!;
+    // Degraded badge in EN
+    expect(within(settleSection).getByText("Degraded collection")).toHaveClass("badge-warn");
+    expect(within(settleSection).getByText(/12\/35 coins/)).toBeInTheDocument();
+
+    // <10-event outlier is filtered out
+    expect(within(settleSection).queryByText("tiny_outlier_15m")).not.toBeInTheDocument();
+
+    // Verified row ranks #1 ahead of higher-bps unverified rows
+    const bodyRows = within(settleSection).getAllByRole("row").slice(1);
+    expect(bodyRows[0]).toHaveTextContent("verified_edge_15m");
+    expect(within(bodyRows[0]).getByText("16.50 bps")).toHaveClass("pos");
+
+    // fdr_pass === false and clustered t < 2.0 do NOT color net_maker_bps bright green (.pos)
+    const fdrFailCell = within(settleSection).getByText("32.00 bps").closest("td")!;
+    expect(fdrFailCell).not.toHaveClass("pos");
+    const lowClusterCell = within(settleSection).getByText("21.00 bps").closest("td")!;
+    expect(lowClusterCell).not.toHaveClass("pos");
+
+    // Switch to RU -> degraded badge & notice translate cleanly
+    await user.click(screen.getByRole("button", { name: "RU" }));
+    expect(screen.getByText("Неполный сбор")).toHaveClass("badge-warn");
+    expect(screen.getByText(/12\/35 монет/)).toBeInTheDocument();
+    window.localStorage.setItem("hl_desk_lang", "en");
+    unmount();
+
+    // Small synthetic fixture fallback: when ALL rows have events < 10, rows are preserved
+    mockFetch(
+      makeOverview({
+        settlement_stats: [
+          {
+            strategy: "synthetic_small_only",
+            bucket: "tiny_bucket",
+            split: "OOS",
+            events: 6,
+            mean_gross_bps: 8.0,
+            t_stat: 2.5,
+            win_rate_pct: 66.7,
+            net_maker_bps: 5.0,
+            net_taker_bps: -1.0,
+          },
+        ],
+      }),
+    );
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+    expect(screen.getByText("synthetic_small_only")).toBeInTheDocument();
+  });
+
+  it("UI-02: clamps and rebases 370d benchmarks on All when Rebase is unchecked unless all desk strategies are hidden", async () => {
+    const overview = makeOverview();
+    const analyticsPayload = {
+      generated_at_utc: "2026-11-28 12:00 UTC",
+      leaderboard: [],
+      curves: {
+        btc: {
+          id: "btc",
+          name: "BTC Buy & Hold",
+          category: "Benchmark",
+          is_benchmark: true,
+          dates: ["2025-11-20", "2026-06-01", "2026-11-26", "2026-11-28"],
+          // +100% prior run-up, then +1% over the 2-day desk strategy window
+          gross_shares: [1.0, 1.5, 2.0, 2.02],
+          net_shares: [1.0, 1.5, 2.0, 2.02],
+        },
+        spot_perp: {
+          id: "spot_perp",
+          name: "Spot+Perp",
+          category: "Market Neutral",
+          is_benchmark: false,
+          dates: ["2026-11-26", "2026-11-28"],
+          // Started at 1.02 (e.g. +2.0% inception base=1 vs 0% window-start base=1.02)
+          gross_shares: [1.02, 1.0251],
+          net_shares: [1.02, 1.0251],
+        },
+      },
+      correlation: { ids: [], matrix: [], overlap_days: 0 },
+      market_exposure: {},
+      risk_exposure: {
+        leverage_by_strategy: [],
+        venue_concentration: [],
+        asset_tier_concentration: [],
+        total_nav_guard_triggers: 0,
+      },
+    };
+
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/api/v1/analytics")) {
+        return new Response(JSON.stringify(analyticsPayload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      if (url.includes("/api/v1/overview")) {
+        return new Response(JSON.stringify(overview), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ service: "hl-frontend", sha: BASE_SHA, built_at: "" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    await user.click(screen.getByRole("tab", { name: "Analytics & Risk" }));
+    // Period defaults to "All" (periodDays === 0); uncheck "Rebase to window"
+    await user.click(screen.getByLabelText("Rebase to window"));
+
+    const chartSvg = screen.getByRole("img", { name: /Multi-strategy cumulative performance chart/i });
+    // BTC stays clamped to 2026-11-26 and rebased (max ~ +2.5% from Spot+Perp inception, never +102.0% from 2025-11-20)
+    expect(chartSvg.textContent).toContain("2026-11-26");
+    expect(chartSvg.textContent).not.toContain("2025-11-20");
+    expect(chartSvg.textContent).not.toContain("+102.0%");
+
+    // Hide the only desk strategy -> earliestStrategyMs becomes null, revealing full 370d BTC benchmark history
+    await user.click(screen.getByRole("button", { name: "Spot+Perp" }));
+    expect(chartSvg.textContent).toContain("2025-11-20");
+    expect(chartSvg.textContent).toContain("+102.0%");
+  });
+
+  it("UI-04: formats cross_dex_paper costs negative, keeps null oracle drift neutral, and gates maker/orphan KPI classes", async () => {
+    const base = makeOverview();
+    mockFetch(
+      makeOverview({
+        cross_dex_paper: {
+          ...base.cross_dex_paper!,
+          cum_costs_usd: 73.96,
+        },
+        hyperevm: {
+          chain: { block_number: 1842310, usdt0_peg_discount_bps: 1.25 },
+          l1_read_oracles: [
+            { coin: "NULL_DRIFT", l1read_mark_px: 10.0, rest_mark_px: null, drift_bps: null },
+            { coin: "OK_DRIFT", l1read_mark_px: 26.42, rest_mark_px: 26.41, drift_bps: 3.78 },
+          ],
+        },
+        attribution: {
+          ...base.attribution,
+          maker_volume_share_pct: 0,
+        },
+        testnet_risk: {
+          equity_usd: 1018.45,
+          free_margin_usd: 742.1,
+          high_water_mark_usd: 1025.0,
+          drawdown_pct: 0.64,
+          open_positions: 2,
+          gross_notional_usd: 755.0,
+          gross_leverage: 0.74,
+          max_mark_oracle_dev_pct: 0.5,
+          orphan_positions: { GRAM: { szi: -30, notional_usd: -48.5, book: "empty" } },
+          unmanaged_orphan_positions: 0,
+          orphan_notional_usd: 48.5,
+        },
+      }),
+    );
+
+    const user = userEvent.setup();
+    const { unmount } = render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    // 1. Cross-DEX cum_costs_usd renders as -$73.96
+    await user.click(screen.getByRole("tab", { name: "5-DEX & Paper" }));
+    expect(screen.getByText("-$73.96")).toBeInTheDocument();
+    expect(screen.queryByText("$73.96")).not.toBeInTheDocument();
+
+    // 2. Null drift_bps is neutral (never .pos), valid small drift stays .pos
+    await user.click(screen.getByRole("tab", { name: "On-Chain Alpha" }));
+    const nullRow = screen.getByText("NULL_DRIFT").closest("tr")!;
+    const nullDriftCell = within(nullRow).getAllByRole("cell")[3];
+    expect(nullDriftCell).toHaveTextContent("—");
+    expect(nullDriftCell).not.toHaveClass("pos");
+    expect(nullDriftCell).not.toHaveClass("warn");
+    const okRow = screen.getByText("OK_DRIFT").closest("tr")!;
+    expect(within(okRow).getByText("3.78 bps").closest("td")).toHaveClass("pos");
+
+    // 3. Maker share 0.0% (<50%) gets .warn (never .pos); managed orphan ($48.50, unmanaged=0) has no .warn
+    await user.click(screen.getByRole("tab", { name: "Testnet & MM" }));
+    const makerKpi = screen.getByText("0.0%");
+    expect(makerKpi).toHaveClass("warn");
+    expect(makerKpi).not.toHaveClass("pos");
+    const orphanKpi = screen.getByText("$48.50");
+    expect(orphanKpi).not.toHaveClass("warn");
+    unmount();
+
+    // 4. Null maker share is neutral (no .pos/.warn) and unmanaged_orphan_positions > 0 gets .warn
+    mockFetch(
+      makeOverview({
+        attribution: {
+          ...base.attribution,
+          maker_volume_share_pct: null,
+        },
+        testnet_risk: {
+          equity_usd: 1018.45,
+          free_margin_usd: 742.1,
+          high_water_mark_usd: 1025.0,
+          drawdown_pct: 0.64,
+          open_positions: 2,
+          gross_notional_usd: 755.0,
+          gross_leverage: 0.74,
+          max_mark_oracle_dev_pct: 0.5,
+          orphan_positions: { GRAM: { szi: -30, notional_usd: -48.5, book: "empty" } },
+          unmanaged_orphan_positions: 1,
+          orphan_notional_usd: 48.5,
+        },
+      }),
+    );
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+    await user.click(screen.getByRole("tab", { name: "Testnet & MM" }));
+    const makerCard = screen.getByText("Maker Share & ALO Fill").closest(".card")!;
+    const nullMakerVal = makerCard.querySelector(".kpi-value")!;
+    expect(nullMakerVal).toHaveTextContent("—");
+    expect(nullMakerVal).not.toHaveClass("pos");
+    expect(nullMakerVal).not.toHaveClass("warn");
+    expect(screen.getByText("$48.50")).toHaveClass("warn");
+  });
+
+  it("UI-03: passes paper.ticks as totalTicks to Overview EquityCurveChart for trailing slice % and label", async () => {
+    mockFetch(
+      makeOverview({
+        paper: {
+          ticks: 1200,
+          starting_capital_usd: 10000,
+          equity_usd: 11220,
+          return_pct: 12.2,
+          active_positions: 2,
+        },
+        paper_ticks: [
+          {
+            tick_hour_ms: 1795636800000,
+            equity_usd: 11000,
+            net_pnl_usd: 0,
+            fund_pnl_usd: 0,
+            cost_pnl_usd: 0,
+            turnover: 0.1,
+          },
+          {
+            tick_hour_ms: 1795651200000,
+            equity_usd: 11220,
+            net_pnl_usd: 220,
+            fund_pnl_usd: 230,
+            cost_pnl_usd: -10,
+            turnover: 0.1,
+          },
+        ],
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+    // Trailing window return is (11220 - 11000) / 11000 = +2.000% over 2 / 1200 ticks (not +12.200% from 10000)
+    expect(screen.getByText("+2.000% (2 / 1200 ticks)")).toBeInTheDocument();
+  });
+});

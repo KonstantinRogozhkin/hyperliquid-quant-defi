@@ -35,7 +35,7 @@ app = typer.Typer(add_completion=False, help=__doc__)
 def main(
     state_dir: Path = typer.Option(ROOT / "data/paper/hl_metamodel", help="Paper ledger directory"),
     max_coins: int = typer.Option(35, min=10, max=100, help="Top liquid HL x Bybit coins to track"),
-    lookback_days: int = typer.Option(20, min=16, max=40, help="Trailing days (>=16 for 30d liquidity min_periods)"),
+    lookback_days: int = typer.Option(30, min=16, max=60, help="Trailing days (>=30 for full 30d liquidity window)"),
     starting_capital_usd: float = typer.Option(100_000.0),
     hl_fee_bps: float = typer.Option(
         5.0,
@@ -90,7 +90,10 @@ def main(
             for c in held
             if c not in known
         ]
-        bn_syms = us._binance_perp_symbols(bn_client)
+        try:
+            bn_syms = us._binance_perp_symbols(bn_client)
+        except Exception:  # noqa: BLE001
+            bn_syms = set()
         tracked_coins: list[str] = []
         for cand in cands:
             c, sym = cand.coin, cand.cex_symbol
@@ -113,22 +116,25 @@ def main(
                     }
                 )
                 if sym in bn_syms:
-                    bn_f = cex.collect_funding(bn_client, "binance", sym, start_ms, fund_end_ms, now_ms=now).rows
-                    bn_b = cex.collect_klines_1h(bn_client, "binance", sym, start_ms, end_ms, now_ms=now).rows
-                    if not bn_f.empty and not bn_b.empty:
-                        p_bn = fa.build_panel(hl_f, bn_f, hl_b, bn_b)[
-                            ["cex_close", "cex_ret", "cex_notional_usd", "cex_fund_next", "cex_rate_h", "spread_h"]
-                        ].rename(
-                            columns={
-                                "cex_close": "binance_close",
-                                "cex_ret": "binance_ret",
-                                "cex_notional_usd": "binance_notional_usd",
-                                "cex_fund_next": "binance_fund_next",
-                                "cex_rate_h": "binance_rate_h",
-                                "spread_h": "binance_spread_h",
-                            }
-                        )
-                        panel = panel.join(p_bn, how="left")
+                    try:
+                        bn_f = cex.collect_funding(bn_client, "binance", sym, start_ms, fund_end_ms, now_ms=now).rows
+                        bn_b = cex.collect_klines_1h(bn_client, "binance", sym, start_ms, end_ms, now_ms=now).rows
+                        if not bn_f.empty and not bn_b.empty:
+                            p_bn = fa.build_panel(hl_f, bn_f, hl_b, bn_b)[
+                                ["cex_close", "cex_ret", "cex_notional_usd", "cex_fund_next", "cex_rate_h", "spread_h"]
+                            ].rename(
+                                columns={
+                                    "cex_close": "binance_close",
+                                    "cex_ret": "binance_ret",
+                                    "cex_notional_usd": "binance_notional_usd",
+                                    "cex_fund_next": "binance_fund_next",
+                                    "cex_rate_h": "binance_rate_h",
+                                    "spread_h": "binance_spread_h",
+                                }
+                            )
+                            panel = panel.join(p_bn, how="left")
+                    except Exception:  # noqa: BLE001
+                        pass
                 try:
                     okx_sym = cex.okx_symbol(c)
                     okx_f = cex.collect_funding(okx_client, "okx", okx_sym, start_ms, fund_end_ms, now_ms=now).rows

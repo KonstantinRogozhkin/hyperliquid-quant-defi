@@ -278,12 +278,12 @@ def scan_hip3_cross_builder_arb(
             by_base.setdefault(m.base_symbol, []).append(m)
 
     prelim: list[Hip3CrossBuilderOpp] = []
+    candidates_by_base: dict[str, list[Hip3CrossBuilderOpp]] = {}
     for base, legs in by_base.items():
         if len(legs) < 2:
             continue
         legs_sorted = sorted(legs, key=lambda x: -x.funding_apr_pct)
-        best_opp: Hip3CrossBuilderOpp | None = None
-        best_rank: tuple[bool, float, float] | None = None
+        pair_cands: list[tuple[tuple[bool, float, float], Hip3CrossBuilderOpp]] = []
         for i, hi in enumerate(legs_sorted):
             for lo in legs_sorted[i + 1 :]:
                 if hi.dex == lo.dex:
@@ -300,103 +300,122 @@ def scan_hip3_cross_builder_arb(
                 rt_taker = round(2.0 * (hi.est_taker_fee_bps + lo.est_taker_fee_bps), 2)
                 locks = [d for d in (hi.growth_mode_lock_days_left, lo.growth_mode_lock_days_left) if d is not None]
                 min_lock = min(locks) if locks else None
-                # Each leg posts N / L margin on its own DEX: the spread on N earns spread * L / 2 on
-                # the 2N / L total margin (= spread at the default 2x per leg; 0.5x was 1x leverage).
                 net_apr_split = round(spread * per_leg_leverage / 2.0, 2)
                 rank_key = (ora_div_bps <= 25.0, round(spread, 6), min(hi.day_vol_usd, lo.day_vol_usd))
-                if best_rank is None or rank_key > best_rank:
-                    best_rank = rank_key
-                    best_opp = Hip3CrossBuilderOpp(
-                        base_symbol=base,
-                        short_symbol=hi.full_symbol,
-                        long_symbol=lo.full_symbol,
-                        short_dex=hi.dex,
-                        long_dex=lo.dex,
-                        short_apr_pct=hi.funding_apr_pct,
-                        long_apr_pct=lo.funding_apr_pct,
-                        spread_apr_pct=round(spread, 2),
-                        mark_basis_bps=round(mark_basis, 2),
-                        short_vol_usd=hi.day_vol_usd,
-                        long_vol_usd=lo.day_vol_usd,
-                        short_oi_usd=hi.oi_usd,
-                        long_oi_usd=lo.oi_usd,
-                        any_only_isolated=bool(hi.only_isolated or lo.only_isolated),
-                        both_growth_mode=bool(hi.growth_mode and lo.growth_mode),
-                        oracle_divergence_bps=round(ora_div_bps, 2),
-                        oracle_risk_warning=ora_div_bps > 15.0,
-                        est_rt_maker_fee_bps=rt_maker,
-                        est_rt_taker_fee_bps=rt_taker,
-                        independent_dex_margin=True,
-                        net_apr_split_margin_pct=net_apr_split,
-                        min_growth_lock_days_left=min_lock,
-                    )
-        if best_opp is not None:
-            prelim.append(best_opp)
+                cand_opp = Hip3CrossBuilderOpp(
+                    base_symbol=base,
+                    short_symbol=hi.full_symbol,
+                    long_symbol=lo.full_symbol,
+                    short_dex=hi.dex,
+                    long_dex=lo.dex,
+                    short_apr_pct=hi.funding_apr_pct,
+                    long_apr_pct=lo.funding_apr_pct,
+                    spread_apr_pct=round(spread, 2),
+                    mark_basis_bps=round(mark_basis, 2),
+                    short_vol_usd=hi.day_vol_usd,
+                    long_vol_usd=lo.day_vol_usd,
+                    short_oi_usd=hi.oi_usd,
+                    long_oi_usd=lo.oi_usd,
+                    any_only_isolated=bool(hi.only_isolated or lo.only_isolated),
+                    both_growth_mode=bool(hi.growth_mode and lo.growth_mode),
+                    oracle_divergence_bps=round(ora_div_bps, 2),
+                    oracle_risk_warning=ora_div_bps > 15.0,
+                    est_rt_maker_fee_bps=rt_maker,
+                    est_rt_taker_fee_bps=rt_taker,
+                    independent_dex_margin=True,
+                    net_apr_split_margin_pct=net_apr_split,
+                    min_growth_lock_days_left=min_lock,
+                )
+                pair_cands.append((rank_key, cand_opp))
+        if pair_cands:
+            pair_cands.sort(key=lambda t: t[0], reverse=True)
+            candidates_by_base[base] = [c for _, c in pair_cands]
+            prelim.append(pair_cands[0][1])
 
     prelim.sort(key=lambda o: (-o.spread_apr_pct, -min(o.short_vol_usd, o.long_vol_usd)))
     if book_fetcher is None:
         return prelim
+
+    book_cache: dict[str, tuple[list[tuple[float, float]], list[tuple[float, float]]]] = {}
+
+    def _cached_book(sym: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
+        if sym not in book_cache:
+            book_cache[sym] = book_fetcher(sym)
+        return book_cache[sym]
+
+    def _enrich_pair(opp: Hip3CrossBuilderOpp) -> Hip3CrossBuilderOpp:
+        sb, sa = _cached_book(opp.short_symbol)
+        lb, la = _cached_book(opp.long_symbol)
+        eb5, sl5, ok5 = cds.compute_executable_cross_dex_entry_bps(sb, sa, lb, la, short_hl=True, clip_usd=5_000.0)
+        _, sl25, ok25 = cds.compute_executable_cross_dex_entry_bps(sb, sa, lb, la, short_hl=True, clip_usd=25_000.0)
+        be_h: float | None = None
+        be_h_taker: float | None = None
+        if sl5 is not None and eb5 is not None:
+            rt_m = opp.est_rt_maker_fee_bps if opp.est_rt_maker_fee_bps > 0 else round_trip_fee_bps
+            mark_credit = cds.credited_entry_basis_bps(eb5, opp.mark_basis_bps)
+            credit = (
+                max(0.0, mark_credit - abs(float(opp.oracle_divergence_bps))) if mark_credit > 0 else mark_credit
+            )
+            one_way_m = 0.5 * rt_m
+            one_way_t = 0.5 * opp.est_rt_taker_fee_bps
+            credit_m = min(max(credit, -50.0), one_way_m)
+            credit_t = min(max(credit, -50.0), one_way_t)
+            net_cost_m = max(1.0, rt_m + sl5 - credit_m)
+            net_cost_t = max(1.0, opp.est_rt_taker_fee_bps + sl5 - credit_t)
+            hourly_bps = opp.spread_apr_pct / (HOURS_PER_YEAR * 100.0) * 1e4
+            if hourly_bps > 1e-9:
+                be_h = round(net_cost_m / hourly_bps, 1)
+                be_h_taker = round(net_cost_t / hourly_bps, 1)
+        return Hip3CrossBuilderOpp(
+            base_symbol=opp.base_symbol,
+            short_symbol=opp.short_symbol,
+            long_symbol=opp.long_symbol,
+            short_dex=opp.short_dex,
+            long_dex=opp.long_dex,
+            short_apr_pct=opp.short_apr_pct,
+            long_apr_pct=opp.long_apr_pct,
+            spread_apr_pct=opp.spread_apr_pct,
+            mark_basis_bps=opp.mark_basis_bps,
+            short_vol_usd=opp.short_vol_usd,
+            long_vol_usd=opp.long_vol_usd,
+            short_oi_usd=opp.short_oi_usd,
+            long_oi_usd=opp.long_oi_usd,
+            any_only_isolated=opp.any_only_isolated,
+            both_growth_mode=opp.both_growth_mode,
+            oracle_divergence_bps=opp.oracle_divergence_bps,
+            oracle_risk_warning=opp.oracle_risk_warning,
+            est_rt_maker_fee_bps=opp.est_rt_maker_fee_bps,
+            est_rt_taker_fee_bps=opp.est_rt_taker_fee_bps,
+            exec_basis_5k_bps=eb5,
+            l2_slip_5k_bps=sl5,
+            l2_slip_25k_bps=sl25,
+            depth_5k_ok=ok5,
+            depth_25k_ok=ok25,
+            payback_hours_5k=be_h,
+            payback_hours_5k_taker=be_h_taker,
+            independent_dex_margin=opp.independent_dex_margin,
+            net_apr_split_margin_pct=opp.net_apr_split_margin_pct,
+            min_growth_lock_days_left=opp.min_growth_lock_days_left,
+        )
 
     enriched: list[Hip3CrossBuilderOpp] = []
     for idx, opp in enumerate(prelim):
         if idx >= enrich_top_n:
             enriched.append(opp)
             continue
-        sb, sa = book_fetcher(opp.short_symbol)
-        lb, la = book_fetcher(opp.long_symbol)
-        eb5, sl5, ok5 = cds.compute_executable_cross_dex_entry_bps(sb, sa, lb, la, short_hl=True, clip_usd=5_000.0)
-        _, sl25, ok25 = cds.compute_executable_cross_dex_entry_bps(sb, sa, lb, la, short_hl=True, clip_usd=25_000.0)
-        be_h: float | None = None
-        be_h_taker: float | None = None
-        if sl5 is not None and eb5 is not None:
-            # Always respect per-builder deployerFeeScale in est_rt_maker_fee_bps (not only in Growth Mode).
-            # eb5 already prices entry VWAP slippage, so adding 1x sl5 accounts for estimated exit slippage without double-counting.
-            rt_m = opp.est_rt_maker_fee_bps if opp.est_rt_maker_fee_bps > 0 else round_trip_fee_bps
-            # Only basis that is (a) also present in the mark basis the ledger marks on and (b) not
-            # explained by structural builder-oracle divergence may be credited as convergence edge.
-            mark_credit = cds.credited_entry_basis_bps(eb5, opp.mark_basis_bps)
-            credit = (
-                max(0.0, mark_credit - abs(float(opp.oracle_divergence_bps))) if mark_credit > 0 else mark_credit
-            )
-            net_cost_m = max(0.0, rt_m + sl5 - credit)
-            net_cost_t = max(0.0, opp.est_rt_taker_fee_bps + sl5 - credit)
-            hourly_bps = opp.spread_apr_pct / (HOURS_PER_YEAR * 100.0) * 1e4
-            if hourly_bps > 1e-9:
-                be_h = round(net_cost_m / hourly_bps, 1)
-                be_h_taker = round(net_cost_t / hourly_bps, 1)
-        enriched.append(
-            Hip3CrossBuilderOpp(
-                base_symbol=opp.base_symbol,
-                short_symbol=opp.short_symbol,
-                long_symbol=opp.long_symbol,
-                short_dex=opp.short_dex,
-                long_dex=opp.long_dex,
-                short_apr_pct=opp.short_apr_pct,
-                long_apr_pct=opp.long_apr_pct,
-                spread_apr_pct=opp.spread_apr_pct,
-                mark_basis_bps=opp.mark_basis_bps,
-                short_vol_usd=opp.short_vol_usd,
-                long_vol_usd=opp.long_vol_usd,
-                short_oi_usd=opp.short_oi_usd,
-                long_oi_usd=opp.long_oi_usd,
-                any_only_isolated=opp.any_only_isolated,
-                both_growth_mode=opp.both_growth_mode,
-                oracle_divergence_bps=opp.oracle_divergence_bps,
-                oracle_risk_warning=opp.oracle_risk_warning,
-                est_rt_maker_fee_bps=opp.est_rt_maker_fee_bps,
-                est_rt_taker_fee_bps=opp.est_rt_taker_fee_bps,
-                exec_basis_5k_bps=eb5,
-                l2_slip_5k_bps=sl5,
-                l2_slip_25k_bps=sl25,
-                depth_5k_ok=ok5,
-                depth_25k_ok=ok25,
-                payback_hours_5k=be_h,
-                payback_hours_5k_taker=be_h_taker,
-                independent_dex_margin=opp.independent_dex_margin,
-                net_apr_split_margin_pct=opp.net_apr_split_margin_pct,
-                min_growth_lock_days_left=opp.min_growth_lock_days_left,
-            )
+        cands = candidates_by_base.get(opp.base_symbol) or [opp]
+        enriched_cands = [_enrich_pair(c) for c in cands]
+        best_enriched = max(
+            enriched_cands,
+            key=lambda c: (
+                bool(c.depth_5k_ok),
+                not bool(c.oracle_risk_warning),
+                c.spread_apr_pct,
+                -(c.l2_slip_5k_bps if c.l2_slip_5k_bps is not None else 1e9),
+            ),
         )
+        enriched.append(best_enriched)
+    enriched.sort(key=lambda o: (-int(bool(o.depth_5k_ok)), -o.spread_apr_pct, -min(o.short_vol_usd, o.long_vol_usd)))
     return enriched
 
 
@@ -417,7 +436,7 @@ def run_hip3_builder_scan(
         tot_vol = sum(m.day_vol_usd for m in markets)
 
         def _fetch_book(sym: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
-            return cds.fetch_dex_l2_book(c, "hyperliquid", sym)
+            return cds.fetch_dex_l2_book(c, "hyperliquid", sym, info_url=info_url)
 
         opps = scan_hip3_cross_builder_arb(
             markets,

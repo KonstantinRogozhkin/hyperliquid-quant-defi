@@ -141,11 +141,13 @@ export function AnalyticsRiskTab({
       const rawShares = feeMode === "gross" ? c.gross_shares : c.net_shares;
       let startIdx = 0;
 
-      // When Rebase is enabled alongside visible desk strategies, clamp long-history benchmarks to
-      // the later of the selected window cutoff and earliest desk strategy inception so a 30D/90D
-      // benchmark tail never crushes young multi-day strategy curves flat.
+      // Whenever at least one desk strategy is visible (`earliestStrategyMs !== null`), always clamp
+      // long-history benchmarks to the later of the selected window cutoff and earliest desk strategy
+      // inception—even when "Rebase to window" is unchecked on "All"—so 370d benchmark history never
+      // crushes young multi-day strategy curves into a 2px sliver. (Hiding all desk strategies sets
+      // `earliestStrategyMs === null` and reveals the full benchmark history.)
       const seriesCutoffMs =
-        c.is_benchmark && rebaseWindow && earliestStrategyMs !== null
+        c.is_benchmark && earliestStrategyMs !== null
           ? cutoffMs !== null
             ? Math.max(cutoffMs, earliestStrategyMs)
             : earliestStrategyMs
@@ -186,8 +188,8 @@ export function AnalyticsRiskTab({
         }
         cleanShares.push(lastValid);
       }
-      // Benchmarks always rebase on finite windows (7D/30D/90D) so a 370d base never distorts short-window comparison.
-      const shouldRebase = rebaseWindow || (c.is_benchmark && periodDays > 0);
+      // Benchmarks always rebase on finite windows (7D/30D/90D) or whenever clamped to visible desk strategies.
+      const shouldRebase = rebaseWindow || (c.is_benchmark && (periodDays > 0 || earliestStrategyMs !== null));
       const base = shouldRebase ? (cleanShares[0] || 1) : 1;
       const pctVals = cleanShares.map((s) => (base > 0 ? (s / base - 1) * 100 : 0));
       lines.push({

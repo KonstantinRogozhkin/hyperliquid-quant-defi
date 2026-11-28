@@ -40,6 +40,10 @@ def main(
             frontier_summary_path=frontier_summary,
         )
 
+    if res.get("status") == "duplicate_hour_skipped":
+        typer.echo(json.dumps({"status": "duplicate_hour_skipped", "ts_ms": res["tick"]["ts_ms"]}))
+        return
+
     md = hp.format_hip3_paper_markdown(res)
     tmp_md = state_dir / "report.tmp.md"
     tmp_md.write_text(md, encoding="utf-8")
