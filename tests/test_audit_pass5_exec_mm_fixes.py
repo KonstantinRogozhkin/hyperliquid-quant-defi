@@ -96,55 +96,131 @@ def test_bug1_mm_modify_fallback_never_stacks_on_failed_cancel_and_guards_transp
     )
     assert pl3 == 0 and empty_active == {}
 
-    # 2. HTTP 429 JSON error dict on userFills + place_alo_order exception in run_live_mm_session & WS session
-    def err429_handler(req: httpx.Request) -> httpx.Response:
+    # 2A. Missing/429 initial clearinghouseState aborts live MM startup cleanly without fake 0 baseline
+    def init429_handler(req: httpx.Request) -> httpx.Response:
         t = json.loads(req.content)["type"]
         if t == "meta":
             return httpx.Response(200, json={"universe": [{"name": "ETH", "szDecimals": 4, "maxLeverage": 25}]})
-        if t == "l2Book":
-            return httpx.Response(
-                200,
-                json={"coin": "ETH", "time": NOW, "levels": [[{"px": "2500.0", "sz": "5.0"}], [{"px": "2500.5", "sz": "5.0"}]]},
-            )
-        if t == "userFills":
-            # Dict instead of list -> previously crashed `for fl in uf: fl.get(...)` with AttributeError on str key!
-            return httpx.Response(429, json={"status": "err", "response": "rate limited"})
         if t == "clearinghouseState":
             return httpx.Response(429, json={"status": "err", "response": "rate limited"})
         return httpx.Response(200, json=[])
 
-    class _FlakyRestAdapter(ex.DryRunAdapter):
-        def __init__(self) -> None:
-            super().__init__()
-            self.calls = 0
-
-        def place_alo_order(self, order: ex.PlannedOrder) -> dict[str, Any]:
-            self.calls += 1
-            if self.calls == 1:
-                raise httpx.ReadTimeout("transient place timeout")
-            rec = super().place_alo_order(order)
-            rec.pop("mode", None)
-            return rec
-
-    with httpx.Client(transport=httpx.MockTransport(err429_handler)) as client:
-        s_rest, _, _ = mm.run_live_mm_session(
+    with httpx.Client(transport=httpx.MockTransport(init429_handler)) as client_init_err:
+        s_init_rest, _, _ = mm.run_live_mm_session(
             "ETH",
-            _FlakyRestAdapter(),
+            ex.DryRunAdapter(),
             account_address="0xMM",
             execute_live=True,
-            duration_sec=0.3,
-            poll_interval_sec=0.2,
-            client=client,
+            duration_sec=0.2,
+            poll_interval_sec=0.1,
+            client=client_init_err,
         )
-        assert s_rest.ticks_observed >= 1
+        assert s_init_rest.quotes_placed == 0
+        assert "init_clearinghouse_unavailable" in s_init_rest.halt_events
 
         ws_msgs = [
             {"channel": "l2Book", "data": {"coin": "ETH", "time": NOW, "levels": [[{"px": "2500.0", "sz": "5.0"}], [{"px": "2500.5", "sz": "5.0"}]]}}
         ]
-        s_ws, _, _ = asyncio.run(
-            mm.run_live_mm_ws_session("ETH", _FlakyRestAdapter(), account_address="0xMM", execute_live=True, client=client, ws_messages=ws_msgs)
+        s_init_ws, _, _ = asyncio.run(
+            mm.run_live_mm_ws_session("ETH", ex.DryRunAdapter(), account_address="0xMM", execute_live=True, client=client_init_err, ws_messages=ws_msgs)
         )
-        assert s_ws.ticks_observed == 1
+        assert s_init_ws.quotes_placed == 0
+        assert "init_clearinghouse_unavailable" in s_init_ws.halt_events
+
+    # 2B. userFills 429 suspends polling quotes until fill reconciliation succeeds; ambiguous timeout placement
+    #     adopts exchange-accepted order via openOrders + userFills instead of submitting a duplicate quote!
+    uf_call_idx = {"n": 0}
+    oo_after_ambig = {"n": 0}
+    buy_attempts_while_resting: list[int] = []
+    accepted_ambig: list[dict[str, Any]] = []
+    ambig_filled = {"done": False}
+
+    class _AmbiguousAcceptAdapter(ex.DryRunAdapter):
+        def __init__(self) -> None:
+            super().__init__()
+            self.buy_attempts = 0
+            self.sell_attempts = 0
+
+        def place_alo_order(self, order: ex.PlannedOrder) -> dict[str, Any]:
+            if order.side == "buy":
+                self.buy_attempts += 1
+                if self.buy_attempts == 1:
+                    # Exchange accepted oid=888, then HTTP response timed out before reaching client!
+                    accepted_ambig.append(
+                        {
+                            "coin": order.coin,
+                            "oid": 888,
+                            "side": "B",
+                            "limitPx": str(order.limit_px),
+                            "sz": str(order.sz),
+                            "origSz": str(order.sz),
+                            "reduceOnly": bool(order.reduce_only),
+                        }
+                    )
+                    raise httpx.ReadTimeout("response timed out after exchange accepted oid=888")
+                return {
+                    "mode": "testnet_live",
+                    "response": {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 890 + self.buy_attempts}}]}}},
+                }
+            self.sell_attempts += 1
+            return {
+                "mode": "testnet_live",
+                "response": {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 900 + self.sell_attempts}}]}}},
+            }
+
+    def reconcile_handler(req: httpx.Request) -> httpx.Response:
+        t = json.loads(req.content)["type"]
+        if t == "meta":
+            return httpx.Response(200, json={"universe": [{"name": "ETH", "szDecimals": 4, "maxLeverage": 25}]})
+        if t == "clearinghouseState":
+            return httpx.Response(200, json={"assetPositions": [{"position": {"coin": "ETH", "szi": "-0.02"}}]})
+        if t == "l2Book":
+            if accepted_ambig and not ambig_filled["done"] and oo_after_ambig["n"] >= 1:
+                buy_attempts_while_resting.append(ambig_ad.buy_attempts)
+            return httpx.Response(
+                200,
+                json={"coin": "ETH", "time": int(mm.time.time() * 1000), "levels": [[{"px": "2500.0", "sz": "5.0"}], [{"px": "2500.5", "sz": "5.0"}]]},
+            )
+        if t == "userFills":
+            uf_call_idx["n"] += 1
+            if uf_call_idx["n"] == 1:
+                # Tick 1: userFills returns 429 dict -> quoting MUST be suspended on Tick 1!
+                return httpx.Response(429, json={"status": "err", "response": "rate limited"})
+            if ambig_filled["done"] and accepted_ambig:
+                o = accepted_ambig[0]
+                return httpx.Response(
+                    200,
+                    json=[{"tid": 501, "coin": "ETH", "oid": 888, "side": "B", "px": o["limitPx"], "sz": o["sz"], "fee": "0.0", "time": int(mm.time.time() * 1000)}],
+                )
+            return httpx.Response(200, json=[])
+        if t == "openOrders":
+            if accepted_ambig and not ambig_filled["done"]:
+                oo_after_ambig["n"] += 1
+                if oo_after_ambig["n"] <= 2:
+                    # Keep oid=888 resting across 2 ticks so we verify zero duplicate buy placement while resting!
+                    return httpx.Response(200, json=list(accepted_ambig))
+                ambig_filled["done"] = True
+            return httpx.Response(200, json=[])
+        return httpx.Response(200, json=[])
+
+    ambig_ad = _AmbiguousAcceptAdapter()
+    with httpx.Client(transport=httpx.MockTransport(reconcile_handler)) as client_rec:
+        s_rec, fills_rec, _ = mm.run_live_mm_session(
+            "ETH",
+            ambig_ad,
+            account_address="0xMM",
+            execute_live=True,
+            duration_sec=1.0,
+            poll_interval_sec=0.18,
+            client=client_rec,
+        )
+    assert "user_fills_unavailable" in s_rec.halt_events
+    assert "ambiguous_placement:buy" in s_rec.halt_events
+    # While oid=888 rested across Ticks 3 & 4, buy_attempts stayed strictly 1 (adopted oid=888, zero duplicates!)
+    assert buy_attempts_while_resting and all(n == 1 for n in buy_attempts_while_resting)
+    # Once oid=888 subsequently filled, its fill was ingested into the session ledger!
+    assert s_rec.buy_fills == 1
+    assert not fills_rec.empty and int(fills_rec.iloc[0]["oid"]) == 888
 
 
 # --------------------------------------------------------------------------- Bug 2: Post-Withdrawal Loss Masking & Immediate Probe Persistence
@@ -472,7 +548,11 @@ def test_bug6_cross_usdc_protected_limit_budget_pre_perp_usdc_gate_bnb_and_sprea
         == Decimal("0.0500")
     )
     acct_with_bnb = {"takerCommission": 10, "balances": [{"asset": "BNB", "free": "0.25", "locked": "0"}]}
-    assert micro._binance_effective_base_fee_rate(acct_with_bnb) == Decimal("0")
+    # Holding BNB WITHOUT verified spotBNBBurn must NOT assume 0 base-asset fee!
+    assert micro._binance_effective_base_fee_rate(acct_with_bnb) == Decimal("0.001")
+    assert micro._binance_effective_base_fee_rate(acct_with_bnb, bnb_burn={"spotBNBBurn": False}) == Decimal("0.001")
+    # Verified /sapi/v1/bnbBurn spotBNBBurn=True + sufficient free BNB -> 0 base-asset fee
+    assert micro._binance_effective_base_fee_rate(acct_with_bnb, bnb_burn={"spotBNBBurn": True}) == Decimal("0")
     assert micro._binance_effective_base_fee_rate({"takerCommission": 0, "balances": []}) == Decimal("0")
 
     # 2. +0.5 bps normal spot-perp ask-bid spread ($2000.10 spot ask vs $2000.00 perps) passes plan & preflight!

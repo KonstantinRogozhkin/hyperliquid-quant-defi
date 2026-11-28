@@ -799,15 +799,23 @@ def _load_benchmarks(
     if not isinstance(series, dict):
         return {}
     ap_state = _read_json(data_root / "hl_autopilot" / "state.json")
-    eff_latest_day = latest_strat_day[:10] if isinstance(latest_strat_day, str) and len(latest_strat_day) >= 10 else None
-    if eff_latest_day is None and isinstance(ap_state, dict):
+    ap_source_day: str | None = None
+    if isinstance(ap_state, dict):
         last_ms = int(_f(ap_state.get("last_tick_ms")))
         if last_ms > 0:
-            eff_latest_day = datetime.fromtimestamp(last_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
+            ap_source_day = datetime.fromtimestamp(last_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d")
         else:
             obs_raw = str(ap_state.get("observed_at_utc") or "").strip()
             if len(obs_raw) >= 10 and obs_raw[4:5] == "-" and obs_raw[7:8] == "-":
-                eff_latest_day = obs_raw[:10]
+                ap_source_day = obs_raw[:10]
+    req_day = latest_strat_day[:10] if isinstance(latest_strat_day, str) and len(latest_strat_day) >= 10 else None
+    # Stamp live Autopilot marks strictly with Autopilot's own verified UTC day (never re-labeling an
+    # older Autopilot mark with a newer sleeve's date when Autopilot is delayed/clamped).
+    eff_latest_day = (
+        ap_source_day
+        if (ap_source_day is not None and (req_day is None or ap_source_day <= req_day))
+        else None
+    )
 
     out: dict[str, tuple[list[str], list[float]]] = {}
     for sym, pts in series.items():

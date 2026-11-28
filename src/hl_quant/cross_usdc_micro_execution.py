@@ -485,6 +485,14 @@ class BinanceClient:
     def account(self) -> dict[str, Any]:
         return self._signed("GET", "/api/v3/account")
 
+    def bnb_burn_status(self) -> dict[str, Any] | None:
+        """Read-only check of Binance ``/sapi/v1/bnbBurn`` (returns ``None`` if SAPI scope is unavailable)."""
+        try:
+            payload = self._signed("GET", "/sapi/v1/bnbBurn")
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
     def instrument(self, symbol: str) -> dict[str, Any]:
         response = self.client.get(f"{BINANCE}/api/v3/exchangeInfo", params={"symbol": symbol})
         response.raise_for_status()
@@ -901,19 +909,26 @@ def _binance_spot_taker_fee_rate(account: Mapping[str, Any]) -> Decimal:
 def _binance_effective_base_fee_rate(
     account: Mapping[str, Any],
     *,
+    bnb_burn: Mapping[str, Any] | None = None,
     pair_taker_fee_rate: Decimal | None = None,
 ) -> Decimal:
-    """Return base-asset commission rate deducted from Spot buys (0 when paid in BNB or 0-fee pair)."""
+    """Return base-asset commission rate deducted from Spot buys.
+
+    Returns ``0`` only when the pair/VIP fee rate is ``0`` OR BNB fee payment is explicitly
+    verified active (via ``/sapi/v1/bnbBurn`` ``spotBNBBurn: True`` or explicit account flag)
+    with sufficient free BNB balance. Never infers BNB fee burn from BNB balance alone.
+    """
     rate = pair_taker_fee_rate if pair_taker_fee_rate is not None else _binance_spot_taker_fee_rate(account)
     if rate <= 0 or rate >= Decimal("0.05"):
         return Decimal("0")
     if account.get("canPayFeeInBnb") is True:
         return Decimal("0")
-    if (
-        account.get("canPayFeeInBnb") is not False
-        and account.get("bnbBurnSpot") is not False
-        and _binance_free_balance(account, "BNB") >= Decimal("0.001")
-    ):
+    spot_bnb_burn_enabled = (
+        (isinstance(bnb_burn, Mapping) and bnb_burn.get("spotBNBBurn") is True)
+        or account.get("spotBNBBurn") is True
+        or account.get("bnbBurnSpot") is True
+    )
+    if spot_bnb_burn_enabled and _binance_free_balance(account, "BNB") >= Decimal("0.001"):
         return Decimal("0")
     return rate
 
@@ -1114,8 +1129,14 @@ class MicroExecutionRunner:
                 "hyperliquid_marks": self.hyperliquid.mark_prices,
             })
             binance_account = responses["binance_account"]
+            binance_bnb_burn = (
+                self.binance.bnb_burn_status() if hasattr(self.binance, "bnb_burn_status") else None
+            )
             binance_available_usdc = _binance_free_balance(binance_account, "USDC")
-            binance_taker_fee_rate = _binance_effective_base_fee_rate(binance_account)
+            binance_taker_fee_rate = _binance_effective_base_fee_rate(
+                binance_account,
+                bnb_burn=binance_bnb_burn,
+            )
             bybit_permissions = responses["bybit_api"].get("result", {}).get("permissions") or []
             expected_agent = self.hyperliquid.api_wallet_address.lower()
             now_ms = int(time.time() * 1000)
@@ -1519,7 +1540,8 @@ class MicroExecutionRunner:
             if pf.get("status") != "passed":
                 raise PreflightBlocked("preflight_blocked")
         b_account = self.binance.account()
-        b_fee_rate = _binance_effective_base_fee_rate(b_account)
+        b_bnb_burn = self.binance.bnb_burn_status() if hasattr(self.binance, "bnb_burn_status") else None
+        b_fee_rate = _binance_effective_base_fee_rate(b_account, bnb_burn=b_bnb_burn)
         b_avail_usdc = _binance_free_balance(b_account, "USDC")
         b_instrument = self.binance.instrument(symbol)
         b_step, b_min, b_min_notional = _binance_constraints(b_instrument)

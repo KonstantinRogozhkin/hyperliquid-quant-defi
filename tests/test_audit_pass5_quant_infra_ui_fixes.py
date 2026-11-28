@@ -576,3 +576,52 @@ def test_pass5_bug8_zero_max_tick_nav_jump_pct_cleanly_disables_circuit_breaker(
     assert r_ap2["state"]["risk_telemetry"]["nav_guard_triggered"] is False
     assert r_ap2["state"]["nav_guard_triggers"] == 0
     assert r_ap2["state"]["gross_equity_usd"] > 260_000.0
+
+
+# --------------------------------------------------------------------------- 9. Benchmark Source Date Validation
+def test_pass5_bug9_stale_autopilot_mark_never_fabricates_newer_benchmark_day(tmp_path: Path):
+    # daily_closes.json ends on 2026-11-27; spot_perp advanced to 2026-11-28, while autopilot is stuck on 2026-11-27!
+    t_nov26 = 1_795_694_400_000  # 2026-11-26 12:00 UTC
+    t_nov27 = t_nov26 + 86_400_000  # 2026-11-27 12:00 UTC
+    t_nov28 = t_nov27 + 86_400_000  # 2026-11-28 12:00 UTC
+
+    (tmp_path / "hl_benchmarks").mkdir()
+    (tmp_path / "hl_benchmarks" / "daily_closes.json").write_text(
+        json.dumps(
+            {
+                "updated_at_utc": "2026-11-28 00:05 UTC",
+                "benchmarks": {
+                    "BTC": [
+                        {"date": "2026-11-26", "close": 90_000.0},
+                        {"date": "2026-11-27", "close": 91_000.0},
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    sp_dir = tmp_path / "hl_spot_perp_paper"
+    sp_dir.mkdir()
+    (sp_dir / "state.json").write_text(json.dumps({"starting_capital_usd": 100_000.0, "equity_usd": 100_100.0}), encoding="utf-8")
+    pd.DataFrame({"tick_ms": [t_nov26, t_nov27, t_nov28], "equity_usd": [100_000.0, 100_050.0, 100_100.0]}).to_parquet(
+        sp_dir / "ticks.parquet", index=False
+    )
+
+    ap_dir = tmp_path / "hl_autopilot"
+    ap_dir.mkdir()
+    (ap_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "starting_capital_usd": 250_000.0,
+                "equity_usd": 250_000.0,
+                "last_tick_ms": t_nov27,  # STALE Nov-27 mark!
+                "cta_state": {"assets": {"BTC": {"mark_px": 95_000.0, "last_close": 91_000.0}}},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    payload = ar.build_desk_analytics_payload(tmp_path)
+    assert payload["curves"]["spot_perp"]["dates"][-1] == "2026-11-28"
+    # Stale Nov-27 Autopilot mark MUST NOT be appended as a fabricated 2026-11-28 benchmark observation!
+    assert payload["curves"]["bench_btc"]["dates"][-1] == "2026-11-27"
