@@ -256,6 +256,33 @@ def build_coin_settlement_events_15m(
     return pd.DataFrame(rows)
 
 
+def one_sided_p_value(t_stat: float) -> float:
+    """Normal-approximation one-sided p-value for ``H1: mean > 0`` (NaN/inf-safe)."""
+    if not math.isfinite(t_stat):
+        return 1.0 if t_stat != math.inf else 0.0
+    return 0.5 * math.erfc(t_stat / math.sqrt(2.0))
+
+
+def benjamini_hochberg(p_values: list[float], q: float = 0.10) -> list[bool]:
+    """Benjamini–Hochberg FDR control: which of ``p_values`` are discoveries at level ``q``."""
+    m = len(p_values)
+    if m == 0:
+        return []
+    order = sorted(range(m), key=lambda i: p_values[i])
+    k_max = 0
+    for rank, i in enumerate(order, start=1):
+        if p_values[i] <= rank / m * q:
+            k_max = rank
+    passed = [False] * m
+    for rank, i in enumerate(order, start=1):
+        if rank <= k_max:
+            passed[i] = True
+    return passed
+
+
+SETTLEMENT_FDR_Q = 0.10
+
+
 def _clustered_t_stat(sub: pd.DataFrame, strat: str) -> tuple[float, int]:
     """t-stat of the mean using one observation per settlement timestamp (cross-sectional mean)."""
     if "t0_ms" not in sub.columns or sub.empty:
@@ -608,6 +635,18 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
         "|---|---|---:|---:|---:|---:|---:|---:|---|",
     ]
     winners: list[tuple[str, str, float, float, int, float]] = []
+    # ~44 bucket x strategy cells are tested at once: control the false-discovery rate across
+    # them (Benjamini–Hochberg on the conservative holdout t = min(t, clustered t)) so a lone
+    # t ~ 2-4 on a small N cannot pass as an edge by multiple-comparison luck.
+    def _holdout_t(key: tuple[str, str]) -> float:
+        h_row = hld.loc[key]
+        t_cl = float(h_row.get("t_stat_clustered", h_row["t_stat"]))
+        t_cl = t_cl if math.isfinite(t_cl) else -math.inf
+        return min(float(h_row["t_stat"]), t_cl)
+
+    fdr_pass = dict(
+        zip(common_idx, benjamini_hochberg([one_sided_p_value(_holdout_t(k)) for k in common_idx], SETTLEMENT_FDR_Q))
+    )
     for b_name, strat in common_idx:
         d = dev.loc[(b_name, strat)]
         h = hld.loc[(b_name, strat)]
@@ -623,6 +662,7 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
             and (float(h["net_maker_bps"]) > 0.0)
             and (min(float(h["t_stat"]), h_t_cl) >= 2.0)
             and ((ex_g - maker_rt) > 0.0)
+            and fdr_pass.get((b_name, strat), False)
         )
         verdict = (
             "🟢 **GO (Maker)**"
@@ -637,6 +677,11 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
             f"{int(h['events'])} | {h['mean_gross_bps']:+.2f} ({h['t_stat']:+.1f}) | **{h['net_maker_bps']:+.2f} б.п.** | {ex_txt} | {verdict} |"
         )
 
+    lines.append("")
+    lines.append(
+        f"_GO также требует прохождения FDR-контроля Benjamini–Hochberg (q = {SETTLEMENT_FDR_Q:.2f}) "
+        f"по {len(common_idx)} одновременным тестам Holdout._"
+    )
     lines.append("")
     lines.append("## Честный вывод исследования")
     lines.append("")
@@ -678,10 +723,21 @@ def format_settlement_study_telegram_rich_html(stats_df: pd.DataFrame, meta: dic
         '<tr><th align="left">Бакет / Стратегия</th><th align="right">Dev Gross</th><th align="right">Holdout Gross (t)</th><th align="right">Net Maker</th></tr>'
     ]
     if not hld.empty:
+        keys = list(hld.index)
+
+        def _cons_t(row: Any) -> float:
+            t_cl = float(row.get("t_stat_clustered", row["t_stat"]))
+            return min(float(row["t_stat"]), t_cl if math.isfinite(t_cl) else -math.inf)
+
+        fdr_ok = dict(zip(keys, benjamini_hochberg([one_sided_p_value(_cons_t(hld.loc[k])) for k in keys], SETTLEMENT_FDR_Q)))
         top_h = hld.sort_values("mean_gross_bps", ascending=False).head(6)
         for (b_name, strat), h in top_h.iterrows():
             d_g = f"{dev.loc[(b_name, strat), 'mean_gross_bps']:+.2f}" if (b_name, strat) in dev.index else "—"
-            dot = "🟢" if (float(h["net_maker_bps"]) > 0 and float(h["t_stat"]) >= 2.0) else "⚪"
+            dot = (
+                "🟢"
+                if (float(h["net_maker_bps"]) > 0 and float(h["t_stat"]) >= 2.0 and fdr_ok.get((b_name, strat), False))
+                else "⚪"
+            )
             rows.append(
                 "<tr>"
                 f'<td align="left"><b>{html.escape(str(strat))}</b> ({html.escape(str(b_name))})</td>'

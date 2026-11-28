@@ -134,6 +134,36 @@ def _estimate_exit_cost_usd(
     return exit_notional * (cfg.hl_fee_bps + cfg.other_fee_bps(other_dex) + slip_bps) * 1e-4
 
 
+def settled_funding_by_position(
+    client: Any,
+    positions: dict[str, dict[str, Any]],
+    symbols_of: Any,
+    prev_ms: int,
+    ts_ms: int,
+) -> dict[str, float]:
+    """Realized ``fundingHistory`` rate sums per symbol, each over its position's own accrual window.
+
+    ``symbols_of(pos)`` yields the HL symbols to fetch for a position. Symbols missing from the
+    result (no history / unsupported) fall back to the snapshot rate in the caller.
+    """
+    if client is None or prev_ms <= 0 or not positions:
+        return {}
+    from hl_quant.hl_spot_perp_arb import fetch_settled_funding_sum
+
+    by_start: dict[int, set[str]] = {}
+    for pos in positions.values():
+        start = pc.position_accrual_start_ms(pos, prev_ms)
+        if start > 0 and (ts_ms // 3_600_000) - (start // 3_600_000) > 0:
+            by_start.setdefault(start, set()).update(str(s) for s in symbols_of(pos) if s)
+    out: dict[str, float] = {}
+    for start, syms in by_start.items():
+        try:
+            out.update(fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms))
+        except Exception:  # noqa: BLE001 - fall back to snapshot-rate accrual
+            continue
+    return out
+
+
 def run_cross_dex_paper_tick(
     client: httpx.Client,
     *,
@@ -205,7 +235,15 @@ def run_cross_dex_paper_tick(
     tick_costs_usd = 0.0
     trade_rows: list[dict[str, Any]] = []
 
-    # 1. Mark-to-market & accrue funding on all currently open dual-leg pairs
+    # 1. Mark-to-market & accrue funding on all currently open dual-leg pairs. The HL leg uses the
+    # realized hourly settlements (``fundingHistory``) when live; snapshot rate x hours otherwise
+    # (offline quotes, other venues, missing history) — a spike at tick time no longer stretches
+    # over the whole 4h window.
+    settled_hl = (
+        settled_funding_by_position(client, positions, lambda p: [p.get("coin")], prev_ms, ts_ms)
+        if hl_quotes is None
+        else {}
+    )
     for coin, pos in list(positions.items()):
         other_dex = str(pos.get("other_dex") or "lighter")
         h = hl_q.get(coin)
@@ -232,7 +270,11 @@ def run_cross_dex_paper_tick(
         pos["last_accrual_ms"] = ts_ms
         hl_notional = hl_qty * h.mark_px
         oth_notional = oth_qty * oth.mark_px
-        hl_fund_pnl = hl_notional * (-hl_sgn) * h.funding_rate_h * pos_settled_hours
+        hl_fund_pnl = (
+            hl_notional * (-hl_sgn) * settled_hl[coin]
+            if coin in settled_hl
+            else hl_notional * (-hl_sgn) * h.funding_rate_h * pos_settled_hours
+        )
         oth_fund_pnl = oth_notional * (-oth_sgn) * oth.funding_rate_h * pos_settled_hours
         fund_pnl = hl_fund_pnl + oth_fund_pnl
 

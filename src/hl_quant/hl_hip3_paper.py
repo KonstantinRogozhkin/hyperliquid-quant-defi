@@ -149,6 +149,36 @@ def _leg_fee_bps(mkt: hip3.Hip3BuilderMarket, *, use_taker: bool) -> float:
     return float(mkt.est_taker_fee_bps if use_taker else mkt.est_maker_fee_bps)
 
 
+def settled_funding_by_position(
+    client: Any,
+    positions: dict[str, dict[str, Any]],
+    symbols_of: Any,
+    prev_ms: int,
+    ts_ms: int,
+) -> dict[str, float]:
+    """Realized ``fundingHistory`` rate sums per symbol, each over its position's own accrual window.
+
+    ``symbols_of(pos)`` yields the HL symbols to fetch for a position. Symbols missing from the
+    result (no history / unsupported) fall back to the snapshot rate in the caller.
+    """
+    if client is None or prev_ms <= 0 or not positions:
+        return {}
+    from hl_quant.hl_spot_perp_arb import fetch_settled_funding_sum
+
+    by_start: dict[int, set[str]] = {}
+    for pos in positions.values():
+        start = pc.position_accrual_start_ms(pos, prev_ms)
+        if start > 0 and (ts_ms // 3_600_000) - (start // 3_600_000) > 0:
+            by_start.setdefault(start, set()).update(str(s) for s in symbols_of(pos) if s)
+    out: dict[str, float] = {}
+    for start, syms in by_start.items():
+        try:
+            out.update(fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms))
+        except Exception:  # noqa: BLE001 - fall back to snapshot-rate accrual
+            continue
+    return out
+
+
 def run_hip3_paper_tick(
     client: httpx.Client | None = None,
     *,
@@ -224,7 +254,15 @@ def run_hip3_paper_tick(
         tick_costs_usd = 0.0
         trade_rows: list[dict[str, Any]] = []
 
-        # 1. Mark-to-market & accrue hourly funding on open dual-builder pairs
+        # 1. Mark-to-market & accrue hourly funding on open dual-builder pairs; realized settlements
+        # per leg (``fundingHistory``) when live, snapshot rate x hours as fallback.
+        settled = (
+            settled_funding_by_position(
+                http_client, positions, lambda p: [p.get("short_symbol"), p.get("long_symbol")], prev_ms, ts_ms
+            )
+            if markets is None
+            else {}
+        )
         for _base, pos in list(positions.items()):
             s_mkt = by_symbol.get(str(pos["short_symbol"]))
             l_mkt = by_symbol.get(str(pos["long_symbol"]))
@@ -247,7 +285,10 @@ def run_hip3_paper_tick(
             pos_dt_hours = max(0.0, min(dt_cap_h, (ts_ms - pos_prev_ms) / 3_600_000.0)) if pos_prev_ms > 0 else dt_hours
             pos["last_accrual_ms"] = ts_ms
             # Short receives positive funding (+s_mkt.funding_rate_h); long pays positive funding (-l_mkt.funding_rate_h).
-            fund_pnl = (s_notional * s_mkt.funding_rate_h - l_notional * l_mkt.funding_rate_h) * pos_settled_hours
+            s_sym, l_sym = str(pos["short_symbol"]), str(pos["long_symbol"])
+            s_rate_sum = settled.get(s_sym, s_mkt.funding_rate_h * pos_settled_hours)
+            l_rate_sum = settled.get(l_sym, l_mkt.funding_rate_h * pos_settled_hours)
+            fund_pnl = s_notional * s_rate_sum - l_notional * l_rate_sum
 
             live_spread_apr = round(s_mkt.funding_apr_pct - l_mkt.funding_apr_pct, 2)
             live_mark_basis = round((s_mkt.mark_px - l_mkt.mark_px) / l_mkt.mark_px * 1e4, 2) if l_mkt.mark_px > 0 else 0.0
