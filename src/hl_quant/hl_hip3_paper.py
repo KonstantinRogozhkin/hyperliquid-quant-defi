@@ -155,6 +155,8 @@ def settled_funding_by_position(
     symbols_of: Any,
     prev_ms: int,
     ts_ms: int,
+    *,
+    cap_hours: float | None = None,
 ) -> dict[str, float]:
     """Realized ``fundingHistory`` rate sums per symbol, each over its position's own accrual window.
 
@@ -168,6 +170,10 @@ def settled_funding_by_position(
     by_start: dict[int, set[str]] = {}
     for pos in positions.values():
         start = pc.position_accrual_start_ms(pos, prev_ms)
+        if cap_hours is not None and cap_hours > 0:
+            # Same window as the snapshot-rate fallback used for the other leg (dt_cap_h), so equal
+            # legs keep cancelling after a long gap.
+            start = max(start, ts_ms - int(cap_hours * 3_600_000))
         if start > 0 and (ts_ms // 3_600_000) - (start // 3_600_000) > 0:
             by_start.setdefault(start, set()).update(str(s) for s in symbols_of(pos) if s)
     out: dict[str, float] = {}
@@ -258,7 +264,12 @@ def run_hip3_paper_tick(
         # per leg (``fundingHistory``) when live, snapshot rate x hours as fallback.
         settled = (
             settled_funding_by_position(
-                http_client, positions, lambda p: [p.get("short_symbol"), p.get("long_symbol")], prev_ms, ts_ms
+                http_client,
+                positions,
+                lambda p: [p.get("short_symbol"), p.get("long_symbol")],
+                prev_ms,
+                ts_ms,
+                cap_hours=dt_cap_h,
             )
             if markets is None
             else {}

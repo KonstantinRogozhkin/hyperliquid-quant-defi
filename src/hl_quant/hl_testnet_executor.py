@@ -1052,6 +1052,16 @@ def load_hwm_net_flow(path: Path) -> float | None:
         return None
 
 
+def hwm_persist_allowed(cur_net_flow_usd: float | None, stored_net_flow_usd: float | None) -> bool:
+    """Whether a freshly ratcheted HWM may be saved this cycle.
+
+    While flow tracking is active (a baseline is stored) but the ledger is unreadable, a peak
+    ratcheted now may already include a deposit the baseline has not seen; saving it would add the
+    same deposit again on recovery (false drawdown -> kill-switch). Legacy files keep saving.
+    """
+    return not (cur_net_flow_usd is None and stored_net_flow_usd is not None)
+
+
 def flow_adjusted_high_water_mark(
     stored_hwm: float, prev_net_flow_usd: float | None, cur_net_flow_usd: float | None
 ) -> float:

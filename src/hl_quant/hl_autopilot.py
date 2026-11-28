@@ -365,12 +365,23 @@ def compute_crisis_cta_weights(
 
 
 def _read_sleeve_tick_returns(ticks_path: Path, eq_col: str = "equity_usd") -> list[float]:
+    """Raw per-tick sleeve returns (see :func:`_read_sleeve_tick_returns_with_dt` for intervals)."""
+    return _read_sleeve_tick_returns_with_dt(ticks_path, eq_col)[0]
+
+
+def _read_sleeve_tick_returns_with_dt(ticks_path: Path, eq_col: str = "equity_usd") -> tuple[list[float], list[float]]:
+    """``(returns, interval_hours)`` per tick; intervals are ``[]`` when the ticks carry no timestamp.
+
+    Raw returns are kept together with their interval so the optimizer can normalize drift by
+    elapsed time (sum r / sum dt) and volatility by sqrt(dt) separately — a single transformed
+    series makes the annualized mean (and Sharpe) depend on tick cadence or downtime.
+    """
     if not ticks_path.is_file():
-        return []
+        return [], []
     try:
         df = pd.read_parquet(ticks_path)
         if df.empty or eq_col not in df.columns:
-            return []
+            return [], []
         work = df.copy()
         if "nav_guard_triggered" in work.columns:
             clamped = work["nav_guard_triggered"].fillna(False).astype(bool)
@@ -384,18 +395,17 @@ def _read_sleeve_tick_returns(ticks_path: Path, eq_col: str = "equity_usd") -> l
         work = work.dropna(subset=["_eq"])
         work = work[work["_eq"] > 0]
         if len(work) < 2:
-            return []
+            return [], []
         eq = work["_eq"].to_numpy(dtype=float)
         rets = np.diff(eq) / eq[:-1]
-        if ts_col is not None:
-            ts_arr = work["_ts"].to_numpy(dtype=float)
-            dt_h = np.clip(np.diff(ts_arr) / 3_600_000.0, 0.5, 48.0)
-            # Normalize irregular intervals to a 4h-equivalent for volatility: variance scales with
-            # time, so returns scale with sqrt(4 / dt) (linear scaling inflated short-interval vol).
-            rets = rets * np.sqrt(4.0 / dt_h)
-        return [float(r) for r in rets if math.isfinite(r)]
+        if ts_col is None:
+            return [float(r) for r in rets if math.isfinite(r)], []
+        ts_arr = work["_ts"].to_numpy(dtype=float)
+        dt_h = np.clip(np.diff(ts_arr) / 3_600_000.0, 0.5, 48.0)
+        pairs = [(float(r), float(d)) for r, d in zip(rets, dt_h, strict=False) if math.isfinite(r) and math.isfinite(d)]
+        return [r for r, _ in pairs], [d for _, d in pairs]
     except Exception:
-        return []
+        return [], []
 
 
 def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float = 12.0) -> dict[str, dict[str, Any]]:
@@ -404,7 +414,7 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
 
     # 1. Spot + Perp (+ 10% HLP)
     sp_st = _read_json(data_root / "hl_spot_perp_paper" / "state.json")
-    sp_rets = _read_sleeve_tick_returns(data_root / "hl_spot_perp_paper" / "ticks.parquet")
+    sp_rets, sp_rets_dt = _read_sleeve_tick_returns_with_dt(data_root / "hl_spot_perp_paper" / "ticks.parquet")
     if sp_st:
         rt = sp_st.get("risk_telemetry") or {}
         sp_eq = max(_f(sp_st.get("equity_usd"), 100_000.0), 1.0)
@@ -419,12 +429,13 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
             "deployed_frac": round(min(1.0, max(0.0, 1.0 - sp_free / sp_eq)), 6),
             "venue_breakdown_usd": dict(rt.get("venue_breakdown_usd") or {}),
             "returns": sp_rets,
+            "returns_dt_hours": sp_rets_dt,
             "venue": "HyperCore",
         }
 
     # 2. Cross-DEX Paper v2 (HL x Lighter x Extended)
     cd_st = _read_json(data_root / "hl_cross_dex_paper" / "state.json")
-    cd_rets = _read_sleeve_tick_returns(data_root / "hl_cross_dex_paper" / "ticks.parquet")
+    cd_rets, cd_rets_dt = _read_sleeve_tick_returns_with_dt(data_root / "hl_cross_dex_paper" / "ticks.parquet")
     if cd_st:
         cd_pos = cd_st.get("positions") or {}
         cd_eq = max(_f(cd_st.get("equity_usd"), 100_000.0), 1.0)
@@ -444,12 +455,13 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
             "positions_count": len(cd_pos),
             "deployed_frac": round(min(1.0, max(0.0, cd_locked / cd_eq)), 6),
             "returns": cd_rets,
+            "returns_dt_hours": cd_rets_dt,
             "venue": "HL x Lighter/Extended",
         }
 
     # 3. HIP-3 Cross-Builder Split-Margin Paper
     h3_st = _read_json(data_root / "hl_hip3_paper" / "state.json")
-    h3_rets = _read_sleeve_tick_returns(data_root / "hl_hip3_paper" / "ticks.parquet")
+    h3_rets, h3_rets_dt = _read_sleeve_tick_returns_with_dt(data_root / "hl_hip3_paper" / "ticks.parquet")
     if h3_st:
         h3_pos = h3_st.get("positions") or {}
         h3_eq = max(_f(h3_st.get("equity_usd"), 50_000.0), 1.0)
@@ -463,12 +475,13 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
             "positions_count": len(h3_pos),
             "deployed_frac": round(min(1.0, max(0.0, h3_locked / h3_eq)), 6),
             "returns": h3_rets,
+            "returns_dt_hours": h3_rets_dt,
             "venue": "HIP-3 Builders",
         }
 
     # 4. Metamodel Paper (Observation-only unless positive live OOS Sharpe)
     mm_st = _read_json(data_root / "hl_metamodel" / "state.json")
-    mm_rets = _read_sleeve_tick_returns(data_root / "hl_metamodel" / "ticks.parquet")
+    mm_rets, mm_rets_dt = _read_sleeve_tick_returns_with_dt(data_root / "hl_metamodel" / "ticks.parquet")
     if mm_st:
         mm_pos = mm_st.get("positions") or {}
         mm_lev = sum(_metamodel_position_gross(p) for p in mm_pos.values() if isinstance(p, dict))
@@ -483,6 +496,7 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
             "positions_count": len(mm_pos),
             "deployed_frac": round(min(1.0, max(0.0, mm_lev / 2.0)), 6),
             "returns": mm_rets,
+            "returns_dt_hours": mm_rets_dt,
             "venue": "HL x CEX",
         }
 
@@ -505,11 +519,29 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
     return out
 
 
-def _sleeve_sharpe_and_vol(rets: list[float], *, periods_per_year: float = 2190.0) -> tuple[float, float]:
-    """Compute annualized Sharpe and volatility from 4h tick returns (2190 = 365 * 6)."""
+def _sleeve_sharpe_and_vol(
+    rets: list[float],
+    *,
+    periods_per_year: float = 2190.0,
+    dt_hours: list[float] | None = None,
+) -> tuple[float, float]:
+    """Annualized Sharpe and volatility from sleeve tick returns.
+
+    With ``dt_hours`` (irregular ticks): drift = sum(r) / sum(dt) per hour and volatility =
+    std(r / sqrt(dt)) per sqrt-hour, each annualized over 8760 h, so neither depends on tick
+    cadence. Without it, returns are treated as regular 4h ticks (2190 = 365 * 6).
+    """
     if len(rets) < 3:
         return 0.0, 0.05
     arr = np.asarray(rets, dtype=float)
+    if dt_hours is not None and len(dt_hours) == len(rets):
+        dts = np.asarray(dt_hours, dtype=float)
+        hours_per_year = 8760.0
+        vol = float(np.std(arr / np.sqrt(dts), ddof=1)) * math.sqrt(hours_per_year)
+        mean = float(arr.sum() / dts.sum()) * hours_per_year
+        if vol <= 1e-8:
+            return 0.0, 0.05
+        return mean / vol, max(vol, 0.01)
     vol = float(np.std(arr, ddof=1)) * math.sqrt(periods_per_year)
     mean = float(np.mean(arr)) * periods_per_year
     if vol <= 1e-8:
@@ -536,7 +568,8 @@ def compute_autopilot_target_weights(
         if not info or not info.get("active"):
             continue
         rets = list(info.get("returns") or [])
-        sh, vol = _sleeve_sharpe_and_vol(rets)
+        dts = list(info.get("returns_dt_hours") or []) or None
+        sh, vol = _sleeve_sharpe_and_vol(rets, dt_hours=dts)
         sharpe_map[name] = sh
         vol_map[name] = vol
         if name == "metamodel_paper":
@@ -745,8 +778,13 @@ def run_autopilot_tick(
     # Mark with the live mid; if it is unavailable this tick, hold the previous mark (zero return)
     # instead of falling back to a daily close that differs from the live mark the last tick used
     # (which booked a phantom PnL that reversed on the next tick).
+    offline_closes = daily_closes is not None
     cta_mark_map = {
-        c: float(live_marks.get(c) or (_f(prev_cta_px.get(c)) if _f(prev_cta_px.get(c)) > 0 else vals[-1]))
+        c: float(
+            vals[-1]
+            if offline_closes  # explicit closes supplied (simulation / backfill): mark with them
+            else (live_marks.get(c) or (_f(prev_cta_px.get(c)) if _f(prev_cta_px.get(c)) > 0 else vals[-1]))
+        )
         for c, vals in closes_map.items()
         if vals
     }

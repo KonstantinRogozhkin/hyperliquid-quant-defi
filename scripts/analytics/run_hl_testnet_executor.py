@@ -261,11 +261,8 @@ def main(
         orphan_target_weights=intended_targets,
     )
     if execute_testnet and account_addr and math.isfinite(account.equity_usd) and account.equity_usd > 0.0 and hwm > 0.0:
-        ex.save_high_water_mark(
-            hwm_state,
-            hwm,
-            net_external_flow_usd=cur_net_flow if cur_net_flow is not None else ex.load_hwm_net_flow(hwm_state),
-        )
+        if ex.hwm_persist_allowed(cur_net_flow, ex.load_hwm_net_flow(hwm_state)):
+            ex.save_high_water_mark(hwm_state, hwm, net_external_flow_usd=cur_net_flow)
     tg_resp = None
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(

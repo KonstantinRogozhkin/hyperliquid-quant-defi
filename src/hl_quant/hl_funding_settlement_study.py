@@ -256,11 +256,34 @@ def build_coin_settlement_events_15m(
     return pd.DataFrame(rows)
 
 
-def one_sided_p_value(t_stat: float) -> float:
-    """Normal-approximation one-sided p-value for ``H1: mean > 0`` (NaN/inf-safe)."""
+def one_sided_p_value(t_stat: float, df: float | None = None) -> float:
+    """One-sided p-value for ``H1: mean > 0``: Student-t with ``df`` degrees of freedom when given
+    (small samples / few clusters), normal approximation otherwise. NaN/inf-safe."""
     if not math.isfinite(t_stat):
         return 1.0 if t_stat != math.inf else 0.0
+    if df is not None and math.isfinite(df) and df >= 1:
+        try:
+            from scipy.stats import t as student_t  # scipy ships with scikit-learn
+
+            return float(student_t.sf(t_stat, df))
+        except ImportError:  # pragma: no cover - fall back to the normal tail
+            pass
     return 0.5 * math.erfc(t_stat / math.sqrt(2.0))
+
+
+def conservative_holdout_p_value(row: Any) -> float:
+    """Larger of the naive (df = events - 1) and clustered (df = clusters - 1) Student-t p-values.
+
+    A clustered t of 4.5 from 3 timestamp clusters has p ~ 0.023, not the ~3e-6 a normal tail
+    gives, so sparse buckets cannot sail through the BH FDR gate.
+    """
+    t_naive = float(row.get("t_stat", float("nan")))
+    t_cl = float(row.get("t_stat_clustered", t_naive))
+    events = float(row.get("events", 0) or 0)
+    clusters = float(row.get("clusters", 0) or 0)
+    p_naive = one_sided_p_value(t_naive, events - 1 if events >= 2 else None)
+    p_cl = one_sided_p_value(t_cl if math.isfinite(t_cl) else -math.inf, clusters - 1 if clusters >= 2 else (events - 1 if events >= 2 else None))
+    return max(p_naive, p_cl)
 
 
 def benjamini_hochberg(p_values: list[float], q: float = 0.10) -> list[bool]:
@@ -638,14 +661,11 @@ def format_settlement_study_markdown(stats_df: pd.DataFrame, meta: dict[str, Any
     # ~44 bucket x strategy cells are tested at once: control the false-discovery rate across
     # them (Benjamini–Hochberg on the conservative holdout t = min(t, clustered t)) so a lone
     # t ~ 2-4 on a small N cannot pass as an edge by multiple-comparison luck.
-    def _holdout_t(key: tuple[str, str]) -> float:
-        h_row = hld.loc[key]
-        t_cl = float(h_row.get("t_stat_clustered", h_row["t_stat"]))
-        t_cl = t_cl if math.isfinite(t_cl) else -math.inf
-        return min(float(h_row["t_stat"]), t_cl)
-
     fdr_pass = dict(
-        zip(common_idx, benjamini_hochberg([one_sided_p_value(_holdout_t(k)) for k in common_idx], SETTLEMENT_FDR_Q))
+        zip(
+            common_idx,
+            benjamini_hochberg([conservative_holdout_p_value(hld.loc[k]) for k in common_idx], SETTLEMENT_FDR_Q),
+        )
     )
     for b_name, strat in common_idx:
         d = dev.loc[(b_name, strat)]
@@ -724,12 +744,9 @@ def format_settlement_study_telegram_rich_html(stats_df: pd.DataFrame, meta: dic
     ]
     if not hld.empty:
         keys = list(hld.index)
-
-        def _cons_t(row: Any) -> float:
-            t_cl = float(row.get("t_stat_clustered", row["t_stat"]))
-            return min(float(row["t_stat"]), t_cl if math.isfinite(t_cl) else -math.inf)
-
-        fdr_ok = dict(zip(keys, benjamini_hochberg([one_sided_p_value(_cons_t(hld.loc[k])) for k in keys], SETTLEMENT_FDR_Q)))
+        fdr_ok = dict(
+            zip(keys, benjamini_hochberg([conservative_holdout_p_value(hld.loc[k]) for k in keys], SETTLEMENT_FDR_Q))
+        )
         top_h = hld.sort_values("mean_gross_bps", ascending=False).head(6)
         for (b_name, strat), h in top_h.iterrows():
             d_g = f"{dev.loc[(b_name, strat), 'mean_gross_bps']:+.2f}" if (b_name, strat) in dev.index else "—"
