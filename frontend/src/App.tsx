@@ -1558,7 +1558,17 @@ function Desk() {
                         <tr key={idx}>
                           <td className="mono">{rec.observed_at_utc ?? "—"}</td>
                           <td>
-                            <span className={`badge ${rec.status === "ok" ? "badge-ok" : "badge-danger"}`}>
+                            <span
+                              className={`badge ${
+                                rec.status === "ok"
+                                  ? "badge-ok"
+                                  : rec.derisk_mode === "orphan_unwind_only" &&
+                                      rec.violations.length > 0 &&
+                                      rec.violations.every((v) => v.startsWith("missing_quote:"))
+                                    ? "badge-warn"
+                                    : "badge-danger"
+                              }`}
+                            >
                               {rec.status}
                             </span>
                             {rec.derisk_mode && rec.derisk_mode !== "none" && (

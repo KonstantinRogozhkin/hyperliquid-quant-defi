@@ -306,7 +306,26 @@ def render_prometheus_metrics(
             else None
         )
         if isinstance(latest_audit, dict):
-            testnet_last_ok = str(latest_audit.get("status")) == "ok"
+            raw_status = str(latest_audit.get("status") or "")
+            testnet_last_ok = raw_status == "ok"
+            if not testnet_last_ok and raw_status == "kill_switch_triggered":
+                viols = [str(v) for v in (latest_audit.get("violations") or [])]
+                only_missing_quote = bool(viols) and all(v.startswith("missing_quote:") for v in viols)
+                risk_snap = overview.get("testnet_risk")
+                audit_ms = _num(latest_audit.get("ts_ms")) or 0.0
+                probe_ms = _obs_ms(risk_snap) if isinstance(risk_snap, dict) else None
+                if (
+                    only_missing_quote
+                    and str(latest_audit.get("derisk_mode") or "") == "orphan_unwind_only"
+                    and isinstance(risk_snap, dict)
+                    and probe_ms is not None
+                    and probe_ms > audit_ms
+                    and int(_num(risk_snap.get("unknown_books")) or 0) == 0
+                    and int(_num(risk_snap.get("unmanaged_orphan_positions")) or 0) == 0
+                    and (_num(risk_snap.get("drawdown_pct")) or 0.0)
+                    < (_num(risk_snap.get("kill_switch_drawdown_pct")) or 5.0)
+                ):
+                    testnet_last_ok = True
             testnet_hwm_val = _num(latest_audit.get("high_water_mark_usd"))
             b.emit("hl_testnet_hwm_usd", testnet_hwm_val, help_text="Testnet equity high-water mark USD")
             b.emit(

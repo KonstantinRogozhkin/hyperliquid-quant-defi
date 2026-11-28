@@ -382,13 +382,19 @@ def filter_unquoted_targets(
     if not missing:
         return dict(target_weights), []
     quoted_count = len(nonzero) - len(missing)
-    if book_tops is not None:
-        outage = [c for c in missing if c not in book_tops or int(book_tops[c][2] or 0) <= 0]
+    if book_tops is None:
+        missing_frac = len(missing) / len(nonzero)
+        if quoted_count <= 0 or (len(nonzero) >= 2 and quoted_count < 2) or missing_frac > max_missing_fraction + 1e-9:
+            return dict(target_weights), []
     else:
-        outage = missing
-    missing_frac = len(outage) / len(nonzero)
-    if quoted_count <= 0 or (len(nonzero) >= 2 and quoted_count < 2) or missing_frac > max_missing_fraction + 1e-9:
-        return dict(target_weights), []
+        outage = [c for c in missing if c not in book_tops or int(book_tops[c][2] or 0) <= 0]
+        missing_frac = len(outage) / len(nonzero)
+        if missing_frac > max_missing_fraction + 1e-9 or (quoted_count <= 0 and len(outage) > 0):
+            return dict(target_weights), []
+        if quoted_count <= 0 or (len(nonzero) >= 2 and quoted_count < 2):
+            # Books were read cleanly (`observed_ms > 0`) yet <2 coins have two-sided Testnet BBO:
+            # skip opening a 1-legged directional book without tripping a feed-outage kill-switch.
+            return {}, sorted(nonzero.keys())
     missing_set = set(missing)
     filtered = {c: float(w) for c, w in target_weights.items() if c not in missing_set}
     return filtered, missing

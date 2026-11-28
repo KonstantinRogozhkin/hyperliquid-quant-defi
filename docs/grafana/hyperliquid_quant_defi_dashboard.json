@@ -1174,7 +1174,7 @@
     {
       "id": 13,
       "type": "timeseries",
-      "title": "Cumulative Return % — Our Strategies vs Crypto & Gold Benchmarks (90D)",
+      "title": "Cumulative Return % — Our Strategies vs Crypto & Gold Benchmarks (1Y)",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -1202,7 +1202,7 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "legendFormat": "Benchmark {{asset}} (90D)"
+          "legendFormat": "Benchmark {{asset}} (1Y)"
         }
       ],
       "options": {

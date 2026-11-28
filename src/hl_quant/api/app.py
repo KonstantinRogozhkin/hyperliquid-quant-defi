@@ -20,7 +20,7 @@ from fastapi.responses import PlainTextResponse
 import pandas as pd
 
 from hl_quant.hl_analytics_risk import build_desk_analytics_payload
-from hl_quant.hl_portfolio_dashboard import collect_dashboard_payload
+from hl_quant.hl_portfolio_dashboard import collect_dashboard_payload, normalize_autopilot_state
 from hl_quant.metrics import PROMETHEUS_CONTENT_TYPE, render_prometheus_metrics
 
 ARTIFACT_FILES: dict[str, str] = {
@@ -361,7 +361,7 @@ def create_app(
         _no_store(response)
         return sanitize_json(
             {
-                "state": _read_json(resolved_data_root / "hl_autopilot" / "state.json"),
+                "state": normalize_autopilot_state(_read_json(resolved_data_root / "hl_autopilot" / "state.json")),
                 "ticks": _read_parquet_tail(resolved_data_root / "hl_autopilot" / "ticks.parquet", limit=200),
                 "rebalances": _read_parquet_tail(resolved_data_root / "hl_autopilot" / "rebalances.parquet", limit=100),
             }
