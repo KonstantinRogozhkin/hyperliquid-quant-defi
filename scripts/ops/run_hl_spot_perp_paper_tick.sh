@@ -13,7 +13,7 @@ fi
 SCRIPT_PATH="${0:A}"
 REPO_ROOT="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${REPO_ROOT}/.venv/bin/python}"
-LOCK_FILE="${HL_LOCK_FILE:-${TMPDIR:-/tmp}/hl_spot_perp_paper_tick.flock}"
+LOCK_FILE="${HL_LOCK_FILE:-${REPO_ROOT}/.neira/state/locks/hl_spot_perp_paper_tick.flock}"
 
 # Atomic kernel flock (released automatically on crash/SIGKILL): no stale-lock reclaim race.
 # Overlapping invocations exit 0 without running the tick.

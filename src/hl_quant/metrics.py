@@ -152,6 +152,7 @@ def _emit_strategy_row(
     share_price: Any,
     sharpe_90d: Any = None,
     beta_btc: Any = None,
+    current_dd_pct: Any = None,
 ) -> None:
     """Emit standardized unified strategy-leaderboard gauges sharing identical labels."""
     lbl = {"strategy": strategy, "category": category, "mode": mode}
@@ -167,6 +168,13 @@ def _emit_strategy_row(
     b.emit("hl_strategy_open_positions", open_positions, help_text="Currently open positions or pairs", labels=lbl)
     b.emit("hl_strategy_leverage", leverage, help_text="Current gross leverage multiple", labels=lbl)
     b.emit("hl_strategy_max_dd_pct", max_dd_pct, help_text="Maximum historical drawdown %", labels=lbl)
+    if current_dd_pct is not None:
+        b.emit(
+            "hl_strategy_current_dd_pct",
+            current_dd_pct,
+            help_text="Current drawdown below the running share-price peak % (0 at a high-water mark)",
+            labels=lbl,
+        )
     b.emit("hl_strategy_share_price", share_price, help_text="Normalized NAV share price ($1.00 inception)", labels=lbl)
     if sharpe_90d is not None:
         b.emit("hl_strategy_sharpe_90d", sharpe_90d, help_text="Trailing 90D Sharpe ratio (>=5 calendar days)", labels=lbl)
@@ -783,6 +791,9 @@ def render_prometheus_metrics(
             beta,
         )
 
+    def _lb_current_dd(lb_id: str) -> float | None:
+        return _num((lb_by_id.get(lb_id) or {}).get("current_dd_gross_pct"))
+
     s_meta = overview.get("settlement_last_attempt") or overview.get("settlement_meta")
     if isinstance(s_meta, dict):
         degraded_val: bool | None = None
@@ -881,6 +892,7 @@ def render_prometheus_metrics(
             open_positions=active_sleeves,
             leverage=_num(ap_rt.get("gross_leverage")) or 0.0,
             max_dd_pct=max_dd,
+            current_dd_pct=_lb_current_dd("autopilot"),
             share_price=_num(ap_st.get("gross_share_price")) or (eq / sc if sc > 0 else 1.0),
             sharpe_90d=sh90,
             beta_btc=beta,
@@ -912,6 +924,7 @@ def render_prometheus_metrics(
             open_positions=pos_cnt,
             leverage=_num(sp_rt.get("gross_leverage")) or 0.0,
             max_dd_pct=max_dd,
+            current_dd_pct=_lb_current_dd("spot_perp"),
             share_price=_num(sp.get("share_price")) or (eq / sc if sc > 0 else 1.0),
             sharpe_90d=sh90,
             beta_btc=beta,
@@ -950,6 +963,7 @@ def render_prometheus_metrics(
             open_positions=pos_cnt,
             leverage=round(gross_ntl / max(eq, 1.0), 3),
             max_dd_pct=max_dd,
+            current_dd_pct=_lb_current_dd("cross_dex"),
             share_price=round(eq / sc, 6) if sc > 0 else 1.0,
             sharpe_90d=sh90,
             beta_btc=beta,
@@ -989,6 +1003,7 @@ def render_prometheus_metrics(
             open_positions=pos_cnt,
             leverage=round(gross_ntl / max(eq, 1.0), 3),
             max_dd_pct=max_dd,
+            current_dd_pct=_lb_current_dd("hip3_paper"),
             share_price=round(eq / sc, 6) if sc > 0 else 1.0,
             sharpe_90d=sh90,
             beta_btc=beta,
@@ -1029,6 +1044,7 @@ def render_prometheus_metrics(
             open_positions=pos_cnt,
             leverage=mm_lev,
             max_dd_pct=max_dd,
+            current_dd_pct=_lb_current_dd("metamodel"),
             share_price=round(eq / sc, 6) if sc > 0 else 1.0,
             sharpe_90d=sh90,
             beta_btc=beta,
@@ -1094,6 +1110,7 @@ def render_prometheus_metrics(
             leverage=lev_val,
             max_dd_pct=testnet_dd,
             share_price=round(eq / sc, 6) if sc > 0 else 1.0,
+            current_dd_pct=testnet_dd,
         )
 
     if hlp_apr_val is not None or hlp_tvl_val is not None:

@@ -28,6 +28,12 @@ TICK_PATH="${ROOT_DIR}/scripts/ops/run_hl_onchain_event_tick.sh"
 HL_ONCHAIN_CRON_SCHEDULE="${HL_ONCHAIN_CRON_SCHEDULE:-*/15 * * * *}"
 
 EXISTING_CRONTAB="$(crontab -l 2>/dev/null || true)"
+# Refuse to silently re-activate blocks that cutover_local_crons_to_dokploy.py disabled (double-runs vs hl-worker).
+if [[ "${HL_FORCE_LOCAL_CRONS:-0}" != "1" ]] && printf "%s\n" "${EXISTING_CRONTAB}" | grep -qF "(cutover to Dokploy worker)"; then
+  echo "refusing_install: current crontab has hyperliquid-quant-defi blocks disabled by the Dokploy cutover (\"# Disabled ... (cutover to Dokploy worker)\")." >&2
+  echo "Re-installing local crons would double-run jobs alongside the Dokploy hl-worker. Set HL_FORCE_LOCAL_CRONS=1 to override." >&2
+  exit 3
+fi
 printf "%s\n" "${EXISTING_CRONTAB}" > "${BACKUP_PATH}"
 
 {

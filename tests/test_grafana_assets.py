@@ -157,7 +157,7 @@ def _sample_full_metrics_names() -> set[str]:
     analytics = {
         "leaderboard": [
             {"id": "bench_btc", "is_benchmark": True, "spot_price_usd": 61400.0, "gross_returns": {"all_time": -22.0}, "max_dd_gross_pct": 32.0},
-            {"id": "spot_perp", "is_benchmark": False, "net_returns": {"all_time": 0.08}, "max_dd_gross_pct": 0.1, "sharpe_gross": 4.2},
+            {"id": "spot_perp", "is_benchmark": False, "net_returns": {"all_time": 0.08}, "max_dd_gross_pct": 0.1, "current_dd_gross_pct": 0.05, "sharpe_gross": 4.2},
         ],
         "market_exposure": {"BTC": {"rows": [{"id": "spot_perp", "beta": 0.002}]}},
     }
@@ -200,7 +200,7 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
     crit_rules = groups[0]["rules"]
     warn_rules = groups[1]["rules"]
     assert len(crit_rules) == 11
-    assert len(warn_rules) == 9
+    assert len(warn_rules) == 11
     for grp in groups:
         for rule in grp["rules"]:
             assert rule.get("alert") and rule.get("expr")
@@ -209,7 +209,7 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
 
     graf = yaml.safe_load(GRAFANA_ALERTS_PATH.read_text(encoding="utf-8"))
     assert len(graf["groups"][0]["rules"]) == 11
-    assert len(graf["groups"][1]["rules"]) == 9
+    assert len(graf["groups"][1]["rules"]) == 11
     g_rules = [r for grp in graf["groups"] for r in grp["rules"]]
     uids = [r["uid"] for r in g_rules]
     assert len(uids) == len(set(uids)), "Grafana alert rule uids must be unique"
@@ -222,6 +222,8 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
         "hl-warn-coin-mark-oracle",
         "hl-warn-testnet-risk-stale",
         "hl-warn-testnet-attr-stale",
+        "hl-warn-testnet-executor-stale",
+        "hl-warn-onchain-events-stale",
     ):
         assert required in uids
     prom_names = {r["alert"] for grp in groups for r in grp["rules"]}
@@ -231,12 +233,18 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
         "HLTestnetCoinMarkOracleDislocation",
         "HLTestnetRiskProbeStale",
         "HLTestnetAttributionStale",
+        "HLTestnetExecutorStale",
+        "HLOnchainEventsStale",
     ):
         assert required in prom_names
     # Freshness alerts must also fire when the artifact was never written (no age sample at all).
     by_uid = {r["uid"]: r for r in g_rules}
     by_alert = {r["alert"]: r for grp in groups for r in grp["rules"]}
-    for uid, alert in (("hl-warn-testnet-risk-stale", "HLTestnetRiskProbeStale"), ("hl-warn-testnet-attr-stale", "HLTestnetAttributionStale")):
+    for uid, alert in (
+        ("hl-warn-testnet-risk-stale", "HLTestnetRiskProbeStale"),
+        ("hl-warn-testnet-attr-stale", "HLTestnetAttributionStale"),
+        ("hl-warn-testnet-executor-stale", "HLTestnetExecutorStale"),
+    ):
         assert "hl_artifact_exists" in by_uid[uid]["data"][0]["model"]["expr"]
         assert "hl_worker_job_enabled" in by_uid[uid]["data"][0]["model"]["expr"]
         assert "hl_artifact_exists" in by_alert[alert]["expr"]

@@ -20,7 +20,7 @@ def test_boros_market_parsing_fixed_lock_and_spread_market_detection():
             "midApr": 0.0915,
             "bestBid": 0.0894,
             "bestAsk": 0.0937,
-            "floatingApr": 0.1095,
+            "floatingApr": 0.0700,  # fixed 8.94% beats floating 7.00% by more than the amortized hedge cost
             "notionalOI": 391776.9,
             "volume24h": 50000.0,
         },
@@ -36,8 +36,8 @@ def test_boros_market_parsing_fixed_lock_and_spread_market_detection():
             "bestBid": 0.0228,
             "bestAsk": 0.0230,
             "floatingApr": -0.0384,
-            "notionalOI": 9958.0,
-            "volume24h": 1200.0,
+            "notionalOI": 150_000.0,
+            "volume24h": 12_000.0,
         },
     }
     lt_q = {

@@ -186,7 +186,7 @@ def test_risk_exposure_leverage_history_metamodel_and_canonical_tiers(tmp_path: 
     assert cd_row["current_leverage"] == 1.0
     assert cd_row["leverage_30d_avg"] < 1.0  # 0.2x / 0.8x / 1.0x history, not a copy of current
     assert cd_row["leverage_30d_max"] == 1.0
-    assert rows["Metamodel (HL x CEX)"]["current_leverage"] == 0.6
+    assert rows["6-Family Metamodel (Obs)"]["current_leverage"] == 0.6
 
     tiers = {r["label"]: r["usd"] for r in rx["asset_tier_concentration"]}
     assert "HLP / USDC Reserve" not in tiers and "HLP Vault Reserve" not in tiers
@@ -318,7 +318,7 @@ def test_metamodel_gross_uses_per_venue_legs_and_tick_history(tmp_path: Path):
         {"tick_hour_ms": [t0, t0 + 3_600_000], "gross_hl": [0.9, 0.1], "gross_cex": [0.9, 0.5]}
     ).to_parquet(mm_dir / "ticks.parquet", index=False)
     row = next(
-        r for r in ar.build_consolidated_risk_exposure(tmp_path)["leverage_by_strategy"] if r["strategy"].startswith("Metamodel")
+        r for r in ar.build_consolidated_risk_exposure(tmp_path)["leverage_by_strategy"] if r["id"] == "metamodel"
     )
     assert row["current_leverage"] == pytest.approx(0.6)
     assert row["leverage_30d_max"] == pytest.approx(1.8)  # historical peak, not a copy of current

@@ -325,7 +325,8 @@ def test_analytics_consecutive_day_gap_guard_and_autopilot_look_through(tmp_path
     strat_vals = [1.0 * (1.0005 ** i) for i in (0, 1, 2, 6, 7, 8, 9)]
     strat_ser = pd.Series(strat_vals, index=strat_idx)
 
-    ols = ar.compute_ols_market_exposure({"sp": ("Spot+Perp", strat_ser)}, btc_ser, factor_name="BTC")
+    # min_overlap=3: this test targets the gap guard, not the production 10-day overlap threshold.
+    ols = ar.compute_ols_market_exposure({"sp": ("Spot+Perp", strat_ser)}, btc_ser, factor_name="BTC", min_overlap=3)
     row = ols["rows"][0]
     # 2026-09-07 is excluded because 09-03 -> 09-07 is a 4-day gap, leaving 5 true consecutive 1-day returns with 0 variance -> beta=0!
     assert row["days"] == 5

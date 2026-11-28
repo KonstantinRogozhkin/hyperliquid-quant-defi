@@ -10,7 +10,8 @@
 - Секреты хранятся строго в локальном gitignored `.env` (см. шаблон `.env.example`):
   - `HL_TESTNET_PRIVATE_KEY` / `HL_TESTNET_ACCOUNT_ADDRESS` — API-кошелёк Testnet без права вывода;
   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `TELEGRAM_THREAD_ID` — уведомления Telegram Bot API 10.1+ (`sendRichMessage` с нативными HTML-таблицами).
-- Все cron-обёртки используют атомарный ядровый `flock` через `python -m hl_quant.ops_lock` (`${TMPDIR:-/tmp}/*.flock`, автоматически освобождаемый ядром при `SIGKILL`/падении) — параллельные дубли и залипшие lock-файлы невозможны.
+- Все cron-обёртки используют атомарный ядровый `flock` через `python -m hl_quant.ops_lock` (`<repo>/.neira/state/locks/*.flock` — стабильный путь, общий для cron и интерактивного shell, в отличие от `${TMPDIR}` на macOS; автоматически освобождается ядром при `SIGKILL`/падении) — параллельные дубли и залипшие lock-файлы невозможны.
+- Инсталляторы `scripts/ops/install_*cron*.sh` отказываются (exit 3) переустанавливать локальные cron-блоки, если в текущем crontab есть строки `# Disabled ... (cutover to Dokploy worker)` от `cutover_local_crons_to_dokploy.py`; принудительно — `HL_FORCE_LOCAL_CRONS=1`.
 
 ---
 

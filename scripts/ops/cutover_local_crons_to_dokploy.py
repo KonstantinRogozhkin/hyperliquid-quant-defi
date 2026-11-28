@@ -6,7 +6,8 @@ Workflow:
    - ``/api/v1/healthz`` reports ``status == "ok"``
    - ``/build-info.json`` and ``/api/v1/build-info.json`` match (and optionally match ``--expected-sha``)
    - ``/api/v1/scheduler/status`` reports a live ``hl-worker`` heartbeat fresher than ``--max-heartbeat-age-sec``
-     and none of the required core jobs are missing, disabled, or in ``failed`` state.
+     and none of the required core jobs are missing, disabled, or in ``failed`` state; when the worker reports
+     ``testnet_execution_enabled`` the ``testnet_executor`` and ``testnet_risk_probe`` jobs are required too.
 2. Reads the local user's ``crontab -l`` and transforms ONLY ``hyperliquid-quant-defi`` entries
    (either commenting them out in place with a dated marker or removing the managed blocks).
    Unrelated cron entries are preserved byte-for-byte.
@@ -35,6 +36,9 @@ from urllib.request import Request, urlopen
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_BACKUP_DIR = ROOT / "data" / "crontab_backups"
+# Jobs that must be enabled and healthy whenever the worker reports testnet_execution_enabled=true.
+TESTNET_REQUIRED_JOBS = ("testnet_executor", "testnet_risk_probe")
+
 DEFAULT_REQUIRED_JOBS = (
     "market_snapshot",
     "metamodel_paper",
@@ -188,24 +192,24 @@ def verify_dokploy_stack(
             "Dokploy worker has testnet_execution_enabled=false while --expect-testnet-worker was requested"
         )
 
-    te_job = jobs_by_name.get("testnet_executor")
-    if isinstance(te_job, dict) and (testnet_enabled or expect_testnet_worker):
-        te_job_enabled = bool(te_job.get("enabled") is True)
-        te_job_failed = str(te_job.get("state") or "").lower() == "failed"
-        if te_job_failed:
-            raise RuntimeError(
-                f"Dokploy worker job 'testnet_executor' is in failed state (exit={te_job.get('last_exit_code')})"
-            )
-        if not te_job_enabled:
-            if expect_testnet_worker:
+    if testnet_enabled or expect_testnet_worker:
+        # A worker that executes on Testnet must also run its executor AND the 15m risk probe (live drawdown /
+        # orphan telemetry); otherwise cutting over local crons leaves Testnet unmanaged or unmonitored.
+        for te_name in TESTNET_REQUIRED_JOBS:
+            te_job = jobs_by_name.get(te_name)
+            if not isinstance(te_job, dict):
                 raise RuntimeError(
-                    f"Dokploy worker has testnet_executor disabled ({te_job.get('status_reason')}) "
-                    "while --expect-testnet-worker was requested"
+                    f"Dokploy worker has testnet_execution_enabled=true but job '{te_name}' is missing from worker_status"
                 )
-            warnings.append(
-                f"worker reported testnet_execution_enabled=true, but testnet_executor job is disabled ({te_job.get('status_reason')})"
-            )
-            testnet_enabled = False
+            if str(te_job.get("state") or "").lower() == "failed":
+                raise RuntimeError(
+                    f"Dokploy worker job '{te_name}' is in failed state (exit={te_job.get('last_exit_code')})"
+                )
+            if te_job.get("enabled") is not True:
+                raise RuntimeError(
+                    f"Dokploy worker has {te_name} disabled ({te_job.get('status_reason')}) "
+                    "while testnet execution is enabled"
+                )
     if not testnet_enabled:
         warnings.append(
             "Dokploy worker has HL_ENABLE_TESTNET_EXECUTION=false (read-only). "

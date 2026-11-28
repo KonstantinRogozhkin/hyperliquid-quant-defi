@@ -17,6 +17,10 @@ from typing import Any
 
 MS_PER_HOUR = 3_600_000
 DEFAULT_MIN_SPACING_HOURS = 3.5  # 4h cron cadence with jitter tolerance
+# A streak is "consecutive" only while qualifying ticks keep arriving: a gap longer than this
+# (worker down, job failing) restarts the streak at 1 instead of silently continuing it.
+GAP_SPACING_MULTIPLE = 2.5
+MIN_GAP_HOURS = 8.5
 
 
 def streak_count(value: object) -> int:
@@ -48,13 +52,20 @@ def advance_streak(
     qualifies: bool,
     now_ms: int,
     min_spacing_hours: float = DEFAULT_MIN_SPACING_HOURS,
+    max_gap_hours: float | None = None,
 ) -> dict[str, int]:
-    """Advance (or reset) one streak honoring the minimum wall-clock spacing between increments."""
+    """Advance (or reset) one streak honoring the minimum wall-clock spacing between increments.
+
+    ``max_gap_hours`` (default ``max(8.5h, 2.5 x spacing)``): if the last increment is older than
+    this, the ticks in between were missed, so the streak restarts at 1 rather than continuing.
+    """
     cur = _normalize(value)
     if not qualifies:
         return {"n": 0, "first_ms": 0, "last_inc_ms": 0}
     spacing_ms = int(max(0.0, min_spacing_hours) * MS_PER_HOUR)
-    if cur["n"] <= 0:
+    gap_h = max_gap_hours if max_gap_hours is not None else max(MIN_GAP_HOURS, GAP_SPACING_MULTIPLE * min_spacing_hours)
+    gap_ms = int(max(0.0, gap_h) * MS_PER_HOUR)
+    if cur["n"] <= 0 or (cur["last_inc_ms"] > 0 and gap_ms > 0 and now_ms - cur["last_inc_ms"] > gap_ms):
         return {"n": 1, "first_ms": now_ms, "last_inc_ms": now_ms}
     if now_ms - cur["last_inc_ms"] >= spacing_ms:
         return {"n": cur["n"] + 1, "first_ms": cur["first_ms"] or now_ms, "last_inc_ms": now_ms}
@@ -80,3 +91,20 @@ def update_streak_map(
             if key not in q:
                 out[key] = {"n": 0, "first_ms": 0, "last_inc_ms": 0}
     return out
+
+
+def settled_hours_between(prev_ms: int, now_ms: int, *, cap_hours: float) -> float:
+    """Number of hourly ``:00`` funding settlements crossed in ``(prev_ms, now_ms]`` (capped)."""
+    if prev_ms <= 0 or now_ms <= prev_ms:
+        return 0.0
+    return min(float(cap_hours), float(max(0, (now_ms // MS_PER_HOUR) - (prev_ms // MS_PER_HOUR))))
+
+
+def position_accrual_start_ms(pos: MutableMapping[str, Any], fallback_prev_ms: int) -> int:
+    """Per-position accrual clock: positions skipped on a tick (missing quote) keep their own
+    ``last_accrual_ms`` so the next quoted tick accrues the whole skipped interval."""
+    try:
+        v = int(pos.get("last_accrual_ms") or 0)
+    except (TypeError, ValueError):
+        v = 0
+    return v if v > 0 else int(fallback_prev_ms)

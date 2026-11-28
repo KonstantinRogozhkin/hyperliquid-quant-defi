@@ -11,6 +11,8 @@ const MONTH_LABELS_RU = ["Янв", "Фев", "Мар", "Апр", "Май", "Ию
 const MONTH_NAMES_EN = ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 const MONTH_NAMES_RU = ["январь", "февраль", "март", "апрель", "май", "июнь", "июль", "август", "сентябрь", "октябрь", "ноябрь", "декабрь"];
 const MAX_STEP_BACK_MS = 2 * 86_400_000;
+/** Mirrors backend MIN_STAT_OVERLAP_DAYS: rho/beta are only reported with >= 10 overlapping daily returns. */
+const MIN_CORR_OVERLAP_DAYS = 10;
 
 function fmtNum(v: number | null | undefined, digits = 2, suffix = "", signed = false): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "—";
@@ -28,8 +30,10 @@ function fmtUsd(v: number | null | undefined, digits = 2): string {
   return `${sign}$${abs.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
-function signCls(v: number | null | undefined): string {
+/** Sign colour class; values that round to zero at `digits` (as displayed) are neutral. */
+export function signCls(v: number | null | undefined, digits = 2): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "";
+  if (Math.abs(v) < 0.5 * Math.pow(10, -digits)) return "";
   return v > 0 ? "pos" : v < 0 ? "neg" : "";
 }
 
@@ -608,7 +612,7 @@ export function AnalyticsRiskTab({
               </div>
             </div>
           </div>
-          {corr && corr.ids.length >= 2 && corr.overlap_days >= 3 ? (
+          {corr && corr.ids.length >= 2 && corr.overlap_days >= MIN_CORR_OVERLAP_DAYS ? (
             <div className="table-wrap">
               <table>
                 <thead>
@@ -653,8 +657,8 @@ export function AnalyticsRiskTab({
           ) : (
             <div className="muted">
               {t(
-                "Waiting for at least 2 strategies with ≥ 3 overlapping days.",
-                "Ждём минимум 2 стратегии с ≥ 3 общими днями.",
+                `Waiting for at least 2 strategies with ≥ ${MIN_CORR_OVERLAP_DAYS} overlapping days.`,
+                `Ждём минимум 2 стратегии с ≥ ${MIN_CORR_OVERLAP_DAYS} общими днями.`,
               )}
             </div>
           )}
@@ -721,7 +725,7 @@ export function AnalyticsRiskTab({
                           </td>
                           <td className="num">{fmtNum(r.beta, 3)}</td>
                           <td className="num">{fmtNum(r.r2_pct, 1, "%")}</td>
-                          <td className={`num ${signCls(r.alpha_ann_pct)}`}>
+                          <td className={`num ${signCls(r.alpha_ann_pct, 1)}`}>
                             {fmtNum(r.alpha_ann_pct, 1, "%", true)}
                           </td>
                           <td className="num">{r.days}</td>
@@ -802,12 +806,19 @@ export function AnalyticsRiskTab({
                     </td>
                     {MONTHS.map((m) => {
                       const v = yr.months[m];
+                      const partial = v !== undefined && yr.partial_first_month === m;
                       return (
                         <td
                           key={m}
                           className={`num ${v === undefined ? "muted" : signCls(v)}`}
+                          title={
+                            partial
+                              ? t("Partial month: tracking started mid-month", "Неполный месяц: учёт начат в середине месяца")
+                              : undefined
+                          }
                         >
                           {v === undefined ? "—" : fmtNum(v, 2, "%", true)}
+                          {partial ? "*" : ""}
                         </td>
                       );
                     })}
@@ -857,7 +868,7 @@ export function AnalyticsRiskTab({
               </thead>
               <tbody>
                 {(risk?.leverage_by_strategy ?? []).map((row) => (
-                  <tr key={row.strategy}>
+                  <tr key={row.id ?? row.strategy}>
                     <td>
                       <strong>{row.strategy}</strong>
                     </td>

@@ -61,15 +61,16 @@ def _make_fetcher(
                 "last_exit_code": 1 if name == failed_job else 0,
             }
         )
-    jobs.append(
-        {
-            "name": "testnet_executor",
-            "enabled": testnet_enabled,
-            "status_reason": "active" if testnet_enabled else "disabled",
-            "state": "ok" if testnet_enabled else "disabled",
-            "last_exit_code": 0 if testnet_enabled else None,
-        }
-    )
+    for te_name in ("testnet_executor", "testnet_risk_probe"):
+        jobs.append(
+            {
+                "name": te_name,
+                "enabled": testnet_enabled,
+                "status_reason": "active" if testnet_enabled else "disabled",
+                "state": "ok" if testnet_enabled else "disabled",
+                "last_exit_code": 0 if testnet_enabled else None,
+            }
+        )
 
     def _fetch(url: str) -> dict[str, Any]:
         if url.endswith("/api/v1/healthz"):

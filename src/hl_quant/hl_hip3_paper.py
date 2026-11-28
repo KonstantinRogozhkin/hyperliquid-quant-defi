@@ -30,6 +30,7 @@ import pandas as pd
 
 from hl_quant import cross_dex_scanner as cds
 from hl_quant import hl_hip3_builder_arb as hip3
+from hl_quant import persistence_clock as pc
 from hl_quant.persistence_clock import streak_count, update_streak_map
 
 
@@ -215,11 +216,6 @@ def run_hip3_paper_tick(
 
         dt_cap_h = 168.0 if state.get("nav_guard_pending_ms") else 24.0
         dt_hours = max(0.0, min(dt_cap_h, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
-        settled_hours = (
-            min(dt_cap_h, float(max(0, (ts_ms // 3_600_000) - (prev_ms // 3_600_000))))
-            if prev_ms > 0
-            else 0.0
-        )
 
         positions: dict[str, dict[str, Any]] = state.get("positions") or {}
         positions_backup = {k: dict(v) for k, v in positions.items()}
@@ -245,8 +241,13 @@ def run_hip3_paper_tick(
             basis_pnl = -short_qty * (s_mkt.mark_px - prev_s) + long_qty * (l_mkt.mark_px - prev_l)
             s_notional = short_qty * s_mkt.mark_px
             l_notional = long_qty * l_mkt.mark_px
+            # Per-position clock: a tick skipped for a missing quote keeps its funding interval.
+            pos_prev_ms = pc.position_accrual_start_ms(pos, prev_ms)
+            pos_settled_hours = pc.settled_hours_between(pos_prev_ms, ts_ms, cap_hours=dt_cap_h) if prev_ms > 0 else 0.0
+            pos_dt_hours = max(0.0, min(dt_cap_h, (ts_ms - pos_prev_ms) / 3_600_000.0)) if pos_prev_ms > 0 else dt_hours
+            pos["last_accrual_ms"] = ts_ms
             # Short receives positive funding (+s_mkt.funding_rate_h); long pays positive funding (-l_mkt.funding_rate_h).
-            fund_pnl = (s_notional * s_mkt.funding_rate_h - l_notional * l_mkt.funding_rate_h) * settled_hours
+            fund_pnl = (s_notional * s_mkt.funding_rate_h - l_notional * l_mkt.funding_rate_h) * pos_settled_hours
 
             live_spread_apr = round(s_mkt.funding_apr_pct - l_mkt.funding_apr_pct, 2)
             live_mark_basis = round((s_mkt.mark_px - l_mkt.mark_px) / l_mkt.mark_px * 1e4, 2) if l_mkt.mark_px > 0 else 0.0
@@ -271,7 +272,7 @@ def run_hip3_paper_tick(
             pos["margin_locked_usd"] = round(dyn_margin, 2)
             pos["last_short_px"] = s_mkt.mark_px
             pos["last_long_px"] = l_mkt.mark_px
-            pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + dt_hours, 2)
+            pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + pos_dt_hours, 2)
             pos["cum_funding_usd"] = round(float(pos.get("cum_funding_usd", 0.0)) + fund_pnl, 4)
             pos["cum_basis_mtm_usd"] = round(float(pos.get("cum_basis_mtm_usd", 0.0)) + basis_pnl, 4)
             pos["live_spread_apr_pct"] = live_spread_apr

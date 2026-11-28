@@ -427,13 +427,16 @@ def scan_cross_dex_opportunities(
     *,
     min_day_vol_usd: float = 500_000.0,
     max_price_log_diff: float = 0.05,
-    round_trip_fee_bps: float = 7.0,
+    round_trip_fee_bps: float | None = None,
     bridge_rebalance_drag_bps: float = 2.0,
 ) -> pd.DataFrame:
-    """Compare Hyperliquid against another Perp DEX and rank cross-DEX funding opportunities."""
+    """Compare Hyperliquid against another Perp DEX and rank cross-DEX funding opportunities.
+
+    ``breakeven_hours`` uses the same per-venue round-trip fee table as ``depth_be_10k_h``
+    (``DEFAULT_VENUE_RT_FEE_BPS``) unless an explicit ``round_trip_fee_bps`` override is passed.
+    """
     rows: list[dict[str, Any]] = []
     common = sorted(set(hl_quotes.keys()) & set(other_quotes.keys()))
-    total_cost_bps = round_trip_fee_bps + bridge_rebalance_drag_bps
     for coin in common:
         h = hl_quotes[coin]
         o = other_quotes[coin]
@@ -451,6 +454,11 @@ def scan_cross_dex_opportunities(
             favorable_basis_bps = (o.mark_px - h.mark_px) / h.mark_px * 1e4
 
         hourly_spread_bps = abs(h.funding_rate_h - o.funding_rate_h) * 1e4
+        total_cost_bps = (
+            float(round_trip_fee_bps) + bridge_rebalance_drag_bps
+            if round_trip_fee_bps is not None
+            else default_round_trip_fee_bps(o.dex, bridge_drag_bps=bridge_rebalance_drag_bps)
+        )
         breakeven_h = (total_cost_bps / hourly_spread_bps) if hourly_spread_bps > 1e-9 else float("inf")
         rows.append(
             {

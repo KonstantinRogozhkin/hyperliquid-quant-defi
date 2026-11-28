@@ -18,7 +18,7 @@ ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 STATE_DIR="${HL_PAPER_STATE_DIR:-${ROOT_DIR}/data/paper/hl_metamodel}"
-LOCK_FILE="${HL_LOCK_FILE:-${TMPDIR:-/tmp}/hl_metamodel_paper_tick.flock}"
+LOCK_FILE="${HL_LOCK_FILE:-${ROOT_DIR}/.neira/state/locks/hl_metamodel_paper_tick.flock}"
 
 if [[ "${HL_OPS_LOCK_HELD:-0}" != "1" ]]; then
   cd "${ROOT_DIR}"

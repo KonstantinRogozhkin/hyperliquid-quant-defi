@@ -631,7 +631,7 @@ def build_xs_velocity_divergence_weights(market: WideMarket, params: dict[str, A
 def build_ml_feature_panel(market: WideMarket) -> dict[str, pd.DataFrame]:
     """Build strictly causal ``(T x N)`` feature matrices (all inputs ``shift(1)``)."""
     px = market.hl_close.shift(1)
-    r1 = px.pct_change()
+    r1 = px.pct_change(fill_method=None)
     vol24 = r1.rolling(24, min_periods=12).std().replace(0.0, np.nan)
     vol168 = r1.rolling(168, min_periods=48).std().replace(0.0, np.nan)
     hl_r = market.hl_rate_h.shift(1)
@@ -679,7 +679,7 @@ def build_ml_walkforward_weights(
     feats = feature_cache if feature_cache is not None else build_ml_feature_panel(market)
     feat_names = sorted(feats.keys())
     mask = causal_liquid_mask(market, min_daily_vol_usd=min_vol, require_bybit=False)
-    vol = market.hl_close.pct_change().shift(1).rolling(72, min_periods=24).std().replace(0.0, np.nan)
+    vol = market.hl_close.pct_change(fill_method=None).shift(1).rolling(72, min_periods=24).std().replace(0.0, np.nan)
 
     # Forward total return (price + funding) over (h_t, h_{t+horizon_h}]
     # Close of bar opening at h_t is price at h_{t+1}, so price at h_t is hl_close.shift(1)
