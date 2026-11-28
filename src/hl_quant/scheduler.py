@@ -674,9 +674,14 @@ class WorkerScheduler:
             else:
                 restored_state = "idle"
             last_started = prev.get("last_started_at_utc")
-            if isinstance(last_started, str) and len(last_started) >= 16:
+            if restored_state == "interrupted" and job.readonly:
+                # A read-only/paper job killed mid-flight by worker shutdown never finished its slot:
+                # leave ``_last_slot_run`` clear and mark run history earlier than any catch-up slot so
+                # ``collect_due_jobs`` re-runs the interrupted slot on startup instead of stranding it.
+                self._last_started_dt[job.name] = datetime.min.replace(tzinfo=timezone.utc)
+            elif isinstance(last_started, str) and len(last_started) >= 16:
                 # Hydrate in-memory slot guard (`YYYY-MM-DD HH:MM`) so a container restart inside a scheduled
-                # UTC minute never executes `testnet_executor` or paper ledgers a second time.
+                # UTC minute never executes `testnet_executor` or already-completed paper ledgers a second time.
                 self._last_slot_run[job.name] = last_started[:16]
                 try:
                     self._last_started_dt[job.name] = datetime.strptime(
@@ -684,6 +689,9 @@ class WorkerScheduler:
                     ).replace(tzinfo=timezone.utc)
                 except ValueError:
                     pass
+            prior_alerted = bool(prev.get("alerted_failed")) or restored_state == "failed"
+            if prior_alerted and enabled:
+                self._alerted_failed_jobs.add(job.name)
             self._state[job.name] = {
                 "name": job.name,
                 "description": job.description,
@@ -699,6 +707,7 @@ class WorkerScheduler:
                 "last_error": prev.get("last_error"),
                 "runs_ok": int(prev.get("runs_ok", 0)),
                 "runs_failed": int(prev.get("runs_failed", 0)),
+                "alerted_failed": job.name in self._alerted_failed_jobs,
                 "next_run_utc": job.next_run_utc(now).strftime("%Y-%m-%d %H:%M UTC"),
             }
 
@@ -933,8 +942,16 @@ class WorkerScheduler:
                     entry["last_error"] = last_err or f"exit_code={exit_code}"
                 if exit_code == 0:
                     entry["runs_ok"] = int(entry["runs_ok"]) + 1
+                    entry["alerted_failed"] = False
                 elif not interrupted:
                     entry["runs_failed"] = int(entry["runs_failed"]) + 1
+                    self._alerted_failed_jobs.add(job.name)
+                    entry["alerted_failed"] = True
+                else:
+                    # Preserve prior failure memory across a shutdown interruption so the next ok run sends recovery.
+                    if prev_failed:
+                        self._alerted_failed_jobs.add(job.name)
+                    entry["alerted_failed"] = job.name in self._alerted_failed_jobs
                 final_err = entry["last_error"]
             print(f"[hl-worker] finished {job.name} rc={exit_code} in {duration:.1f}s", flush=True)
             self.publish_status(end_dt)
@@ -1085,6 +1102,13 @@ class WorkerScheduler:
                     return True
                 if any(not isinstance(v, dict) or "calibration_ok" not in v for v in doc.values()):
                     return True
+            elif job_name == "frontier_persistence":
+                boros_path = self.paper_dir / "hl_boros" / "snapshot.json"
+                if boros_path.is_file():
+                    bdoc = json.loads(boros_path.read_text(encoding="utf-8"))
+                    mkts = bdoc.get("markets") if isinstance(bdoc, dict) else None
+                    if not isinstance(mkts, list) or (mkts and "collateral_symbol" not in mkts[0]):
+                        return True
         except Exception:
             return True
         return False
