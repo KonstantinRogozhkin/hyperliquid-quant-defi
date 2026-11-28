@@ -28,8 +28,10 @@ function fmtUsd(v: number | null | undefined, digits = 2): string {
   return `${sign}$${abs.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
-function signCls(v: number | null | undefined): string {
+/** Sign colour class; values that round to zero at `digits` (as displayed) are neutral. */
+export function signCls(v: number | null | undefined, digits = 2): string {
   if (v === null || v === undefined || !Number.isFinite(v)) return "";
+  if (Math.abs(v) < 0.5 * Math.pow(10, -digits)) return "";
   return v > 0 ? "pos" : v < 0 ? "neg" : "";
 }
 
@@ -721,7 +723,7 @@ export function AnalyticsRiskTab({
                           </td>
                           <td className="num">{fmtNum(r.beta, 3)}</td>
                           <td className="num">{fmtNum(r.r2_pct, 1, "%")}</td>
-                          <td className={`num ${signCls(r.alpha_ann_pct)}`}>
+                          <td className={`num ${signCls(r.alpha_ann_pct, 1)}`}>
                             {fmtNum(r.alpha_ann_pct, 1, "%", true)}
                           </td>
                           <td className="num">{r.days}</td>

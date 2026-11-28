@@ -13,7 +13,7 @@ interface LangContextValue {
 // Default value keeps components usable outside the provider (e.g. isolated chart tests) in English.
 const LangContext = createContext<LangContextValue>({ lang: "en", setLang: () => undefined });
 
-function detectInitialLang(): Lang {
+export function detectInitialLang(): Lang {
   try {
     const saved = window.localStorage.getItem(STORAGE_KEY);
     if (saved === "en" || saved === "ru") return saved;
