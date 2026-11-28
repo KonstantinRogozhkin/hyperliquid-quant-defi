@@ -763,7 +763,8 @@ def run_spot_perp_paper_tick(
             perp_notional = qty * cur_perp
             spot_notional = qty * cur_spot
             p_start = pos_start_ms.get(base, prev_ms)
-            pos_dt_hours = max(0.0, min(24.0, (ts_ms - p_start) / 3_600_000.0)) if p_start > 0 else dt_hours
+            # Same cap as the global clock (168h while a NAV-guard confirmation is pending).
+            pos_dt_hours = max(0.0, min(dt_cap_h, (ts_ms - p_start) / 3_600_000.0)) if p_start > 0 else dt_hours
             pos_settlements = (ts_ms // 3_600_000) - (p_start // 3_600_000) if p_start > 0 else 0
             pos["last_accrual_ms"] = ts_ms
             if prev_ms > 0 and markets is None and pos_settlements == 0:

@@ -265,3 +265,110 @@ def test_metamodel_stale_held_coin_is_written_off_after_max_blocked_ticks(tmp_pa
     assert res["status"] == "ok"
     assert res["forced_stale_exits"] == [dead]
     assert not (tmp_path / "held_missing.json").exists()
+
+
+def _mm_market_helpers():
+    import sys
+    from pathlib import Path
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    try:
+        from test_paper_and_alpha_high_fixes import H, T0, _market, _quotes
+    finally:
+        sys.path.pop(0)
+    return H, T0, _market, _quotes
+
+
+def _patch_btc_eth_targets(monkeypatch):
+    from hl_quant import paper_tracker as pt
+
+    monkeypatch.setattr(
+        pt,
+        "compute_latest_target_positions",
+        lambda m, s: {
+            "BTC": {"hl_weight": -0.20, "cex_legs": {"bybit": 0.20}, "cex_weight": 0.20, "cex_venue": "bybit"},
+            "ETH": {"hl_weight": 0.10, "cex_legs": {"bybit": -0.10}, "cex_weight": -0.10, "cex_venue": "bybit"},
+        },
+    )
+
+
+def test_metamodel_missing_feed_grace_period_is_per_coin(tmp_path, monkeypatch):
+    from hl_quant import paper_tracker as pt
+
+    _, _, _market, _quotes = _mm_market_helpers()
+    _patch_btc_eth_targets(monkeypatch)
+    kw = {"state_dir": tmp_path, "sleeves": [], "max_held_missing_ticks": 3}
+    both = {"bybit": {"BTC": 100.0, "ETH": 100.0}}
+    assert pt.run_paper_tick(_market(20), _quotes(), cex_mid_prices=both, **kw)["status"] == "ok"
+    # BTC's CEX feed dies for two tick hours...
+    for n in (21, 22):
+        assert pt.run_paper_tick(_market(n), _quotes(), cex_mid_prices={"bybit": {"ETH": 100.0}}, **kw)["status"] == "held_coins_missing"
+    # ...then recovers while ETH's dies: ETH has missed ONE observation and must not be written off.
+    r = pt.run_paper_tick(_market(23), _quotes(), cex_mid_prices={"bybit": {"BTC": 100.0}}, **kw)
+    assert r["status"] == "held_coins_missing"
+    assert r["blocked_ticks"] == {"ETH": 1}
+
+
+def test_metamodel_written_off_coin_is_not_reopened_until_feed_recovers(tmp_path, monkeypatch):
+    import json
+
+    from hl_quant import paper_tracker as pt
+
+    _, _, _market, _quotes = _mm_market_helpers()
+    _patch_btc_eth_targets(monkeypatch)
+    kw = {"state_dir": tmp_path, "sleeves": [], "max_held_missing_ticks": 3}
+    eth_only = {"bybit": {"ETH": 100.0}}
+    pt.run_paper_tick(_market(20), _quotes(), cex_mid_prices={"bybit": {"BTC": 100.0, "ETH": 100.0}}, **kw)
+    for n in (21, 22):
+        pt.run_paper_tick(_market(n), _quotes(), cex_mid_prices=eth_only, **kw)
+    r3 = pt.run_paper_tick(_market(23), _quotes(), cex_mid_prices=eth_only, **kw)
+    assert r3["status"] == "ok" and r3["forced_stale_exits"] == ["BTC"]
+    st = json.loads((tmp_path / "state.json").read_text())
+    assert "BTC" not in st["positions"] and st["stale_excluded_coins"] == ["BTC"]
+    # Feed still dead: BTC stays out (no re-entry from historical fallbacks, no new block).
+    r4 = pt.run_paper_tick(_market(24), _quotes(), cex_mid_prices=eth_only, **kw)
+    assert r4["status"] == "ok"
+    assert "BTC" not in json.loads((tmp_path / "state.json").read_text())["positions"]
+    # Feed recovers: BTC is eligible again.
+    pt.run_paper_tick(_market(25), _quotes(), cex_mid_prices={"bybit": {"BTC": 100.0, "ETH": 100.0}}, **kw)
+    st5 = json.loads((tmp_path / "state.json").read_text())
+    assert "BTC" in st5["positions"] and st5["stale_excluded_coins"] == []
+
+
+def test_spot_perp_position_accrual_uses_extended_cap_while_nav_guard_pending(tmp_path):
+    import json
+
+    from hl_quant import hl_spot_perp_arb as spa
+
+    H = 3_600_000
+    t0 = 1_795_700_000_000
+    markets = [{
+        "base_symbol": "HYPE", "spot_pair": "@107", "spot_token": "HYPE", "quote_token": "USDC",
+        "is_proxy_hedge": False, "spot_mid_px": 20.0, "spot_day_vol_usd": 10_000_000.0,
+        "perp_mark_px": 20.0, "perp_oracle_px": 20.0, "funding_rate_h": 0.0001,
+        "perp_day_vol_usd": 50_000_000.0, "perp_oi_usd": 20_000_000.0, "only_isolated": False, "max_leverage": 5,
+    }]
+
+    def book(coin_key: str):
+        return [(20.0 * 0.9999, 10_000.0)], [(20.0 * 1.0001, 10_000.0)]
+
+    state_dir = tmp_path / "sp"
+    state_dir.mkdir()
+    pos = {
+        "base_symbol": "HYPE", "spot_pair": "@107", "qty": 1000.0, "entry_spot_px": 20.0, "entry_perp_px": 20.0,
+        "last_spot_px": 20.0, "last_perp_px": 20.0, "spot_notional_usd": 20_000.0, "perp_notional_usd": 20_000.0,
+        "perp_margin_usd": 10_000.0, "entry_cost_usd": 6.0, "cum_cost_usd": 6.0, "cum_funding_usd": 0.0,
+        "cum_basis_mtm_usd": 0.0, "hours_held": 4.0,
+    }
+    (state_dir / "state.json").write_text(json.dumps({
+        "starting_capital_usd": 100_000.0, "equity_usd": 100_000.0, "hlp_reserve_usd": 10_000.0,
+        "free_cash_usd": 60_000.0, "hlp_apr_pct": 12.0, "last_tick_ms": t0, "ticks_count": 1,
+        "nav_guard_pending_ms": t0 + H, "positions": {"HYPE": pos},
+    }))
+    res = spa.run_spot_perp_paper_tick(
+        state_dir=state_dir, cfg=spa.SpotPerpPaperConfig(max_tick_nav_jump_pct=50.0), now_ms=t0 + 48 * H,
+        markets=markets, book_fetcher=book, hlp_summary=(12.0, 250_000_000.0),
+    )
+    hype = res["state"]["positions"]["HYPE"]
+    # 48h of fallback funding on the $20k perp (not a 24h truncation).
+    assert hype["cum_funding_usd"] == pytest.approx(20_000.0 * 0.0001 * 48.0, rel=1e-6)

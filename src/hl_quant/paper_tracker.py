@@ -412,23 +412,47 @@ def run_paper_tick(
             blocked = json.loads(blocked_path.read_text()) if blocked_path.is_file() else {}
         except (OSError, ValueError):
             blocked = {}
-        hours_seen = [int(h) for h in (blocked.get("tick_hours") or []) if isinstance(h, (int, float))]
-        if tick_hour_ms not in hours_seen:
-            hours_seen.append(int(tick_hour_ms))
-        if max_held_missing_ticks <= 0 or len(hours_seen) < max_held_missing_ticks:
+        # Per-coin blocked tick hours: a coin that recovered drops out, and a coin that just lost its
+        # feed starts from 1 — another coin's earlier outage never shortens its grace period.
+        prior = blocked.get("coins") if isinstance(blocked.get("coins"), dict) else {}
+        per_coin: dict[str, list[int]] = {}
+        for c in sorted(missing_held_set):
+            hrs = [int(h) for h in (prior.get(c) or []) if isinstance(h, (int, float))]
+            if tick_hour_ms not in hrs:
+                hrs.append(int(tick_hour_ms))
+            per_coin[c] = hrs[-50:]
+        still_waiting = [c for c, hrs in per_coin.items() if len(hrs) < max_held_missing_ticks]
+        if max_held_missing_ticks <= 0 or still_waiting:
             tmp_blocked = blocked_path.with_suffix(".tmp.json")
-            tmp_blocked.write_text(json.dumps({"coins": sorted(missing_held_set), "tick_hours": hours_seen[-50:]}))
+            tmp_blocked.write_text(json.dumps({"coins": per_coin}))
             tmp_blocked.replace(blocked_path)
             return {
                 "status": "held_coins_missing",
                 "tick_hour_ms": tick_hour_ms,
                 "equity_usd": state["equity_usd"],
                 "missing_coins": sorted(missing_held_set),
-                "blocked_ticks": len(hours_seen),
+                "blocked_ticks": {c: len(h) for c, h in per_coin.items()},
             }
         forced_stale_exits = sorted(missing_held_set)
         prev_pos = {c: p for c, p in prev_pos.items() if c not in missing_held_set}
     (state_dir / "held_missing.json").unlink(missing_ok=True)
+
+    def _live_feed_ok(coin_name: str) -> bool:
+        if coin_name not in market.coins or coin_name not in quotes:
+            return False
+        if cex_mid_prices is None:
+            return True
+        for v_map in cex_mid_prices.values():
+            px = (v_map or {}).get(coin_name)
+            if px is not None and math.isfinite(float(px)) and float(px) > 0:
+                return True
+        return False
+
+    # Written-off coins stay out of the target book until their live feeds recover, otherwise the
+    # rebalance would reopen them from historical-close fallbacks right away (new entry cost, reset
+    # PnL) and the ledger would block on them again.
+    stale_excluded = {c for c in (state.get("stale_excluded_coins") or []) if not _live_feed_ok(str(c))}
+    stale_excluded |= set(forced_stale_exits)
 
     # 1. Mark-to-market PnL and funding accrual over (prev_hour_ms, tick_hour_ms]
     price_pnl_usd = 0.0
@@ -511,7 +535,9 @@ def run_paper_tick(
         new_equity = equity
     else:
         # 2. Compute new target weights (with optional micro-turnover deadband) and L2-priced costs
-        raw_targets = compute_latest_target_positions(market, active_sleeves)
+        raw_targets = {
+            c: t for c, t in compute_latest_target_positions(market, active_sleeves).items() if c not in stale_excluded
+        }
         targets: dict[str, dict[str, Any]] = {}
         for coin, t in raw_targets.items():
             if rebalance_deadband_weight > 0.0 and coin in prev_pos:
@@ -673,6 +699,7 @@ def run_paper_tick(
         "nav_guard_reason": nav_guard_reason,
         "nav_guard_pending_tick_hour_ms": nav_guard_pending,
         "last_forced_stale_exits": forced_stale_exits,
+        "stale_excluded_coins": sorted(stale_excluded),
         "positions": new_positions,
         "sleeves": [{"name": s.spec.name, "weight": s.weight} for s in active_sleeves],
     }
