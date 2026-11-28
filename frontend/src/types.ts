@@ -530,6 +530,8 @@ export interface MonthlyReturnRow {
   year: number;
   months: Record<string, number>;
   ytd: number | null;
+  /** Month key ("1".."12") of the series' first, partially covered calendar month (null otherwise). */
+  partial_first_month?: string | null;
 }
 
 export interface LeaderboardRow {
@@ -604,6 +606,8 @@ export interface RiskConcentrationRow {
 }
 
 export interface StrategyLeverageRow {
+  /** Leaderboard id (autopilot, spot_perp, cross_dex, hip3_paper, metamodel). */
+  id?: string;
   strategy: string;
   current_leverage: number;
   leverage_30d_avg: number;

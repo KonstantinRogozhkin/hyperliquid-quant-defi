@@ -670,8 +670,8 @@ def test_h19_m18_l4_analytics_net_streaks_risk_exposure_and_single_parquet_read(
     assert by_strat["Cross-DEX (HL×Lighter×Ext)"]["net_exposure_pct"] == pytest.approx(-1.0, abs=0.01)
     assert by_strat["Cross-DEX (HL×Lighter×Ext)"]["nav_guard_triggers"] == 3
     # HIP-3: 10400 - 9900 = +500 USD on ~100,010 eq -> ~ +0.5%
-    assert by_strat["HIP-3 Split-Margin"]["net_exposure_pct"] == pytest.approx(0.5, abs=0.01)
-    assert by_strat["HIP-3 Split-Margin"]["nav_guard_triggers"] == 2
+    assert by_strat["HIP-3 Growth Split-Margin"]["net_exposure_pct"] == pytest.approx(0.5, abs=0.01)
+    assert by_strat["HIP-3 Growth Split-Margin"]["nav_guard_triggers"] == 2
 
     tiers = {r["label"]: r["usd"] for r in rx["asset_tier_concentration"]}
     assert "Crypto - Cross-DEX Neutral" in tiers

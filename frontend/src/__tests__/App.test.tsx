@@ -1087,7 +1087,7 @@ describe("App", () => {
     expect(screen.getByText("11d / 3d")).toBeInTheDocument();
 
     // 1x1 correlation matrix triggers the >= 2 strategies guard instead of rendering self-correlation
-    expect(screen.getByText(/Waiting for at least 2 strategies with ≥ 3 overlapping days/i)).toBeInTheDocument();
+    expect(screen.getByText(/Waiting for at least 2 strategies with ≥ 10 overlapping days/i)).toBeInTheDocument();
 
     // Switch to Gross mode -> shows gross positive days (82.0%) and gross streaks (14d / 2d)
     await user.click(screen.getByRole("button", { name: "Gross" }));
@@ -1282,7 +1282,7 @@ describe("App", () => {
           [1.0, null],
           [0.02, 1.0],
         ],
-        overlap_days: 7,
+        overlap_days: 12,
       },
       market_exposure: {},
       risk_exposure: {

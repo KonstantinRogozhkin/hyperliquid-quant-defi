@@ -50,6 +50,76 @@ def test_metrics_emit_current_dd_gauge_from_leaderboard() -> None:
     assert cur and cur[0].endswith(" 0.4")
 
 
+# --------------------------------------------------------------------------- 13-16. analytics
+
+
+def _dts(days: list[str]) -> list[datetime]:
+    return [datetime.strptime(d, "%Y-%m-%d").replace(tzinfo=timezone.utc) for d in days]
+
+
+def test_ytd_base_is_last_close_strictly_before_jan_1_and_matches_monthly_table() -> None:
+    dates = _dts(["2025-12-30", "2025-12-31", "2026-01-01", "2026-01-02"])
+    shares = [1.0, 1.1, 1.21, 1.331]
+    ytd, _span = ar._window_return(dates, shares, ytd=True)
+    assert ytd is not None
+    assert round(ytd, 2) == round((1.331 / 1.1 - 1.0) * 100.0, 2)  # Dec-31 close, not the Jan-1 close
+    monthly = ar.compute_monthly_returns(dates, shares)
+    row_2026 = next(r for r in monthly if r["year"] == 2026)
+    assert row_2026["ytd"] == round(ytd, 2)
+    # Un-anchored series starting exactly on Jan 1 still has a YTD (based on its first close), like the table
+    ytd_jan1, _ = ar._window_return(_dts(["2026-01-01", "2026-01-02"]), [1.0, 1.05], ytd=True)
+    assert ytd_jan1 is not None and round(ytd_jan1, 2) == 5.0
+    # Starting after Jan 1 without an inception anchor -> no YTD
+    assert ar._window_return(_dts(["2026-01-05", "2026-01-06"]), [1.0, 1.05], ytd=True)[0] is None
+
+
+def test_correlation_none_for_constant_series_and_min_overlap_10() -> None:
+    import pandas as pd
+
+    idx = pd.date_range("2026-09-01", periods=15, freq="D").strftime("%Y-%m-%d")
+    rising = pd.Series([1.0 * (1.01 ** i) * (1.0 + 0.003 * ((-1) ** i)) for i in range(15)], index=idx)
+    flat = pd.Series([1.0] * 15, index=idx)
+    other = pd.Series([1.0 * (1.02 ** i) * (1.0 - 0.002 * ((-1) ** i)) for i in range(15)], index=idx)
+    corr = ar.compute_correlation_matrix({"a": rising, "flat": flat, "b": other})
+    assert corr["matrix"][1][0] is None  # constant series -> undefined, not 0.0
+    assert isinstance(corr["matrix"][2][0], float)
+
+    short = ar.compute_correlation_matrix({"a": rising.iloc[:6], "b": other.iloc[:6]})
+    assert short["matrix"][1][0] is None and short["overlap_days"] == 5
+    ols = ar.compute_ols_market_exposure({"a": ("A", rising.iloc[:6])}, other.iloc[:6], factor_name="BTC")
+    assert ols["rows"][0]["beta"] is None and ols["rows"][0]["days"] == 5
+    assert ar.MIN_STAT_OVERLAP_DAYS == 10
+
+
+def test_risk_exposure_leverage_rows_carry_leaderboard_ids_and_names(tmp_path: Path) -> None:
+    import json
+
+    for sub, payload in (
+        ("hl_hip3_paper", {"equity_usd": 50_000.0, "positions": {}}),
+        ("hl_metamodel", {"equity_usd": 100_000.0, "positions": {}}),
+        ("hl_cross_dex_paper", {"equity_usd": 50_000.0, "positions": {}}),
+    ):
+        (tmp_path / sub).mkdir(parents=True)
+        (tmp_path / sub / "state.json").write_text(json.dumps(payload), encoding="utf-8")
+    rows = ar.build_consolidated_risk_exposure(tmp_path)["leverage_by_strategy"]
+    by_id = {r["id"]: r["strategy"] for r in rows}
+    assert by_id == {k: ar.STRATEGY_NAMES[k] for k in ("cross_dex", "hip3_paper", "metamodel")}
+    assert by_id["hip3_paper"] == "HIP-3 Growth Split-Margin"
+    assert by_id["metamodel"] == "6-Family Metamodel (Obs)"
+
+
+def test_monthly_returns_flag_partial_first_month() -> None:
+    mid = ar.compute_monthly_returns(_dts(["2026-09-15", "2026-09-30", "2026-10-31"]), [1.0, 1.01, 1.02])
+    assert mid[0]["partial_first_month"] == "9"
+    assert set(mid[0]["months"]) == {"9", "10"}  # values still reported (backward compatible)
+    full = ar.compute_monthly_returns(_dts(["2026-09-01", "2026-09-30", "2026-10-31"]), [1.0, 1.01, 1.02])
+    assert full[0]["partial_first_month"] is None
+    multi = ar.compute_monthly_returns(_dts(["2025-12-10", "2025-12-31", "2026-01-31"]), [1.0, 1.01, 1.02])
+    by_year = {r["year"]: r for r in multi}
+    assert by_year[2025]["partial_first_month"] == "12"
+    assert by_year[2026]["partial_first_month"] is None
+
+
 # --------------------------------------------------------------------------- 7. installers vs Dokploy cutover
 
 _INSTALLERS = sorted((ROOT / "scripts/ops").glob("install_local_*.sh")) + [ROOT / "scripts/ops/install_all_hl_crons.sh"]
