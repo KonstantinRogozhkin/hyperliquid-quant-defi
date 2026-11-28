@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import threading
 from typing import Any
 
 import numpy as np
@@ -629,6 +630,10 @@ def compute_ols_market_exposure(
 # --------------------------------------------------------------------------- Artifact Loaders
 
 
+_GLOBAL_PARQUET_CACHE: dict[Path, tuple[int, int, pd.DataFrame]] = {}
+_GLOBAL_PARQUET_LOCK = threading.Lock()
+
+
 def _read_parquet_cached(
     path: Path,
     parquet_cache: dict[Path, pd.DataFrame] | None = None,
@@ -639,7 +644,19 @@ def _read_parquet_cached(
     if not path.is_file():
         return None
     try:
+        st = path.stat()
+        with _GLOBAL_PARQUET_LOCK:
+            cached = _GLOBAL_PARQUET_CACHE.get(key)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                df = cached[2]
+                if parquet_cache is not None:
+                    parquet_cache[key] = df
+                return df
         df = pd.read_parquet(path)
+        with _GLOBAL_PARQUET_LOCK:
+            if len(_GLOBAL_PARQUET_CACHE) > 64:
+                _GLOBAL_PARQUET_CACHE.clear()
+            _GLOBAL_PARQUET_CACHE[key] = (st.st_mtime_ns, st.st_size, df)
     except Exception:
         return None
     if parquet_cache is not None:

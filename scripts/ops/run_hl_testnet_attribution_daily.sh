@@ -11,14 +11,15 @@ EOF
   exit 0
 fi
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_PATH="${0:A}"
+ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 LOCK_FILE="${HL_LOCK_FILE:-${TMPDIR:-/tmp}/hl_testnet_attribution_daily.flock}"
 
 if [[ "${HL_OPS_LOCK_HELD:-0}" != "1" ]]; then
   cd "${ROOT_DIR}"
-  HL_OPS_LOCK_HELD=1 exec "${PYTHON_BIN}" -m hl_quant.ops_lock "${LOCK_FILE}" -- zsh "$0" "$@"
+  HL_OPS_LOCK_HELD=1 exec "${PYTHON_BIN}" -m hl_quant.ops_lock "${LOCK_FILE}" -- zsh "${SCRIPT_PATH}" "$@"
 fi
 
 RUN_DATE="$(date -u +%F)"

@@ -627,9 +627,11 @@ describe("App", () => {
           open_positions: 2,
           gross_notional_usd: 755.0,
           gross_leverage: 0.74,
-          max_mark_oracle_dev_pct: 0.18,
-          max_mark_oracle_dev_coin: "ETH",
-          orphan_positions: 1,
+          max_mark_oracle_dev_pct: -16.96,
+          max_mark_oracle_dev_coin: "GRAM",
+          orphan_positions: {
+            GRAM: { szi: -30, notional_usd: -48.5, unrealized_pnl_usd: 0.01, book: "empty" },
+          },
           orphan_notional_usd: 48.5,
         },
         mm_calibration: {
@@ -660,6 +662,8 @@ describe("App", () => {
     expect(screen.getByText(/22% fill volume is from non-audited MM orders/)).toBeInTheDocument();
     expect(screen.getByText("$742.10")).toBeInTheDocument();
     expect(screen.getByText("$48.50")).toBeInTheDocument();
+    expect(screen.getByText("Orphan pos: 1")).toBeInTheDocument();
+    expect(screen.getByText("-16.96%")).toHaveClass("warn");
 
     const attrSection = screen.getByText("Per-Coin Testnet Attribution, Liq Distance & ADL Rank").closest("section")!;
     const zroRow = within(attrSection).getByText("ZRO").closest("tr")!;

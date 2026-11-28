@@ -15,7 +15,7 @@ scrape_configs:
     scheme: https
     static_configs:
       - targets:
-          - hl-quant.95-217-163-111.sslip.io
+          - hl-quant.example.com
 ```
 
 ## 2. Dashboard v2 (`hyperliquid_quant_defi_dashboard.json`)

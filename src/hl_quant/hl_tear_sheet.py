@@ -48,6 +48,28 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+_TS_PARQUET_CACHE: dict[Path, tuple[int, int, pd.DataFrame]] = {}
+_TS_PARQUET_LOCK = threading.Lock()
+
+
+def _read_parquet_cached(path: Path) -> pd.DataFrame:
+    key = path.resolve()
+    try:
+        st = path.stat()
+        with _TS_PARQUET_LOCK:
+            cached = _TS_PARQUET_CACHE.get(key)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                return cached[2]
+        df = pd.read_parquet(path)
+        with _TS_PARQUET_LOCK:
+            if len(_TS_PARQUET_CACHE) > 32:
+                _TS_PARQUET_CACHE.clear()
+            _TS_PARQUET_CACHE[key] = (st.st_mtime_ns, st.st_size, df)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def collect_tear_sheet_data(data_root: Path) -> dict[str, Any]:
     """Load all available live JSON/Parquet outputs under ``data_root`` (e.g. ``data/paper``)."""
     attr = _read_json(data_root / "hl_testnet_attribution" / "attribution.json")
@@ -60,10 +82,7 @@ def collect_tear_sheet_data(data_root: Path) -> dict[str, Any]:
     ticks_p = data_root / "hl_metamodel" / "ticks.parquet"
     state_p = data_root / "hl_metamodel" / "state.json"
     if ticks_p.is_file() and state_p.is_file():
-        try:
-            ticks = pd.read_parquet(ticks_p)
-        except Exception:
-            ticks = pd.DataFrame()
+        ticks = _read_parquet_cached(ticks_p)
         st = _read_json(state_p) or {}
         if not ticks.empty and "equity_usd" in ticks.columns:
             start_cap = float(st.get("starting_capital_usd") or 100_000.0)

@@ -103,14 +103,25 @@ export interface TestnetRiskSnapshot {
   drawdown_headroom_pct?: number;
   open_positions: number;
   gross_notional_usd: number;
-  gross_leverage: number;
+  gross_leverage: number | null;
   unrealized_pnl_mark_usd?: number;
   unrealized_pnl_oracle_usd?: number;
   mark_oracle_pnl_gap_usd?: number;
-  mark_oracle_pnl_gap_pct?: number;
+  mark_oracle_pnl_gap_pct?: number | null;
   max_mark_oracle_dev_pct: number;
   max_mark_oracle_dev_coin?: string | null;
-  orphan_positions: number;
+  orphan_positions:
+    | number
+    | Record<
+        string,
+        {
+          szi?: number;
+          notional_usd?: number;
+          unrealized_pnl_usd?: number;
+          book?: string;
+        }
+      >;
+  unmanaged_orphan_positions?: number;
   orphan_notional_usd: number;
   orphan_unrealized_pnl_usd?: number;
   open_orders?: number;

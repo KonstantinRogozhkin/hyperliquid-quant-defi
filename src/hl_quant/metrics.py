@@ -368,6 +368,12 @@ def render_prometheus_metrics(
                 len(r_orphans),
                 help_text="Live Testnet positions without a two-sided book (unmanageable by ALO planner)",
             )
+            unmanaged = _num(risk.get("unmanaged_orphan_positions"))
+            b.emit(
+                "hl_testnet_unmanaged_orphan_positions",
+                int(unmanaged) if unmanaged is not None else len(r_orphans),
+                help_text="Non-dust live Testnet orphan positions not retained in target weights and without a resting unwind order",
+            )
         b.emit("hl_testnet_live_orphan_notional_usd", risk.get("orphan_notional_usd"), help_text="Gross USD notional of live Testnet orphan positions")
         b.emit(
             "hl_testnet_live_orphan_unrealized_pnl_usd",

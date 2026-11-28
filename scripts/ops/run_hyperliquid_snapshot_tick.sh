@@ -23,7 +23,8 @@ EOF
   exit 0
 fi
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_PATH="${0:A}"
+ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 DEFAULT_PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
 if [[ -x "${DEFAULT_PYTHON_BIN}" ]]; then
   PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PYTHON_BIN}}"
@@ -36,7 +37,7 @@ LOCK_FILE="${HL_LOCK_FILE:-${TMPDIR:-/tmp}/hyperliquid_snapshot_tick.flock}"
 
 if [[ "${HL_OPS_LOCK_HELD:-0}" != "1" ]]; then
   cd "${ROOT_DIR}"
-  HL_OPS_LOCK_HELD=1 exec "${PYTHON_BIN}" -m hl_quant.ops_lock "${LOCK_FILE}" -- zsh "$0" "$@"
+  HL_OPS_LOCK_HELD=1 exec "${PYTHON_BIN}" -m hl_quant.ops_lock "${LOCK_FILE}" -- zsh "${SCRIPT_PATH}" "$@"
 fi
 
 HL_SNAPSHOT_COINS="${HL_SNAPSHOT_COINS:-BTC,ETH,SOL,HYPE,DOGE,XRP,SUI,ENA,WIF,kPEPE,AVAX,LINK,TAO}"

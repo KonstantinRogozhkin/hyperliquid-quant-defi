@@ -92,13 +92,23 @@ def main(
     coin_list = [c.strip() for c in coins.split(",") if c.strip()] if coins else [coin]
 
     if replay_l2 is not None:
-        l2_df = pd.read_parquet(replay_l2)
-        target_coin = coin_list[0]
-        if "coin" in l2_df.columns:
-            l2_df = l2_df[l2_df["coin"] == target_coin].copy()
-        spec = ex.AssetSpec(coin=target_coin, sz_decimals=4 if target_coin == "ETH" else 5, max_leverage=25)
-        summary, fills_df, quotes_df = mm.simulate_avellaneda_stoikov_on_l2(l2_df, spec, params=params)
-        summaries = {target_coin: summary}
+        l2_all = pd.read_parquet(replay_l2)
+        summaries = {}
+        fill_frames: list[pd.DataFrame] = []
+        quote_frames: list[pd.DataFrame] = []
+        for target_coin in coin_list:
+            l2_df = l2_all[l2_all["coin"] == target_coin].copy() if "coin" in l2_all.columns else l2_all.copy()
+            if l2_df.empty:
+                continue
+            spec = ex.AssetSpec(coin=target_coin, sz_decimals=4 if target_coin == "ETH" else 5, max_leverage=25)
+            s_one, f_one, q_one = mm.simulate_avellaneda_stoikov_on_l2(l2_df, spec, params=params)
+            summaries[target_coin] = s_one
+            if not f_one.empty:
+                fill_frames.append(f_one.assign(coin=target_coin) if "coin" not in f_one.columns else f_one)
+            if not q_one.empty:
+                quote_frames.append(q_one.assign(coin=target_coin) if "coin" not in q_one.columns else q_one)
+        fills_df = pd.concat(fill_frames, ignore_index=True) if fill_frames else pd.DataFrame()
+        quotes_df = pd.concat(quote_frames, ignore_index=True) if quote_frames else pd.DataFrame()
     else:
         account_addr = os.getenv("HL_TESTNET_ACCOUNT_ADDRESS", "").strip()
         priv_key = os.getenv("HL_TESTNET_PRIVATE_KEY", "").strip()
@@ -127,6 +137,8 @@ def main(
             )
             summaries, fills_df, quotes_df = res["summaries"], res["fills_df"], res["quotes_df"]
         else:
+            if len(coin_list) > 1:
+                raise typer.BadParameter("--rest supports a single coin; use --ws for concurrent multi-coin quoting")
             summary, fills_df, quotes_df = mm.run_live_mm_session(
                 coin=coin_list[0],
                 adapter=adapter,
@@ -134,6 +146,8 @@ def main(
                 execute_live=execute_testnet,
                 duration_sec=duration_sec,
                 poll_interval_sec=poll_interval_sec,
+                enable_dead_man_switch=dead_man_switch,
+                flatten_on_exit=flatten_on_exit,
                 params=params,
                 audit_log_path=output_dir / "mm_audit.jsonl",
             )
@@ -148,9 +162,13 @@ def main(
         json.dumps({"params": params.to_dict(), "summaries": {k: v.to_dict() for k, v in summaries.items()}}, indent=2),
     )
     if not quotes_df.empty:
-        quotes_df.to_parquet(output_dir / "quotes.parquet", index=False)
+        quotes_tmp = output_dir / "quotes.tmp.parquet"
+        quotes_df.to_parquet(quotes_tmp, index=False)
+        quotes_tmp.replace(output_dir / "quotes.parquet")
     if not fills_df.empty:
-        fills_df.to_parquet(output_dir / "fills.parquet", index=False)
+        fills_tmp = output_dir / "fills.tmp.parquet"
+        fills_df.to_parquet(fills_tmp, index=False)
+        fills_tmp.replace(output_dir / "fills.parquet")
 
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(
@@ -158,9 +176,12 @@ def main(
         )
         if token and chat_id:
             for s in summaries.values():
-                rich = mm.format_mm_telegram_rich_html(s, params)
-                tg = pt.send_telegram_rich_message(rich, bot_token=token, chat_id=chat_id, thread_id=thread_id)
-                typer.echo(f"telegram({s.coin})={json.dumps(tg)}", err=True)
+                try:
+                    rich = mm.format_mm_telegram_rich_html(s, params)
+                    tg = pt.send_telegram_rich_message(rich, bot_token=token, chat_id=chat_id, thread_id=thread_id)
+                    typer.echo(f"telegram({s.coin})={json.dumps(tg)}", err=True)
+                except Exception as exc:
+                    typer.echo(f"telegram_warn({s.coin})={exc}", err=True)
 
     typer.echo(md)
 

@@ -250,8 +250,11 @@ def main(
             (ROOT / ".env",)
         )
         if token and chat_id:
-            rich_html = ex.format_testnet_telegram_rich_html(account, result, bbo, hwm_usd=hwm)
-            tg_resp = pt.send_telegram_rich_message(rich_html, bot_token=token, chat_id=chat_id, thread_id=thread_id)
+            try:
+                rich_html = ex.format_testnet_telegram_rich_html(account, result, bbo, hwm_usd=hwm)
+                tg_resp = pt.send_telegram_rich_message(rich_html, bot_token=token, chat_id=chat_id, thread_id=thread_id)
+            except Exception as exc:
+                typer.echo(f"telegram_warn={exc}", err=True)
     typer.echo(
         json.dumps(
             {

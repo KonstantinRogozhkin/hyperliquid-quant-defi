@@ -120,11 +120,56 @@ def fetch_l2_quotes(client: hl.HyperliquidInfoClient, coins: list[str]) -> dict[
     return quotes
 
 
+def _extend_market_for_live_decision(market: af.WideMarket) -> af.WideMarket:
+    """Append the post-bar decision timestamp ``last_hour + 1h`` for causal ``.shift(1)`` builders.
+
+    ``market.hours[-1]`` is the start of the most recent *completed* 1h bar ``[h_{T-1}, h_T)``
+    (e.g. ``23:00 UTC`` when evaluated at ``00:05 UTC``). Because every weight builder in
+    ``alpha_families`` shifts inputs by ``.shift(1)`` so ``w_df.loc[h_t]`` uses bars closed up
+    through ``h_{t-1}``, evaluating at ``h_T = market.hours[-1] + HOUR_MS`` (``00:00 UTC``)
+    incorporates the just-closed bar with zero look-ahead and hits canonical UTC boundaries
+    (``00:00`` / ``12:00 UTC``) right on schedule.
+    """
+    if len(market.hours) == 0:
+        return market
+    eval_h = int(market.hours[-1]) + 3_600_000
+    ext_hours = np.append(market.hours, np.int64(eval_h))
+
+    def _append_row(df: pd.DataFrame, fill_val: float) -> pd.DataFrame:
+        extra = pd.DataFrame(fill_val, index=[eval_h], columns=df.columns, dtype=float)
+        return pd.concat([df, extra], axis=0)
+
+    return af.WideMarket(
+        hours=ext_hours,
+        coins=list(market.coins),
+        hl_close=_append_row(market.hl_close, np.nan),
+        hl_ret_next=_append_row(market.hl_ret_next, 0.0),
+        hl_fund_next=_append_row(market.hl_fund_next, 0.0),
+        hl_rate_h=_append_row(market.hl_rate_h, np.nan),
+        hl_notional=_append_row(market.hl_notional, np.nan),
+        bybit_close=_append_row(market.bybit_close, np.nan),
+        bybit_ret_next=_append_row(market.bybit_ret_next, 0.0),
+        bybit_fund_next=_append_row(market.bybit_fund_next, 0.0),
+        bybit_rate_h=_append_row(market.bybit_rate_h, np.nan),
+        bybit_notional=_append_row(market.bybit_notional, np.nan),
+        binance_close=_append_row(market.binance_close, np.nan),
+        binance_ret_next=_append_row(market.binance_ret_next, 0.0),
+        binance_fund_next=_append_row(market.binance_fund_next, 0.0),
+        binance_rate_h=_append_row(market.binance_rate_h, np.nan),
+        binance_notional=_append_row(market.binance_notional, np.nan),
+        okx_close=_append_row(market.okx_close, np.nan),
+        okx_ret_next=_append_row(market.okx_ret_next, 0.0),
+        okx_fund_next=_append_row(market.okx_fund_next, 0.0),
+        okx_rate_h=_append_row(market.okx_rate_h, np.nan),
+        okx_notional=_append_row(market.okx_notional, np.nan),
+    )
+
+
 def compute_latest_target_positions(
     market: af.WideMarket,
     sleeves: list[MetamodelSleeve],
 ) -> dict[str, dict[str, Any]]:
-    """Compute net target HL and CEX hedge weights at the latest hour ``market.hours[-1]``.
+    """Compute net target HL and CEX hedge weights after the latest closed bar ``market.hours[-1]``.
 
     Sign convention in output:
     * ``hl_weight``: signed HL perp notional weight (+long HL, -short HL) as fraction of equity.
@@ -132,6 +177,7 @@ def compute_latest_target_positions(
       may hedge the same coin on different venues, so each venue is a separate leg.
     * ``cex_weight``: sum of ``cex_legs``; ``cex_venue``: the venue with the largest leg (display only).
     """
+    eval_market = _extend_market_for_live_decision(market)
     net_hl: dict[str, float] = {c: 0.0 for c in market.coins}
     net_cex: dict[str, dict[str, float]] = {c: {} for c in market.coins}
 
@@ -141,7 +187,7 @@ def compute_latest_target_positions(
     for sl in sleeves:
         spec = sl.spec
         if spec.family == "funding_carry_arb":
-            w_df, vc_df = af.build_funding_carry_weights(market, spec.params)
+            w_df, vc_df = af.build_funding_carry_weights(eval_market, spec.params)
             last_w = w_df.iloc[-1]
             last_vc = vc_df.iloc[-1] if vc_df is not None else None
             for coin, raw_w in last_w.items():
@@ -159,7 +205,7 @@ def compute_latest_target_positions(
                         venue = "binance"
                 add_cex(coin, venue, leg_w)
         elif spec.family == "basis_mean_reversion":
-            w_df = af.build_basis_mr_weights(market, spec.params)
+            w_df = af.build_basis_mr_weights(eval_market, spec.params)
             last_w = w_df.iloc[-1]
             for coin, raw_w in last_w.items():
                 if not math.isfinite(raw_w) or abs(raw_w) < 1e-9:
@@ -168,17 +214,17 @@ def compute_latest_target_positions(
                 net_hl[coin] -= leg_w
                 add_cex(coin, "bybit", leg_w)
         elif spec.family == "hl_xs_funding_contrarian":
-            w_df = af.build_xs_funding_contrarian_weights(market, spec.params)
+            w_df = af.build_xs_funding_contrarian_weights(eval_market, spec.params)
             for coin, raw_w in w_df.iloc[-1].items():
                 if math.isfinite(raw_w) and abs(raw_w) >= 1e-9:
                     net_hl[coin] += float(raw_w) * sl.weight
         elif spec.family == "hl_xs_price_reversal_mom":
-            w_df = af.build_xs_price_weights(market, spec.params)
+            w_df = af.build_xs_price_weights(eval_market, spec.params)
             for coin, raw_w in w_df.iloc[-1].items():
                 if math.isfinite(raw_w) and abs(raw_w) >= 1e-9:
                     net_hl[coin] += float(raw_w) * sl.weight
         elif spec.family == "hl_xs_velocity_div":
-            w_df = af.build_xs_velocity_divergence_weights(market, spec.params)
+            w_df = af.build_xs_velocity_divergence_weights(eval_market, spec.params)
             for coin, raw_w in w_df.iloc[-1].items():
                 if math.isfinite(raw_w) and abs(raw_w) >= 1e-9:
                     net_hl[coin] += float(raw_w) * sl.weight

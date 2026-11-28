@@ -323,12 +323,12 @@ groups:
           severity: warning
           service: hyperliquid-quant-defi
         annotations:
-          summary: "Open Testnet positions the ALO planner cannot price or close; unwind with reduce-only limits near oracle"
+          summary: "Unmanaged non-dust Testnet orphan positions outside active target weights with no resting unwind order"
         data:
           - refId: A
             relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: prometheus
-            model: { expr: "max(hl_testnet_live_orphan_positions)", instant: true, refId: A }
+            model: { expr: "max(hl_testnet_unmanaged_orphan_positions)", instant: true, refId: A }
           - refId: C
             datasourceUid: __expr__
             model: { type: threshold, expression: A, conditions: [{ evaluator: { type: gt, params: [0] } }], refId: C }

@@ -395,10 +395,12 @@ def build_funding_carry_weights(market: WideMarket, params: dict[str, Any]) -> t
         bn_spread = (market.hl_rate_h - market.binance_rate_h).shift(1).rolling(lb, min_periods=lb).mean() * HOURS_PER_YEAR
         okx_spread = (market.hl_rate_h - market.okx_rate_h).shift(1).rolling(lb, min_periods=lb).mean() * HOURS_PER_YEAR
         hl_px = market.hl_close.shift(1)
-        bn_parity = np.log((hl_px / market.binance_close.shift(1)).clip(lower=1e-9)).abs() <= 0.10
-        okx_parity = np.log((hl_px / market.okx_close.shift(1)).clip(lower=1e-9)).abs() <= 0.10
-        bn_ok = market.binance_close.shift(1).notna() & bn_spread.notna() & bn_parity
-        okx_ok = market.okx_close.shift(1).notna() & okx_spread.notna() & okx_parity
+        bn_px = market.binance_close.ffill(limit=2).shift(1)
+        okx_px = market.okx_close.ffill(limit=2).shift(1)
+        bn_parity = np.log((hl_px / bn_px).clip(lower=1e-9)).abs() <= 0.10
+        okx_parity = np.log((hl_px / okx_px).clip(lower=1e-9)).abs() <= 0.10
+        bn_ok = bn_px.notna() & bn_spread.notna() & bn_parity
+        okx_ok = okx_px.notna() & okx_spread.notna() & okx_parity
         vol_win = 30 * 24
         vol_min_p = max(24, vol_win // 2)
         if market.binance_notional.notna().any().any():
@@ -567,7 +569,7 @@ def build_xs_funding_contrarian_weights(market: WideMarket, params: dict[str, An
     mask = causal_liquid_mask(market, min_daily_vol_usd=min_vol, require_bybit=False)
     fund_avg = market.hl_rate_h.shift(1).rolling(lb, min_periods=max(4, lb // 2)).mean()
     score = sign * fund_avg
-    vol_df = market.hl_close.pct_change().shift(1).rolling(72, min_periods=24).std() if vol_scale else None
+    vol_df = market.hl_close.pct_change(fill_method=None).shift(1).rolling(72, min_periods=24).std() if vol_scale else None
     return cross_sectional_weights(score, mask, top_n=top_n, rebalance_h=reb_h, vol_df=vol_df)
 
 
@@ -582,7 +584,7 @@ def build_xs_price_weights(market: WideMarket, params: dict[str, Any]) -> pd.Dat
     mask = causal_liquid_mask(market, min_daily_vol_usd=min_vol, require_bybit=False)
     px_known = market.hl_close.shift(1)
     past_ret = np.log(px_known / px_known.shift(lb))
-    vol = market.hl_close.pct_change().shift(1).rolling(72, min_periods=24).std().replace(0.0, np.nan)
+    vol = market.hl_close.pct_change(fill_method=None).shift(1).rolling(72, min_periods=24).std().replace(0.0, np.nan)
     score = sign * (past_ret / (vol * math.sqrt(lb)))
 
     if blend_funding != 0.0:
@@ -602,7 +604,7 @@ def build_xs_velocity_divergence_weights(market: WideMarket, params: dict[str, A
     sign = float(params.get("sign", -1.0))
 
     mask = causal_liquid_mask(market, min_daily_vol_usd=min_vol, require_bybit=(variant == "hl_bybit_div"))
-    vol = market.hl_close.pct_change().shift(1).rolling(72, min_periods=24).std().replace(0.0, np.nan)
+    vol = market.hl_close.pct_change(fill_method=None).shift(1).rolling(72, min_periods=24).std().replace(0.0, np.nan)
 
     if variant == "funding_vel":
         fast = market.hl_rate_h.shift(1).rolling(12, min_periods=6).mean()

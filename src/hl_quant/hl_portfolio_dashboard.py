@@ -32,8 +32,18 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-_PARQUET_CACHE: dict[str, tuple[int, int, int | None, list[dict[str, Any]]]] = {}
+_PARQUET_CACHE: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
 _PARQUET_CACHE_LOCK = threading.Lock()
+
+
+def _slice_records(records: list[dict[str, Any]], limit: int | None, *, head: bool) -> list[dict[str, Any]]:
+    if limit is None:
+        sliced = records
+    elif limit <= 0:
+        sliced = []
+    else:
+        sliced = records[:limit] if head else records[-limit:]
+    return [dict(r) for r in sliced]
 
 
 def _read_parquet_records(path: Path, limit: int | None = None, *, head: bool = False) -> list[dict[str, Any]]:
@@ -41,20 +51,18 @@ def _read_parquet_records(path: Path, limit: int | None = None, *, head: bool = 
         return []
     try:
         st = path.stat()
-        cache_key = f"{path.resolve()}::{head}"
+        cache_key = str(path.resolve())
         with _PARQUET_CACHE_LOCK:
             cached = _PARQUET_CACHE.get(cache_key)
-            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size and cached[2] == limit:
-                return [dict(r) for r in cached[3]]
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                return _slice_records(cached[2], limit, head=head)
         df = pd.read_parquet(path)
-        if limit is not None:
-            df = df.head(limit) if head else df.tail(limit)
         records = df.to_dict(orient="records")
         with _PARQUET_CACHE_LOCK:
             if len(_PARQUET_CACHE) > 64:
                 _PARQUET_CACHE.clear()
-            _PARQUET_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, limit, records)
-        return [dict(r) for r in records]
+            _PARQUET_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, records)
+        return _slice_records(records, limit, head=head)
     except Exception:
         return []
 
@@ -80,11 +88,16 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
             paper_info["nav_guard_triggered"] = bool(
                 last_tick.get("nav_guard_triggered") or mm_state.get("nav_guard_pending_tick_hour_ms") is not None
             )
-        if all_paper_ticks:
+        if mm_state.get("cum_funding_usd") is not None:
+            paper_info["cum_funding_usd"] = round(_nf(mm_state.get("cum_funding_usd")), 4)
+        elif all_paper_ticks and paper_info.get("cum_funding_usd") is None:
             paper_info["cum_funding_usd"] = round(
                 sum(_nf(t.get("fund_pnl_usd")) for t in all_paper_ticks if isinstance(t, dict)),
                 4,
             )
+        if mm_state.get("cum_costs_usd") is not None:
+            paper_info["cum_costs_usd"] = round(abs(_nf(mm_state.get("cum_costs_usd"))), 4)
+        elif all_paper_ticks and paper_info.get("cum_costs_usd") is None:
             paper_info["cum_costs_usd"] = round(
                 abs(sum(_nf(t.get("cost_pnl_usd")) for t in all_paper_ticks if isinstance(t, dict))),
                 4,

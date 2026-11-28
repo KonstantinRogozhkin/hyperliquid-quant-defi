@@ -176,6 +176,27 @@ def wait_for_latest_deployment(
     raise RuntimeError(f"Dokploy deployment timed out after {deploy_timeout_s}s")
 
 
+def _worker_heartbeat_is_fresh(raw_ts: object, *, max_age_s: float = 300.0) -> bool:
+    if not raw_ts:
+        return True
+    from datetime import datetime, timezone
+
+    s = str(raw_ts).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%d %H:%M UTC"):
+        try:
+            dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)
+            return (datetime.now(tz=timezone.utc) - dt).total_seconds() <= max_age_s
+        except ValueError:
+            continue
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return (datetime.now(tz=timezone.utc) - dt).total_seconds() <= max_age_s
+    except ValueError:
+        return False
+
+
 def verify_live_probes(
     public_url: str,
     *,
@@ -203,7 +224,9 @@ def verify_live_probes(
             sc_build = sc.get("build_info")
             sc_sha = sc_build.get("sha") if isinstance(sc_build, dict) else None
             ws = sc.get("worker_status")
-            ws_valid = ws is None or isinstance(ws, dict)
+            ws_sha = ws.get("build_sha") if isinstance(ws, dict) else None
+            ws_hb_ok = _worker_heartbeat_is_fresh(ws.get("heartbeat_utc")) if isinstance(ws, dict) else False
+            ws_valid = isinstance(ws, dict) and ws_sha == expected_sha and ws_hb_ok
             if (
                 fe.get("sha") == expected_sha
                 and be.get("sha") == expected_sha
@@ -216,7 +239,7 @@ def verify_live_probes(
                 return verified
             last_err = (
                 f"mismatch fe={fe.get('sha')} be={be.get('sha')} "
-                f"health={hz.get('status')} sched_sha={sc_sha} ws_valid={ws_valid}"
+                f"health={hz.get('status')} sched_sha={sc_sha} ws_sha={ws_sha} ws_hb_ok={ws_hb_ok}"
             )
         except Exception as exc:
             last_err = str(exc)

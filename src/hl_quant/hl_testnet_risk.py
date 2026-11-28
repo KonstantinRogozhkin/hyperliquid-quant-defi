@@ -117,16 +117,35 @@ def build_risk_snapshot(
     asset_ctxs: dict[str, AssetCtx],
     book_sides: dict[str, str],
     max_drawdown_pct: float = ex.RiskLimits().max_drawdown_pct,
+    target_weights: dict[str, float] | None = None,
+    min_orphan_alert_usd: float = 10.0,
     now_ms: int | None = None,
 ) -> dict[str, Any]:
     """Pure function: combine an account snapshot, HWM, asset contexts and book sides into a risk record.
 
     A position is an orphan when its Testnet book is not two-sided: the ALO planner cannot price,
     rebalance or close it, matching ``execute_rebalance_cycle``'s ``coin not in bbo`` rule.
+    ``unmanaged_orphan_positions`` counts non-dust orphans that are not retained same-side target
+    holdings and do not already have a resting reduce-only unwind order working on the book.
     """
     equity = float(account.equity_usd)
     hwm = max(float(high_water_mark_usd or 0.0), equity if math.isfinite(equity) else 0.0)
     dd = ex.drawdown_pct(equity, hwm)
+
+    resting_unwind_coins: set[str] = set()
+    for oo in account.open_orders:
+        if not isinstance(oo, dict):
+            continue
+        c_oo = str(oo.get("coin") or "")
+        if not c_oo:
+            continue
+        szi_oo = float(account.positions_sz.get(c_oo, 0.0) or 0.0)
+        if abs(szi_oo) <= 1e-12:
+            continue
+        oo_side = str(oo.get("side") or "").upper()
+        closes_dir = (szi_oo > 0 and oo_side in {"A", "SELL"}) or (szi_oo < 0 and oo_side in {"B", "BUY"})
+        if closes_dir and bool(oo.get("reduceOnly", True)):
+            resting_unwind_coins.add(c_oo)
 
     per_coin: list[dict[str, Any]] = []
     gross = 0.0
@@ -135,6 +154,7 @@ def build_risk_snapshot(
     orphan_notional = 0.0
     orphan_upnl = 0.0
     orphans: dict[str, dict[str, Any]] = {}
+    unmanaged_orphans = 0
     unknown_books = 0
     max_dev_pct = 0.0
     max_dev_coin = ""
@@ -164,11 +184,22 @@ def build_risk_snapshot(
         if is_orphan:
             orphan_notional += abs(notional)
             orphan_upnl += u_mark
+            tgt_w = float((target_weights or {}).get(coin, 0.0) or 0.0)
+            retained_target = target_weights is not None and (tgt_w * szi > 0.0)
+            has_unwind_order = coin in resting_unwind_coins
+            is_unmanaged = (
+                abs(notional) >= float(min_orphan_alert_usd)
+                and not retained_target
+                and not has_unwind_order
+            )
+            if is_unmanaged:
+                unmanaged_orphans += 1
             orphans[coin] = {
                 "szi": szi,
                 "notional_usd": round(notional, 4),
                 "unrealized_pnl_usd": round(u_mark, 4),
                 "book": book,
+                "unmanaged": is_unmanaged,
             }
         per_coin.append(
             {
@@ -206,6 +237,7 @@ def build_risk_snapshot(
         "max_mark_oracle_dev_pct": round(max_dev_pct, 4),
         "max_mark_oracle_dev_coin": max_dev_coin,
         "orphan_positions": orphans,
+        "unmanaged_orphan_positions": unmanaged_orphans,
         "orphan_notional_usd": round(orphan_notional, 4),
         "orphan_unrealized_pnl_usd": round(orphan_upnl, 4),
         "unknown_books": unknown_books,

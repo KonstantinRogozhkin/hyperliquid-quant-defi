@@ -44,8 +44,14 @@ def main(
     data = ts.collect_tear_sheet_data(data_root)
     md = ts.format_tear_sheet_markdown(data)
     report_path.parent.mkdir(parents=True, exist_ok=True)
-    report_path.write_text(md)
-    (data_root / "hl_tear_sheet.json").write_text(json.dumps(data, indent=2, default=str))
+    rep_tmp = report_path.with_suffix(f".tmp{report_path.suffix}")
+    rep_tmp.write_text(md, encoding="utf-8")
+    rep_tmp.replace(report_path)
+    json_out = data_root / "hl_tear_sheet.json"
+    json_out.parent.mkdir(parents=True, exist_ok=True)
+    json_tmp = json_out.with_suffix(".tmp.json")
+    json_tmp.write_text(json.dumps(data, indent=2, default=str), encoding="utf-8")
+    json_tmp.replace(json_out)
 
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(

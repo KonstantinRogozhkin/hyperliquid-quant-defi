@@ -558,8 +558,8 @@ class WorkerScheduler:
     """UTC scheduler executing isolated subprocess ticks with non-overlapping per-job concurrency."""
 
     DEFAULT_JOB_DEPENDENCIES: dict[str, tuple[str, float]] = {
-        "testnet_executor": ("metamodel_paper", 120.0),
-        "hip3_paper": ("frontier_persistence", 60.0),
+        "testnet_executor": ("metamodel_paper", 750.0),
+        "hip3_paper": ("frontier_persistence", 510.0),
     }
 
     def __init__(

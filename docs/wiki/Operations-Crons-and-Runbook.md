@@ -10,7 +10,7 @@
 - Секреты хранятся строго в локальном gitignored `.env` (см. шаблон `.env.example`):
   - `HL_TESTNET_PRIVATE_KEY` / `HL_TESTNET_ACCOUNT_ADDRESS` — API-кошелёк Testnet без права вывода;
   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `TELEGRAM_THREAD_ID` — уведомления Telegram Bot API 10.1+ (`sendRichMessage` с нативными HTML-таблицами).
-- Все cron-обёртки используют lock-директории `.neira/state/*.lock` с проверкой живого PID — параллельные дубли невозможны.
+- Все cron-обёртки используют атомарный ядровый `flock` через `python -m hl_quant.ops_lock` (`${TMPDIR:-/tmp}/*.flock`, автоматически освобождаемый ядром при `SIGKILL`/падении) — параллельные дубли и залипшие lock-файлы невозможны.
 
 ---
 

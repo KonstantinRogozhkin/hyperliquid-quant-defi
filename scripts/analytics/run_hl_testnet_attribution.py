@@ -71,16 +71,21 @@ def main(
         _atomic_write_text(output_dir / "report.md", md)
         _atomic_write_text(output_dir / "attribution.json", json.dumps(attr.to_dict(), indent=2))
         if snap["fills"]:
-            pd.DataFrame(snap["fills"]).to_parquet(output_dir / "fills.parquet", index=False)
+            fills_tmp = output_dir / "fills.tmp.parquet"
+            pd.DataFrame(snap["fills"]).to_parquet(fills_tmp, index=False)
+            fills_tmp.replace(output_dir / "fills.parquet")
 
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(
             (ROOT / ".env",)
         )
         if token and chat_id:
-            rich = pta.format_attribution_telegram_rich_html(attr)
-            tg = pt.send_telegram_rich_message(rich, bot_token=token, chat_id=chat_id, thread_id=thread_id)
-            typer.echo(f"telegram={json.dumps(tg)}", err=True)
+            try:
+                rich = pta.format_attribution_telegram_rich_html(attr)
+                tg = pt.send_telegram_rich_message(rich, bot_token=token, chat_id=chat_id, thread_id=thread_id)
+                typer.echo(f"telegram={json.dumps(tg)}", err=True)
+            except Exception as exc:
+                typer.echo(f"telegram_warn={exc}", err=True)
 
     typer.echo(md)
 

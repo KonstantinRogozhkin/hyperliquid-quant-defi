@@ -64,7 +64,7 @@ def test_deploy_sha_to_dokploy_happy_path_and_live_verification(monkeypatch):
         if url.endswith("/api/v1/healthz"):
             return {"status": "ok", "sha": sha}
         if url.endswith("/api/v1/scheduler/status"):
-            return {"build_info": {"sha": sha}, "worker_status": {"service": "hl-worker"}}
+            return {"build_info": {"sha": sha}, "worker_status": {"service": "hl-worker", "build_sha": sha}}
         return {"sha": sha}
 
     monkeypatch.setattr(mod, "fetch_json", fake_fetch_json)

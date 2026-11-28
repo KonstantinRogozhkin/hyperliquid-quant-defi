@@ -45,6 +45,7 @@ def _load_dotenv(path: Path) -> None:
 @app.command()
 def main(
     hwm_state: Path = typer.Option(ROOT / "data/paper/hl_testnet_hwm.json", help="Executor-owned HWM state (read-only)"),
+    metamodel_state: Path = typer.Option(ROOT / "data/paper/hl_metamodel/state.json", help="Metamodel target weights (read-only)"),
     output_json: Path = typer.Option(ROOT / "data/paper/hl_testnet_risk/latest.json", help="Atomic risk snapshot output"),
 ) -> None:
     _load_dotenv(ROOT / ".env")
@@ -56,6 +57,19 @@ def main(
         account = ex.fetch_testnet_account(client, account_addr)
         asset_ctxs = risk.fetch_testnet_asset_ctxs(client)
         book_sides = risk.fetch_book_sides(client, list(account.positions_sz))
+
+    target_weights: dict[str, float] | None = None
+    if metamodel_state.is_file():
+        try:
+            mm_obj = json.loads(metamodel_state.read_text(encoding="utf-8"))
+            if isinstance(mm_obj, dict) and isinstance(mm_obj.get("positions"), dict):
+                target_weights = {
+                    str(c): float(p.get("hl_weight", 0.0) or 0.0)
+                    for c, p in mm_obj["positions"].items()
+                    if isinstance(p, dict)
+                }
+        except Exception:
+            target_weights = None
 
     stored_hwm = ex.load_high_water_mark(hwm_state)
     if stored_hwm <= 0.0 and not hwm_state.is_file():
@@ -69,6 +83,7 @@ def main(
         high_water_mark_usd=stored_hwm,
         asset_ctxs=asset_ctxs,
         book_sides=book_sides,
+        target_weights=target_weights,
     )
     output_json.parent.mkdir(parents=True, exist_ok=True)
     tmp = output_json.with_suffix(".tmp.json")

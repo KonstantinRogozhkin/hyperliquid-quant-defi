@@ -1042,6 +1042,9 @@ def run_live_mm_session(
     execute_live: bool = False,
     duration_sec: float = 45.0,
     poll_interval_sec: float = 2.0,
+    enable_dead_man_switch: bool = False,
+    dead_man_timeout_ms: int = 15_000,
+    flatten_on_exit: bool = False,
     params: ASParams = ASParams(),
     audit_log_path: Path | None = None,
     client: httpx.Client | None = None,
@@ -1060,6 +1063,30 @@ def run_live_mm_session(
     all_mm_oids: set[int] = set()
     seen_fill_keys: set[tuple[Any, ...]] = set()
     cleanup_cancelled = 0
+    dead_man_refreshes = 0
+    dead_man_armed = False
+    flattened_exit_sz = 0.0
+    dms_left_armed = False
+    spec: AssetSpec | None = None
+    ledger: _InventoryLedger | None = None
+    last_mid = 0.0
+    fills: list[dict[str, Any]] = []
+
+    def _refresh_rest_dms(ts_ms: int) -> None:
+        nonlocal dead_man_refreshes, dead_man_armed
+        if not (enable_dead_man_switch and hasattr(adapter, "schedule_cancel")):
+            return
+        try:
+            resp = adapter.schedule_cancel(ts_ms + max(6_000, dead_man_timeout_ms))
+            inner = resp.get("response") if isinstance(resp, dict) else None
+            if (
+                (isinstance(resp, dict) and resp.get("status") == "ok")
+                or (isinstance(inner, dict) and inner.get("status") == "ok")
+            ):
+                dead_man_refreshes += 1
+                dead_man_armed = True
+        except Exception:
+            return
 
     try:
         meta = fetch_testnet_meta(http)
@@ -1088,22 +1115,28 @@ def run_live_mm_session(
         )
         ledger = _InventoryLedger(start_sz=start_inv_sz, maker_fee_bps=params.maker_fee_bps)
 
+        if enable_dead_man_switch:
+            _refresh_rest_dms(started_ms)
+        dms_refresh_sec = max(3.0, (dead_man_timeout_ms / 1000.0) * 0.4)
+        last_dms_mono = time.monotonic()
+
         ticks_observed = 0
         quotes_placed = 0
         quotes_cancelled = 0
         requotes_skipped = 0
         halt_events: list[str] = []
-        fills: list[dict[str, Any]] = []
         quote_rows: list[dict[str, Any]] = []
         mids_series: list[tuple[int, float]] = []
         half_spreads: list[float] = []
         sigmas: list[float] = []
-        last_mid = 0.0
 
         deadline = time.monotonic() + max(1.0, duration_sec)
         while True:
             loop_start = time.monotonic()
             now_ms = int(time.time() * 1000)
+            if enable_dead_man_switch and (loop_start - last_dms_mono) >= dms_refresh_sec:
+                _refresh_rest_dms(now_ms)
+                last_dms_mono = loop_start
             book = fetch_testnet_l2_snapshot(http, coin)
             if book is None:
                 if time.monotonic() >= deadline:
@@ -1307,12 +1340,92 @@ def run_live_mm_session(
                 cleanup_cancelled = len(cancel_list)
             except Exception:
                 pass
+
+        mm_orders_cleared = True
+        if execute_live and account_address:
+            mm_orders_cleared = False
+            for _attempt in range(2):
+                try:
+                    oo_resp = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address})
+                    oo_resp.raise_for_status()
+                    oo_check = oo_resp.json()
+                    if not isinstance(oo_check, list):
+                        break
+                except Exception:
+                    break
+                leftovers = [
+                    {"coin": coin, "oid": int(o["oid"])}
+                    for o in oo_check
+                    if isinstance(o, dict)
+                    and str(o.get("coin")) == coin
+                    and o.get("oid") is not None
+                    and int(o["oid"]) in all_mm_oids
+                ]
+                if not leftovers:
+                    mm_orders_cleared = True
+                    break
+                try:
+                    adapter.cancel_all_open_orders(leftovers)
+                except Exception:
+                    pass
+
+        if flatten_on_exit and spec is not None and ledger is not None and last_mid > 0 and abs(ledger.net_sz) > 1e-12:
+            unwind_sz = round_hl_size(abs(ledger.net_sz), spec.sz_decimals)
+            unwind_side = "sell" if ledger.net_sz > 0 else "buy"
+            acct_pos = ledger.start_sz + ledger.net_sz
+            flat_reduce_only = reduce_only_is_valid(unwind_side, unwind_sz, acct_pos)
+            closes_full_acct = flat_reduce_only and abs(unwind_sz - abs(acct_pos)) <= max(
+                1e-9, 0.5 * (10.0 ** -spec.sz_decimals)
+            )
+            min_flat_usd = 0.50 if closes_full_acct else 10.5
+            if unwind_sz > 0 and unwind_sz * last_mid >= min_flat_usd and hasattr(adapter, "place_ioc_order"):
+                raw_px = last_mid * (0.9975 if unwind_side == "sell" else 1.0025)
+                limit_px = round_hl_price(raw_px, spec.sz_decimals, side=unwind_side)
+                flat_ord = PlannedOrder(
+                    coin=coin,
+                    side=unwind_side,
+                    limit_px=limit_px,
+                    sz=unwind_sz,
+                    notional_usd=round(unwind_sz * last_mid, 2),
+                    tif="Ioc",
+                    reduce_only=flat_reduce_only,
+                )
+                try:
+                    flat_resp = adapter.place_ioc_order(flat_ord)
+                    filled_sz, filled_px = _extract_ioc_fill(
+                        flat_resp, fallback_sz=unwind_sz, fallback_px=last_mid, execute_live=execute_live
+                    )
+                    if filled_sz > 0:
+                        flattened_exit_sz = filled_sz
+                        ledger.on_fill(unwind_side, filled_px, filled_sz, fee_usd=filled_sz * filled_px * 4.5e-4)
+                        fills.append(
+                            {
+                                "ts_ms": int(time.time() * 1000),
+                                "oid": None,
+                                "side": unwind_side,
+                                "px": filled_px,
+                                "sz": filled_sz,
+                                "notional_usd": filled_sz * filled_px,
+                                "crossed": True,
+                            }
+                        )
+                except Exception:
+                    pass
+
+        if dead_man_armed and not mm_orders_cleared:
+            dms_left_armed = True
+        if dead_man_armed and mm_orders_cleared and hasattr(adapter, "schedule_cancel"):
+            try:
+                adapter.schedule_cancel(None)
+            except Exception:
+                pass
         if owns_client:
             http.close()
 
     ended_ms = int(time.time() * 1000)
     maker_vol = sum(f["notional_usd"] for f in fills if not f.get("crossed", False))
     tot_vol = sum(f["notional_usd"] for f in fills)
+    assert spec is not None and ledger is not None
     summary = MMSessionSummary(
         mode="testnet_live_mm" if execute_live else "testnet_dry_run_mm",
         coin=coin,
@@ -1340,6 +1453,9 @@ def run_live_mm_session(
         vw_markout_30s_bps=_compute_vw_markout(fills, mids_series, 30_000),
         halt_events=halt_events[:20],
         final_cleanup_cancelled=cleanup_cancelled,
+        flattened_exit_sz=round(flattened_exit_sz, spec.sz_decimals),
+        dead_man_refreshes=dead_man_refreshes,
+        dms_left_armed=dms_left_armed,
     )
     return summary, pd.DataFrame(fills), pd.DataFrame(quote_rows)
 

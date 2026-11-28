@@ -98,7 +98,10 @@ def main(
             requote_threshold_bps=1.0,
         )
         sw = mm.sweep_as_parameters_on_l2(l2_c, spec, trades_df=tr_c, gammas=(0.01, 0.03, 0.08, 0.15), kappas=k_grid, base_params=base_p)
-        sw.to_parquet(capture_dir / f"sweep_{coin}.parquet", index=False)
+        capture_dir.mkdir(parents=True, exist_ok=True)
+        sw_tmp = capture_dir / f"sweep_{coin}.tmp.parquet"
+        sw.to_parquet(sw_tmp, index=False)
+        sw_tmp.replace(capture_dir / f"sweep_{coin}.parquet")
 
         sweep_blocks += [
             "",

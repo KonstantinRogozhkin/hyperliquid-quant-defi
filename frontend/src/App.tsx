@@ -1420,12 +1420,17 @@ function Desk() {
                       {fmtUsd(tnRisk.orphan_notional_usd)}
                     </div>
                     <div className="kpi-sub">
-                      {t("Orphan pos", "Сирот")}: {tnRisk.orphan_positions ?? 0}
+                      {t("Orphan pos", "Сирот")}:{" "}
+                      {typeof tnRisk.orphan_positions === "number"
+                        ? tnRisk.orphan_positions
+                        : tnRisk.orphan_positions && typeof tnRisk.orphan_positions === "object"
+                          ? Object.keys(tnRisk.orphan_positions).length
+                          : 0}
                     </div>
                   </div>
                   <div className="card">
                     <KpiLabel k="kpiTnMarkOracle" />
-                    <div className={`kpi-value ${(num(tnRisk.max_mark_oracle_dev_pct) ?? 0) >= 0.5 ? "warn" : ""}`}>
+                    <div className={`kpi-value ${Math.abs(num(tnRisk.max_mark_oracle_dev_pct) ?? 0) >= 2.0 ? "warn" : ""}`}>
                       {fmtPct(tnRisk.max_mark_oracle_dev_pct, 2, false)}
                     </div>
                     <div className="kpi-sub">
