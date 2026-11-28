@@ -1175,7 +1175,9 @@ def main() -> None:
     out = root / "docs" / "grafana" / "hyperliquid_quant_defi_dashboard.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     dash = build_dashboard()
-    out.write_text(json.dumps(dash, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp = out.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(dash, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+    tmp.replace(out)
     print(f"Wrote {out} ({len(dash['panels'])} panels)")
 
 

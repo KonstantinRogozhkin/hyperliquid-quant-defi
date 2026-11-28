@@ -20,8 +20,13 @@ import pandas as pd
 
 # Support both repo layout (scripts/analytics/...) and Colab flat upload (/content/...)
 HERE = Path(__file__).resolve()
-for candidate in (HERE.parents[2] / "src" if len(HERE.parents) >= 3 else Path("."), HERE.parent, Path("/content")):
-    if (candidate / "overnight").exists() and str(candidate) not in sys.path:
+for candidate in (
+    HERE.parents[2] / "src" if len(HERE.parents) >= 3 else Path("."),
+    HERE.parent,
+    Path("/content/src"),
+    Path("/content"),
+):
+    if (candidate / "hl_quant").exists() and str(candidate) not in sys.path:
         sys.path.insert(0, str(candidate))
 
 from hl_quant import alpha_families as af  # noqa: E402
@@ -116,9 +121,20 @@ def main() -> None:
         },
         "summaries": summaries,
     }
-    (args.output_dir / f"shard_{args.shard_id}_summary.json").write_text(json.dumps(meta, indent=2))
-    pd.DataFrame(oof_cols).to_parquet(args.output_dir / f"shard_{args.shard_id}_oof_returns.parquet")
-    pd.DataFrame(stress_cols).to_parquet(args.output_dir / f"shard_{args.shard_id}_stressed_returns.parquet")
+    summary_path = args.output_dir / f"shard_{args.shard_id}_summary.json"
+    summary_tmp = summary_path.with_suffix(".json.tmp")
+    summary_tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    summary_tmp.replace(summary_path)
+
+    oof_path = args.output_dir / f"shard_{args.shard_id}_oof_returns.parquet"
+    oof_tmp = oof_path.with_suffix(".parquet.tmp")
+    pd.DataFrame(oof_cols).to_parquet(oof_tmp)
+    oof_tmp.replace(oof_path)
+
+    stress_path = args.output_dir / f"shard_{args.shard_id}_stressed_returns.parquet"
+    stress_tmp = stress_path.with_suffix(".parquet.tmp")
+    pd.DataFrame(stress_cols).to_parquet(stress_tmp)
+    stress_tmp.replace(stress_path)
     print(f"[shard {args.shard_id}] DONE {len(my_specs)} hypotheses in {time.time() - t0:.1f}s", flush=True)
 
 

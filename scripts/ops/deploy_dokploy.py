@@ -325,11 +325,38 @@ def deploy_sha_to_dokploy(
         raise
 
 
+def _env_positive_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        val = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"Environment variable {name} must be an integer, got {raw!r}") from exc
+    if val <= 0:
+        raise ValueError(f"Environment variable {name} must be > 0, got {val}")
+    return val
+
+
 def main(argv: list[str]) -> int:
+    prog = argv[0] if argv else "deploy_dokploy.py"
+    if len(argv) == 2 and argv[1].strip() in {"-h", "--help"}:
+        doc = (__doc__ or "").strip()
+        print(f"Usage: {prog} <40-char-git-sha>\n\n{doc}")
+        return 0
     if len(argv) != 2:
-        print(f"Usage: {argv[0]} <40-char-git-sha>", file=sys.stderr)
+        print(f"Usage: {prog} <40-char-git-sha>", file=sys.stderr)
         return 2
     sha = argv[1].strip()
+    if not SHA_PATTERN.match(sha):
+        print(f"Error: expected 40-char lowercase hex git SHA, got {sha!r}", file=sys.stderr)
+        return 2
+    try:
+        deploy_timeout_s = _env_positive_int("DOKPLOY_DEPLOY_TIMEOUT_S", 600)
+        verify_timeout_s = _env_positive_int("DOKPLOY_VERIFY_TIMEOUT_S", 180)
+    except ValueError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
     client = DokployClient(
         api_url=_require_env("DOKPLOY_API_URL"),
         api_key=_require_env("DOKPLOY_API_KEY"),
@@ -341,8 +368,8 @@ def main(argv: list[str]) -> int:
         sha_var=os.environ.get("DOKPLOY_SHA_VAR", "DEPLOY_SHA").strip() or "DEPLOY_SHA",
         public_url=os.environ.get("DOKPLOY_PUBLIC_URL", "").strip(),
         allow_auto_deploy=os.environ.get("DOKPLOY_ALLOW_AUTO_DEPLOY", "false").strip().lower() in {"1", "true", "yes"},
-        deploy_timeout_s=int(os.environ.get("DOKPLOY_DEPLOY_TIMEOUT_S", "600")),
-        verify_timeout_s=int(os.environ.get("DOKPLOY_VERIFY_TIMEOUT_S", "180")),
+        deploy_timeout_s=deploy_timeout_s,
+        verify_timeout_s=verify_timeout_s,
     )
     print(json.dumps(result, indent=2))
     return 0

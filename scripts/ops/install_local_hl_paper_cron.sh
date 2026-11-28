@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -15,7 +15,8 @@ EOF
   exit 0
 fi
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_PATH="${0:A}"
+ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 RUN_DATE="$(date +%F)"
 RUN_TIME="$(date +%H%M)"
 TEMP_DIR="${ROOT_DIR}/.neira/temp"
@@ -41,7 +42,7 @@ printf "%s\n" "${EXISTING_CRONTAB}" > "${BACKUP_PATH}"
     '
   fi
   echo "${BEGIN_MARKER}"
-  echo "${HL_PAPER_CRON_SCHEDULE} zsh ${TICK_PATH}"
+  echo "${HL_PAPER_CRON_SCHEDULE} zsh \"${TICK_PATH}\""
   echo "${END_MARKER}"
 } > "${CRON_PATH}"
 
