@@ -380,7 +380,9 @@ def save_crontab_backup(text: str, backup_dir: Path = DEFAULT_BACKUP_DIR) -> Pat
     backup_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     path = backup_dir / f"crontab_{ts}.txt"
-    path.write_text(text, encoding="utf-8")
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
     return path
 
 

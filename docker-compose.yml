@@ -11,6 +11,7 @@ services:
       target: backend
       args:
         BUILD_SHA: ${DEPLOY_SHA:-local}
+        BUILT_AT: ${BUILT_AT:-}
     environment:
       HL_DATA_DIR: /app/data
       HL_DATA_ROOT: /app/data/paper
@@ -29,6 +30,7 @@ services:
       target: frontend
       args:
         BUILD_SHA: ${DEPLOY_SHA:-local}
+        BUILT_AT: ${BUILT_AT:-}
     depends_on:
       backend:
         condition: service_healthy
@@ -44,6 +46,7 @@ services:
       target: worker
       args:
         BUILD_SHA: ${DEPLOY_SHA:-local}
+        BUILT_AT: ${BUILT_AT:-}
     env_file:
       - path: .env
         required: false
@@ -51,6 +54,8 @@ services:
       HL_DATA_DIR: /app/data
       HL_DATA_ROOT: /app/data/paper
       HL_BUILD_SHA: ${DEPLOY_SHA:-local}
+      HL_WORKER_BOOTSTRAP_READONLY: ${HL_WORKER_BOOTSTRAP_READONLY:-true}
+      HL_TELEGRAM_ENABLED: ${HL_TELEGRAM_ENABLED:-false}
       HL_ENABLE_TESTNET_EXECUTION: ${HL_ENABLE_TESTNET_EXECUTION:-false}
     volumes:
       - ./data:/app/data:rw

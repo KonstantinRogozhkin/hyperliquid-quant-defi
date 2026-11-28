@@ -167,8 +167,8 @@ def test_relative_path_ops_run_script_execs_cleanly_from_outside_repo(tmp_path: 
     if not shutil.which("zsh"):
         pytest.skip("zsh not available in minimal environment")
     rel_script = os.path.relpath(ROOT / "scripts/ops/run_hl_frontier_persistence_tick.sh", start=tmp_path)
-    # Create a tiny stub python that prints args when running the analytics script, while using real .venv python for ops_lock
-    real_py = ROOT / ".venv/bin/python"
+    # Create a tiny stub python that prints args when running the analytics script, while using current python for ops_lock
+    real_py = Path(sys.executable)
     wrapper_py = tmp_path / "stub_python.sh"
     wrapper_py.write_text(
         f'#!/bin/sh\nif [ "$1" = "-m" ]; then exec "{real_py}" "$@"; else echo "RAN_ANALYTICS:$1"; fi\n',

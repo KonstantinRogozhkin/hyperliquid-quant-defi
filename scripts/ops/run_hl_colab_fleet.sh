@@ -1,7 +1,18 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  cat <<'EOF'
+Usage: run_hl_colab_fleet.sh
+
+Packages minimal hl_quant modules and evaluates the 6-family alpha hypothesis
+registry in parallel across NUM_SHARDS Google Colab sessions.
+EOF
+  exit 0
+fi
+
+SCRIPT_PATH="${0:A}"
+ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 WORK_DIR="${WORK_DIR:-/tmp/hl-meta-20261125}"
 BUNDLE="${WORK_DIR}/dataset_bundle.parquet"
 SHARDS_DIR="${WORK_DIR}/shards"

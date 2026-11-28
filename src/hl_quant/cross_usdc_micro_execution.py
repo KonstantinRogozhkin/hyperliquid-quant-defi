@@ -233,7 +233,23 @@ def write_frozen_contract(path: Path, contract: MicroExecutionContract) -> dict[
             raise MicroExecutionError("immutable_contract_conflict")
         return existing
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    rendered = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(rendered, encoding="utf-8")
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            existing = json.loads(path.read_text(encoding="utf-8"))
+            if existing.get("contract_sha256") != payload["contract_sha256"]:
+                raise MicroExecutionError("immutable_contract_conflict") from None
+            return existing
+        else:
+            os.close(fd)
+            tmp.replace(path)
+    finally:
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
     return payload
 
 
