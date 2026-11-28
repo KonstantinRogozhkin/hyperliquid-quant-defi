@@ -149,6 +149,42 @@ def _leg_fee_bps(mkt: hip3.Hip3BuilderMarket, *, use_taker: bool) -> float:
     return float(mkt.est_taker_fee_bps if use_taker else mkt.est_maker_fee_bps)
 
 
+def settled_funding_by_position(
+    client: Any,
+    positions: dict[str, dict[str, Any]],
+    symbols_of: Any,
+    prev_ms: int,
+    ts_ms: int,
+    *,
+    cap_hours: float | None = None,
+) -> dict[str, float]:
+    """Realized ``fundingHistory`` rate sums per symbol, each over its position's own accrual window.
+
+    ``symbols_of(pos)`` yields the HL symbols to fetch for a position. Symbols missing from the
+    result (no history / unsupported) fall back to the snapshot rate in the caller.
+    """
+    if client is None or prev_ms <= 0 or not positions:
+        return {}
+    from hl_quant.hl_spot_perp_arb import fetch_settled_funding_sum
+
+    by_start: dict[int, set[str]] = {}
+    for pos in positions.values():
+        start = pc.position_accrual_start_ms(pos, prev_ms)
+        if cap_hours is not None and cap_hours > 0:
+            # Same window as the snapshot-rate fallback used for the other leg (dt_cap_h), so equal
+            # legs keep cancelling after a long gap.
+            start = max(start, ts_ms - int(cap_hours * 3_600_000))
+        if start > 0 and (ts_ms // 3_600_000) - (start // 3_600_000) > 0:
+            by_start.setdefault(start, set()).update(str(s) for s in symbols_of(pos) if s)
+    out: dict[str, float] = {}
+    for start, syms in by_start.items():
+        try:
+            out.update(fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms))
+        except Exception:  # noqa: BLE001 - fall back to snapshot-rate accrual
+            continue
+    return out
+
+
 def run_hip3_paper_tick(
     client: httpx.Client | None = None,
     *,
@@ -224,7 +260,20 @@ def run_hip3_paper_tick(
         tick_costs_usd = 0.0
         trade_rows: list[dict[str, Any]] = []
 
-        # 1. Mark-to-market & accrue hourly funding on open dual-builder pairs
+        # 1. Mark-to-market & accrue hourly funding on open dual-builder pairs; realized settlements
+        # per leg (``fundingHistory``) when live, snapshot rate x hours as fallback.
+        settled = (
+            settled_funding_by_position(
+                http_client,
+                positions,
+                lambda p: [p.get("short_symbol"), p.get("long_symbol")],
+                prev_ms,
+                ts_ms,
+                cap_hours=dt_cap_h,
+            )
+            if markets is None
+            else {}
+        )
         for _base, pos in list(positions.items()):
             s_mkt = by_symbol.get(str(pos["short_symbol"]))
             l_mkt = by_symbol.get(str(pos["long_symbol"]))
@@ -247,7 +296,10 @@ def run_hip3_paper_tick(
             pos_dt_hours = max(0.0, min(dt_cap_h, (ts_ms - pos_prev_ms) / 3_600_000.0)) if pos_prev_ms > 0 else dt_hours
             pos["last_accrual_ms"] = ts_ms
             # Short receives positive funding (+s_mkt.funding_rate_h); long pays positive funding (-l_mkt.funding_rate_h).
-            fund_pnl = (s_notional * s_mkt.funding_rate_h - l_notional * l_mkt.funding_rate_h) * pos_settled_hours
+            s_sym, l_sym = str(pos["short_symbol"]), str(pos["long_symbol"])
+            s_rate_sum = settled.get(s_sym, s_mkt.funding_rate_h * pos_settled_hours)
+            l_rate_sum = settled.get(l_sym, l_mkt.funding_rate_h * pos_settled_hours)
+            fund_pnl = s_notional * s_rate_sum - l_notional * l_rate_sum
 
             live_spread_apr = round(s_mkt.funding_apr_pct - l_mkt.funding_apr_pct, 2)
             live_mark_basis = round((s_mkt.mark_px - l_mkt.mark_px) / l_mkt.mark_px * 1e4, 2) if l_mkt.mark_px > 0 else 0.0
@@ -332,12 +384,15 @@ def run_hip3_paper_tick(
             if not (s_mkt and l_mkt):
                 if not hip3_online:
                     continue
-                miss = int(pos.get("missing_quote_ticks", 0)) + 1
+                # Wall-clock ticks, not invocations (see cross_dex_paper).
+                pos["missing_streak"] = pc.advance_streak(pos.get("missing_streak"), qualifies=True, now_ms=ts_ms)
+                miss = streak_count(pos["missing_streak"])
                 pos["missing_quote_ticks"] = miss
                 if miss >= cfg.max_missing_ticks:
                     exit_reason = "delisted_or_missing"
             else:
                 pos["missing_quote_ticks"] = 0
+                pos.pop("missing_streak", None)
                 live_apr = float(pos.get("live_spread_apr_pct", 0.0))
                 live_ora = float(pos.get("live_oracle_div_bps", 0.0))
                 if live_ora > cfg.exit_oracle_div_bps:
@@ -506,7 +561,8 @@ def run_hip3_paper_tick(
             rt_fee_bps = 2.0 * entry_fee_bps
             # Conservative 50% credit on positive entry basis (same policy as cross_dex_paper)
             basis_credit = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
-            est_rt_cost_bps = max(0.0, rt_fee_bps + l2_slip - basis_credit)
+            # Exit crosses the book again: charge the L2 slip twice (as spot_perp does).
+            est_rt_cost_bps = max(0.0, rt_fee_bps + 2.0 * l2_slip - basis_credit)
             hourly_bps = opp.spread_apr_pct / (hip3.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
             if be_hours > cfg.max_payback_hours:
@@ -543,9 +599,8 @@ def run_hip3_paper_tick(
                 "last_long_px": l_mkt.mark_px,
                 "entry_spread_apr_pct": opp.spread_apr_pct,
                 "live_spread_apr_pct": opp.spread_apr_pct,
-                "net_apr_split_margin_pct": round(opp.spread_apr_pct * (cfg.per_leg_leverage / 2.0) * 0.5, 2)
-                if cfg.per_leg_leverage != 2.0
-                else round(opp.spread_apr_pct * 0.5, 2),
+                # Return on the 2 * N / L margin locked across both DEXs: spread * L / 2.
+                "net_apr_split_margin_pct": round(opp.spread_apr_pct * cfg.per_leg_leverage / 2.0, 2),
                 "entry_oracle_div_bps": opp.oracle_divergence_bps,
                 "live_oracle_div_bps": opp.oracle_divergence_bps,
                 "entry_fee_bps": round(entry_fee_bps, 2),

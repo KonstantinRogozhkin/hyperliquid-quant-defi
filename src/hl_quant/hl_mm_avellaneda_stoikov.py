@@ -2594,6 +2594,15 @@ async def run_multi_coin_mm_ws_session(
                                     "crossed": True,
                                 }
                             )
+                        if audit_log_path is not None:
+                            # Log the exit IOC so attribution can tell MM flatten fills from foreign ones.
+                            audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+                            with audit_log_path.open("a", encoding="utf-8") as fh:
+                                fh.write(json.dumps({
+                                    "ts_ms": int(time.time() * 1000), "mode": "ws_flatten_ioc", "coin": c_name,
+                                    "oid": _extract_order_oid(flat_resp)[0], "status": "flatten",
+                                    "filled_sz": filled_sz, "order": flat_ord.to_dict(),
+                                }, default=str) + "\n")
                     except Exception:
                         pass
 

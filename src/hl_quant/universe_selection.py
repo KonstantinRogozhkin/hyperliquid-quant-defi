@@ -35,6 +35,7 @@ class CoinCandidate:
     cex_symbol: str
     hl_day_notional_usd: float
     hl_oi_usd: float
+    is_delisted: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,7 +84,7 @@ def _f(value: object) -> float:
     return out if math.isfinite(out) else 0.0
 
 
-def _binance_perp_symbols(client: cex.PublicGetClient) -> set[str]:
+def _binance_perp_symbols(client: cex.PublicGetClient, *, include_inactive: bool = False) -> set[str]:
     payload = client.get("/fapi/v1/exchangeInfo", {})
     symbols = payload.get("symbols") if isinstance(payload, dict) else None
     if not isinstance(symbols, list):
@@ -92,13 +93,13 @@ def _binance_perp_symbols(client: cex.PublicGetClient) -> set[str]:
         str(item["symbol"])
         for item in symbols
         if isinstance(item, dict)
-        and item.get("status") == "TRADING"
+        and (include_inactive or item.get("status") == "TRADING")
         and item.get("contractType") == "PERPETUAL"
         and item.get("quoteAsset") == "USDT"
     }
 
 
-def _bybit_perp_symbols(client: cex.PublicGetClient) -> set[str]:
+def _bybit_perp_symbols(client: cex.PublicGetClient, *, include_inactive: bool = False) -> set[str]:
     found: set[str] = set()
     cursor = ""
     for _ in range(20):
@@ -113,7 +114,7 @@ def _bybit_perp_symbols(client: cex.PublicGetClient) -> set[str]:
         for item in rows:
             if (
                 isinstance(item, dict)
-                and item.get("status") == "Trading"
+                and (include_inactive or item.get("status") == "Trading")
                 and item.get("contractType") == "LinearPerpetual"
                 and item.get("quoteCoin") == "USDT"
             ):
@@ -131,12 +132,18 @@ def discover_common_coins(
     *,
     min_prefilter_vol_usd: float = 1_000_000.0,
     max_coins: int | None = None,
+    include_delisted: bool = False,
 ) -> list[CoinCandidate]:
     """List active Hyperliquid perps that also trade as USDT linear perps on ``venue``.
 
     Note: ``min_prefilter_vol_usd`` uses current HL 24h notional volume solely as a
     lightweight download pre-filter; the real backtest liquidity gate runs strictly
     on historical train-period bars via :func:`train_liquidity_stats`.
+
+    ``include_delisted`` (backtests): keep HL-delisted perps and non-TRADING CEX symbols that
+    still have history, exempt from the current-volume pre-filter and the ``max_coins`` cap
+    (both are defined by *today's* market), so the universe is not survivorship-biased toward
+    coins that are still alive. Their history is then gated by the same train-period rules.
     """
     if venue not in cex.VENUES:
         raise cex.CexDataError(f"unknown venue {venue!r}")
@@ -150,11 +157,22 @@ def discover_common_coins(
     if len(universe) != len(ctxs):
         raise hl.HyperliquidError("metaAndAssetCtxs universe/context length mismatch")
 
-    cex_symbols = _binance_perp_symbols(cex_client) if venue == "binance" else _bybit_perp_symbols(cex_client)
+    cex_symbols = (
+        _binance_perp_symbols(cex_client, include_inactive=include_delisted)
+        if venue == "binance"
+        else _bybit_perp_symbols(cex_client, include_inactive=include_delisted)
+    )
 
     candidates: list[CoinCandidate] = []
+    delisted: list[CoinCandidate] = []
     for asset, ctx in zip(universe, ctxs):
         if asset.get("isDelisted"):
+            if not include_delisted:
+                continue
+            coin_d = str(asset.get("name") or "").strip()
+            sym_d = cex_symbol(coin_d) if coin_d else ""
+            if coin_d and sym_d in cex_symbols:
+                delisted.append(CoinCandidate(coin=coin_d, cex_symbol=sym_d, hl_day_notional_usd=0.0, hl_oi_usd=0.0, is_delisted=True))
             continue
         coin = str(asset.get("name") or "").strip()
         if not coin:
@@ -177,7 +195,7 @@ def discover_common_coins(
     candidates.sort(key=lambda c: (-c.hl_day_notional_usd, c.coin))
     if max_coins is not None and max_coins > 0:
         candidates = candidates[:max_coins]
-    return candidates
+    return candidates + sorted(delisted, key=lambda c: c.coin)
 
 
 # --------------------------------------------------------------------------- train-only liquidity

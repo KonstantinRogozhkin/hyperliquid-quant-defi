@@ -266,6 +266,7 @@ def scan_hip3_cross_builder_arb(
     *,
     min_leg_vol_usd: float = 200_000.0,
     min_spread_apr_pct: float = 10.0,
+    per_leg_leverage: float = 2.0,
     round_trip_fee_bps: float = 6.0,  # 2 legs × 2 sides × 1.5 bps Tier-0 maker (zero bridge!)
     book_fetcher: Any = None,
     enrich_top_n: int = 12,
@@ -299,7 +300,9 @@ def scan_hip3_cross_builder_arb(
                 rt_taker = round(2.0 * (hi.est_taker_fee_bps + lo.est_taker_fee_bps), 2)
                 locks = [d for d in (hi.growth_mode_lock_days_left, lo.growth_mode_lock_days_left) if d is not None]
                 min_lock = min(locks) if locks else None
-                net_apr_split = round(spread * 0.5, 2)
+                # Each leg posts N / L margin on its own DEX: the spread on N earns spread * L / 2 on
+                # the 2N / L total margin (= spread at the default 2x per leg; 0.5x was 1x leverage).
+                net_apr_split = round(spread * per_leg_leverage / 2.0, 2)
                 rank_key = (ora_div_bps <= 25.0, round(spread, 6), min(hi.day_vol_usd, lo.day_vol_usd))
                 if best_rank is None or rank_key > best_rank:
                     best_rank = rank_key

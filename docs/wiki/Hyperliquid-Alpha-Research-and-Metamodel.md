@@ -96,3 +96,6 @@ flowchart LR
 **Итоговое решение:** не подгонять фильтр режима под 180-дневную историю, перевести `run_hl_metamodel_paper_tick.py` на измеренную цену **`5.0 б.п.`** (PR #19) и держать метамодель строго в режиме **observation-only** (без реального капитала).
 
 Подробные отчёты: `docs/reports/2026-11-26/hl_alo_fill_portfolio_coins.md`, `hl_metamodel_real_costs.md`, `hl_xs_rev_slow_variants.md`.
+
+### Survivorship-free вселенная бэктестов (с 2026-11-28)
+`run_hl_funding_arb_universe_backtest.py` и `run_hl_funding_arb_walkforward.py` по умолчанию запускаются с `--include-delisted`: в выборку попадают делистнутые перпы HL и неактивные CEX-символы, у которых есть история. На них не действуют пре-фильтр по текущему объёму и лимит `max_candidates`, потому что оба определяются сегодняшним рынком. Дальше они проходят тот же гейт ликвидности по train-периоду. Живой metamodel-тик по-прежнему работает только с активными монетами.

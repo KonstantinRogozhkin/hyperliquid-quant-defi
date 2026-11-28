@@ -469,6 +469,10 @@ def scan_spot_perp_opportunities(
             eff_exec_basis = cds.credited_entry_basis_bps(exec_basis, mark_basis_bps) if exec_basis is not None else None
             eff_slip = float(entry_slip) if entry_slip is not None else 4.0
             basis_credit = min(max(float(eff_exec_basis or 0.0), -50.0), one_way_fee + eff_slip)
+            if is_proxy:
+                # Proxy hedge (e.g. XAUT0 spot vs PAXG perp): the cross-issuer basis is structural
+                # and does not converge, so a favorable entry basis is never credited to payback.
+                basis_credit = min(basis_credit, 0.0)
             net_hurdle_bps = max(rt_fee_bps + 2.0 * eff_slip - basis_credit, 1.0)
             hourly_bps = fund_h * 1e4
             payback_h = round(net_hurdle_bps / hourly_bps, 1) if hourly_bps > 1e-6 else None

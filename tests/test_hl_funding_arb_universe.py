@@ -96,8 +96,14 @@ def test_discover_common_coins_filters_delisted_and_intersects_binance():
         cex.PublicGetClient(cex.BINANCE_FAPI, transport=cex_transport) as cex_client,
     ):
         found = us.discover_common_coins(hl_client, cex_client, "binance", min_prefilter_vol_usd=1_000_000.0)
+        # Backtests: keep the delisted perp (survivorship-free), beyond the max_coins cap.
+        with_dead = us.discover_common_coins(
+            hl_client, cex_client, "binance", min_prefilter_vol_usd=1_000_000.0, max_coins=1, include_delisted=True
+        )
     assert [c.coin for c in found] == ["BTC", "kPEPE"]
     assert found[1].cex_symbol == "1000PEPEUSDT"
+    assert [c.coin for c in with_dead] == ["BTC", "DEAD"]
+    assert with_dead[1].is_delisted is True
 
 
 def test_train_liquidity_ignores_test_volume_spikes():

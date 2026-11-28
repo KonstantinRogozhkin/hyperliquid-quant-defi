@@ -83,8 +83,9 @@ def test_rebalance_slices_large_orders_into_alo_children_and_writes_audit(tmp_pa
     assert sum(abs(v) for v in neut.values()) <= 0.90 + 1e-6
 
     hwm_file = tmp_path / "hwm.json"
-    assert ex.update_high_water_mark(hwm_file, 1000.0) == 1000.0
-    assert ex.update_high_water_mark(hwm_file, 950.0) == 1000.0
+    ex.save_high_water_mark(hwm_file, max(ex.load_high_water_mark(hwm_file), 1000.0))
+    ex.save_high_water_mark(hwm_file, max(ex.load_high_water_mark(hwm_file), 950.0))
+    assert ex.load_high_water_mark(hwm_file) == 1000.0
     rich = ex.format_testnet_telegram_rich_html(acct, res, bbo, hwm_usd=20_000.0)
     assert '<table bordered striped>' in rich
     assert "Hyperliquid Testnet" in rich

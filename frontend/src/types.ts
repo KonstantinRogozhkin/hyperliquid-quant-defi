@@ -135,8 +135,8 @@ export interface CoinAttributionRow {
   coin: string;
   position_sz: number;
   position_usd: number;
-  entry_px: number;
-  current_mid: number;
+  entry_px: number | null;
+  current_mid: number | null;
   leverage_mode: string;
   liq_px: number | null;
   liq_distance_pct: number | null;

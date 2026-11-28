@@ -1030,11 +1030,53 @@ def load_high_water_mark(path: Path) -> float:
     return value if math.isfinite(value) and value > 0 else 0.0
 
 
-def save_high_water_mark(path: Path, value: float) -> None:
+def save_high_water_mark(path: Path, value: float, *, net_external_flow_usd: float | None = None) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"high_water_mark_usd": float(value)}
+    if net_external_flow_usd is not None and math.isfinite(net_external_flow_usd):
+        payload["net_external_flow_usd"] = float(net_external_flow_usd)
     tmp = path.with_suffix(".tmp.json")
-    tmp.write_text(json.dumps({"high_water_mark_usd": float(value)}))
+    tmp.write_text(json.dumps(payload))
     tmp.replace(path)
+
+
+def load_hwm_net_flow(path: Path) -> float | None:
+    """Cumulative external USDC flow recorded alongside the high-water mark (``None`` if never stored)."""
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text())
+        value = raw.get("net_external_flow_usd") if isinstance(raw, dict) else None
+        return float(value) if value is not None and math.isfinite(float(value)) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def hwm_persist_allowed(cur_net_flow_usd: float | None, stored_net_flow_usd: float | None) -> bool:
+    """Whether a freshly ratcheted HWM may be saved this cycle.
+
+    While flow tracking is active (a baseline is stored) but the ledger is unreadable, a peak
+    ratcheted now may already include a deposit the baseline has not seen; saving it would add the
+    same deposit again on recovery (false drawdown -> kill-switch). Legacy files keep saving.
+    """
+    return not (cur_net_flow_usd is None and stored_net_flow_usd is not None)
+
+
+def flow_adjusted_high_water_mark(
+    stored_hwm: float, prev_net_flow_usd: float | None, cur_net_flow_usd: float | None
+) -> float:
+    """Shift the HWM by external capital moved since it was stored.
+
+    A withdrawal is not a trading loss: without this, withdrawing > ``max_drawdown_pct`` of equity
+    tripped a permanent drawdown kill-switch (and a deposit inflated returns past the old peak).
+    When either flow total is unknown the HWM is returned unchanged.
+    """
+    if stored_hwm <= 0 or prev_net_flow_usd is None or cur_net_flow_usd is None:
+        return stored_hwm
+    delta = cur_net_flow_usd - prev_net_flow_usd
+    if not math.isfinite(delta):
+        return stored_hwm
+    return max(0.0, stored_hwm + delta)
 
 
 _CANCEL_GONE_MARKERS = ("already canceled", "already cancelled", "filled", "never placed")
@@ -1519,14 +1561,6 @@ def neutralize_target_weights(
             for c, w in out.items()
         }
     return out
-
-
-def update_high_water_mark(hwm_path: Path, equity_usd: float) -> float:
-    """Persist and return peak Testnet equity for cross-run drawdown kill-switch."""
-    prev = load_high_water_mark(hwm_path)
-    hwm = max(prev, float(equity_usd) if math.isfinite(equity_usd) and equity_usd > 0 else 0.0)
-    save_high_water_mark(hwm_path, hwm)
-    return hwm
 
 
 def format_testnet_telegram_rich_html(

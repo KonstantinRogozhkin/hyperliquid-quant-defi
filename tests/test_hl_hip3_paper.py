@@ -61,6 +61,8 @@ def test_hip3_paper_lifecycle_streak_split_margin_funding_and_decay_exit(tmp_pat
         min_clean_streak=2,
         entry_apr_pct=20.0,
         exit_apr_pct=6.0,
+        # Payback now charges the L2 slip on exit too (2x), which puts this 35%-APR fixture at ~26h.
+        max_payback_hours=48.0,
     )
     mkts_open = [
         _mkt("io", "NVDA", 150.0, 40.0, only_isolated=False, growth_mode=True),

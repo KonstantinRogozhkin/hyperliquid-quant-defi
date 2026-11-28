@@ -142,6 +142,11 @@ def main(
     top_k: int = typer.Option(10, min=1, max=50, help="Number of coins to pick strictly on train"),
     max_candidates: int = typer.Option(40, min=5, max=200, help="Cap downloaded candidates by current HL 24h volume"),
     min_prefilter_vol_usd: float = typer.Option(2_000_000.0, help="Download pre-filter on current HL 24h notional volume"),
+    include_delisted: bool = typer.Option(
+        True,
+        "--include-delisted/--no-include-delisted",
+        help="Keep delisted HL perps / inactive CEX symbols with history (avoids survivorship bias)",
+    ),
     min_train_daily_vol_usd: float = typer.Option(5_000_000.0, help="Strict train-only median daily volume floor (both venues)"),
     min_train_coverage: float = typer.Option(0.80, min=0.1, max=1.0, help="Minimum fraction of train hours with prices"),
     rank_by: str = typer.Option("best_sharpe", help="best_sharpe, mean_sharpe, or mean_apr"),
@@ -171,6 +176,7 @@ def main(
             venue,
             min_prefilter_vol_usd=min_prefilter_vol_usd,
             max_coins=max_candidates,
+            include_delisted=include_delisted,
         )
         typer.echo(f"discovered={len(candidates)} venue={venue}", err=True)
         for idx, cand in enumerate(candidates, start=1):

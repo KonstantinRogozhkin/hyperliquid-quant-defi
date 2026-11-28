@@ -134,6 +134,42 @@ def _estimate_exit_cost_usd(
     return exit_notional * (cfg.hl_fee_bps + cfg.other_fee_bps(other_dex) + slip_bps) * 1e-4
 
 
+def settled_funding_by_position(
+    client: Any,
+    positions: dict[str, dict[str, Any]],
+    symbols_of: Any,
+    prev_ms: int,
+    ts_ms: int,
+    *,
+    cap_hours: float | None = None,
+) -> dict[str, float]:
+    """Realized ``fundingHistory`` rate sums per symbol, each over its position's own accrual window.
+
+    ``symbols_of(pos)`` yields the HL symbols to fetch for a position. Symbols missing from the
+    result (no history / unsupported) fall back to the snapshot rate in the caller.
+    """
+    if client is None or prev_ms <= 0 or not positions:
+        return {}
+    from hl_quant.hl_spot_perp_arb import fetch_settled_funding_sum
+
+    by_start: dict[int, set[str]] = {}
+    for pos in positions.values():
+        start = pc.position_accrual_start_ms(pos, prev_ms)
+        if cap_hours is not None and cap_hours > 0:
+            # Same window as the snapshot-rate fallback used for the other leg (dt_cap_h), so equal
+            # legs keep cancelling after a long gap.
+            start = max(start, ts_ms - int(cap_hours * 3_600_000))
+        if start > 0 and (ts_ms // 3_600_000) - (start // 3_600_000) > 0:
+            by_start.setdefault(start, set()).update(str(s) for s in symbols_of(pos) if s)
+    out: dict[str, float] = {}
+    for start, syms in by_start.items():
+        try:
+            out.update(fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms))
+        except Exception:  # noqa: BLE001 - fall back to snapshot-rate accrual
+            continue
+    return out
+
+
 def run_cross_dex_paper_tick(
     client: httpx.Client,
     *,
@@ -205,7 +241,15 @@ def run_cross_dex_paper_tick(
     tick_costs_usd = 0.0
     trade_rows: list[dict[str, Any]] = []
 
-    # 1. Mark-to-market & accrue funding on all currently open dual-leg pairs
+    # 1. Mark-to-market & accrue funding on all currently open dual-leg pairs. The HL leg uses the
+    # realized hourly settlements (``fundingHistory``) when live; snapshot rate x hours otherwise
+    # (offline quotes, other venues, missing history) — a spike at tick time no longer stretches
+    # over the whole 4h window.
+    settled_hl = (
+        settled_funding_by_position(client, positions, lambda p: [p.get("coin")], prev_ms, ts_ms, cap_hours=dt_cap_h)
+        if hl_quotes is None
+        else {}
+    )
     for coin, pos in list(positions.items()):
         other_dex = str(pos.get("other_dex") or "lighter")
         h = hl_q.get(coin)
@@ -232,7 +276,11 @@ def run_cross_dex_paper_tick(
         pos["last_accrual_ms"] = ts_ms
         hl_notional = hl_qty * h.mark_px
         oth_notional = oth_qty * oth.mark_px
-        hl_fund_pnl = hl_notional * (-hl_sgn) * h.funding_rate_h * pos_settled_hours
+        hl_fund_pnl = (
+            hl_notional * (-hl_sgn) * settled_hl[coin]
+            if coin in settled_hl
+            else hl_notional * (-hl_sgn) * h.funding_rate_h * pos_settled_hours
+        )
         oth_fund_pnl = oth_notional * (-oth_sgn) * oth.funding_rate_h * pos_settled_hours
         fund_pnl = hl_fund_pnl + oth_fund_pnl
 
@@ -312,13 +360,17 @@ def run_cross_dex_paper_tick(
             if not venue_online:
                 # Venue feed outage: hold position untouched rather than force-closing on synthetic slippage.
                 continue
-            missing_n = int(pos.get("missing_quote_ticks", 0)) + 1
+            # Count missing observations in wall-clock ticks (>= 3.5 h apart), not invocations: manual
+            # re-runs during a partial outage must not force-close a pair on synthetic slippage.
+            pos["missing_streak"] = pc.advance_streak(pos.get("missing_streak"), qualifies=True, now_ms=ts_ms)
+            missing_n = streak_count(pos["missing_streak"])
             pos["missing_quote_ticks"] = missing_n
             if missing_n < cfg.max_missing_ticks:
                 continue
             should_exit = True
         else:
             pos["missing_quote_ticks"] = 0
+            pos.pop("missing_streak", None)
             live_dir_apr = float(pos.get("live_spread_apr_pct", 0.0))
             live_basis = float(pos.get("live_mark_basis_bps", 0.0))
             hours_held = float(pos.get("hours_held", 0.0))
@@ -523,7 +575,8 @@ def run_cross_dex_paper_tick(
             # Credit only conservative 50% convergence for positive cross-DEX basis (persistent
             # venue oracle/mark offsets do not guarantee 100% reversion at exit); charge full adverse basis.
             basis_credit_bps = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
-            est_rt_cost_bps = max(0.0, venue_rt_fee_bps + l2_slip - basis_credit_bps)
+            # Exit crosses the book again: charge the L2 slip twice (as spot_perp does).
+            est_rt_cost_bps = max(0.0, venue_rt_fee_bps + 2.0 * l2_slip - basis_credit_bps)
             hourly_bps = spread_apr / (cds.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
             if be_hours > cfg.max_breakeven_hours:

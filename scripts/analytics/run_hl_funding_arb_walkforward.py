@@ -96,6 +96,11 @@ def main(
     raw_root: Path | None = typer.Option(None),
     max_candidates: int = typer.Option(100, min=5, max=200),
     min_prefilter_vol_usd: float = typer.Option(500_000.0),
+    include_delisted: bool = typer.Option(
+        True,
+        "--include-delisted/--no-include-delisted",
+        help="Keep delisted HL perps / inactive CEX symbols with history (avoids survivorship bias)",
+    ),
     min_train_daily_vol_usd: float = typer.Option(2_000_000.0),
     min_train_coverage: float = typer.Option(0.80),
     top_k: int = typer.Option(10, min=1, max=50),
@@ -127,6 +132,7 @@ def main(
             venue,
             min_prefilter_vol_usd=min_prefilter_vol_usd,
             max_coins=max_candidates,
+            include_delisted=include_delisted,
         )
         typer.echo(f"discovered={len(candidates)} venue={venue}", err=True)
         for idx, cand in enumerate(candidates, start=1):

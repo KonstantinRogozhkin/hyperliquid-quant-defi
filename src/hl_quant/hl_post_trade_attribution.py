@@ -28,8 +28,8 @@ class CoinAttribution:
     coin: str
     position_sz: float
     position_usd: float
-    entry_px: float
-    current_mid: float
+    entry_px: float | None  # None for flat coins (no open position)
+    current_mid: float | None  # None when allMids has no price for the coin
     leverage_mode: str
     liq_px: float | None
     liq_distance_pct: float | None
@@ -550,6 +550,22 @@ def compute_net_deposited_capital_usd(
     ignored because ``total_eq`` already consolidates Perp + Spot equity.
     Returns ``None`` when no external USDC ledger flows exist so offline callers fall back cleanly.
     """
+    net_flow = net_external_usdc_flow_usd(ledger_updates, account_address)
+    if net_flow is None or net_flow <= 0.0:
+        return None
+    return net_flow
+
+
+def net_external_usdc_flow_usd(
+    ledger_updates: list[dict[str, Any]] | None,
+    account_address: str,
+) -> float | None:
+    """Signed cumulative external USDC flow (deposits/incoming minus withdrawals/outgoing + fees).
+
+    ``None`` when the ledger holds no external USDC flow at all. Unlike
+    :func:`compute_net_deposited_capital_usd` this may be zero or negative, which the drawdown
+    high-water mark needs to offset withdrawals.
+    """
     if not ledger_updates:
         return None
     me = account_address.strip().lower()
@@ -589,7 +605,7 @@ def compute_net_deposited_capital_usd(
             elif me and src == me and dst != me:
                 net_flow -= amt + fee
                 found = True
-    if not found or net_flow <= 0.0:
+    if not found:
         return None
     return round(net_flow, 4)
 
@@ -806,7 +822,6 @@ def compute_post_trade_attribution(
         lev_mode = f"{lev_info.get('type', 'none')}:{lev_info.get('value', '')}" if lev_info else "flat"
         liq_raw = p.get("liquidationPx")
         liq_px = _f(liq_raw) if liq_raw is not None and _f(liq_raw) > 0 else None
-        cur_mid = mids.get(coin, entry_px)
         mark_px = mark_prices.get(coin) or mids.get(coin) or entry_px
 
         liq_dist: float | None = None
@@ -861,8 +876,8 @@ def compute_post_trade_attribution(
                 coin=coin,
                 position_sz=szi,
                 position_usd=round(pos_usd, 2),
-                entry_px=entry_px,
-                current_mid=cur_mid,
+                entry_px=entry_px if (abs(szi) > 1e-12 and entry_px > 0) else None,
+                current_mid=mids.get(coin),
                 leverage_mode=lev_mode,
                 liq_px=liq_px,
                 liq_distance_pct=round(liq_dist, 2) if liq_dist is not None else None,

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import dataclasses
+
 import pytest
 
 from hl_quant import hl_hyperevm_yield_stack as hys
@@ -34,10 +36,18 @@ def test_hyperevm_delta_neutral_yield_stack_math_and_reporting():
     assert fix.capital_efficiency_pct == pytest.approx(66.7, abs=0.1)
     assert fix.net_deposit_apr_pct == pytest.approx(7.21, abs=0.05)
 
-    # Check composable loop math: 1.88 + 8.94 - 0.50 * 3.50 = 9.07% net on 100% deposit!
+    # Composable loop: borrow cost is floored by the live stable supply APY / utilization
+    # (5.20 / 0.80 = 6.50% > the 3.5% assumption): 1.88 + 8.94 - 0.50 * 6.50 = 7.57% net.
     loop = next(s for s in strats if s.name.startswith("Composable Loop:"))
     assert loop.capital_efficiency_pct == pytest.approx(100.0)
-    assert loop.net_deposit_apr_pct == pytest.approx(9.07, abs=0.05)
+    assert loop.net_deposit_apr_pct == pytest.approx(7.57, abs=0.05)
+    # With no live supply rate the explicit assumption still applies.
+    no_supply = hys.build_hyperevm_yield_strategies(
+        dataclasses.replace(inp, morpho_feusd_apy_pct=0.0),
+        perp_leverage=2.0, loop_ltv=0.50, assumed_stable_borrow_apr_pct=3.5,
+    )
+    loop0 = next(s for s in no_supply if s.name.startswith("Composable Loop:"))
+    assert loop0.net_deposit_apr_pct == pytest.approx(9.07, abs=0.05)
 
     assert "Benchmark: HLP Vault (Hyperliquidity Provider)" in by_name
     snap = hys.HyperEvmYieldSnapshot(inputs=inp, strategies=strats)
