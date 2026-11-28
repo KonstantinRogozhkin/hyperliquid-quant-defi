@@ -198,7 +198,9 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
     groups = prom["groups"]
     assert len(groups) == 2
     crit_rules = groups[0]["rules"]
-    assert len(crit_rules) >= 10
+    warn_rules = groups[1]["rules"]
+    assert len(crit_rules) == 11
+    assert len(warn_rules) == 9
     for grp in groups:
         for rule in grp["rules"]:
             assert rule.get("alert") and rule.get("expr")
@@ -206,14 +208,30 @@ def test_prometheus_and_grafana_alert_rules_valid_and_reference_emitted_metrics(
                 assert m in emitted, f"Prometheus alert '{rule['alert']}' references unknown metric '{m}'"
 
     graf = yaml.safe_load(GRAFANA_ALERTS_PATH.read_text(encoding="utf-8"))
-    assert len(graf["groups"][0]["rules"]) >= 9
+    assert len(graf["groups"][0]["rules"]) == 11
+    assert len(graf["groups"][1]["rules"]) == 9
     g_rules = [r for grp in graf["groups"] for r in grp["rules"]]
     uids = [r["uid"] for r in g_rules]
     assert len(uids) == len(set(uids)), "Grafana alert rule uids must be unique"
-    for required in ("hl-crit-testnet-drawdown", "hl-warn-testnet-orphans", "hl-warn-testnet-risk-stale", "hl-warn-testnet-attr-stale"):
+    for required in (
+        "hl-crit-testnet-drawdown",
+        "hl-warn-artifact-stale",
+        "hl-warn-settlement-degraded",
+        "hl-warn-alo-fill-low",
+        "hl-warn-testnet-orphans",
+        "hl-warn-coin-mark-oracle",
+        "hl-warn-testnet-risk-stale",
+        "hl-warn-testnet-attr-stale",
+    ):
         assert required in uids
     prom_names = {r["alert"] for grp in groups for r in grp["rules"]}
-    for required in ("HLTestnetDrawdownNearKillSwitch", "HLTestnetOrphanPositions", "HLTestnetRiskProbeStale", "HLTestnetAttributionStale"):
+    for required in (
+        "HLTestnetDrawdownNearKillSwitch",
+        "HLTestnetOrphanPositions",
+        "HLTestnetCoinMarkOracleDislocation",
+        "HLTestnetRiskProbeStale",
+        "HLTestnetAttributionStale",
+    ):
         assert required in prom_names
     # Freshness alerts must also fire when the artifact was never written (no age sample at all).
     by_uid = {r["uid"]: r for r in g_rules}

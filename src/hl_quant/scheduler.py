@@ -154,6 +154,8 @@ def build_job_specs() -> list[JobSpec]:
             str(data_dir / "paper/hl_testnet_audit.jsonl"),
             "--hwm-state",
             str(data_dir / "paper/hl_testnet_hwm.json"),
+            "--mm-audit-log",
+            str(data_dir / "paper/hl_mm_testnet/mm_audit.jsonl"),
             "--execute-testnet",
             "--max-child-usd",
             os.environ.get("HL_TESTNET_MAX_CHILD_USD", "250"),
@@ -555,6 +557,11 @@ def format_worker_alert_rich_html(
 class WorkerScheduler:
     """UTC scheduler executing isolated subprocess ticks with non-overlapping per-job concurrency."""
 
+    DEFAULT_JOB_DEPENDENCIES: dict[str, tuple[str, float]] = {
+        "testnet_executor": ("metamodel_paper", 750.0),
+        "hip3_paper": ("frontier_persistence", 510.0),
+    }
+
     def __init__(
         self,
         *,
@@ -563,11 +570,13 @@ class WorkerScheduler:
         jobs: list[JobSpec] | None = None,
         telegram_enabled: bool | None = None,
         runner: Callable[[list[str], dict[str, str], int], int] | None = None,
-        max_workers: int = 4,
+        max_workers: int = 6,
         readonly_retries: int = 1,
         readonly_retry_delay_s: float = 15.0,
         alert_cooldown_s: float = 3600.0,
         alert_sender: Callable[[str], Any] | None = None,
+        dependency_wait_s: dict[str, tuple[str, float]] | None = None,
+        dependency_poll_s: float = 0.25,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.data_dir = Path(
@@ -581,6 +590,10 @@ class WorkerScheduler:
         self.readonly_retry_delay_s = max(0.0, float(readonly_retry_delay_s))
         self.alert_cooldown_s = max(0.0, float(alert_cooldown_s))
         self._alert_sender = alert_sender
+        self._job_dependencies = (
+            dict(dependency_wait_s) if dependency_wait_s is not None else dict(self.DEFAULT_JOB_DEPENDENCIES)
+        )
+        self._dependency_poll_s = max(0.01, float(dependency_poll_s))
         self._last_failure_alert_mono: dict[str, float] = {}
         self._alerted_failed_jobs: set[str] = set()
         self._thread_local = threading.local()
@@ -775,11 +788,35 @@ class WorkerScheduler:
                 "started_at_utc": self.started_at_utc.strftime("%Y-%m-%d %H:%M UTC"),
                 "heartbeat_utc": now.strftime("%Y-%m-%d %H:%M:%S UTC"),
                 "telegram_enabled": self.telegram_enabled,
-                "testnet_execution_enabled": _env_flag("HL_ENABLE_TESTNET_EXECUTION", False),
+                "testnet_execution_enabled": _testnet_exec_enabled()[0],
                 "jobs": [dict(self._state[j.name]) for j in self.jobs],
             }
             _write_json_atomic(self.status_path, payload)
             return payload
+
+    def _is_job_running(self, dep_name: str) -> bool:
+        dep_lock = self._job_locks.get(dep_name)
+        if dep_lock is not None and dep_lock.locked():
+            return True
+        with self._status_lock:
+            return str((self._state.get(dep_name) or {}).get("state") or "") == "running"
+
+    def _wait_for_dependency(self, job_name: str) -> None:
+        dep = self._job_dependencies.get(job_name)
+        if dep is None:
+            return
+        dep_name, max_wait_s = dep
+        if max_wait_s <= 0 or not self._is_job_running(dep_name):
+            return
+        print(
+            f"[hl-worker] {job_name} waiting up to {max_wait_s:.0f}s for upstream {dep_name} to finish...",
+            flush=True,
+        )
+        deadline = time.monotonic() + float(max_wait_s)
+        while time.monotonic() < deadline and not self._stop_event.is_set():
+            if not self._is_job_running(dep_name):
+                break
+            self._stop_event.wait(timeout=min(self._dependency_poll_s, max(0.01, deadline - time.monotonic())))
 
     def run_job(self, job: JobSpec, *, force: bool = False) -> int:
         enabled, reason = job.is_enabled()
@@ -802,6 +839,7 @@ class WorkerScheduler:
             print(f"[hl-worker] skipping overlapping run of {job.name}", flush=True)
             return 0
         try:
+            self._wait_for_dependency(job.name)
             start_dt = datetime.now(tz=timezone.utc)
             t0 = time.monotonic()
             with self._status_lock:

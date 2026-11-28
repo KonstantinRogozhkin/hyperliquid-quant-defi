@@ -175,6 +175,15 @@ def classify_ny_tradfi_session(ts_ms: int) -> str:
     return "US_OVERNIGHT"
 
 
+def compute_hip3_builder_fees_bps(*, is_growth: bool, fee_scale: float) -> tuple[float, float]:
+    """Return ``(taker_bps, maker_bps)`` per Hyperliquid HIP-3 deployerFeeScale & Growth Mode spec."""
+    fs = max(0.0, float(fee_scale))
+    scale_mult = (1.0 + fs) if fs <= 1.0 else (2.0 * fs)
+    taker_bps = round((0.45 if is_growth else 4.5) * scale_mult, 2)
+    maker_bps = round((0.15 if is_growth else 1.5) * scale_mult, 2)
+    return taker_bps, maker_bps
+
+
 def fetch_hip3_builders_and_markets(
     client: httpx.Client,
     *,
@@ -222,9 +231,8 @@ def fetch_hip3_builders_and_markets(
                 fee_scale = max(0.0, _f(u.get("deployerFeeScale"), 1.0))
                 last_gm_ts = u.get("lastGrowthModeChangeTime") or u.get("lastFeeScaleChangeTime")
                 gm_lock_left = compute_growth_mode_lock_days_left(str(last_gm_ts)) if (is_growth and last_gm_ts) else None
-                # HIP-3 Growth Mode reduces base fees by >= 90%: Tier-0 taker ~0.45-0.90 bps, maker ~0.15-0.30 bps
-                taker_bps = round((0.45 * (1.0 + fee_scale)) if is_growth else (4.5 * max(1.0, fee_scale)), 2)
-                maker_bps = round((0.15 * (1.0 + fee_scale)) if is_growth else (1.5 * max(1.0, fee_scale)), 2)
+                # HIP-3 fee schedule: scale_mult = (1 + s) for s <= 1 else 2*s; Growth Mode cuts base by 90%
+                taker_bps, maker_bps = compute_hip3_builder_fees_bps(is_growth=is_growth, fee_scale=fee_scale)
                 markets.append(
                     Hip3BuilderMarket(
                         dex=dex_name,
@@ -273,50 +281,54 @@ def scan_hip3_cross_builder_arb(
         if len(legs) < 2:
             continue
         legs_sorted = sorted(legs, key=lambda x: -x.funding_apr_pct)
-        hi, lo = legs_sorted[0], legs_sorted[-1]
-        if hi.dex == lo.dex:
-            continue
-        # Guard symbol collision: mark prices must agree within 10%
-        if not (0.90 <= hi.mark_px / lo.mark_px <= 1.10):
-            continue
-        spread = hi.funding_apr_pct - lo.funding_apr_pct
-        if spread < min_spread_apr_pct:
-            continue
-        mark_basis = (hi.mark_px - lo.mark_px) / lo.mark_px * 1e4
-        ora_div_bps = (abs(hi.oracle_px - lo.oracle_px) / lo.oracle_px * 1e4) if lo.oracle_px > 0 else 0.0
-        rt_maker = round(2.0 * (hi.est_maker_fee_bps + lo.est_maker_fee_bps), 2)
-        rt_taker = round(2.0 * (hi.est_taker_fee_bps + lo.est_taker_fee_bps), 2)
-        locks = [d for d in (hi.growth_mode_lock_days_left, lo.growth_mode_lock_days_left) if d is not None]
-        min_lock = min(locks) if locks else None
-        # Each HIP-3 DEX clears & margins independently (no cross-DEX netting). At 2x per-leg
-        # margin (50% collateral per leg => 1.0x total equity per $1 notional on each leg -> 50% cap eff.):
-        net_apr_split = round(spread * 0.5, 2)
-        prelim.append(
-            Hip3CrossBuilderOpp(
-                base_symbol=base,
-                short_symbol=hi.full_symbol,
-                long_symbol=lo.full_symbol,
-                short_dex=hi.dex,
-                long_dex=lo.dex,
-                short_apr_pct=hi.funding_apr_pct,
-                long_apr_pct=lo.funding_apr_pct,
-                spread_apr_pct=round(spread, 2),
-                mark_basis_bps=round(mark_basis, 2),
-                short_vol_usd=hi.day_vol_usd,
-                long_vol_usd=lo.day_vol_usd,
-                short_oi_usd=hi.oi_usd,
-                long_oi_usd=lo.oi_usd,
-                any_only_isolated=bool(hi.only_isolated or lo.only_isolated),
-                both_growth_mode=bool(hi.growth_mode and lo.growth_mode),
-                oracle_divergence_bps=round(ora_div_bps, 2),
-                oracle_risk_warning=ora_div_bps > 15.0,
-                est_rt_maker_fee_bps=rt_maker,
-                est_rt_taker_fee_bps=rt_taker,
-                independent_dex_margin=True,
-                net_apr_split_margin_pct=net_apr_split,
-                min_growth_lock_days_left=min_lock,
-            )
-        )
+        best_opp: Hip3CrossBuilderOpp | None = None
+        best_rank: tuple[bool, float, float] | None = None
+        for i, hi in enumerate(legs_sorted):
+            for lo in legs_sorted[i + 1 :]:
+                if hi.dex == lo.dex:
+                    continue
+                # Guard symbol collision: mark prices must agree within 10%
+                if not (0.90 <= hi.mark_px / lo.mark_px <= 1.10):
+                    continue
+                spread = hi.funding_apr_pct - lo.funding_apr_pct
+                if spread < min_spread_apr_pct:
+                    continue
+                mark_basis = (hi.mark_px - lo.mark_px) / lo.mark_px * 1e4
+                ora_div_bps = (abs(hi.oracle_px - lo.oracle_px) / lo.oracle_px * 1e4) if lo.oracle_px > 0 else 0.0
+                rt_maker = round(2.0 * (hi.est_maker_fee_bps + lo.est_maker_fee_bps), 2)
+                rt_taker = round(2.0 * (hi.est_taker_fee_bps + lo.est_taker_fee_bps), 2)
+                locks = [d for d in (hi.growth_mode_lock_days_left, lo.growth_mode_lock_days_left) if d is not None]
+                min_lock = min(locks) if locks else None
+                net_apr_split = round(spread * 0.5, 2)
+                rank_key = (ora_div_bps <= 25.0, round(spread, 6), min(hi.day_vol_usd, lo.day_vol_usd))
+                if best_rank is None or rank_key > best_rank:
+                    best_rank = rank_key
+                    best_opp = Hip3CrossBuilderOpp(
+                        base_symbol=base,
+                        short_symbol=hi.full_symbol,
+                        long_symbol=lo.full_symbol,
+                        short_dex=hi.dex,
+                        long_dex=lo.dex,
+                        short_apr_pct=hi.funding_apr_pct,
+                        long_apr_pct=lo.funding_apr_pct,
+                        spread_apr_pct=round(spread, 2),
+                        mark_basis_bps=round(mark_basis, 2),
+                        short_vol_usd=hi.day_vol_usd,
+                        long_vol_usd=lo.day_vol_usd,
+                        short_oi_usd=hi.oi_usd,
+                        long_oi_usd=lo.oi_usd,
+                        any_only_isolated=bool(hi.only_isolated or lo.only_isolated),
+                        both_growth_mode=bool(hi.growth_mode and lo.growth_mode),
+                        oracle_divergence_bps=round(ora_div_bps, 2),
+                        oracle_risk_warning=ora_div_bps > 15.0,
+                        est_rt_maker_fee_bps=rt_maker,
+                        est_rt_taker_fee_bps=rt_taker,
+                        independent_dex_margin=True,
+                        net_apr_split_margin_pct=net_apr_split,
+                        min_growth_lock_days_left=min_lock,
+                    )
+        if best_opp is not None:
+            prelim.append(best_opp)
 
     prelim.sort(key=lambda o: (-o.spread_apr_pct, -min(o.short_vol_usd, o.long_vol_usd)))
     if book_fetcher is None:

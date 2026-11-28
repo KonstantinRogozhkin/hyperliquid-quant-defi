@@ -15,6 +15,7 @@ services:
       HL_DATA_DIR: /app/data
       HL_DATA_ROOT: /app/data/paper
       HL_BUILD_SHA: ${DEPLOY_SHA:-local}
+      HL_CORS_ORIGINS: ${HL_CORS_ORIGINS:-}
     volumes:
       - ./data:/app/data:ro
     ports:

@@ -234,7 +234,16 @@ def fetch_hyperevm_yield_inputs(
     boros_days = 0.0
     try:
         _, b_mkts = boros.fetch_boros_active_markets(client)
-        hype_mkts = [m for m in b_mkts if m.is_hyperliquid and not m.is_spread_market and m.underlying == "HYPE" and m.days_to_maturity >= 5.0]
+        hype_mkts = [
+            m
+            for m in b_mkts
+            if m.is_hyperliquid
+            and not m.is_spread_market
+            and m.underlying == "HYPE"
+            and m.days_to_maturity >= 5.0
+            and m.is_actionable
+            and m.best_bid_apr_pct is not None
+        ]
         if hype_mkts:
             best = max(hype_mkts, key=lambda m: m.notional_oi)
             boros_name = best.name
@@ -262,9 +271,9 @@ def fetch_hyperevm_yield_inputs(
         apy = _f(p.get("apy"))
         if "hyperliquid" not in chain and "hyperevm" not in chain:
             continue
-        if proj == "kinetiq-khype" and sym == "KHYPE":
+        if proj == "kinetiq-khype" and sym == "KHYPE" and tvl >= khype_tvl:
             khype_apy, khype_tvl = apy, tvl
-        elif proj == "sthype" and sym == "STHYPE":
+        elif proj == "sthype" and sym == "STHYPE" and tvl >= sthype_tvl:
             sthype_apy, sthype_tvl = apy, tvl
         elif proj == "morpho-blue" and "FEUSD" in sym and tvl > morpho_feusd_tvl:
             morpho_feusd_apy, morpho_feusd_tvl = apy, tvl
@@ -274,7 +283,7 @@ def fetch_hyperevm_yield_inputs(
             felix_whype_tvl = max(felix_whype_tvl, tvl)
         elif proj == "liminal-basis" and "HYPE" in sym:
             liminal_apy = max(liminal_apy, apy)
-        elif proj == "hyperliquid-hlp":
+        elif proj == "hyperliquid-hlp" and tvl >= hlp_tvl:
             hlp_apr, hlp_tvl = apy, tvl
 
     return HyperEvmYieldInputs(

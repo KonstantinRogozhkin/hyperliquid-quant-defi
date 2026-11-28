@@ -152,11 +152,16 @@ def apply_vol_target(
     target_vol_annual: float = 0.12,
     lookback_h: int = 168,
     max_leverage: float = 3.0,
+    cost_bps: float = 0.0,
 ) -> pd.Series:
     """Strictly causal rolling volatility targeting (uses ``shift(1)`` realized vol)."""
     realized = ret.shift(1).rolling(lookback_h, min_periods=24).std() * math.sqrt(HOURS_PER_YEAR)
     scale = (target_vol_annual / realized.replace(0.0, np.nan)).clip(lower=0.25, upper=max_leverage).fillna(1.0)
-    return (ret * scale).rename(ret.name)
+    scaled = ret * scale
+    if cost_bps > 0.0:
+        d_scale = scale.sub(scale.shift(1, fill_value=1.0)).abs()
+        scaled = scaled - d_scale * (float(cost_bps) / 1e4)
+    return scaled.rename(ret.name)
 
 
 def build_metamodel(

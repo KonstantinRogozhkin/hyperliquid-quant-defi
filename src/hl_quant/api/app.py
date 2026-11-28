@@ -28,7 +28,9 @@ ARTIFACT_FILES: dict[str, str] = {
     "hip3": "hl_hip3_arb/snapshot.json",
     "hip3_paper": "hl_hip3_paper/state.json",
     "spot_perp_paper": "hl_spot_perp_paper/state.json",
+    "spot_perp_scan": "hl_spot_perp_paper/snapshot.json",
     "autopilot": "hl_autopilot/state.json",
+    "benchmarks": "hl_benchmarks/daily_closes.json",
     "boros": "hl_boros/snapshot.json",
     "yield_stack": "hl_hyperevm_yield_stack/snapshot.json",
     "onchain_events": "hl_onchain_events/latest_snapshot.json",
@@ -119,12 +121,19 @@ def _read_metamodel_positions(data_root: Path) -> list[dict[str, Any]]:
     for coin, info in raw_pos.items():
         if not isinstance(info, dict):
             continue
+        raw_legs = info.get("cex_legs")
+        cex_legs = (
+            {str(k): float(v) for k, v in raw_legs.items() if v is not None}
+            if isinstance(raw_legs, dict)
+            else {}
+        )
         rows.append(
             {
                 "coin": str(coin),
                 "hl_weight": float(info.get("hl_weight", 0.0) or 0.0),
                 "cex_weight": float(info.get("cex_weight", 0.0) or 0.0),
                 "cex_venue": str(info.get("cex_venue") or ""),
+                "cex_legs": cex_legs,
                 "last_hl_px": info.get("last_hl_px"),
                 "l2_spread_bps": info.get("l2_spread_bps"),
                 "cum_pnl_usd": float(info.get("cum_pnl_usd", 0.0) or 0.0),
@@ -167,16 +176,22 @@ def _audit_record(rec: dict[str, Any]) -> dict[str, Any]:
     return {
         "ts_ms": ts_ms,
         "observed_at_utc": obs,
+        "mode": str(rec.get("mode") or "testnet_live"),
         "status": str(rec.get("status") or "unknown"),
+        "derisk_mode": rec.get("derisk_mode"),
         "violations": list(rec.get("violations") or []),
         "cancelled_count": int(rec.get("cancelled_count", 0) or 0),
         "placed_count": int(rec.get("placed_count", 0) or 0),
+        "orphan_unwind_count": int(rec.get("orphan_unwind_count", 0) or 0),
         "total_notional_usd": float(rec.get("total_notional_usd", 0.0) or 0.0),
         "high_water_mark_usd": float(rec.get("high_water_mark_usd", 0.0) or 0.0),
         "blocked_isolated_coins": list(rec.get("blocked_isolated_coins") or []),
+        "blocked_leverage_coins": list(rec.get("blocked_leverage_coins") or []),
+        "foreign_coins": list(rec.get("foreign_coins") or []),
         "skipped_unquoted_coins": list(rec.get("skipped_unquoted_coins") or []),
         "orphan_positions": dict(rec.get("orphan_positions") or {}),
         "equity_usd": _opt_float(rec.get("equity_usd")),
+        "free_margin_usd": _opt_float(rec.get("free_margin_usd")),
         "drawdown_pct": _opt_float(rec.get("drawdown_pct")),
         "orphan_notional_usd": _opt_float(rec.get("orphan_notional_usd")),
     }

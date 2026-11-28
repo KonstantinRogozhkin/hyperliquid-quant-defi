@@ -120,11 +120,56 @@ def fetch_l2_quotes(client: hl.HyperliquidInfoClient, coins: list[str]) -> dict[
     return quotes
 
 
+def _extend_market_for_live_decision(market: af.WideMarket) -> af.WideMarket:
+    """Append the post-bar decision timestamp ``last_hour + 1h`` for causal ``.shift(1)`` builders.
+
+    ``market.hours[-1]`` is the start of the most recent *completed* 1h bar ``[h_{T-1}, h_T)``
+    (e.g. ``23:00 UTC`` when evaluated at ``00:05 UTC``). Because every weight builder in
+    ``alpha_families`` shifts inputs by ``.shift(1)`` so ``w_df.loc[h_t]`` uses bars closed up
+    through ``h_{t-1}``, evaluating at ``h_T = market.hours[-1] + HOUR_MS`` (``00:00 UTC``)
+    incorporates the just-closed bar with zero look-ahead and hits canonical UTC boundaries
+    (``00:00`` / ``12:00 UTC``) right on schedule.
+    """
+    if len(market.hours) == 0:
+        return market
+    eval_h = int(market.hours[-1]) + 3_600_000
+    ext_hours = np.append(market.hours, np.int64(eval_h))
+
+    def _append_row(df: pd.DataFrame, fill_val: float) -> pd.DataFrame:
+        extra = pd.DataFrame(fill_val, index=[eval_h], columns=df.columns, dtype=float)
+        return pd.concat([df, extra], axis=0)
+
+    return af.WideMarket(
+        hours=ext_hours,
+        coins=list(market.coins),
+        hl_close=_append_row(market.hl_close, np.nan),
+        hl_ret_next=_append_row(market.hl_ret_next, 0.0),
+        hl_fund_next=_append_row(market.hl_fund_next, 0.0),
+        hl_rate_h=_append_row(market.hl_rate_h, np.nan),
+        hl_notional=_append_row(market.hl_notional, np.nan),
+        bybit_close=_append_row(market.bybit_close, np.nan),
+        bybit_ret_next=_append_row(market.bybit_ret_next, 0.0),
+        bybit_fund_next=_append_row(market.bybit_fund_next, 0.0),
+        bybit_rate_h=_append_row(market.bybit_rate_h, np.nan),
+        bybit_notional=_append_row(market.bybit_notional, np.nan),
+        binance_close=_append_row(market.binance_close, np.nan),
+        binance_ret_next=_append_row(market.binance_ret_next, 0.0),
+        binance_fund_next=_append_row(market.binance_fund_next, 0.0),
+        binance_rate_h=_append_row(market.binance_rate_h, np.nan),
+        binance_notional=_append_row(market.binance_notional, np.nan),
+        okx_close=_append_row(market.okx_close, np.nan),
+        okx_ret_next=_append_row(market.okx_ret_next, 0.0),
+        okx_fund_next=_append_row(market.okx_fund_next, 0.0),
+        okx_rate_h=_append_row(market.okx_rate_h, np.nan),
+        okx_notional=_append_row(market.okx_notional, np.nan),
+    )
+
+
 def compute_latest_target_positions(
     market: af.WideMarket,
     sleeves: list[MetamodelSleeve],
 ) -> dict[str, dict[str, Any]]:
-    """Compute net target HL and CEX hedge weights at the latest hour ``market.hours[-1]``.
+    """Compute net target HL and CEX hedge weights after the latest closed bar ``market.hours[-1]``.
 
     Sign convention in output:
     * ``hl_weight``: signed HL perp notional weight (+long HL, -short HL) as fraction of equity.
@@ -132,6 +177,7 @@ def compute_latest_target_positions(
       may hedge the same coin on different venues, so each venue is a separate leg.
     * ``cex_weight``: sum of ``cex_legs``; ``cex_venue``: the venue with the largest leg (display only).
     """
+    eval_market = _extend_market_for_live_decision(market)
     net_hl: dict[str, float] = {c: 0.0 for c in market.coins}
     net_cex: dict[str, dict[str, float]] = {c: {} for c in market.coins}
 
@@ -141,7 +187,7 @@ def compute_latest_target_positions(
     for sl in sleeves:
         spec = sl.spec
         if spec.family == "funding_carry_arb":
-            w_df, vc_df = af.build_funding_carry_weights(market, spec.params)
+            w_df, vc_df = af.build_funding_carry_weights(eval_market, spec.params)
             last_w = w_df.iloc[-1]
             last_vc = vc_df.iloc[-1] if vc_df is not None else None
             for coin, raw_w in last_w.items():
@@ -159,7 +205,7 @@ def compute_latest_target_positions(
                         venue = "binance"
                 add_cex(coin, venue, leg_w)
         elif spec.family == "basis_mean_reversion":
-            w_df = af.build_basis_mr_weights(market, spec.params)
+            w_df = af.build_basis_mr_weights(eval_market, spec.params)
             last_w = w_df.iloc[-1]
             for coin, raw_w in last_w.items():
                 if not math.isfinite(raw_w) or abs(raw_w) < 1e-9:
@@ -168,17 +214,17 @@ def compute_latest_target_positions(
                 net_hl[coin] -= leg_w
                 add_cex(coin, "bybit", leg_w)
         elif spec.family == "hl_xs_funding_contrarian":
-            w_df = af.build_xs_funding_contrarian_weights(market, spec.params)
+            w_df = af.build_xs_funding_contrarian_weights(eval_market, spec.params)
             for coin, raw_w in w_df.iloc[-1].items():
                 if math.isfinite(raw_w) and abs(raw_w) >= 1e-9:
                     net_hl[coin] += float(raw_w) * sl.weight
         elif spec.family == "hl_xs_price_reversal_mom":
-            w_df = af.build_xs_price_weights(market, spec.params)
+            w_df = af.build_xs_price_weights(eval_market, spec.params)
             for coin, raw_w in w_df.iloc[-1].items():
                 if math.isfinite(raw_w) and abs(raw_w) >= 1e-9:
                     net_hl[coin] += float(raw_w) * sl.weight
         elif spec.family == "hl_xs_velocity_div":
-            w_df = af.build_xs_velocity_divergence_weights(market, spec.params)
+            w_df = af.build_xs_velocity_divergence_weights(eval_market, spec.params)
             for coin, raw_w in w_df.iloc[-1].items():
                 if math.isfinite(raw_w) and abs(raw_w) >= 1e-9:
                     net_hl[coin] += float(raw_w) * sl.weight
@@ -291,6 +337,10 @@ def run_paper_tick(
             "positions": {},
             "tick_count": 0,
             "nav_guard_triggers": 0,
+            "nav_guard_triggered": False,
+            "cum_funding_usd": 0.0,
+            "cum_price_pnl_usd": 0.0,
+            "cum_costs_usd": 0.0,
         }
 
     prev_hour_ms = state.get("last_tick_hour_ms")
@@ -301,17 +351,6 @@ def run_paper_tick(
     prev_pos: dict[str, dict[str, Any]] = state.get("positions", {})
     nav_guard_triggers = int(state.get("nav_guard_triggers", 0) or 0)
 
-    # A held coin missing from this tick's market data cannot be marked to market;
-    # treating it as closed would drop its PnL and charge exit costs. Skip the tick instead.
-    missing_held = sorted(c for c in prev_pos if c not in market.coins)
-    if missing_held:
-        return {
-            "status": "held_coins_missing",
-            "tick_hour_ms": tick_hour_ms,
-            "equity_usd": state["equity_usd"],
-            "missing_coins": missing_held,
-        }
-
     def _cur_cex_px(venue: str, coin_name: str) -> float:
         if cex_mid_prices:
             v_map = cex_mid_prices.get(venue.lower()) or cex_mid_prices.get(venue) or {}
@@ -319,6 +358,51 @@ def run_paper_tick(
             if live_px is not None and math.isfinite(float(live_px)) and float(live_px) > 0:
                 return float(live_px)
         return _last_known(_cex_frames(market, venue)[0], coin_name, tick_hour_ms)
+
+    # A held coin or held CEX leg missing a valid synchronous price/funding feed cannot be marked
+    # to market safely; skip the tick without mutating state.json rather than mixing asynchronous
+    # prices or dropping a leg as NaN.
+    missing_held_set: set[str] = {c for c in prev_pos if c not in market.coins}
+    if prev_hour_ms is not None and prev_pos:
+        for coin, p in prev_pos.items():
+            if coin in missing_held_set:
+                continue
+            cur_hl_px = quotes[coin].mid_px if coin in quotes else _last_known(market.hl_close, coin, tick_hour_ms)
+            if not (math.isfinite(cur_hl_px) and cur_hl_px > 0):
+                missing_held_set.add(coin)
+                continue
+            active_cex_legs = {v: cw for v, cw in _cex_legs(p).items() if abs(cw) > 1e-9}
+            if active_cex_legs and cex_mid_prices is not None and coin not in quotes:
+                missing_held_set.add(coin)
+                continue
+            for venue in active_cex_legs:
+                cex_close_df, cex_fund_df = _cex_frames(market, venue)
+                if cex_mid_prices is not None:
+                    v_map = cex_mid_prices.get(venue.lower()) or cex_mid_prices.get(venue) or {}
+                    live_c_px = v_map.get(coin)
+                    if live_c_px is None or not (math.isfinite(float(live_c_px)) and float(live_c_px) > 0):
+                        missing_held_set.add(coin)
+                        break
+                cur_cex_px = _cur_cex_px(venue, coin)
+                if not (math.isfinite(cur_cex_px) and cur_cex_px > 0):
+                    missing_held_set.add(coin)
+                    break
+                if (
+                    coin not in cex_fund_df.columns
+                    or cex_fund_df[coin].isna().all()
+                    or coin not in cex_close_df.columns
+                    or cex_close_df[coin].loc[:tick_hour_ms].dropna().empty
+                ):
+                    missing_held_set.add(coin)
+                    break
+
+    if missing_held_set:
+        return {
+            "status": "held_coins_missing",
+            "tick_hour_ms": tick_hour_ms,
+            "equity_usd": state["equity_usd"],
+            "missing_coins": sorted(missing_held_set),
+        }
 
     # 1. Mark-to-market PnL and funding accrual over (prev_hour_ms, tick_hour_ms]
     price_pnl_usd = 0.0
@@ -411,8 +495,10 @@ def run_paper_tick(
                 cand_hw = float(t.get("hl_weight", 0.0))
                 cand_legs = dict(t.get("cex_legs", {}))
                 same_hl_dir = old_hw != 0.0 and cand_hw != 0.0 and (old_hw * cand_hw > 0.0)
-                same_venues = bool(old_legs) and set(old_legs) == set(cand_legs) and all(
-                    old_legs[v] * cand_legs[v] > 0.0 for v in old_legs
+                same_venues = (not old_legs and not cand_legs) or (
+                    bool(old_legs)
+                    and set(old_legs) == set(cand_legs)
+                    and all(old_legs[v] * cand_legs[v] > 0.0 for v in old_legs)
                 )
                 if same_hl_dir and same_venues:
                     dhw_cand = abs(cand_hw - old_hw)
@@ -422,7 +508,7 @@ def run_paper_tick(
                             "hl_weight": old_hw,
                             "cex_legs": dict(old_legs),
                             "cex_weight": round(sum(old_legs.values()), 6),
-                            "cex_venue": old_p.get("cex_venue") or t.get("cex_venue"),
+                            "cex_venue": old_p.get("cex_venue") or t.get("cex_venue") or "",
                         }
                         continue
             targets[coin] = t
@@ -518,6 +604,31 @@ def run_paper_tick(
         "nav_guard_triggered": nav_guard_triggered,
     }
 
+    # Seed cumulative totals from prior state (or back-fill from prior non-clamped ticks when upgrading)
+    if (
+        "cum_funding_usd" in state
+        and "cum_price_pnl_usd" in state
+        and "cum_costs_usd" in state
+    ):
+        prev_cum_fund = float(state.get("cum_funding_usd") or 0.0)
+        prev_cum_px = float(state.get("cum_price_pnl_usd") or 0.0)
+        prev_cum_costs = float(state.get("cum_costs_usd") or 0.0)
+    elif ticks_path.exists():
+        old_t = pd.read_parquet(ticks_path)
+        if "tick_hour_ms" in old_t.columns:
+            old_t = old_t[old_t["tick_hour_ms"] < tick_hour_ms]
+        prev_cum_fund = float(old_t["fund_pnl_usd"].sum()) if "fund_pnl_usd" in old_t.columns else 0.0
+        prev_cum_px = float(old_t["price_pnl_usd"].sum()) if "price_pnl_usd" in old_t.columns else 0.0
+        prev_cum_costs = float((-old_t["cost_pnl_usd"]).clip(lower=0.0).sum()) if "cost_pnl_usd" in old_t.columns else 0.0
+    else:
+        prev_cum_fund = 0.0
+        prev_cum_px = 0.0
+        prev_cum_costs = 0.0
+
+    cum_funding_usd = round(prev_cum_fund + fund_pnl_usd, 4)
+    cum_price_pnl_usd = round(prev_cum_px + price_pnl_usd, 4)
+    cum_costs_usd = round(prev_cum_costs + abs(cost_pnl_usd), 4)
+
     _append_parquet(ticks_path, pd.DataFrame([tick_row]), dedup_subset=["tick_hour_ms"])
     if trade_rows:
         _append_parquet(trades_path, pd.DataFrame(trade_rows), dedup_subset=["tick_hour_ms", "coin"])
@@ -525,10 +636,14 @@ def run_paper_tick(
     state_out = {
         "starting_capital_usd": float(state["starting_capital_usd"]),
         "equity_usd": new_equity,
+        "cum_funding_usd": cum_funding_usd,
+        "cum_price_pnl_usd": cum_price_pnl_usd,
+        "cum_costs_usd": cum_costs_usd,
         # A clamped tick keeps the previous clock so the confirming tick covers the full interval.
         "last_tick_hour_ms": prev_hour_ms if nav_guard_triggered else tick_hour_ms,
         "tick_count": int(state.get("tick_count", 0)) + 1,
         "nav_guard_triggers": nav_guard_triggers,
+        "nav_guard_triggered": nav_guard_triggered,
         "nav_guard_reason": nav_guard_reason,
         "nav_guard_pending_tick_hour_ms": nav_guard_pending,
         "positions": new_positions,

@@ -152,6 +152,7 @@ def compute_fold_weights(
     max_active_slots: int = 5,
     max_weight_per_coin: float = 0.25,
     prev_signals: dict[str, int] | None = None,
+    prev_held_coins: Iterable[str] | None = None,
 ) -> tuple[pd.DataFrame, dict[str, int]]:
     """Compute signed per-coin weights for ``fold_hours`` using only past signals.
 
@@ -203,7 +204,8 @@ def compute_fold_weights(
         return pd.DataFrame(weights, index=fold_hours, columns=selected_coins), end_signals
 
     # active_slots: concentrate capital into currently active coins, capped by max_active_slots & max_weight_per_coin
-    held_slots: set[int] = set()
+    init_held = set(prev_held_coins or ())
+    held_slots: set[int] = {j for j, c in enumerate(selected_coins) if c in init_held}
     slots = max(1, min(max_active_slots, len(selected_coins)))
     for i in range(n):
         active_idxs = [j for j, c in enumerate(selected_coins) if sig_map[c][i] != 0]
@@ -298,9 +300,12 @@ def evaluate_walk_forward(
     if len(all_hours) < train_h + test_h:
         raise ValueError("not enough history for even one walk-forward fold")
 
+    max_lookback_h = max(168, max(p.lookback_h for p in grid))
     fold_frames: list[pd.DataFrame] = []
     fold_meta: list[tuple[int, int, int, int, int, list[str], fa.Params, dict[str, float]]] = []
     prev_signals: dict[str, int] = {}
+    prev_held_coins: set[str] = set()
+    prev_test_end_ms: int | None = None
 
     fold_idx = 0
     cursor = train_h
@@ -313,9 +318,12 @@ def evaluate_walk_forward(
         train_start = int(train_hours[0])
         test_start = int(test_hours[0])
         test_end = int(test_hours[-1])
+        warmup_start = train_start - (max_lookback_h + 1) * fa.HOUR_MS
 
-        # Slice panels strictly to [train_start, test_start) for liquidity & ranking
+        # Slice panels strictly to [train_start, test_start) for liquidity & ranking, while keeping
+        # up to max_lookback_h warm-up rows prior to train_start for rolling train feature warm-up.
         train_only_panels: dict[str, pd.DataFrame] = {}
+        train_warm_panels: dict[str, pd.DataFrame] = {}
         eligible: list[str] = []
         for coin, panel in sorted(panels.items()):
             tr = panel[(panel.index >= train_start) & (panel.index < test_start)]
@@ -332,10 +340,13 @@ def evaluate_walk_forward(
             if liq.eligible:
                 eligible.append(coin)
                 train_only_panels[coin] = tr
+                train_warm_panels[coin] = panel[(panel.index >= warmup_start) & (panel.index < test_start)]
 
         if not eligible:
             fold_frames.append(pd.DataFrame(index=test_hours, dtype=float))
             prev_signals = {}
+            prev_held_coins = set()
+            prev_test_end_ms = test_end
             cursor = test_end_idx
             fold_idx += 1
             continue
@@ -351,6 +362,8 @@ def evaluate_walk_forward(
         if ranking.empty or "rank_score" not in ranking.columns:
             fold_frames.append(pd.DataFrame(index=test_hours, dtype=float))
             prev_signals = {}
+            prev_held_coins = set()
+            prev_test_end_ms = test_end
             cursor = test_end_idx
             fold_idx += 1
             continue
@@ -359,7 +372,7 @@ def evaluate_walk_forward(
         selected = picked_df["coin"].head(top_k).tolist()
 
         chosen_params, train_m = _select_params_on_train(
-            train_only_panels,
+            train_warm_panels,
             selected,
             train_hours,
             grid=grid,
@@ -369,7 +382,10 @@ def evaluate_walk_forward(
             max_weight_per_coin=max_weight_per_coin,
         )
 
-        # Compute OOS weights for this fold (carry forward signals only for coins kept from previous fold)
+        # Compute OOS weights for this fold (carry forward signals & held slots across contiguous folds)
+        is_contiguous = prev_test_end_ms is not None and test_start == prev_test_end_ms + fa.HOUR_MS
+        carried_held = (prev_held_coins & set(selected)) if is_contiguous else set()
+        carried_sigs = {c: prev_signals.get(c, 0) for c in selected} if is_contiguous else {}
         fold_w, end_sig = compute_fold_weights(
             panels,
             selected,
@@ -378,11 +394,16 @@ def evaluate_walk_forward(
             allocation=allocation,
             max_active_slots=max_active_slots,
             max_weight_per_coin=max_weight_per_coin,
-            prev_signals={c: prev_signals.get(c, 0) for c in selected},
+            prev_signals=carried_sigs,
+            prev_held_coins=carried_held,
         )
         fold_frames.append(fold_w)
         fold_meta.append((fold_idx, train_start, test_start, test_end, len(eligible), selected, chosen_params, train_m))
         prev_signals = end_sig
+        prev_held_coins = {
+            c for c in fold_w.columns if not fold_w.empty and abs(float(fold_w.iloc[-1][c])) > 1e-12
+        }
+        prev_test_end_ms = test_end
         cursor = test_end_idx
         fold_idx += 1
 

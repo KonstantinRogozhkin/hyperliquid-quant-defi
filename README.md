@@ -13,7 +13,7 @@
 
 ## Verified Live Results
 
-Standalone full-stack quant suite: Python package **`hl_quant`** (`src/hl_quant/`, zero external monorepo dependencies, **186+ passing unit tests**, zero warnings), **FastAPI read-only desk API**, **React + Vite + TypeScript Live Desk SPA** (10 Vitest checks), **15-job Docker `worker` scheduler** (with cooldown-gated Telegram failure/recovery alerts), and automated **GHCR + Dokploy CI/CD** behind a protected PR-only `main` branch (`tests` + `frontend` required checks). Every number below comes from live Hyperliquid Mainnet feeds, Hyperliquid Testnet executions, HyperEVM Chain 999 RPC (`eth_call`), Pendle Boros Open API, and reproducible OOS studies.
+Standalone full-stack quant suite: Python package **`hl_quant`** (`src/hl_quant/`, zero external monorepo dependencies, **291+ passing unit tests**, zero warnings), **FastAPI read-only desk API** (with `/metrics` OpenMetrics exposition & `/api/v1/analytics`), **7-tab React + Vite + TypeScript Live Desk SPA** (28+ Vitest checks, EN/RU i18n), **16-job Docker `worker` scheduler** (with cooldown-gated Telegram failure/recovery alerts), and automated **GHCR + Dokploy CI/CD** behind a protected PR-only `main` branch (`tests` + `frontend` required checks). Every number below comes from live Hyperliquid Mainnet feeds, Hyperliquid Testnet executions, HyperEVM Chain 999 RPC (`eth_call`), Pendle Boros Open API, and reproducible OOS studies.
 
 | Module | Scope | Verified Result | Report / Proof |
 |---|---|---|---|
@@ -58,8 +58,8 @@ flowchart LR
 
     subgraph Web["Dokploy Stack (GHCR Immutable SHA)"]
         VOL[("Shared Volume<br/>/app/data (Atomic Parquet/JSON)")]
-        API["FastAPI Backend (:8000)<br/>Read-Only /api/v1/* · /healthz"]
-        SPA["Nginx + React/Vite/TS SPA (:80)<br/>6-Tab Live Desk · /api/ Proxy"]
+        API["FastAPI Backend (:8000)<br/>Read-Only /api/v1/* · /metrics · /healthz"]
+        SPA["Nginx + React/Vite/TS SPA (:80)<br/>7-Tab Live Desk · /api/ Proxy"]
     end
 
     HL --> MM --> VOL
@@ -82,7 +82,7 @@ Requires **Python >= 3.11.5** (and **Node >= 22** or **Docker** for the live web
 # 1. Install Python environment, dev tools & optional Testnet SDK
 uv sync --all-extras
 
-# 2. Run lint and the full 186+ unit test suite
+# 2. Run lint and the full 291+ unit test suite
 make lint
 make test
 
@@ -123,9 +123,9 @@ zsh scripts/ops/install_all_hl_crons.sh
 
 ## Repository Layout
 
-- `src/hl_quant/` — 31 reusable modules (research, MM, execution, 5-DEX, HIP-3 + Split-Margin Paper, Boros, HyperEVM, attribution, FastAPI `api/`, and 13-job container `scheduler.py`).
-- `frontend/` — React + Vite + TypeScript 6-tab live quant desk SPA (with Vitest suite).
+- `src/hl_quant/` — 37 reusable modules (research, MM, execution, 5-DEX, HIP-3 + Split-Margin Paper, Spot+Perp + Autopilot, Neutral-style analytics, Boros, HyperEVM, attribution, Prometheus `metrics.py`, FastAPI `api/`, and 16-job container `scheduler.py`).
+- `frontend/` — React + Vite + TypeScript 7-tab live quant desk SPA (EN/RU i18n, 28+ Vitest checks).
 - `docker/` & `docker-compose*.yml` — multi-stage `backend`/`worker` (Python + `uv`) and `frontend` (Node + Nginx) containers for Dokploy & local preview.
 - `scripts/analytics/` & `scripts/ops/` — thin CLI entrypoints, lock-aware cron wrappers, Dokploy cron cutover tool, and SHA release script (`deploy_dokploy.py`).
-- `tests/` — 30 test modules (**186+ unit tests**), enforced on GitHub Actions (`tests` + `frontend` required PR checks).
+- `tests/` — 42 test modules (**291+ unit tests**), enforced on GitHub Actions (`tests` + `frontend` required PR checks).
 - `docs/` — deployment runbook (`DEPLOYMENT_DOKPLOY.md`), 10-page Wiki mirror (`docs/wiki/`), and dated research reports (`docs/reports/`).

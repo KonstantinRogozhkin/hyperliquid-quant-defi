@@ -105,10 +105,12 @@ def build_panel(
         panel[f"{name}_fund_next"] = rates.reindex(grid + HOUR_MS).fillna(0.0).to_numpy()
         # Hourly-equivalent rate known at h_k: last settled rate / its interval length.
         known = rates[rates.index <= grid[-1]]
+        diffs_h = np.diff(known.index.to_numpy()) / HOUR_MS if len(known) >= 2 else np.array([], dtype=float)
+        pos_diffs = diffs_h[np.isfinite(diffs_h) & (diffs_h > 0)]
+        default_interval = float(np.median(pos_diffs)) if len(pos_diffs) >= 1 else (1.0 if name == "hl" else 8.0)
         interval_h = pd.Series(np.diff(known.index.to_numpy(), prepend=np.nan) / HOUR_MS, index=known.index)
-        default_interval = 1.0 if name == "hl" else 8.0
         interval_h = interval_h.fillna(default_interval).clip(lower=1.0)
-        hourly_equiv = (known / interval_h).reindex(grid, method="ffill")
+        hourly_equiv = (known / interval_h).reindex(grid, method="ffill", limit=24)
         panel[f"{name}_rate_h"] = hourly_equiv.to_numpy()
         panel[f"{name}_event_now"] = rates.reindex(grid).notna().to_numpy()
 

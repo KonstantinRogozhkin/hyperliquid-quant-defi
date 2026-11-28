@@ -63,9 +63,10 @@ Hyperliquid рассчитывает фандинг **каждый час** (в 
 
 **Файлы:** `src/hl_quant/hl_portfolio_dashboard.py`, `scripts/analytics/build_hl_portfolio_dashboard.py`, `tests/test_hl_portfolio_dashboard.py`, артефакт `docs/reports/2026-11-26/hl_desk_dashboard.html`.
 
-Собирает все живые JSON/Parquet/Markdown-артефакты деска в один **полностью автономный dark-mode HTML-файл** (без внешних CDN, без запущенного сервера — открывается напрямую в браузере) с 6 KPI-карточками, 5 интерактивными вкладками и встроенными SVG-графиками:
+Собирает все живые JSON/Parquet/Markdown-артефакты деска в один **полностью автономный dark-mode HTML-файл** (без внешних CDN, без запущенного сервера — открывается напрямую в браузере; в дополнение к живому 7-вкладочному React SPA) с 6 KPI-карточками, **6 интерактивными вкладками** и встроенными SVG-графиками:
 1. **Testnet & Paper L2**: кривая капитала метамодели (inline SVG), сводка пост-трейд атрибуции Testnet (`ALO Fill Rate`, Maker %, `onlyIsolated` guard) и таблица позиций/ликвидаций.
 2. **Avellaneda–Stoikov MM v2**: живая мульти-монетная сессия `BTC+ETH` (`bbo`, `batchModify`, Binance Lead-Lag, `p50 = 5.62 мкс`), `:59→:05` funding overlay и SVG-кривые калибровки $\hat{\kappa}$ (`ETH`/`BTC`).
-3. **Cross-DEX v2 (5 DEX) & HL×Lighter**: активные пары двуногого Paper-трекера (`data/paper/hl_cross_dex/`) и таблица 5-DEX сканера с L2 VWAP (`10k / 50k USD`).
+3. **Cross-DEX v2 (5 DEX) & HL×Lighter×Extended**: активные пары двуногого Paper-трекера (`data/paper/hl_cross_dex_paper/`) и таблица 5-DEX сканера с L2 VWAP (`10k / 50k USD`).
 4. **HyperEVM Chain 999 & HLP**: нативные `L1Read` прекомпилы (`0.00 б.п.` дрейф), нормализация пега `USDT0/USDC`, V3-глубина пулов и TVL/APR HLP + дочерних стратегий.
-5. **Ликвидации китов & `:00` OOS**: on-chain карта ликвидаций 45 активных топ-китов и таблица 17-дневного OOS-бэктеста (`17 874` событий, Dev 65% vs Holdout 35%).
+5. **Ликвидации китов & `:00` OOS**: on-chain карта ликвидаций активных топ-китов и таблица OOS-бэктеста `:00` расчётов (Dev 65% vs Holdout 35%).
+6. **HIP-3 · Pendle Boros · HyperEVM Yield Stack**: кросс-билдер устойчивость `clean_streak`, Split-Margin Paper-журнал HIP-3, фиксированные ставки Boros и дельта-нейтральный Yield Stack против HLP.

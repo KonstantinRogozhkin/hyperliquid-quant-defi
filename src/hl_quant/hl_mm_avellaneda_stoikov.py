@@ -32,6 +32,7 @@ from hl_quant.hl_testnet_executor import (
     TESTNET_API_URL,
     TESTNET_INFO_URL,
     AssetSpec,
+    DryRunAdapter,
     ExchangeAdapter,
     PlannedOrder,
     extract_hl_order_statuses,
@@ -345,7 +346,7 @@ class LeadLagEstimator:
             self._last_update_ms = int(ts_ms)
             return 0.0
         impulse = raw_bps - self._basis_bps
-        dt_sec = max(0.05, (ts_ms - (self._last_update_ms or ts_ms)) / 1000.0)
+        dt_sec = max(0.0, (ts_ms - (self._last_update_ms if self._last_update_ms is not None else ts_ms)) / 1000.0)
         alpha = 1.0 - math.exp(-math.log(2.0) * dt_sec / self.basis_half_life_sec)
         self._basis_bps = (1.0 - alpha) * self._basis_bps + alpha * raw_bps
         self._last_update_ms = int(ts_ms)
@@ -668,7 +669,7 @@ class _InventoryLedger:
             return
         notional = px * sz
         self.volume_usd += notional
-        fee = abs(fee_usd) if fee_usd is not None else notional * self.maker_fee_bps * 1e-4
+        fee = float(fee_usd) if fee_usd is not None else notional * self.maker_fee_bps * 1e-4
         self.fees_usd += fee
         signed = sz if side == "buy" else -sz
         if side == "buy":
@@ -1041,6 +1042,9 @@ def run_live_mm_session(
     execute_live: bool = False,
     duration_sec: float = 45.0,
     poll_interval_sec: float = 2.0,
+    enable_dead_man_switch: bool = False,
+    dead_man_timeout_ms: int = 15_000,
+    flatten_on_exit: bool = False,
     params: ASParams = ASParams(),
     audit_log_path: Path | None = None,
     client: httpx.Client | None = None,
@@ -1059,6 +1063,30 @@ def run_live_mm_session(
     all_mm_oids: set[int] = set()
     seen_fill_keys: set[tuple[Any, ...]] = set()
     cleanup_cancelled = 0
+    dead_man_refreshes = 0
+    dead_man_armed = False
+    flattened_exit_sz = 0.0
+    dms_left_armed = False
+    spec: AssetSpec | None = None
+    ledger: _InventoryLedger | None = None
+    last_mid = 0.0
+    fills: list[dict[str, Any]] = []
+
+    def _refresh_rest_dms(ts_ms: int) -> None:
+        nonlocal dead_man_refreshes, dead_man_armed
+        if not (enable_dead_man_switch and hasattr(adapter, "schedule_cancel")):
+            return
+        try:
+            resp = adapter.schedule_cancel(ts_ms + max(6_000, dead_man_timeout_ms))
+            inner = resp.get("response") if isinstance(resp, dict) else None
+            if (
+                (isinstance(resp, dict) and resp.get("status") == "ok")
+                or (isinstance(inner, dict) and inner.get("status") == "ok")
+            ):
+                dead_man_refreshes += 1
+                dead_man_armed = True
+        except Exception:
+            return
 
     try:
         meta = fetch_testnet_meta(http)
@@ -1087,22 +1115,28 @@ def run_live_mm_session(
         )
         ledger = _InventoryLedger(start_sz=start_inv_sz, maker_fee_bps=params.maker_fee_bps)
 
+        if enable_dead_man_switch:
+            _refresh_rest_dms(started_ms)
+        dms_refresh_sec = max(3.0, (dead_man_timeout_ms / 1000.0) * 0.4)
+        last_dms_mono = time.monotonic()
+
         ticks_observed = 0
         quotes_placed = 0
         quotes_cancelled = 0
         requotes_skipped = 0
         halt_events: list[str] = []
-        fills: list[dict[str, Any]] = []
         quote_rows: list[dict[str, Any]] = []
         mids_series: list[tuple[int, float]] = []
         half_spreads: list[float] = []
         sigmas: list[float] = []
-        last_mid = 0.0
 
         deadline = time.monotonic() + max(1.0, duration_sec)
         while True:
             loop_start = time.monotonic()
             now_ms = int(time.time() * 1000)
+            if enable_dead_man_switch and (loop_start - last_dms_mono) >= dms_refresh_sec:
+                _refresh_rest_dms(now_ms)
+                last_dms_mono = loop_start
             book = fetch_testnet_l2_snapshot(http, coin)
             if book is None:
                 if time.monotonic() >= deadline:
@@ -1138,7 +1172,7 @@ def run_live_mm_session(
                     if key in seen_fill_keys:
                         continue
                     seen_fill_keys.add(key)
-                    ledger.on_fill(f_side, f_px, f_sz, fee_usd=abs(float(fl.get("fee", 0.0))))
+                    ledger.on_fill(f_side, f_px, f_sz, fee_usd=float(fl.get("fee", 0.0)))
                     fills.append(
                         {
                             "ts_ms": f_time,
@@ -1243,11 +1277,21 @@ def run_live_mm_session(
                         if status in {"resting", "simulated_alo"}:
                             active_orders[side_k] = {"oid": oid, "px": d_px, "sz": d_sz}
                         if audit_log_path is not None:
+                            is_dry = isinstance(adapter, DryRunAdapter) or (
+                                isinstance(resp, dict) and resp.get("mode") == "dry_run"
+                            )
                             audit_log_path.parent.mkdir(parents=True, exist_ok=True)
                             with audit_log_path.open("a", encoding="utf-8") as fh:
                                 fh.write(
                                     json.dumps(
-                                        {"ts_ms": now_ms, "coin": coin, "status": status, "oid": oid, "order": order.to_dict()},
+                                        {
+                                            "ts_ms": now_ms,
+                                            "mode": "dry_run" if is_dry else "rest_live",
+                                            "coin": coin,
+                                            "status": status,
+                                            "oid": oid,
+                                            "order": order.to_dict(),
+                                        },
                                         default=str,
                                     )
                                     + "\n"
@@ -1296,12 +1340,92 @@ def run_live_mm_session(
                 cleanup_cancelled = len(cancel_list)
             except Exception:
                 pass
+
+        mm_orders_cleared = True
+        if execute_live and account_address:
+            mm_orders_cleared = False
+            for _attempt in range(2):
+                try:
+                    oo_resp = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address})
+                    oo_resp.raise_for_status()
+                    oo_check = oo_resp.json()
+                    if not isinstance(oo_check, list):
+                        break
+                except Exception:
+                    break
+                leftovers = [
+                    {"coin": coin, "oid": int(o["oid"])}
+                    for o in oo_check
+                    if isinstance(o, dict)
+                    and str(o.get("coin")) == coin
+                    and o.get("oid") is not None
+                    and int(o["oid"]) in all_mm_oids
+                ]
+                if not leftovers:
+                    mm_orders_cleared = True
+                    break
+                try:
+                    adapter.cancel_all_open_orders(leftovers)
+                except Exception:
+                    pass
+
+        if flatten_on_exit and spec is not None and ledger is not None and last_mid > 0 and abs(ledger.net_sz) > 1e-12:
+            unwind_sz = round_hl_size(abs(ledger.net_sz), spec.sz_decimals)
+            unwind_side = "sell" if ledger.net_sz > 0 else "buy"
+            acct_pos = ledger.start_sz + ledger.net_sz
+            flat_reduce_only = reduce_only_is_valid(unwind_side, unwind_sz, acct_pos)
+            closes_full_acct = flat_reduce_only and abs(unwind_sz - abs(acct_pos)) <= max(
+                1e-9, 0.5 * (10.0 ** -spec.sz_decimals)
+            )
+            min_flat_usd = 0.50 if closes_full_acct else 10.5
+            if unwind_sz > 0 and unwind_sz * last_mid >= min_flat_usd and hasattr(adapter, "place_ioc_order"):
+                raw_px = last_mid * (0.9975 if unwind_side == "sell" else 1.0025)
+                limit_px = round_hl_price(raw_px, spec.sz_decimals, side=unwind_side)
+                flat_ord = PlannedOrder(
+                    coin=coin,
+                    side=unwind_side,
+                    limit_px=limit_px,
+                    sz=unwind_sz,
+                    notional_usd=round(unwind_sz * last_mid, 2),
+                    tif="Ioc",
+                    reduce_only=flat_reduce_only,
+                )
+                try:
+                    flat_resp = adapter.place_ioc_order(flat_ord)
+                    filled_sz, filled_px = _extract_ioc_fill(
+                        flat_resp, fallback_sz=unwind_sz, fallback_px=last_mid, execute_live=execute_live
+                    )
+                    if filled_sz > 0:
+                        flattened_exit_sz = filled_sz
+                        ledger.on_fill(unwind_side, filled_px, filled_sz, fee_usd=filled_sz * filled_px * 4.5e-4)
+                        fills.append(
+                            {
+                                "ts_ms": int(time.time() * 1000),
+                                "oid": None,
+                                "side": unwind_side,
+                                "px": filled_px,
+                                "sz": filled_sz,
+                                "notional_usd": filled_sz * filled_px,
+                                "crossed": True,
+                            }
+                        )
+                except Exception:
+                    pass
+
+        if dead_man_armed and not mm_orders_cleared:
+            dms_left_armed = True
+        if dead_man_armed and mm_orders_cleared and hasattr(adapter, "schedule_cancel"):
+            try:
+                adapter.schedule_cancel(None)
+            except Exception:
+                pass
         if owns_client:
             http.close()
 
     ended_ms = int(time.time() * 1000)
     maker_vol = sum(f["notional_usd"] for f in fills if not f.get("crossed", False))
     tot_vol = sum(f["notional_usd"] for f in fills)
+    assert spec is not None and ledger is not None
     summary = MMSessionSummary(
         mode="testnet_live_mm" if execute_live else "testnet_dry_run_mm",
         coin=coin,
@@ -1329,6 +1453,9 @@ def run_live_mm_session(
         vw_markout_30s_bps=_compute_vw_markout(fills, mids_series, 30_000),
         halt_events=halt_events[:20],
         final_cleanup_cancelled=cleanup_cancelled,
+        flattened_exit_sz=round(flattened_exit_sz, spec.sz_decimals),
+        dead_man_refreshes=dead_man_refreshes,
+        dms_left_armed=dms_left_armed,
     )
     return summary, pd.DataFrame(fills), pd.DataFrame(quote_rows)
 
@@ -1582,6 +1709,37 @@ async def _binance_lead_reader(
         return
 
 
+def _cancel_response_ok(cancel_resps: Any) -> bool:
+    """Return True when an explicit cancel confirmed the order was removed without error.
+
+    Returns False when the cancel reported an exchange error (e.g. order already filled/cancelled
+    or rate-limited), so failed ``batchModify`` fallback never re-places on stale inventory or
+    stacks a duplicate quote on top of an uncancelled resting order.
+    """
+    if isinstance(cancel_resps, int):
+        return cancel_resps > 0
+    if not isinstance(cancel_resps, list) or not cancel_resps:
+        return False
+    for item in cancel_resps:
+        if not isinstance(item, dict):
+            continue
+        if item.get("status") == "err" or item.get("error"):
+            return False
+        if item.get("mode") == "dry_run":
+            continue
+        sdk_resp = _unwrap_sdk_response(item)
+        if sdk_resp is not None:
+            statuses, err_msg = extract_hl_order_statuses(sdk_resp)
+            if err_msg is not None:
+                return False
+            for st in statuses:
+                if isinstance(st, dict) and st.get("error"):
+                    return False
+                if isinstance(st, str) and "error" in st.lower():
+                    return False
+    return True
+
+
 async def _sync_coin_quotes_atomic(
     coin: str,
     dec: MMQuoteDecision,
@@ -1673,13 +1831,41 @@ async def _sync_coin_quotes_atomic(
                 all_mm_oids.add(new_oid)
                 active_orders[side_k] = {"oid": new_oid, "px": order.limit_px, "sz": order.sz}
             else:
-                # Modify failed (e.g., resting order already filled/crossed) -> clean fallback to fresh placement
+                # Modify rejected/failed: prev_oid may still be resting on the book OR may have just
+                # filled. Explicitly cancel prev_oid first; only re-place if cancel confirmed removal.
                 active_orders.pop(side_k, None)
-                to_place.append((side_k, order))
+                cancel_req = [{"coin": coin, "oid": prev_oid}]
+                try:
+                    cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_req, fast=True)
+                except TypeError:
+                    cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_req)
+                except Exception as exc:
+                    cancel_resps = [{"status": "err", "response": str(exc)}]
+                if _cancel_response_ok(cancel_resps):
+                    cancelled += 1
+                    to_place.append((side_k, order))
             if audit_log_path is not None:
+                is_dry = isinstance(adapter, DryRunAdapter) or (
+                    isinstance(resp, dict) and resp.get("mode") == "dry_run"
+                )
                 audit_log_path.parent.mkdir(parents=True, exist_ok=True)
                 with audit_log_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"ts_ms": recv_ms, "mode": "ws_modify", "coin": coin, "prev_oid": prev_oid, "oid": new_oid, "status": status, "order": order.to_dict()}, default=str) + "\n")
+                    fh.write(
+                        json.dumps(
+                            {
+                                "ts_ms": recv_ms,
+                                "mode": "dry_run" if is_dry else "ws_modify",
+                                "action": "ws_modify",
+                                "coin": coin,
+                                "prev_oid": prev_oid,
+                                "oid": new_oid,
+                                "status": status,
+                                "order": order.to_dict(),
+                            },
+                            default=str,
+                        )
+                        + "\n"
+                    )
 
     placed = 0
     if to_place:
@@ -1695,9 +1881,26 @@ async def _sync_coin_quotes_atomic(
             if status in {"resting", "simulated_alo"}:
                 active_orders[side_k] = {"oid": oid, "px": order.limit_px, "sz": order.sz}
             if audit_log_path is not None:
+                is_dry = isinstance(adapter, DryRunAdapter) or (
+                    isinstance(resp, dict) and resp.get("mode") == "dry_run"
+                )
                 audit_log_path.parent.mkdir(parents=True, exist_ok=True)
                 with audit_log_path.open("a", encoding="utf-8") as fh:
-                    fh.write(json.dumps({"ts_ms": recv_ms, "mode": "ws_bulk", "coin": coin, "oid": oid, "status": status, "order": order.to_dict()}, default=str) + "\n")
+                    fh.write(
+                        json.dumps(
+                            {
+                                "ts_ms": recv_ms,
+                                "mode": "dry_run" if is_dry else "ws_bulk",
+                                "action": "ws_bulk",
+                                "coin": coin,
+                                "oid": oid,
+                                "status": status,
+                                "order": order.to_dict(),
+                            },
+                            default=str,
+                        )
+                        + "\n"
+                    )
 
     return placed, modified, cancelled, skipped
 
@@ -1919,7 +2122,7 @@ async def run_multi_coin_mm_ws_session(
                     if key in seen_fill_keys:
                         continue
                     seen_fill_keys.add(key)
-                    ledgers[c_name].on_fill(f_side, f_px, f_sz, fee_usd=abs(float(fl.get("fee", 0.0))))
+                    ledgers[c_name].on_fill(f_side, f_px, f_sz, fee_usd=float(fl.get("fee", 0.0)))
                     stats[c_name]["fills"].append(
                         {"coin": c_name, "ts_ms": f_time, "oid": f_oid, "side": f_side, "px": f_px, "sz": f_sz, "notional_usd": f_px * f_sz, "crossed": bool(fl.get("crossed", False))}
                     )
@@ -2130,44 +2333,82 @@ async def run_multi_coin_mm_ws_session(
             import websockets
 
             deadline = time.monotonic() + max(1.0, duration_sec)
-            last_ping = time.monotonic()
             last_dms = time.monotonic()
             dms_refresh_sec = max(3.0, (dead_man_timeout_ms / 1000.0) * 0.4)
+            reconnects = 0
+            max_reconnects = 3
+            stop_session = False
 
-            async with websockets.connect(ws_url, ping_interval=20, ping_timeout=20, max_size=4 * 1024 * 1024) as ws:
-                subs: list[dict[str, Any]] = []
-                for c in coin_list:
-                    subs.extend([{"type": "bbo", "coin": c}, {"type": "l2Book", "coin": c}, {"type": "trades", "coin": c}])
-                if execute_live and account_address:
-                    subs.append({"type": "userFills", "user": account_address})
-                    subs.append({"type": "orderUpdates", "user": account_address})
-                for sub in subs:
-                    await ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
+            while not stop_session and time.monotonic() < deadline:
+                try:
+                    async with websockets.connect(
+                        ws_url, ping_interval=20, ping_timeout=20, max_size=4 * 1024 * 1024
+                    ) as ws:
+                        subs: list[dict[str, Any]] = []
+                        for c in coin_list:
+                            subs.extend(
+                                [{"type": "bbo", "coin": c}, {"type": "l2Book", "coin": c}, {"type": "trades", "coin": c}]
+                            )
+                        if execute_live and account_address:
+                            subs.append({"type": "userFills", "user": account_address})
+                            subs.append({"type": "orderUpdates", "user": account_address})
+                        for sub in subs:
+                            await ws.send(json.dumps({"method": "subscribe", "subscription": sub}))
 
-                while True:
-                    remaining = deadline - time.monotonic()
-                    if remaining <= 0:
+                        last_ping = time.monotonic()
+                        while True:
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                stop_session = True
+                                break
+                            now_mono = time.monotonic()
+                            if now_mono - last_ping >= 25.0:
+                                await ws.send(json.dumps({"method": "ping"}))
+                                last_ping = now_mono
+                            if enable_dead_man_switch and (now_mono - last_dms) >= dms_refresh_sec:
+                                await _refresh_dead_man(int(time.time() * 1000))
+                                last_dms = now_mono
+                            try:
+                                raw = await asyncio.wait_for(ws.recv(), timeout=min(1.5, remaining))
+                            except asyncio.TimeoutError:
+                                continue
+                            recv_ms = int(time.time() * 1000)
+                            try:
+                                msg = json.loads(raw)
+                            except ValueError:
+                                continue
+                            if isinstance(msg, dict):
+                                keep = await _handle_message(msg, recv_ms)
+                                if not keep:
+                                    stop_session = True
+                                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    reconnects += 1
+                    for c in coin_list:
+                        stats[c]["halt_events"].append(f"ws_reconnect:{reconnects}:{type(exc).__name__}")
+                    if reconnects > max_reconnects or time.monotonic() >= deadline:
                         break
-                    now_mono = time.monotonic()
-                    if now_mono - last_ping >= 25.0:
-                        await ws.send(json.dumps({"method": "ping"}))
-                        last_ping = now_mono
-                    if enable_dead_man_switch and (now_mono - last_dms) >= dms_refresh_sec:
-                        await _refresh_dead_man(int(time.time() * 1000))
-                        last_dms = now_mono
-                    try:
-                        raw = await asyncio.wait_for(ws.recv(), timeout=min(1.5, remaining))
-                    except asyncio.TimeoutError:
-                        continue
-                    recv_ms = int(time.time() * 1000)
-                    try:
-                        msg = json.loads(raw)
-                    except ValueError:
-                        continue
-                    if isinstance(msg, dict):
-                        keep = await _handle_message(msg, recv_ms)
-                        if not keep:
-                            break
+                    if execute_live and account_address:
+                        try:
+                            oo_rc = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address}).json() or []
+                            live_by_coin: dict[str, set[int]] = {c: set() for c in coin_list}
+                            for o in oo_rc:
+                                if isinstance(o, dict) and o.get("oid") is not None:
+                                    cn = str(o.get("coin") or "")
+                                    if cn in live_by_coin:
+                                        live_by_coin[cn].add(int(o["oid"]))
+                            for cn in coin_list:
+                                for sk in list(active_orders[cn].keys()):
+                                    oid_v = active_orders[cn][sk].get("oid")
+                                    if oid_v is not None and int(oid_v) not in live_by_coin[cn]:
+                                        active_orders[cn].pop(sk, None)
+                        except Exception:
+                            pass
+                    backoff_s = min(0.5 * reconnects, max(0.0, deadline - time.monotonic()))
+                    if backoff_s > 0:
+                        await asyncio.sleep(backoff_s)
 
             # Final REST fill reconciliation for any fill arriving right at socket close
             if execute_live and account_address and any(all_mm_oids.values()):
@@ -2187,7 +2428,7 @@ async def run_multi_coin_mm_ws_session(
                     if key in seen_fill_keys:
                         continue
                     seen_fill_keys.add(key)
-                    ledgers[c_name].on_fill(f_side, f_px, f_sz, fee_usd=abs(float(fl.get("fee", 0.0))))
+                    ledgers[c_name].on_fill(f_side, f_px, f_sz, fee_usd=float(fl.get("fee", 0.0)))
                     stats[c_name]["fills"].append(
                         {"coin": c_name, "ts_ms": f_time, "oid": f_oid, "side": f_side, "px": f_px, "sz": f_sz, "notional_usd": f_px * f_sz, "crossed": bool(fl.get("crossed", False))}
                     )
@@ -2267,12 +2508,16 @@ async def run_multi_coin_mm_ws_session(
                 if sp is None or mid <= 0 or abs(net) <= 1e-12:
                     continue
                 unwind_sz = round_hl_size(abs(net), sp.sz_decimals)
-                if unwind_sz > 0 and unwind_sz * mid >= 10.5:
-                    unwind_side = "sell" if net > 0 else "buy"
-                    # Returning the session delta to zero may *increase* the shared account
-                    # position (other engines' inventory); reduceOnly would then be rejected.
-                    acct_pos = ledgers[c_name].start_sz + net
-                    flat_reduce_only = reduce_only_is_valid(unwind_side, unwind_sz, acct_pos)
+                unwind_side = "sell" if net > 0 else "buy"
+                # Returning the session delta to zero may *increase* the shared account
+                # position (other engines' inventory); reduceOnly would then be rejected.
+                acct_pos = ledgers[c_name].start_sz + net
+                flat_reduce_only = reduce_only_is_valid(unwind_side, unwind_sz, acct_pos)
+                closes_full_acct = flat_reduce_only and abs(unwind_sz - abs(acct_pos)) <= max(
+                    1e-9, 0.5 * (10.0 ** -sp.sz_decimals)
+                )
+                min_flat_usd = 0.50 if closes_full_acct else 10.5
+                if unwind_sz > 0 and unwind_sz * mid >= min_flat_usd:
                     raw_px = mid * (0.9975 if unwind_side == "sell" else 1.0025)
                     limit_px = round_hl_price(raw_px, sp.sz_decimals, side=unwind_side)
                     flat_ord = PlannedOrder(
@@ -2293,6 +2538,18 @@ async def run_multi_coin_mm_ws_session(
                             stats[c_name]["flattened_exit_sz"] = filled_sz
                             ledgers[c_name].on_fill(
                                 unwind_side, filled_px, filled_sz, fee_usd=filled_sz * filled_px * 4.5e-4
+                            )
+                            stats[c_name]["fills"].append(
+                                {
+                                    "coin": c_name,
+                                    "ts_ms": int(time.time() * 1000),
+                                    "oid": None,
+                                    "side": unwind_side,
+                                    "px": filled_px,
+                                    "sz": filled_sz,
+                                    "notional_usd": filled_sz * filled_px,
+                                    "crossed": True,
+                                }
                             )
                     except Exception:
                         pass
@@ -2425,6 +2682,8 @@ def format_mm_report_markdown(summary: MMSessionSummary, params: ASParams) -> st
     ]
     if summary.halt_events:
         lines.append(f"- **Защитные паузы:** {', '.join(summary.halt_events[:5])}")
+    if summary.dms_left_armed:
+        lines.append("- ⚠️ **Внимание (DMS):** не все ордера подтверждены отменёнными — Dead Man's Switch (`scheduleCancel`) оставлен активным!")
     return "\n".join(lines) + "\n"
 
 
@@ -2446,10 +2705,22 @@ def format_mm_telegram_rich_html(summary: MMSessionSummary, params: ASParams) ->
         f'<tr><td align="left">Инвентарь (конец / пик)</td><td align="right">{summary.end_inventory_sz:g} {html.escape(summary.coin)} / ${summary.max_abs_inventory_usd:,.1f}</td></tr>',
         f'<tr><td align="left">Итог PnL / Markout +5s</td><td align="right">{dot} {summary.net_pnl_usd:+,.4f}$ · {html.escape(mk5)}</td></tr>',
     ]
+    dms_warn = (
+        "<p>⚠️ <b>Внимание:</b> не все ордера подтверждены отменёнными — Dead Man's Switch "
+        "(<code>scheduleCancel</code>) оставлен активным для авто-снятия!</p>"
+        if summary.dms_left_armed
+        else ""
+    )
+    footer_note = (
+        "DMS оставлен активным для авто-очистки"
+        if summary.dms_left_armed
+        else "финальная очистка ордеров выполнена"
+    )
     return (
         f"<h1>📐 Маркет-мейкер A–S · {html.escape(summary.coin)} · {html.escape(date_str)}</h1>"
         f"<p><b>Параметры ({html.escape(time_str)}):</b> γ={params.gamma}, κ={params.kappa}, "
         f"ордер ${params.base_order_usd:.0f}, лимит инвентаря ${params.max_inventory_usd:.0f}</p>"
+        f"{dms_warn}"
         f'<table bordered striped>{"".join(rows)}</table>'
-        "<footer>Hyperliquid Testnet · Avellaneda–Stoikov ALO (финальная очистка ордеров выполнена)</footer>"
+        f"<footer>Hyperliquid Testnet · Avellaneda–Stoikov ALO ({footer_note})</footer>"
     )

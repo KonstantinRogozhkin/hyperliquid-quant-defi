@@ -14,7 +14,7 @@ groups:
           service: hyperliquid-quant-defi
         annotations:
           summary: "Hyperliquid Quant Worker is DOWN or metrics scrape is absent"
-          description: "hl_worker_up has been 0 or missing for >3m. Check hl-worker container and https://hl-quant.95-217-163-111.sslip.io/api/v1/metrics."
+          description: "hl_worker_up has been 0 or missing for >3m. Check hl-worker container and https://hl-quant.example.com/api/v1/metrics."
 
       - alert: HLWorkerJobFailed
         expr: hl_worker_job_failed == 1
@@ -57,14 +57,14 @@ groups:
           description: "One or more open Testnet positions triggered high Auto-Deleveraging (ADL) risk thresholds."
 
       - alert: HLBoundedNavGuardTriggered
-        expr: hl_desk_nav_guard_triggers_total > 0
+        expr: hl_desk_nav_guard_active > 0
         for: 1m
         labels:
           severity: critical
           service: hyperliquid-quant-defi
         annotations:
-          summary: "CRITICAL: Bounded NAV Sanity Guard circuit breaker triggered"
-          description: "Anomalous single-tick NAV jump detected in Spot+Perp or Autopilot ledger (corrupt quote/oracle). Entries & rebalances paused."
+          summary: "CRITICAL: Bounded NAV Sanity Guard circuit breaker active"
+          description: "Anomalous single-tick NAV jump currently active on a desk strategy ledger (corrupt quote/oracle). Entries & rebalances paused until confirming tick."
 
       - alert: HLHIP3OracleDivergenceCritical
         expr: hl_hip3_paper_pair_oracle_div_bps > 30
@@ -120,14 +120,16 @@ groups:
     interval: 60s
     rules:
       - alert: HLArtifactStale
-        expr: hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_.*"} > 360
+        expr: >-
+          hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_.*"} > 360
+          or hl_artifact_exists{artifact!~"mm_calibration|settlement_study|testnet_.*"} == 0
         for: 15m
         labels:
           severity: warning
           service: hyperliquid-quant-defi
         annotations:
-          summary: "Telemetry artifact stale (> 6h): {{ $labels.artifact }}"
-          description: "Artifact {{ $labels.artifact }} has not refreshed for {{ $value | humanize }} minutes."
+          summary: "Telemetry artifact stale (> 6h) or missing: {{ $labels.artifact }}"
+          description: "Artifact {{ $labels.artifact }} is missing or has not refreshed for > 360 minutes."
 
       - alert: HLSettlementStudyDegraded
         expr: hl_settlement_study_degraded == 1
@@ -160,14 +162,14 @@ groups:
           description: "Live Testnet drawdown from the executor HWM exceeded 2% for 15m; kill-switch fires at 5% on the next 4h executor cycle."
 
       - alert: HLTestnetOrphanPositions
-        expr: hl_testnet_live_orphan_positions > 0
+        expr: hl_testnet_unmanaged_orphan_positions > 0
         for: 30m
         labels:
           severity: warning
           service: hyperliquid-quant-defi
         annotations:
-          summary: "{{ $value }} Testnet position(s) have no two-sided book (orphans)"
-          description: "The ALO planner cannot price, rebalance or close these positions. See hl_testnet_live_position_orphan and hl_testnet_live_orphan_notional_usd; unwind manually with reduce-only limits near oracle."
+          summary: "{{ $value }} unmanaged Testnet orphan position(s) have no two-sided book"
+          description: "Non-dust orphan Testnet position(s) outside active target weights have no resting unwind order. See hl_testnet_live_position_orphan and hl_testnet_live_orphan_notional_usd."
 
       - alert: HLTestnetMarkOracleDislocation
         expr: hl_testnet_mark_oracle_pnl_gap_pct > 1.0
@@ -179,24 +181,36 @@ groups:
           summary: "Testnet mark-vs-oracle uPnL gap is {{ $value | humanize }}% of equity"
           description: "Thin Testnet books moved mark prices away from oracle; mark-based PnL and drawdown overstate (or understate) economic exposure."
 
+      - alert: HLTestnetCoinMarkOracleDislocation
+        expr: abs(hl_testnet_mark_oracle_max_dev_pct) > 15
+        for: 30m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Testnet per-coin mark-vs-oracle deviation is {{ $value | humanize }}% (> 15%)"
+          description: "At least one open Testnet perp position has |mark/oracle - 1| > 15% for 30m (illiquid Testnet book dislocation)."
+
       - alert: HLTestnetRiskProbeStale
-        expr: hl_artifact_age_minutes{artifact="testnet_risk"} > 45
-          or on() (hl_artifact_exists{artifact="testnet_risk"} == 0 and on() hl_worker_job_enabled{worker_job="testnet_risk_probe"} == 1)
+        expr: >-
+          (hl_artifact_age_minutes{artifact="testnet_risk"} > 45 and ignoring(artifact, worker_job) hl_worker_job_enabled{worker_job="testnet_risk_probe"} == 1)
+          or (hl_artifact_exists{artifact="testnet_risk"} == 0 and ignoring(artifact, worker_job) hl_worker_job_enabled{worker_job="testnet_risk_probe"} == 1)
         for: 5m
         labels:
           severity: warning
           service: hyperliquid-quant-defi
         annotations:
           summary: "Testnet 15m risk probe stale (> 45 min) or snapshot missing"
-          description: "hl_testnet_risk/latest.json has not refreshed in > 45 min; live drawdown/orphan telemetry is blind. Check the testnet_risk_probe worker job."
+          description: "hl_testnet_risk/latest.json has not refreshed in > 45 min while enabled; live drawdown/orphan telemetry is blind. Check the testnet_risk_probe worker job."
 
       - alert: HLTestnetAttributionStale
-        expr: hl_artifact_age_minutes{artifact="testnet_attribution"} > 300
-          or on() (hl_artifact_exists{artifact="testnet_attribution"} == 0 and on() hl_worker_job_enabled{worker_job="testnet_attribution"} == 1)
+        expr: >-
+          (hl_artifact_age_minutes{artifact="testnet_attribution"} > 300 and ignoring(artifact, worker_job) hl_worker_job_enabled{worker_job="testnet_attribution"} == 1)
+          or (hl_artifact_exists{artifact="testnet_attribution"} == 0 and ignoring(artifact, worker_job) hl_worker_job_enabled{worker_job="testnet_attribution"} == 1)
         for: 15m
         labels:
           severity: warning
           service: hyperliquid-quant-defi
         annotations:
           summary: "Testnet attribution stale (> 5h, cadence 4h) or artifact missing"
-          description: "hl_testnet_* attribution gauges (equity, PnL, per-coin) are frozen at the last successful 4h run. Check the testnet_attribution worker job."
+          description: "hl_testnet_* attribution gauges (equity, PnL, per-coin) are frozen at the last successful 4h run while enabled. Check the testnet_attribution worker job."

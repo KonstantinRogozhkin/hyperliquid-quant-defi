@@ -1,7 +1,7 @@
 import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import App from "../App";
+import App, { fmtUsd, fx } from "../App";
 import type { BuildInfo, OverviewPayload } from "../types";
 
 const BASE_SHA = "3b4d8f21aa5fa13082fec5635eedd0252989f3a1";
@@ -434,12 +434,44 @@ function mockFetch(overview: OverviewPayload, feBuild?: BuildInfo) {
         headers: { "Content-Type": "application/json" },
       });
     }
+    if (url.includes("/api/v1/analytics")) {
+      return new Response(
+        JSON.stringify({
+          generated_at_utc: "2026-11-26T22:00:00Z",
+          leaderboard: [],
+          curves: {},
+          correlation: { ids: [], matrix: [], overlap_days: 0 },
+          market_exposure: {},
+          risk_exposure: {
+            leverage_by_strategy: [],
+            venue_concentration: [],
+            asset_tier_concentration: [],
+            total_nav_guard_triggers: 0,
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
     return new Response("Not found", { status: 404 });
   });
 }
 
+describe("Formatting helpers", () => {
+  it("formats signed USD values cleanly without $-5.40 or —h artifacts", () => {
+    expect(fmtUsd(-5.4)).toBe("-$5.40");
+    expect(fmtUsd(-1_250_000)).toBe("-$1.25M");
+    expect(fmtUsd(-1_100_000_000)).toBe("-$1.10B");
+    expect(fmtUsd(-0.0001, 2)).toBe("$0.00");
+    expect(fmtUsd(null)).toBe("—");
+    expect(fmtUsd(Number.NaN)).toBe("—");
+    expect(fx(null, 1, "h")).toBe("—");
+    expect(fx(undefined, 1, "ч")).toBe("—");
+    expect(fx(18.4, 1, "h")).toBe("18.4h");
+  });
+});
+
 describe("App", () => {
-  it("renders overview telemetry, FE/BE SHA badge, and filters Metamodel Open Positions", async () => {
+  it("renders overview telemetry, FE/BE SHA badge, -$5.40 signed PnL, and filters Metamodel Open Positions", async () => {
     mockFetch(makeOverview());
     const user = userEvent.setup();
 
@@ -450,10 +482,11 @@ describe("App", () => {
     const shaPill = screen.getByText("FE 3b4d8f21 · BE 3b4d8f21");
     expect(shaPill).toHaveClass("pill-info");
 
-    // Metamodel positions table shows both BTC and SOL initially
+    // Metamodel positions table shows both BTC and SOL (with -$5.40, never $-5.40)
     const posSection = screen.getByText("Metamodel Open Positions (Live Paper Ledger)").closest("section")!;
     expect(within(posSection).getByText("BTC")).toBeInTheDocument();
     expect(within(posSection).getByText("SOL")).toBeInTheDocument();
+    expect(within(posSection).getByText("-$5.40")).toBeInTheDocument();
     expect(within(posSection).getByText("bybit")).toBeInTheDocument();
     expect(within(posSection).getByText("HL-only")).toBeInTheDocument();
 
@@ -466,13 +499,15 @@ describe("App", () => {
     // Settlement split selector switches between OOS (310 events) and IS (620 events)
     const settleSection = screen.getByText(":00 Funding Settlement OOS Study").closest("section")!;
     expect(within(settleSection).getByText("310")).toBeInTheDocument();
+    expect(within(settleSection).getByText("OOS")).toHaveClass("badge-ok");
     expect(within(settleSection).queryByText("620")).not.toBeInTheDocument();
     await user.selectOptions(within(settleSection).getByRole("combobox"), "IS");
     expect(within(settleSection).getByText("620")).toBeInTheDocument();
+    expect(within(settleSection).getByText("IS")).toHaveClass("badge-cyan");
   });
 
-  it("flags FE/BE SHA mismatch with warning pill", async () => {
-    mockFetch(makeOverview(), {
+  it("flags FE/BE SHA mismatch with warning pill including when BE is dev and FE is pinned", async () => {
+    mockFetch(makeOverview({ build_info: { service: "hl-backend", sha: "dev", built_at: "" } }), {
       service: "hl-frontend",
       sha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       built_at: "2026-11-26T21:00:00Z",
@@ -480,7 +515,7 @@ describe("App", () => {
 
     render(<App />);
 
-    const shaPill = await screen.findByText("FE aaaaaaaa · BE 3b4d8f21");
+    const shaPill = await screen.findByText("FE aaaaaaaa · BE dev");
     expect(shaPill).toHaveClass("pill-warn");
   });
 
@@ -526,90 +561,275 @@ describe("App", () => {
             },
           },
         },
-      })
+      }),
     );
     const user = userEvent.setup();
 
     render(<App />);
     await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
 
-    await user.click(screen.getByRole("button", { name: "HIP-3 · Boros · Yield" }));
+    await user.click(screen.getByRole("tab", { name: "HIP-3 · Boros · Yield" }));
 
     const hip3PaperSection = screen.getByText("HIP-3 Split-Margin Paper Ledger").closest("section")!;
     expect(within(hip3PaperSection).getByText("$50,042.50")).toBeInTheDocument();
+    expect(within(hip3PaperSection).getByText(/Fees -\$7\.50/)).toBeInTheDocument();
     expect(within(hip3PaperSection).getByText("MU")).toBeInTheDocument();
     expect(within(hip3PaperSection).getByText("Isolated")).toHaveClass("badge-warn");
 
     const hip3Section = screen.getByText("HIP-3 Cross-Builder Spread Persistence").closest("section")!;
-    // Active only is checked by default: AAPL and NVDA shown, stale TSLA hidden
     expect(within(hip3Section).getByText("AAPL")).toBeInTheDocument();
     expect(within(hip3Section).getByText("NVDA")).toBeInTheDocument();
     expect(within(hip3Section).queryByText("TSLA")).not.toBeInTheDocument();
 
-    // Uncheck Active only -> stale TSLA appears with Stale (-3t) badge
     await user.click(screen.getByLabelText("Active only"));
     expect(within(hip3Section).getByText("TSLA")).toBeInTheDocument();
     expect(within(hip3Section).getByText("Stale (-3t)")).toBeInTheDocument();
 
-    // Check Only steady (0 flips) -> hides flipped NVDA and stale TSLA (clean_streak=0), keeps AAPL
     await user.click(screen.getByLabelText("Only steady (0 flips)"));
     expect(within(hip3Section).getByText("AAPL")).toBeInTheDocument();
     expect(within(hip3Section).queryByText("NVDA")).not.toBeInTheDocument();
     expect(within(hip3Section).queryByText("TSLA")).not.toBeInTheDocument();
   });
 
-  it("renders Testnet & MM per-coin attribution, ADL badges, audit cycles, and kappa chart", async () => {
-    mockFetch(makeOverview());
+  it("renders Testnet & MM flat positions as Flat (never L $0.00), 0-fill Maker as —, 15m risk KPIs, and calibration warning", async () => {
+    const base = makeOverview();
+    mockFetch(
+      makeOverview({
+        attribution: {
+          ...base.attribution,
+          mixed_account_warning: "22% fill volume is from non-audited MM orders",
+          per_coin: [
+            ...(base.attribution?.per_coin as unknown[]),
+            {
+              coin: "ZRO",
+              position_sz: 0,
+              position_usd: 0,
+              entry_px: 0,
+              current_mid: 4.12,
+              leverage_mode: "flat",
+              liq_px: null,
+              liq_distance_pct: null,
+              fills_count: 0,
+              fill_volume_usd: 0,
+              maker_share_pct: 100,
+              net_pnl_usd: -0.45,
+              vw_markout_bps: null,
+              adl_rank_score: null,
+            },
+          ],
+        },
+        testnet_risk: {
+          equity_usd: 1018.45,
+          free_margin_usd: 742.1,
+          high_water_mark_usd: 1025.0,
+          drawdown_pct: 0.64,
+          kill_switch_drawdown_pct: 5.0,
+          open_positions: 2,
+          gross_notional_usd: 755.0,
+          gross_leverage: 0.74,
+          max_mark_oracle_dev_pct: -16.96,
+          max_mark_oracle_dev_coin: "GRAM",
+          orphan_positions: {
+            GRAM: { szi: -30, notional_usd: -48.5, unrealized_pnl_usd: 0.01, book: "empty" },
+          },
+          orphan_notional_usd: 48.5,
+        },
+        mm_calibration: {
+          BTC: {
+            coin: "BTC",
+            trades_count: 12,
+            empirical_sigma_tau_bps: 2.8,
+            kappa_per_bp: 0.42,
+            arrival_a_per_sec: 1.5,
+            r2_fit: 0.31,
+            implied_min_half_spread_bps: 2.38,
+            calibration_ok: false,
+            depth_curve: [
+              { delta_bps: 1, lambda_per_sec: 1.1, fitted_lambda: 1.08 },
+              { delta_bps: 3, lambda_per_sec: 0.45, fitted_lambda: 0.44 },
+            ],
+          },
+        },
+      }),
+    );
     const user = userEvent.setup();
 
     render(<App />);
     await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
 
-    await user.click(screen.getByRole("button", { name: "Testnet & MM" }));
+    await user.click(screen.getByRole("tab", { name: "Testnet & MM" }));
 
-    expect(screen.getByText("HEALTHY")).toBeInTheDocument();
+    expect(screen.getByText(/22% fill volume is from non-audited MM orders/)).toBeInTheDocument();
+    expect(screen.getByText("$742.10")).toBeInTheDocument();
+    expect(screen.getByText("$48.50")).toBeInTheDocument();
+    expect(screen.getByText("Orphan pos: 1")).toBeInTheDocument();
+    expect(screen.getByText("-16.96%")).toHaveClass("warn");
+
     const attrSection = screen.getByText("Per-Coin Testnet Attribution, Liq Distance & ADL Rank").closest("section")!;
-    expect(within(attrSection).getByText("BTC")).toBeInTheDocument();
-    expect(within(attrSection).getByText("ETH")).toBeInTheDocument();
-    expect(within(attrSection).getByText("2.35")).toHaveClass("badge-warn");
-    expect(within(attrSection).getByText("0.85")).toHaveClass("badge-ok");
+    const zroRow = within(attrSection).getByText("ZRO").closest("tr")!;
+    expect(within(zroRow).getByText("Flat")).toHaveClass("muted");
+    expect(within(zroRow).queryByText(/L \$0\.00/)).not.toBeInTheDocument();
+    expect(within(zroRow).queryByText("100%")).not.toBeInTheDocument();
+    expect(within(zroRow).getByText("-$0.45")).toHaveClass("neg");
 
-    const auditSection = screen.getByText("Recent Testnet ALO Rebalance Cycles").closest("section")!;
-    expect(within(auditSection).getByText("$380.34")).toBeInTheDocument();
-    expect(within(auditSection).getByText("drawdown_kill_switch")).toBeInTheDocument();
-    expect(within(auditSection).getByText("halted")).toHaveClass("badge-danger");
-
-    expect(screen.getByRole("img", { name: "BTC kappa curve" })).toBeInTheDocument();
+    expect(screen.getByText("Low sample / fallback")).toHaveClass("badge-warn");
   });
 
-  it("renders 5-DEX filter, On-Chain Alpha alerts, and Scheduler & Ops worker telemetry", async () => {
-    mockFetch(makeOverview());
+  it("renders 5-DEX L2 slippage & depth_be_10k_h (with clean — on null), live 15m H2/H5/H6 events, and failed job last_error", async () => {
+    const base = makeOverview();
+    mockFetch(
+      makeOverview({
+        cross_dex_all: [
+          {
+            coin: "HYPE",
+            other_dex: "lighter",
+            direction: "SHORT_HL_LONG_OTHER",
+            hl_apr_pct: 45.0,
+            other_apr_pct: 8.0,
+            spread_apr_pct: 37.0,
+            favorable_basis_bps: 3.2,
+            exec_basis_10k_bps: -1.8,
+            l2_slip_10k_bps: 2.4,
+            depth_be_10k_h: 11.6,
+            breakeven_hours: 8.0,
+          },
+          {
+            coin: "BTC",
+            other_dex: "paradex",
+            direction: "LONG_HL_SHORT_OTHER",
+            hl_apr_pct: 4.0,
+            other_apr_pct: 16.5,
+            spread_apr_pct: 12.5,
+            favorable_basis_bps: -119.0,
+            exec_basis_10k_bps: -119.0,
+            l2_slip_10k_bps: 88.0,
+            depth_be_10k_h: null,
+            breakeven_hours: null,
+          },
+        ],
+        onchain_events: {
+          observed_at_utc: "2026-11-26T21:45:00Z",
+          hlp_tvl_usd: 412_500_000,
+          hlp_mm_pnl: {
+            pnl_source: "vault_pnlHistory_deposit_clean",
+            hlp_pnl_delta_usd: 185_200,
+            mm_pnl_regime: "CALM",
+          },
+          any_alert: true,
+          active_alert_keys: ["H2:ETH"],
+          h2_events: [
+            {
+              coin: "ETH",
+              mark_px: 3320,
+              total_0_5_usd: 14_200_000,
+              total_0_10_usd: 52_000_000,
+              nearest_wall_pct: 2.1,
+              cascade_bias: "downside_cascade",
+              alert: true,
+            },
+          ],
+          h5_events: [
+            {
+              coin: "SOL",
+              hlp_side: "HLP_SHORT",
+              hlp_net_usd: -420_000,
+              hlp_tvl_share_pct: 0.102,
+              vaults_holding: 2,
+              alert: true,
+            },
+          ],
+          h6_events: [
+            {
+              coin: "INIT",
+              mid_vs_mark_bps: -4.2,
+              mark_vs_oracle_bps: -110.9,
+              funding_apr_pct: -840.0,
+              stress_type: "CROWDED_FUNDING_BASIS",
+              alert: false,
+            },
+          ],
+        },
+        worker_status: {
+          ...base.worker_status!,
+          jobs: [
+            ...base.worker_status!.jobs,
+            {
+              name: "cross_dex_scan",
+              description: "5-DEX Funding & L2 Depth Scan",
+              cron_expr: "25 */4 * * *",
+              readonly: true,
+              enabled: true,
+              status_reason: "active",
+              state: "failed",
+              last_started_at_utc: "2026-11-26T20:25:00Z",
+              last_finished_at_utc: "2026-11-26T20:25:09Z",
+              last_exit_code: 1,
+              last_duration_s: 9.0,
+              last_error: "httpx.ReadTimeout: Paradex orderbook timeout",
+              runs_ok: 4,
+              runs_failed: 1,
+              next_run_utc: "2026-11-27T00:25:00Z",
+            },
+          ],
+        },
+      }),
+    );
     const user = userEvent.setup();
 
     render(<App />);
     await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
 
-    // 5-DEX tab
-    await user.click(screen.getByRole("button", { name: "5-DEX & Paper" }));
+    // 5-DEX tab: shows depth_be_10k_h=11.6h, l2_slip_10k_bps=88.0 bps, and clean "—" (never "—h") for null breakeven
+    await user.click(screen.getByRole("tab", { name: "5-DEX & Paper" }));
     const dexSection = screen.getByText("5-DEX Live Funding & Basis Opportunities").closest("section")!;
-    expect(within(dexSection).getByText("HYPE")).toBeInTheDocument();
-    expect(within(dexSection).getByText("ARB")).toBeInTheDocument();
-    await user.selectOptions(within(dexSection).getByRole("combobox"), "30");
-    expect(within(dexSection).getByText("HYPE")).toBeInTheDocument();
-    expect(within(dexSection).queryByText("ARB")).not.toBeInTheDocument();
+    expect(within(dexSection).getByText("11.6h")).toBeInTheDocument();
+    expect(within(dexSection).getByText("88.0 bps")).toBeInTheDocument();
+    expect(dexSection.textContent).not.toContain("—h");
 
-    // On-Chain tab
-    await user.click(screen.getByRole("button", { name: "On-Chain Alpha" }));
-    expect(screen.getByText(/H2_BTC_LIQ_WALL/)).toBeInTheDocument();
-    expect(screen.getByText("#1,842,310")).toBeInTheDocument();
+    // On-Chain Alpha tab: prefers 15m h2_events (ETH $52.00M) over stale 4h clusters, and renders H5 + H6 tables
+    await user.click(screen.getByRole("tab", { name: "On-Chain Alpha" }));
+    expect(screen.getByText("$52.00M")).toBeInTheDocument();
+    expect(screen.getByText("HLP_SHORT")).toBeInTheDocument();
+    expect(screen.getByText("-$420,000")).toBeInTheDocument();
+    expect(screen.getByText("CROWDED_FUNDING_BASIS")).toBeInTheDocument();
 
-    // Scheduler & Ops tab
-    await user.click(screen.getByRole("button", { name: "Scheduler & Ops" }));
-    expect(screen.getByText("ONLINE")).toBeInTheDocument();
-    expect(screen.getByText("READ-ONLY")).toBeInTheDocument();
-    expect(screen.getByText("snapshot")).toBeInTheDocument();
-    expect(screen.getByText("testnet_executor")).toBeInTheDocument();
-    expect(screen.getByText("hl_testnet_audit.jsonl")).toBeInTheDocument();
+    // Scheduler & Ops tab: surfaces last_error on failed job
+    await user.click(screen.getByRole("tab", { name: "Scheduler & Ops" }));
+    expect(screen.getByText(/Paradex orderbook timeout/)).toBeInTheDocument();
+  });
+
+  it("sorts :00 Settlement rows by net_maker_bps descending before slicing so star OOS buckets are top-ranked", async () => {
+    const lowRows = Array.from({ length: 12 }, (_, idx) => ({
+      strategy: `noise_rule_${idx}`,
+      bucket: `bucket_${idx}`,
+      split: "holdout",
+      events: 100,
+      mean_gross_bps: 1.0,
+      t_stat: 0.5,
+      win_rate_pct: 50,
+      net_maker_bps: -2.0 - idx * 0.1,
+      net_taker_bps: -8.0,
+    }));
+    const starRow = {
+      strategy: "post_unwind_fade_15m",
+      bucket: "APR<=-50% + pre15m>0",
+      split: "holdout",
+      events: 84,
+      mean_gross_bps: 55.37,
+      t_stat: 4.08,
+      win_rate_pct: 71.4,
+      net_maker_bps: 52.37,
+      net_taker_bps: 46.37,
+    };
+
+    mockFetch(makeOverview({ settlement_stats: [...lowRows, starRow] }));
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    const settleSection = screen.getByText(":00 Funding Settlement OOS Study").closest("section")!;
+    const bodyRows = within(settleSection).getAllByRole("row").slice(1);
+    expect(bodyRows[0]).toHaveTextContent("APR<=-50% + pre15m>0");
+    expect(bodyRows[0]).toHaveTextContent("52.37 bps");
   });
 
   it("surfaces backend error state and recovers on manual Refresh", async () => {
@@ -644,7 +864,34 @@ describe("App", () => {
     expect(screen.getByText("● Calm Regime")).toBeInTheDocument();
   });
 
-  it("renders Neutral-style Analytics & Risk tab with Gross/Net, Correlation, OLS, Monthly, and Risk Telemetry", async () => {
+  it("renders analyticsError banner on Analytics & Risk tab when /api/v1/analytics returns HTTP 500", async () => {
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+      const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/api/v1/analytics")) {
+        return new Response("analytics boom", { status: 500 });
+      }
+      if (url.includes("/api/v1/overview")) {
+        return new Response(JSON.stringify(makeOverview()), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(JSON.stringify({ service: "hl-frontend", sha: BASE_SHA, built_at: "" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    await user.click(screen.getByRole("tab", { name: "Analytics & Risk" }));
+    expect(screen.getByText(/Backend \/api\/v1\/analytics returned HTTP 500/i)).toBeInTheDocument();
+    expect(screen.queryByText(/No strategy ticks persisted yet/i)).not.toBeInTheDocument();
+  });
+
+  it("renders Neutral-style Analytics & Risk tab with Net-mode streaks, Correlation guard, OLS keyboard selection, and 14d APY methodology", async () => {
     const overview = makeOverview({
       autopilot: {
         starting_capital_usd: 250000,
@@ -719,9 +966,9 @@ describe("App", () => {
           share_price_net: 1.0145,
           days_tracked: 45,
           gross_returns: { "7d": 0.25, "30d": 1.12, ytd: 1.85, all_time: 1.85 },
-          gross_apy: { "7d": 13.9, "30d": 14.5, ytd: 15.1, all_time: 15.1 },
+          gross_apy: { "7d": null, "30d": 14.5, ytd: 15.1, all_time: 15.1 },
           net_returns: { "7d": 0.19, "30d": 0.88, ytd: 1.45, all_time: 1.45 },
-          net_apy: { "7d": 10.4, "30d": 11.2, ytd: 11.8, all_time: 11.8 },
+          net_apy: { "7d": null, "30d": 11.2, ytd: 11.8, all_time: 11.8 },
           sharpe_gross: 5.9,
           sortino_gross: 7.4,
           sharpe_net: 5.1,
@@ -730,8 +977,11 @@ describe("App", () => {
           max_dd_net_pct: 0.24,
           dd_recovery_days: 3,
           positive_days_pct: 82.0,
+          positive_days_net_pct: 76.5,
           longest_win_streak: 14,
           longest_loss_streak: 2,
+          longest_win_streak_net: 11,
+          longest_loss_streak_net: 3,
           monthly_gross: [{ year: 2026, months: { "10": 0.95, "11": 0.89 }, ytd: 1.85 }],
           monthly_net: [{ year: 2026, months: { "10": 0.74, "11": 0.70 }, ytd: 1.45 }],
         },
@@ -769,6 +1019,19 @@ describe("App", () => {
                 { date: "2026-10-01", factor_ret_pct: -2.5, strat_ret_pct: 0.04 },
                 { date: "2026-10-02", factor_ret_pct: 1.8, strat_ret_pct: 0.03 },
                 { date: "2026-10-03", factor_ret_pct: -1.1, strat_ret_pct: 0.05 },
+              ],
+            },
+            {
+              id: "hip3_paper",
+              name: "HIP-3 Split-Margin Paper",
+              beta: -0.004,
+              r2_pct: 0.2,
+              alpha_ann_pct: 14.2,
+              days: 30,
+              scatter: [
+                { date: "2026-10-01", factor_ret_pct: -2.5, strat_ret_pct: 0.06 },
+                { date: "2026-10-02", factor_ret_pct: 1.8, strat_ret_pct: 0.05 },
+                { date: "2026-10-03", factor_ret_pct: -1.1, strat_ret_pct: 0.07 },
               ],
             },
           ],
@@ -815,19 +1078,30 @@ describe("App", () => {
     render(<App />);
     await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
 
-    await user.click(screen.getByRole("button", { name: "Analytics & Risk" }));
+    await user.click(screen.getByRole("tab", { name: "Analytics & Risk" }));
     expect(screen.getByText("Performance vs Buy & Hold Leaderboard")).toBeInTheDocument();
-    expect(screen.getByText("Correlation Between Strategies (Pearson ρ)")).toBeInTheDocument();
-    expect(screen.getByText("Market Exposure (OLS Regression)")).toBeInTheDocument();
-    expect(screen.getByText("Gold RWA")).toBeInTheDocument();
-    expect(screen.getByText("spot_perp_paper")).toBeInTheDocument();
+    // Default Net mode uses net positive days (76.5%) and net streaks (11d / 3d)
+    expect(screen.getByText("76.5%")).toBeInTheDocument();
+    expect(screen.getByText("11d / 3d")).toBeInTheDocument();
 
-    // Toggle Gross vs Net & APY vs Returns & Methodology drawer
+    // 1x1 correlation matrix triggers the >= 2 strategies guard instead of rendering self-correlation
+    expect(screen.getByText(/Waiting for at least 2 strategies with ≥ 3 overlapping days/i)).toBeInTheDocument();
+
+    // Switch to Gross mode -> shows gross positive days (82.0%) and gross streaks (14d / 2d)
     await user.click(screen.getByRole("button", { name: "Gross" }));
+    expect(screen.getByText("82.0%")).toBeInTheDocument();
+    expect(screen.getByText("14d / 2d")).toBeInTheDocument();
+
     await user.click(screen.getByRole("button", { name: "APY" }));
     expect(screen.getAllByText("+15.10%").length).toBeGreaterThanOrEqual(1);
     await user.click(screen.getByRole("button", { name: "How calculated" }));
-    expect(screen.getByText(/Methodology \(Neutral Trade Standard\)/i)).toBeInTheDocument();
+    expect(screen.getByText(/apy_min_days = 14/i)).toBeInTheDocument();
+
+    // Keyboard Enter on OLS row switches scatter plot target
+    const hip3OlsRow = screen.getByText("HIP-3 Split-Margin Paper").closest("tr")!;
+    hip3OlsRow.focus();
+    await user.keyboard("{Enter}");
+    expect(screen.getByRole("img", { name: /OLS regression scatter HIP-3 Split-Margin Paper vs BTC/i })).toBeInTheDocument();
   });
 
   it("maps backend holdout/dev settlement splits to OOS/IS filters and renders Testnet orphan positions", async () => {
@@ -873,8 +1147,158 @@ describe("App", () => {
       ],
     });
 
+    mockFetch(overview);
+
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    expect(screen.getByText("post_unwind_fade_15m")).toBeInTheDocument();
+    expect(screen.queryByText("pre_crowding_15m")).not.toBeInTheDocument();
+
+    const splitSelect = screen.getByDisplayValue("OOS only");
+    await user.selectOptions(splitSelect, "IS");
+    expect(screen.getByText("pre_crowding_15m")).toBeInTheDocument();
+    expect(screen.queryByText("post_unwind_fade_15m")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Testnet & MM" }));
+    expect(screen.getByText(/orphans: SKY, VVV/)).toBeInTheDocument();
+  });
+
+  it("rebases benchmarks on 7D window, omits stale curves outside window, renders +0.00% hedged cex_weight, Boros SPREAD badge, and clean HIP-3 leader", async () => {
+    const overview = makeOverview({
+      paper_positions: [
+        {
+          coin: "ETH",
+          hl_weight: 0.1,
+          cex_weight: 0,
+          cex_venue: "bybit+okx",
+          cex_legs: { bybit: -0.05, okx: 0.05 },
+          last_hl_px: 3310.0,
+          l2_spread_bps: 0.5,
+          cum_pnl_usd: 12.0,
+        },
+      ],
+      frontier_history: {
+        observed_at_utc: "2026-11-27T12:00:00Z",
+        ny_session: "RTH",
+        hlp_apr_pct: 14.25,
+        total_logged: { hip3: 120 },
+        hip3_persistence: [
+          {
+            base_symbol: "STALE_TOP",
+            short_symbol: "xyz:STALE_TOP",
+            long_symbol: "io:STALE_TOP",
+            ticks_seen: 20,
+            active_in_latest_tick: false,
+            ticks_since_last_seen: 2,
+            raw_apr_streak: 0,
+            clean_streak: 0,
+            direction_flips: 0,
+            latest_apr_pct: 90.0,
+            median_apr_pct: 50.0,
+            median_oracle_div_bps: 5.0,
+            both_growth_mode: true,
+            any_only_isolated: false,
+          },
+          {
+            base_symbol: "NVDA",
+            short_symbol: "xyz:NVDA",
+            long_symbol: "io:NVDA",
+            ticks_seen: 14,
+            active_in_latest_tick: true,
+            ticks_since_last_seen: 0,
+            raw_apr_streak: 5,
+            clean_streak: 4,
+            direction_flips: 0,
+            latest_apr_pct: 41.3,
+            median_apr_pct: 39.0,
+            median_oracle_div_bps: 4.2,
+            both_growth_mode: true,
+            any_only_isolated: false,
+          },
+        ],
+      },
+      boros: {
+        active_markets_count: 5,
+        hl_and_spread_count: 1,
+        markets: [
+          {
+            market_id: 7,
+            name: "Hyperliquid ETH - Gate ETHUSDT",
+            symbol: "HL-GATE-ETH-DEC",
+            underlying: "ETH",
+            is_spread_market: true,
+            days_to_maturity: 28,
+            best_bid_apr_pct: 2.3,
+            best_ask_apr_pct: 2.5,
+            floating_apr_pct: -4.1,
+            fixed_minus_float_bid_pct: 6.4,
+            recommended_action: "SHORT_FIXED",
+          },
+        ],
+      },
+    });
+
+    const analyticsPayload = {
+      generated_at_utc: "2026-11-27 14:30 UTC",
+      leaderboard: [],
+      curves: {
+        btc: {
+          id: "btc",
+          name: "BTC Buy & Hold",
+          category: "Benchmark",
+          is_benchmark: true,
+          dates: ["2025-11-27", "2026-11-20", "2026-11-27"],
+          // 1.0 -> 2.0 (+100% over 1y), then 2.0 -> 2.02 (+1% over last 7D)
+          gross_shares: [1.0, 2.0, 2.02],
+          net_shares: [1.0, 2.0, 2.02],
+        },
+        spot_perp: {
+          id: "spot_perp",
+          name: "Spot+Perp",
+          category: "Market Neutral",
+          is_benchmark: false,
+          dates: ["2026-11-21", "2026-11-27"],
+          gross_shares: [1.0, 1.005],
+          net_shares: [1.0, 1.004],
+        },
+        stale_strat: {
+          id: "stale_strat",
+          name: "Dormant Old Strat",
+          category: "Market Neutral",
+          is_benchmark: false,
+          dates: ["2026-09-01", "2026-09-05"],
+          gross_shares: [1.0, 1.02],
+          net_shares: [1.0, 1.02],
+        },
+      },
+      correlation: {
+        ids: ["spot_perp", "btc"],
+        labels: { spot_perp: "HyperCore Spot+Perp (+10% HLP)", btc: "BTC Buy & Hold" },
+        matrix: [
+          [1.0, null],
+          [0.02, 1.0],
+        ],
+        overlap_days: 7,
+      },
+      market_exposure: {},
+      risk_exposure: {
+        leverage_by_strategy: [],
+        venue_concentration: [],
+        asset_tier_concentration: [],
+        total_nav_guard_triggers: 0,
+      },
+    };
+
     vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
       const url = typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+      if (url.includes("/api/v1/analytics")) {
+        return new Response(JSON.stringify(analyticsPayload), {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
       if (url.includes("/api/v1/overview")) {
         return new Response(JSON.stringify(overview), {
           status: 200,
@@ -891,19 +1315,31 @@ describe("App", () => {
     render(<App />);
     await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
 
-    // Default "OOS" filter matches backend `split: "holdout"`
-    expect(screen.getByText("post_unwind_fade_15m")).toBeInTheDocument();
-    expect(screen.queryByText("pre_crowding_15m")).not.toBeInTheDocument();
+    // Overview: HIP-3 Clean Leader skips STALE_TOP and picks active NVDA
+    expect(screen.getByText("NVDA +41.3%")).toBeInTheDocument();
+    // Overview: net-zero multi-venue hedge shows +0.00% (never "—") and singular "1 active HL × CEX position"
+    const posSection = screen.getByText("Metamodel Open Positions (Live Paper Ledger)").closest("section")!;
+    expect(within(posSection).getByText(/1 active HL × CEX position sorted/i)).toBeInTheDocument();
+    expect(within(posSection).getByText("+0.00%")).toBeInTheDocument();
 
-    // Switching to "IS" matches backend `split: "dev"`
-    const splitSelect = screen.getByDisplayValue("OOS only");
-    await user.selectOptions(splitSelect, "IS");
-    expect(screen.getByText("pre_crowding_15m")).toBeInTheDocument();
-    expect(screen.queryByText("post_unwind_fade_15m")).not.toBeInTheDocument();
+    // Frontier tab: Boros shows market name + SPREAD badge
+    await user.click(screen.getByRole("tab", { name: "HIP-3 · Boros · Yield" }));
+    const borosSection = screen.getByText("Pendle Boros Fixed vs Floating Markets").closest("section")!;
+    expect(within(borosSection).getByText("Hyperliquid ETH - Gate ETHUSDT")).toBeInTheDocument();
+    expect(within(borosSection).getByText("SPREAD")).toHaveClass("badge-cyan");
 
-    // Testnet tab surfaces orphan_positions
-    await user.click(screen.getByRole("button", { name: "Testnet & MM" }));
-    expect(screen.getByText(/orphans: SKY, VVV/)).toBeInTheDocument();
+    // Analytics tab: 7D window omits stale_strat (2 polylines, not 3) and rebases BTC even if Rebase checkbox is unchecked
+    await user.click(screen.getByRole("tab", { name: "Analytics & Risk" }));
+    await user.click(screen.getByRole("button", { name: "7D" }));
+    await user.click(screen.getByLabelText("Rebase to window"));
+    const chartSvg = screen.getByRole("img", { name: /Multi-strategy cumulative performance chart/i });
+    expect(chartSvg.querySelectorAll("polyline")).toHaveLength(2);
+    // BTC rebased to 2.0 on 2026-11-20 -> max tick is around +1.0%, NOT +102.0%
+    expect(chartSvg.textContent).not.toContain("+102.0%");
+
+    // 2x2 correlation matrix with >= 3 overlap days renders shortened label headers
+    const corrSection = screen.getByText("Correlation Between Strategies (Pearson ρ)").closest<HTMLElement>(".card")!;
+    expect(within(corrSection).getByText("0.02")).toBeInTheDocument();
   });
 });
 
@@ -921,7 +1357,7 @@ describe("i18n & tooltips", () => {
     expect(screen.getByRole("button", { name: "RU" })).toHaveAttribute("aria-pressed", "true");
     expect(screen.getByText("Открытые позиции метамодели (paper-журнал)")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Обновить" })).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Аналитика и риски" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Аналитика и риски" })).toBeInTheDocument();
     expect(document.documentElement.lang).toBe("ru");
     expect(window.localStorage.getItem("hl_desk_lang")).toBe("ru");
 
@@ -930,16 +1366,18 @@ describe("i18n & tooltips", () => {
     expect(await screen.findByText("Открытые позиции метамодели (paper-журнал)")).toBeInTheDocument();
   });
 
-  it("shows plain-language tooltips for table columns and blocks on hover and focus", async () => {
+  it("shows plain-language tooltips for table columns and blocks on hover and focus without adding tabIndex to th", async () => {
     mockFetch(makeOverview());
     const user = userEvent.setup();
     render(<App />);
     await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
 
     const posSection = screen.getByText("Metamodel Open Positions (Live Paper Ledger)").closest("section")!;
-    await user.hover(within(posSection).getByText("HL Weight"));
+    const hlWeightHeader = within(posSection).getByText("HL Weight");
+    expect(hlWeightHeader).not.toHaveAttribute("tabindex");
+    await user.hover(hlWeightHeader);
     expect(screen.getByRole("tooltip")).toHaveTextContent(/Share of capital in the Hyperliquid leg/);
-    await user.unhover(within(posSection).getByText("HL Weight"));
+    await user.unhover(hlWeightHeader);
     expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
 
     const infoIcons = within(posSection).getAllByLabelText("What is this?");

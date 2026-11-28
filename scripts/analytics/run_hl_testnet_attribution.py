@@ -40,6 +40,13 @@ def _load_dotenv(path: Path) -> None:
             os.environ[k] = v.strip().strip('"').strip("'")
 
 
+def _atomic_write_text(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(f".tmp{path.suffix}")
+    tmp.write_text(content, encoding="utf-8")
+    tmp.replace(path)
+
+
 @app.command()
 def main(
     account_address: str | None = typer.Option(None, help="Default: $HL_TESTNET_ACCOUNT_ADDRESS"),
@@ -61,19 +68,24 @@ def main(
 
     if output_dir is not None:
         output_dir.mkdir(parents=True, exist_ok=True)
-        (output_dir / "report.md").write_text(md)
-        (output_dir / "attribution.json").write_text(json.dumps(attr.to_dict(), indent=2))
+        _atomic_write_text(output_dir / "report.md", md)
+        _atomic_write_text(output_dir / "attribution.json", json.dumps(attr.to_dict(), indent=2))
         if snap["fills"]:
-            pd.DataFrame(snap["fills"]).to_parquet(output_dir / "fills.parquet", index=False)
+            fills_tmp = output_dir / "fills.tmp.parquet"
+            pd.DataFrame(snap["fills"]).to_parquet(fills_tmp, index=False)
+            fills_tmp.replace(output_dir / "fills.parquet")
 
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(
             (ROOT / ".env",)
         )
         if token and chat_id:
-            rich = pta.format_attribution_telegram_rich_html(attr)
-            tg = pt.send_telegram_rich_message(rich, bot_token=token, chat_id=chat_id, thread_id=thread_id)
-            typer.echo(f"telegram={json.dumps(tg)}", err=True)
+            try:
+                rich = pta.format_attribution_telegram_rich_html(attr)
+                tg = pt.send_telegram_rich_message(rich, bot_token=token, chat_id=chat_id, thread_id=thread_id)
+                typer.echo(f"telegram={json.dumps(tg)}", err=True)
+            except Exception as exc:
+                typer.echo(f"telegram_warn={exc}", err=True)
 
     typer.echo(md)
 

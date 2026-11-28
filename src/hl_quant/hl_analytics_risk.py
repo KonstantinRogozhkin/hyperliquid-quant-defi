@@ -19,6 +19,7 @@ from datetime import datetime, timezone
 import json
 import math
 from pathlib import Path
+import threading
 from typing import Any
 
 import numpy as np
@@ -361,8 +362,8 @@ def compute_series_performance(
     # Trailing 90-day daily log returns for Sharpe & Sortino (require >= 5 distinct calendar days
     # so intraday bootstrap ticks never produce inflated annualized ratios)
     sharpe_g = sortino_g = sharpe_n = sortino_n = None
-    pos_days_pct = None
-    win_streak = loss_streak = 0
+    pos_days_pct = pos_days_net_pct = None
+    win_streak = loss_streak = win_streak_net = loss_streak_net = 0
     unique_cal_days = len({d.astimezone(timezone.utc).strftime("%Y-%m-%d") for d in dates_dt})
 
     def _with_daily_inception(daily_ser: pd.Series) -> pd.Series:
@@ -408,6 +409,10 @@ def compute_series_performance(
         lr_g = _consecutive_daily_log_returns(daily_g).to_numpy(dtype=float)
         if len(lr_g) >= 1:
             pos_days_pct, win_streak, loss_streak = _compute_streaks(lr_g)
+        daily_n = _with_daily_inception(_daily_close_series(dates_dt, net_s))
+        lr_n = _consecutive_daily_log_returns(daily_n).to_numpy(dtype=float)
+        if len(lr_n) >= 1:
+            pos_days_net_pct, win_streak_net, loss_streak_net = _compute_streaks(lr_n)
     if len(gross_shares) >= 2:
         sharpe_g, sortino_g = _ratios(gross_shares)
         sharpe_n, sortino_n = _ratios(net_s)
@@ -450,6 +455,9 @@ def compute_series_performance(
         "positive_days_pct": pos_days_pct,
         "longest_win_streak": win_streak,
         "longest_loss_streak": loss_streak,
+        "positive_days_net_pct": pos_days_net_pct,
+        "longest_win_streak_net": win_streak_net,
+        "longest_loss_streak_net": loss_streak_net,
         "monthly_gross": compute_monthly_returns(dates_dt, gross_shares, inception_share=inception_share),
         "monthly_net": compute_monthly_returns(dates_dt, net_s, inception_share=inception_share),
     }
@@ -622,6 +630,40 @@ def compute_ols_market_exposure(
 # --------------------------------------------------------------------------- Artifact Loaders
 
 
+_GLOBAL_PARQUET_CACHE: dict[Path, tuple[int, int, pd.DataFrame]] = {}
+_GLOBAL_PARQUET_LOCK = threading.Lock()
+
+
+def _read_parquet_cached(
+    path: Path,
+    parquet_cache: dict[Path, pd.DataFrame] | None = None,
+) -> pd.DataFrame | None:
+    key = path.resolve()
+    if parquet_cache is not None and key in parquet_cache:
+        return parquet_cache[key]
+    if not path.is_file():
+        return None
+    try:
+        st = path.stat()
+        with _GLOBAL_PARQUET_LOCK:
+            cached = _GLOBAL_PARQUET_CACHE.get(key)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                df = cached[2]
+                if parquet_cache is not None:
+                    parquet_cache[key] = df
+                return df
+        df = pd.read_parquet(path)
+        with _GLOBAL_PARQUET_LOCK:
+            if len(_GLOBAL_PARQUET_CACHE) > 64:
+                _GLOBAL_PARQUET_CACHE.clear()
+            _GLOBAL_PARQUET_CACHE[key] = (st.st_mtime_ns, st.st_size, df)
+    except Exception:
+        return None
+    if parquet_cache is not None:
+        parquet_cache[key] = df
+    return df
+
+
 def _load_daily_share_series_from_ticks(
     ticks_path: Path,
     state_path: Path,
@@ -629,6 +671,7 @@ def _load_daily_share_series_from_ticks(
     ts_col_candidates: tuple[str, ...] = ("tick_ms", "tick_hour_ms", "ts_ms"),
     eq_col: str = "equity_usd",
     net_col: str | None = None,
+    parquet_cache: dict[Path, pd.DataFrame] | None = None,
 ) -> tuple[list[str], list[float], list[float] | None, float | None]:
     """Load daily-closed share price series from a strategy's ``ticks.parquet`` + ``state.json``."""
     st = _read_json(state_path) or {}
@@ -642,11 +685,8 @@ def _load_daily_share_series_from_ticks(
             return [today], [sp], None, cur_eq
         return [], [], None, cur_eq
 
-    try:
-        df = pd.read_parquet(ticks_path)
-    except Exception:
-        return [], [], None, cur_eq
-    if df.empty or eq_col not in df.columns:
+    df = _read_parquet_cached(ticks_path, parquet_cache)
+    if df is None or df.empty or eq_col not in df.columns:
         return [], [], None, cur_eq
 
     ts_col = next((c for c in ts_col_candidates if c in df.columns), None)
@@ -842,6 +882,7 @@ def _leverage_history_stats(
     *,
     now_ms: int | None = None,
     window_days: float = 30.0,
+    parquet_cache: dict[Path, pd.DataFrame] | None = None,
 ) -> tuple[float, float]:
     """``(avg, max)`` gross leverage over the trailing window from a tick ledger.
 
@@ -851,11 +892,8 @@ def _leverage_history_stats(
     when history is available).
     """
     vals: list[float] = []
-    if ticks_path.is_file():
-        try:
-            df = pd.read_parquet(ticks_path)
-        except Exception:
-            df = pd.DataFrame()
+    df = _read_parquet_cached(ticks_path, parquet_cache)
+    if df is not None and not df.empty:
         ts_col = next((c for c in ("ts_ms", "tick_ms", "tick_hour_ms") if c in df.columns), None)
         ts = pd.to_numeric(df[ts_col], errors="coerce") if (ts_col is not None and not df.empty) else None
         if ts is not None and ts.notna().any():
@@ -878,7 +916,23 @@ def _leverage_history_stats(
     return round(sum(vals) / len(vals), 3), round(max(vals), 3)
 
 
-def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
+def _cross_dex_hl_sign(pos: dict[str, Any]) -> float:
+    raw = pos.get("hl_sign")
+    if raw is not None:
+        s = _f(raw)
+        if s != 0.0:
+            return 1.0 if s > 0 else -1.0
+    direction = str(pos.get("direction") or "").lower()
+    if "short hl" in direction:
+        return -1.0
+    return 1.0
+
+
+def build_consolidated_risk_exposure(
+    data_root: Path,
+    *,
+    parquet_cache: dict[Path, pd.DataFrame] | None = None,
+) -> dict[str, Any]:
     """Build Neutral-style consolidated Live Risk & Exposure telemetry across all active desk engines."""
     ap = _read_json(data_root / "hl_autopilot" / "state.json")
     sp = _read_json(data_root / "hl_spot_perp_paper" / "state.json")
@@ -928,38 +982,80 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
                 venue_usd[str(v)] = round(venue_usd.get(str(v), 0.0) + _f(amt), 2)
 
     if cd:
+        cd_nav_guards = int(cd.get("nav_guard_triggers", 0) or 0)
+        total_nav_guard_triggers += cd_nav_guards
         cd_pos = cd.get("positions") or {}
         cd_eq = max(_f(cd.get("equity_usd"), 100_000.0), 1.0)
         cd_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in cd_pos.values() if isinstance(p, dict))
         lev = round(cd_gross / cd_eq, 3)
-        cd_avg, cd_max = _leverage_history_stats(data_root / "hl_cross_dex_paper" / "ticks.parquet", lev)
+        cd_avg, cd_max = _leverage_history_stats(
+            data_root / "hl_cross_dex_paper" / "ticks.parquet",
+            lev,
+            parquet_cache=parquet_cache,
+        )
+        cd_net_usd = sum(
+            _cross_dex_hl_sign(p) * _f(p.get("hl_notional_usd"))
+            - _cross_dex_hl_sign(p) * _f(p.get("other_notional_usd"))
+            for p in cd_pos.values()
+            if isinstance(p, dict)
+            and p.get("hl_notional_usd") is not None
+            and p.get("other_notional_usd") is not None
+        )
+        cd_net_pct = _clean_zero(round(cd_net_usd / cd_eq * 100.0, 3))
         leverage_rows.append(
             {
                 "strategy": "Cross-DEX (HL×Lighter×Ext)",
                 "current_leverage": lev,
                 "leverage_30d_avg": cd_avg,
                 "leverage_30d_max": cd_max,
-                "net_exposure_pct": 0.0,
-                "nav_guard_triggers": 0,
+                "net_exposure_pct": cd_net_pct,
+                "nav_guard_triggers": cd_nav_guards,
             }
         )
         if not ap:
             venue_usd["HL x Lighter/Extended"] = round(venue_usd.get("HL x Lighter/Extended", 0.0) + cd_eq, 2)
+            locked_cd = sum(
+                _f(p.get("margin_locked_usd"))
+                if p.get("margin_locked_usd") is not None
+                else (2.0 * _f(p.get("leg_notional_usd"))) / max(_f(p.get("per_leg_leverage"), 2.0), 1.0)
+                for p in cd_pos.values()
+                if isinstance(p, dict)
+            )
+            cd_deployed = min(cd_eq, max(0.0, locked_cd))
+            if cd_deployed > 0:
+                lbl = _SLEEVE_TIER_LABEL["cross_dex_paper"]
+                tier_usd[lbl] = round(tier_usd.get(lbl, 0.0) + cd_deployed, 2)
+            cd_cash = max(0.0, cd_eq - cd_deployed)
+            if cd_cash > 0:
+                tier_usd[TIER_CASH] = round(tier_usd.get(TIER_CASH, 0.0) + cd_cash, 2)
 
     if h3:
+        h3_nav_guards = int(h3.get("nav_guard_triggers", 0) or 0)
+        total_nav_guard_triggers += h3_nav_guards
         h3_pos = h3.get("positions") or {}
         h3_eq = max(_f(h3.get("equity_usd"), 50_000.0), 1.0)
         h3_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in h3_pos.values() if isinstance(p, dict))
         lev = round(h3_gross / h3_eq, 3)
-        h3_avg, h3_max = _leverage_history_stats(data_root / "hl_hip3_paper" / "ticks.parquet", lev)
+        h3_avg, h3_max = _leverage_history_stats(
+            data_root / "hl_hip3_paper" / "ticks.parquet",
+            lev,
+            parquet_cache=parquet_cache,
+        )
+        h3_net_usd = sum(
+            _f(p.get("long_notional_usd")) - _f(p.get("short_notional_usd"))
+            for p in h3_pos.values()
+            if isinstance(p, dict)
+            and (p.get("long_notional_usd") is not None or p.get("short_notional_usd") is not None)
+        )
+        h3_net_pct = _clean_zero(round(h3_net_usd / h3_eq * 100.0, 3))
         leverage_rows.append(
             {
                 "strategy": "HIP-3 Split-Margin",
                 "current_leverage": lev,
                 "leverage_30d_avg": h3_avg,
                 "leverage_30d_max": h3_max,
-                "net_exposure_pct": 0.0,
-                "nav_guard_triggers": 0,
+                "net_exposure_pct": h3_net_pct,
+                "nav_guard_triggers": h3_nav_guards,
             }
         )
         eq_deployed = sum(_f(p.get("margin_locked_usd")) for p in h3_pos.values() if isinstance(p, dict))
@@ -975,7 +1071,11 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
         mm_eq = max(_f(mm.get("equity_usd"), 100_000.0), 1.0)
         mm_lev = round(sum(metamodel_position_gross(p) for p in mm_pos.values() if isinstance(p, dict)), 3)
         mm_net = sum(_f(p.get("hl_weight")) + _f(p.get("cex_weight")) for p in mm_pos.values() if isinstance(p, dict))
-        mm_avg, mm_max = _leverage_history_stats(data_root / "hl_metamodel" / "ticks.parquet", mm_lev)
+        mm_avg, mm_max = _leverage_history_stats(
+            data_root / "hl_metamodel" / "ticks.parquet",
+            mm_lev,
+            parquet_cache=parquet_cache,
+        )
         leverage_rows.append(
             {
                 "strategy": "Metamodel (HL x CEX)",
@@ -988,6 +1088,13 @@ def build_consolidated_risk_exposure(data_root: Path) -> dict[str, Any]:
         )
         if not ap:
             venue_usd["HL x CEX"] = round(venue_usd.get("HL x CEX", 0.0) + mm_eq, 2)
+            mm_deployed = mm_eq * min(1.0, max(0.0, mm_lev / 2.0))
+            if mm_deployed > 0:
+                lbl = _SLEEVE_TIER_LABEL["metamodel_paper"]
+                tier_usd[lbl] = round(tier_usd.get(lbl, 0.0) + mm_deployed, 2)
+            mm_cash = max(0.0, mm_eq - mm_deployed)
+            if mm_cash > 0:
+                tier_usd[TIER_CASH] = round(tier_usd.get(TIER_CASH, 0.0) + mm_cash, 2)
 
     # Asset-tier concentration must describe the SAME portfolio as venue concentration. When the
     # Autopilot master vault exists, both are derived from its sleeve allocations (look-through into
@@ -1098,10 +1205,11 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
     curves: dict[str, dict[str, Any]] = {}
     corr_inputs: dict[str, pd.Series] = {}
     ols_strat_inputs: dict[str, tuple[str, pd.Series]] = {}
+    parquet_cache: dict[Path, pd.DataFrame] = {}
 
     for spec in strategy_specs:
         dates, gross_s, net_s, cur_eq = _load_daily_share_series_from_ticks(
-            spec["ticks"], spec["state"], net_col=spec["net_col"]
+            spec["ticks"], spec["state"], net_col=spec["net_col"], parquet_cache=parquet_cache
         )
         if not dates:
             continue
@@ -1199,5 +1307,5 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
         "curves": curves,
         "correlation": correlation,
         "market_exposure": market_exposure,
-        "risk_exposure": build_consolidated_risk_exposure(data_root),
+        "risk_exposure": build_consolidated_risk_exposure(data_root, parquet_cache=parquet_cache),
     }

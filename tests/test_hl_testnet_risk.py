@@ -93,8 +93,9 @@ def test_build_risk_snapshot_without_oracle_falls_back_to_mark_and_new_peak_has_
     assert snap["high_water_mark_usd"] == pytest.approx(992.67)
     assert snap["drawdown_pct"] == 0.0
     assert snap["unrealized_pnl_oracle_usd"] == pytest.approx(snap["unrealized_pnl_mark_usd"])
-    # Unknown book state is treated as unmanageable (fail-closed visibility).
-    assert set(snap["orphan_positions"]) == {"XMR", "INIT", "SKY"}
+    # Unknown HTTP book errors are reported via unknown_books rather than falsely marked as orphans.
+    assert snap["orphan_positions"] == {}
+    assert snap["unknown_books"] == 3
 
 
 def test_fetch_book_sides_classifies_one_sided_and_empty_books():

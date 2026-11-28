@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -23,7 +23,8 @@ EOF
   exit 0
 fi
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_PATH="${0:A}"
+ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 DEFAULT_PYTHON_BIN="${ROOT_DIR}/.venv/bin/python"
 if [[ -x "${DEFAULT_PYTHON_BIN}" ]]; then
   PYTHON_BIN="${PYTHON_BIN:-${DEFAULT_PYTHON_BIN}}"
@@ -31,28 +32,17 @@ else
   PYTHON_BIN="${PYTHON_BIN:-python3}"
 fi
 
-export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
+export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+LOCK_FILE="${HL_LOCK_FILE:-${TMPDIR:-/tmp}/hyperliquid_snapshot_tick.flock}"
+
+if [[ "${HL_OPS_LOCK_HELD:-0}" != "1" ]]; then
+  cd "${ROOT_DIR}"
+  HL_OPS_LOCK_HELD=1 exec "${PYTHON_BIN}" -m hl_quant.ops_lock "${LOCK_FILE}" -- zsh "${SCRIPT_PATH}" "$@"
+fi
 
 HL_SNAPSHOT_COINS="${HL_SNAPSHOT_COINS:-BTC,ETH,SOL,HYPE,DOGE,XRP,SUI,ENA,WIF,kPEPE,AVAX,LINK,TAO}"
 HL_SNAPSHOT_TRADES="${HL_SNAPSHOT_TRADES:-0}"
 HL_SNAPSHOT_OUTPUT_ROOT="${HL_SNAPSHOT_OUTPUT_ROOT:-}"
-
-LOCK_DIR="${ROOT_DIR}/.neira/state/hyperliquid_snapshot.lock"
-mkdir -p "${ROOT_DIR}/.neira/state"
-if mkdir "${LOCK_DIR}" 2>/dev/null; then
-  echo "$$" > "${LOCK_DIR}/pid"
-else
-  if [[ -f "${LOCK_DIR}/pid" ]]; then
-    ACTIVE_PID="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
-    if [[ -n "${ACTIVE_PID}" ]] && kill -0 "${ACTIVE_PID}" 2>/dev/null; then
-      exit 0
-    fi
-  fi
-  rm -rf "${LOCK_DIR}"
-  mkdir "${LOCK_DIR}"
-  echo "$$" > "${LOCK_DIR}/pid"
-fi
-trap 'rm -rf "${LOCK_DIR}"' EXIT
 
 RUN_DATE="$(date -u +%F)"
 RUN_TIME="$(date -u +%H%M)"
@@ -74,6 +64,7 @@ fi
 if [[ -n "${HL_SNAPSHOT_OUTPUT_ROOT}" ]]; then
   CMD+=(--output-root "${HL_SNAPSHOT_OUTPUT_ROOT}")
 fi
+CMD+=("$@")
 
 {
   echo "utc_now=$(date -u +%Y-%m-%dT%H:%M:%SZ)"

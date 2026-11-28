@@ -1,4 +1,4 @@
-#!/bin/zsh
+#!/usr/bin/env zsh
 set -euo pipefail
 
 if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
@@ -12,26 +12,16 @@ EOF
   exit 0
 fi
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_PATH="${0:A}"
+ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
-export PYTHONPATH="${ROOT_DIR}/src:${PYTHONPATH:-}"
+export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
+LOCK_FILE="${HL_LOCK_FILE:-${TMPDIR:-/tmp}/hl_onchain_event_tick.flock}"
 
-LOCK_DIR="${ROOT_DIR}/.neira/state/hl_onchain_events.lock"
-mkdir -p "${ROOT_DIR}/.neira/state"
-if mkdir "${LOCK_DIR}" 2>/dev/null; then
-  echo "$$" > "${LOCK_DIR}/pid"
-else
-  if [[ -f "${LOCK_DIR}/pid" ]]; then
-    ACTIVE_PID="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
-    if [[ -n "${ACTIVE_PID}" ]] && kill -0 "${ACTIVE_PID}" 2>/dev/null; then
-      exit 0
-    fi
-  fi
-  rm -rf "${LOCK_DIR}"
-  mkdir "${LOCK_DIR}"
-  echo "$$" > "${LOCK_DIR}/pid"
+if [[ "${HL_OPS_LOCK_HELD:-0}" != "1" ]]; then
+  cd "${ROOT_DIR}"
+  HL_OPS_LOCK_HELD=1 exec "${PYTHON_BIN}" -m hl_quant.ops_lock "${LOCK_FILE}" -- zsh "${SCRIPT_PATH}" "$@"
 fi
-trap 'rm -rf "${LOCK_DIR}"' EXIT
 
 RUN_DATE="$(date -u +%F)"
 RUN_TIME="$(date -u +%H%M)"
@@ -42,5 +32,6 @@ CMD=("${PYTHON_BIN}" "${ROOT_DIR}/scripts/analytics/run_hl_onchain_event_tick.py
 if [[ "${HL_ONCHAIN_TELEGRAM:-1}" == "1" ]]; then
   CMD+=(--telegram-on-alert)
 fi
+CMD+=("$@")
 
 "${CMD[@]}" | tee -a "${LOG_DIR}/run_hl_onchain_event_tick.log"

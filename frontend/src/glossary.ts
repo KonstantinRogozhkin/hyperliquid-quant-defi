@@ -70,8 +70,8 @@ export const GLOSSARY = {
   secEquityCurve: e(
     "Metamodel L2 Paper Equity Curve",
     "Кривая капитала метамодели (L2 paper)",
-    "How the paper portfolio value changed over time. Each point is one tick. The strategy holds HL and Bybit positions in opposite directions (dollar-neutral), so it should grow steadily rather than follow the market.",
-    "Как менялась стоимость бумажного портфеля во времени. Каждая точка — один тик. Стратегия держит позиции на HL и Bybit в противоположных направлениях (долларово-нейтрально), поэтому должна расти ровно, а не повторять рынок.",
+    "How the observation-only paper portfolio value changed over time (measured 5.0 bps HL execution cost). Combines multi-CEX funding carry (Bybit / Binance / OKX) with dollar-neutral Hyperliquid cross-sectional sleeves.",
+    "Как менялась стоимость бумажного портфеля в режиме наблюдения (с учётом измеренных 5,0 bps издержек на HL). Объединяет мульти-CEX фандинг-carry (Bybit / Binance / OKX) и долларово-нейтральные кросс-секционные рукава на Hyperliquid.",
   ),
   secSettlement: e(
     ":00 Funding Settlement OOS Study",
@@ -205,8 +205,50 @@ export const GLOSSARY = {
     "Compares the price that smart contracts on HyperEVM read from Hyperliquid (L1Read) with the price from the regular API. A large drift means contracts may act on a stale price.",
     "Сравнивает цену, которую смарт-контракты в HyperEVM читают из Hyperliquid (L1Read), с ценой из обычного API. Большое расхождение значит, что контракты могут работать с устаревшей ценой.",
   ),
+  secH4Disloc: e(
+    "H4 HyperEVM ↔ HyperCore V3 Dislocations (15m)",
+    "Дислокации V3 HyperEVM ↔ HyperCore (H4, 15м)",
+    "Live 15-minute scan of peg-adjusted Uniswap/PRJX V3 pool spreads on HyperEVM versus HyperCore reference prices after fees and $25k slippage.",
+    "Живой 15-минутный скан спредов V3-пулов в HyperEVM (с поправкой на пег стейблкоина) относительно цен HyperCore с учётом комиссий и проскальзывания на $25k.",
+  ),
+  secH5Skew: e(
+    "H5 HLP Child-Vault Inventory Skew (15m)",
+    "Перекос инвентаря дочерних волтов HLP (H5, 15м)",
+    "Live 15-minute aggregate directional exposure held by HLP child strategies (Strategy A/B, Liquidator). Large net inventory reveals where the community market-maker absorbed heavy retail flow.",
+    "Живая 15-минутная суммарная направленная позиция дочерних стратегий HLP (Strategy A/B, Liquidator). Крупный перекос показывает, где хранилище приняло на себя сильный односторонний поток.",
+  ),
+  secH6Stress: e(
+    "H6 BookMid · Mark · Oracle Stress Regimes (15m)",
+    "Стресс-режимы BookMid · Mark · Oracle (H6, 15м)",
+    "Separates acute order-book liquidity vacuums (CRASH_BOOK_STRESS) and true oracle decoupling (ORACLE_DECOUPLING) from structural crowded-short discounts (CROWDED_FUNDING_BASIS).",
+    "Разделяет острый провал ликвидности стакана (CRASH_BOOK_STRESS) и отвязку оракула (ORACLE_DECOUPLING) от структурного дисконта при переполненных шортах (CROWDED_FUNDING_BASIS).",
+  ),
 
   /* ───────────────────────────── Testnet & MM ───────────────────────────── */
+  kpiTnDrawdown: e(
+    "15m Drawdown vs HWM",
+    "Просадка 15м от HWM",
+    "Live 15-minute drawdown from the account's high-water mark (HWM) versus the automated kill-switch limit.",
+    "Живая 15-минутная просадка от исторического пика (HWM) аккаунта относительно порога защитного kill-switch.",
+  ),
+  kpiTnFreeMargin: e(
+    "15m Free Margin",
+    "Свободная маржа (15м)",
+    "Available withdrawable / unencumbered margin from the 15-minute Testnet risk probe, plus gross leverage.",
+    "Доступная свободная маржа по данным 15-минутного риск-зонда Testnet и текущее валовое плечо.",
+  ),
+  kpiTnOrphanRisk: e(
+    "Orphan Notional (15m)",
+    "Номинал сирот (15м)",
+    "Dollar notional of positions lacking two-sided quotes or outside the active target book, tracked every 15 minutes.",
+    "Долларовый объём позиций без двустороннего стакана или вне целевой книги, отслеживаемый каждые 15 минут.",
+  ),
+  kpiTnMarkOracle: e(
+    "Max Mark–Oracle Dev",
+    "Макс. расх. Mark–Oracle",
+    "Largest percentage gap between mark price and oracle price across open Testnet positions.",
+    "Максимальное процентное расхождение между марк-ценой и оракулом среди открытых позиций на Testnet.",
+  ),
   kpiTnEquity: e(
     "Testnet Equity",
     "Капитал на Testnet",
@@ -398,6 +440,12 @@ export const GLOSSARY = {
     "Стратегия",
     "Name of the trading rule being tested around the funding payment (e.g. enter 15 min before :00).",
     "Название торгового правила, которое проверяется вокруг выплаты фандинга (например, вход за 15 минут до :00).",
+  ),
+  colSettleSplit: e(
+    "Split",
+    "Выборка",
+    "OOS (holdout) = out-of-sample test period never used to select rules; IS (dev) = in-sample development period.",
+    "OOS (holdout) — проверочный период вне выборки; IS (dev) — период разработки и отбора правил.",
   ),
   colBucket: e(
     "Bucket",
@@ -688,16 +736,22 @@ export const GLOSSARY = {
     "Разница двух ставок фандинга — годовая доходность от удержания пары.",
   ),
   colFavBasis: e(
-    "Fav Basis",
-    "Выгодный базис",
-    "Extra edge from the current price gap between venues, in bps. Positive helps the trade from the start.",
-    "Дополнительная выгода от текущего разрыва цен между площадками, в bps. Плюс помогает сделке с самого начала.",
+    "Exec Basis ($10k)",
+    "Базис исп. ($10k)",
+    "Executable L2 VWAP price edge on a $10k clip (or mid/mark basis when L2 depth is unavailable), in bps. Positive helps the trade from entry.",
+    "Исполнимый ценовой базис по L2 VWAP на клипе $10k (или марк-базис при отсутствии L2), в bps. Плюс даёт преимущество уже на входе.",
+  ),
+  colDexL2Slip10k: e(
+    "L2 Slip ($10k)",
+    "Слип L2 ($10k)",
+    "Combined two-leg order-book slippage on a $10k clip, in bps. High values expose thin order books.",
+    "Суммарное проскальзывание по двум стаканам L2 на клипе $10k, в bps. Высокие значения выдают пустой стакан.",
   ),
   colBreakeven: e(
     "Breakeven",
     "Окупаемость",
-    "Hours of funding needed to earn back entry fees and slippage. Shorter is better.",
-    "Сколько часов фандинга нужно, чтобы окупить комиссии и проскальзывание при входе. Меньше — лучше.",
+    "Depth-adjusted hours of funding needed on a $10k clip to earn back entry fees and L2 slippage. \"—\" when spread/depth cannot pay back costs.",
+    "Сколько часов фандинга (с учётом L2-глубины на $10k) нужно, чтобы окупить комиссии и проскальзывание входа. «—», если сделка не окупается.",
   ),
   colMark: e(
     "Mark",
@@ -705,11 +759,23 @@ export const GLOSSARY = {
     "Current mark price used by the exchange for liquidations.",
     "Текущая марк-цена, по которой биржа считает ликвидации.",
   ),
+  colTotal05: e(
+    "Near 0–5%",
+    "Ближ. 0–5%",
+    "Dollar value of whale positions that would liquidate within 5% of mark price.",
+    "Объём позиций китов в долларах, которые ликвидируются при движении цены до 5%.",
+  ),
   colTotal010: e(
     "Total 0–10%",
     "Всего 0–10%",
     "Dollar value of whale positions that would be liquidated if the price moved up to 10% in either direction.",
     "Сколько долларов в позициях китов будет ликвидировано, если цена сдвинется до 10% в любую сторону.",
+  ),
+  colNearestWall: e(
+    "Nearest Wall",
+    "Ближ. стенка",
+    "Distance (in %) from mark price to the closest whale liquidation wall.",
+    "Расстояние (в %) от текущей марк-цены до ближайшей стены ликвидаций китов.",
   ),
   colNearestL: e(
     "Nearest L",
@@ -747,11 +813,101 @@ export const GLOSSARY = {
     "Difference between the two prices in bps. Above 15 bps is a warning.",
     "Разница между двумя ценами в bps. Больше 15 bps — тревожный сигнал.",
   ),
+  colDex: e(
+    "DEX",
+    "DEX",
+    "HyperEVM decentralized exchange hosting the V3 liquidity pool.",
+    "Децентрализованная биржа в HyperEVM, где находится V3-пул.",
+  ),
+  colPool: e(
+    "Pool",
+    "Пул",
+    "Concentrated-liquidity V3 pool pair and fee tier.",
+    "Пара токенов и комиссионный уровень V3-пула.",
+  ),
+  colPegAdjSpread: e(
+    "Peg-Adj Spread",
+    "Спред (пег)",
+    "Price gap between HyperEVM V3 and HyperCore after adjusting for USDT0/USDC peg discount, in bps.",
+    "Разница цен между V3-пулом HyperEVM и HyperCore после поправки на курс USDT0/USDC, в bps.",
+  ),
+  colNetArb: e(
+    "Net Arb",
+    "Чистый арб.",
+    "Zero-clip spread after subtracting both HyperEVM pool and HyperCore trading fees, in bps.",
+    "Чистый спред после вычета комиссий V3-пула и HyperCore, в bps.",
+  ),
+  colSlip25k: e(
+    "Slip ($25k)",
+    "Слип ($25k)",
+    "Estimated V3 price impact for a $25,000 swap, in bps.",
+    "Оценка ценового проскальзывания в V3-пуле на объём $25 000, в bps.",
+  ),
+  colV3Depth: e(
+    "V3 Depth",
+    "Глубина V3",
+    "Active virtual liquidity inside the current V3 tick, in USD.",
+    "Активная виртуальная ликвидность в текущем тике V3-пула, в долларах.",
+  ),
+  colAlert: e(
+    "Alert",
+    "Триггер",
+    "Whether this row breached the active 15-minute on-chain alert threshold.",
+    "Превысил ли этот сигнал порог 15-минутного on-chain алерта.",
+  ),
+  colHlpSide: e(
+    "HLP Side",
+    "Сторона HLP",
+    "Net direction held by HLP child strategies (HLP_LONG or HLP_SHORT).",
+    "Чистое направление позиции дочерних стратегий HLP (HLP_LONG или HLP_SHORT).",
+  ),
+  colHlpNetUsd: e(
+    "Net Exposure",
+    "Чистый объём",
+    "Signed net USD inventory held across HLP child vaults in this coin.",
+    "Чистый долларовый объём позиции дочерних волтов HLP по этой монете.",
+  ),
+  colHlpTvlShare: e(
+    "% of HLP TVL",
+    "% от TVL HLP",
+    "Net coin inventory as a percentage of total HLP vault TVL.",
+    "Чистый инвентарь по монете в процентах от общего TVL хранилища HLP.",
+  ),
+  colVaultsCount: e(
+    "Vaults",
+    "Волтов",
+    "Number of HLP child vaults currently holding a position in this coin.",
+    "Сколько дочерних волтов HLP сейчас держат позицию по этой монете.",
+  ),
+  colMidMarkBps: e(
+    "Mid vs Mark",
+    "Mid к Mark",
+    "Order-book mid minus mark price in bps. Above ±50 bps signals acute book liquidity stress.",
+    "Отклонение середины стакана от марк-цены в bps. Свыше ±50 bps — острый стресс ликвидности стакана.",
+  ),
+  colMarkOracleBps: e(
+    "Mark vs Oracle",
+    "Mark к Oracle",
+    "Mark price minus oracle price in bps.",
+    "Отклонение марк-цены от цены оракула в bps.",
+  ),
+  colFundingApr: e(
+    "Funding APR",
+    "Фандинг APR",
+    "Annualized hourly funding rate on HyperCore.",
+    "Годовая ставка почасового фандинга на HyperCore.",
+  ),
+  colStressType: e(
+    "Regime",
+    "Режим",
+    "Classified microstructure regime: CRASH_BOOK_STRESS, ORACLE_DECOUPLING, CROWDED_FUNDING_BASIS, or BOOK_STRESS.",
+    "Классифицированный режим микроструктуры: CRASH_BOOK_STRESS, ORACLE_DECOUPLING, CROWDED_FUNDING_BASIS или BOOK_STRESS.",
+  ),
   colPositionUsd: e(
     "Position USD",
     "Позиция, $",
-    "Position size in dollars. L = long (profits if price rises), S = short (profits if price falls).",
-    "Размер позиции в долларах. L — лонг (заработок при росте цены), S — шорт (заработок при падении).",
+    "Position size in dollars. L = long, S = short, Flat = closed position with historical fills/funding.",
+    "Размер позиции в долларах. L — лонг, S — шорт, Закрыта — нулевая текущая позиция с историей сделок/фандинга.",
   ),
   colLeverage: e(
     "Leverage",
@@ -768,8 +924,8 @@ export const GLOSSARY = {
   colMakerPct: e(
     "Maker %",
     "Maker %",
-    "Share of volume filled with resting limit orders (cheaper fees).",
-    "Доля объёма, исполненная лимитными ордерами (дешевле по комиссии).",
+    "Share of volume filled with resting limit orders (cheaper fees). \"—\" when the coin has zero fills.",
+    "Доля объёма, исполненная лимитными ордерами (дешевле по комиссии). «—», если сделок по монете не было.",
   ),
   colVwMarkout: e(
     "VW Markout",
@@ -846,8 +1002,8 @@ export const GLOSSARY = {
   colState: e(
     "State",
     "Состояние",
-    "Result of the last run: ok, failed, running or disabled.",
-    "Результат последнего запуска: ok, failed (ошибка), running (идёт) или disabled (выключена).",
+    "Current state of the job: ok, failed, running, idle (awaiting its first scheduled slot) or disabled.",
+    "Текущее состояние задачи: ok, failed (ошибка), running (идёт), idle (ждёт первого запуска по расписанию) или disabled (выключена).",
   ),
   colLastFinished: e(
     "Last Finished",
@@ -920,8 +1076,8 @@ export const GLOSSARY = {
   col7d: e(
     "7D",
     "7Д",
-    "Return over the last 7 days (or annualized yield in APY mode).",
-    "Доходность за последние 7 дней (или годовая доходность в режиме APY).",
+    "Return over the last 7 days. In APY mode, annualization requires ≥ 14 elapsed days (apy_min_days = 14) and a non-negative return, so 7D and negative periods show \"—\".",
+    "Доходность за последние 7 дней. В режиме APY пересчёт в годовые требует минимум 14 дней истории (apy_min_days = 14) и неотрицательного результата, поэтому колонка 7Д и убыточные периоды показываются как «—».",
   ),
   col30d: e(
     "30D",

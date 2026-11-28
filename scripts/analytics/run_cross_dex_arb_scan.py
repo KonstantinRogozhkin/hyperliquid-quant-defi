@@ -24,6 +24,13 @@ from hl_quant import cross_dex_scanner as cds  # noqa: E402
 app = typer.Typer(add_completion=False, help=__doc__)
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 @app.command()
 def main(
     min_day_vol_usd: float = typer.Option(500_000.0, help="Min 24h USD volume on both DEXs"),
@@ -91,11 +98,13 @@ def main(
     md = "\n".join(lines) + "\n"
     output_dir.mkdir(parents=True, exist_ok=True)
     if not top_df.empty:
-        top_df.to_parquet(output_dir / "opportunities.parquet", index=False)
-    (output_dir / "report.md").write_text(md)
+        pq_path = output_dir / "opportunities.parquet"
+        tmp_pq = output_dir / "opportunities.tmp.parquet"
+        top_df.to_parquet(tmp_pq, index=False)
+        tmp_pq.replace(pq_path)
+    _write_text_atomic(output_dir / "report.md", md)
     if report_path is not None:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(md)
+        _write_text_atomic(report_path, md)
     typer.echo(md)
 
 

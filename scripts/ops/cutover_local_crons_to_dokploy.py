@@ -38,6 +38,7 @@ DEFAULT_BACKUP_DIR = ROOT / "data" / "crontab_backups"
 DEFAULT_REQUIRED_JOBS = (
     "market_snapshot",
     "metamodel_paper",
+    "cross_dex_paper",
     "frontier_persistence",
     "onchain_events",
     "spot_perp_paper",
@@ -46,8 +47,10 @@ DEFAULT_REQUIRED_JOBS = (
 
 BEGIN_RE = re.compile(r"^#\s*BEGIN\s+(?:hyperliquid-quant-defi|Spy2Money\s+BackTester(?:\s+hl|\s+hyperliquid)?)\s+(?P<label>.+?)\s*$")
 END_RE = re.compile(r"^#\s*END\s+(?:hyperliquid-quant-defi|Spy2Money\s+BackTester(?:\s+hl|\s+hyperliquid)?)\s+(?P<label>.+?)\s*$")
-STRAY_HL_LINE_RE = re.compile(r"hyperliquid-quant-defi/scripts/ops/")
-TESTNET_MARKER_RE = re.compile(r"(testnet\s+executor|run_hl_testnet_executor_tick\.sh)", re.IGNORECASE)
+STRAY_HL_LINE_RE = re.compile(
+    r"(?:hyperliquid-quant-defi/scripts/ops/|scripts/analytics/(?:run_hl_|collect_hyperliquid_|run_cross_dex_)[^\s#]*\.py)"
+)
+TESTNET_MARKER_RE = re.compile(r"(testnet\s+executor|run_hl_testnet_executor(?:_tick\.sh|\.py))", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -179,10 +182,30 @@ def verify_dokploy_stack(
 
     if worker_sha and not allow_sha_mismatch and worker_sha != be_sha:
         warnings.append(f"worker build_sha ({worker_sha[:12]}) differs from backend ({be_sha[:12]})")
+
     if expect_testnet_worker and not testnet_enabled:
         raise RuntimeError(
             "Dokploy worker has testnet_execution_enabled=false while --expect-testnet-worker was requested"
         )
+
+    te_job = jobs_by_name.get("testnet_executor")
+    if isinstance(te_job, dict) and (testnet_enabled or expect_testnet_worker):
+        te_job_enabled = bool(te_job.get("enabled") is True)
+        te_job_failed = str(te_job.get("state") or "").lower() == "failed"
+        if te_job_failed:
+            raise RuntimeError(
+                f"Dokploy worker job 'testnet_executor' is in failed state (exit={te_job.get('last_exit_code')})"
+            )
+        if not te_job_enabled:
+            if expect_testnet_worker:
+                raise RuntimeError(
+                    f"Dokploy worker has testnet_executor disabled ({te_job.get('status_reason')}) "
+                    "while --expect-testnet-worker was requested"
+                )
+            warnings.append(
+                f"worker reported testnet_execution_enabled=true, but testnet_executor job is disabled ({te_job.get('status_reason')})"
+            )
+            testnet_enabled = False
     if not testnet_enabled:
         warnings.append(
             "Dokploy worker has HL_ENABLE_TESTNET_EXECUTION=false (read-only). "

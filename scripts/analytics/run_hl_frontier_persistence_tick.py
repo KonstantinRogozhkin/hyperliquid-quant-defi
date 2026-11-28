@@ -18,6 +18,13 @@ from hl_quant import hl_frontier_persistence as fp  # noqa: E402
 app = typer.Typer(add_completion=False, help=__doc__)
 
 
+def _write_text_atomic(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f"{path.name}.tmp")
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(path)
+
+
 @app.command()
 def main(
     data_root: Path = typer.Option(ROOT / "data/paper", help="Paper data root directory"),
@@ -25,10 +32,9 @@ def main(
 ) -> None:
     res = fp.run_frontier_persistence_tick(data_root=data_root)
     md = fp.format_frontier_persistence_markdown(res)
-    (data_root / "hl_frontier_history" / "report.md").write_text(md, encoding="utf-8")
+    _write_text_atomic(data_root / "hl_frontier_history" / "report.md", md)
     if report_path is not None:
-        report_path.parent.mkdir(parents=True, exist_ok=True)
-        report_path.write_text(md, encoding="utf-8")
+        _write_text_atomic(report_path, md)
     typer.echo(md)
 
 

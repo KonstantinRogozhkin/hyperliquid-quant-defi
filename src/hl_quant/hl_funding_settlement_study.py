@@ -94,11 +94,19 @@ def build_coin_settlement_events(
         return pd.DataFrame()
 
     bars: dict[int, tuple[float, float]] = {}
+    ntl_by_ts: list[tuple[int, float]] = []
     for c in candles_5m:
         t = int(c.get("t", 0))
         o, cl = _f(c.get("o")), _f(c.get("c"))
         if t > 0 and o > 0 and cl > 0:
             bars[t] = (o, cl)
+            v = _f(c.get("v"))
+            if v > 0:
+                ntl_by_ts.append((t, v * cl))
+
+    ntl_by_ts.sort(key=lambda x: x[0])
+    vol_ts = np.array([x[0] for x in ntl_by_ts], dtype=np.int64) if ntl_by_ts else np.empty(0, dtype=np.int64)
+    vol_cs = np.concatenate([[0.0], np.cumsum([x[1] for x in ntl_by_ts])]) if ntl_by_ts else np.zeros(1)
 
     fund_by_hour = _index_funding_by_hour(funding_history)
     rows: list[dict[str, Any]] = []
@@ -118,6 +126,8 @@ def build_coin_settlement_events(
             continue
 
         p_m15, p_m5, p_0, p_p5, p_p15 = b_m15[0], b_m5[0], b_0[0], b_0[1], b_p10[1]
+        if not all(math.isfinite(px) and px > 0 for px in (p_m15, p_m5, p_0, p_p5, p_p15)):
+            continue
         recv_sgn = -1.0 if prev_rate > 0 else 1.0
         fade_sgn = -recv_sgn
 
@@ -130,8 +140,16 @@ def build_coin_settlement_events(
         payout_bps = (-recv_sgn) * actual_fund_bps
         naive_harvest_5m = recv_sgn * (p_p5 - p_m5) / p_m5 * 1e4 + payout_bps
 
-        if max(abs(pre_5m_recv), abs(post_5m_fade), abs(post_15m_fade)) > 500.0:
+        # Causally reject only pre-entry broken-feed >90% corrupt glitches; never filter on post-entry future returns.
+        if max(abs(pre_5m_recv), abs(pre_15m_recv)) > 9000.0:
             continue
+
+        causal_vol = day_vol_usd
+        if len(vol_ts) > 0:
+            hi = int(np.searchsorted(vol_ts, t0, side="left"))
+            lo = int(np.searchsorted(vol_ts, t0 - 24 * HOUR_MS, side="left"))
+            if hi > lo:
+                causal_vol = float(vol_cs[hi] - vol_cs[lo])
 
         rows.append(
             {
@@ -140,7 +158,7 @@ def build_coin_settlement_events(
                 "prev_funding_bps": prev_rate * 1e4,
                 "prev_apr_pct": prev_rate * 24.0 * 365.0 * 100.0,
                 "curr_funding_bps": actual_fund_bps,
-                "day_vol_usd": day_vol_usd,
+                "day_vol_usd": causal_vol,
                 "oi_usd": oi_usd,
                 "pre_crowding_5m": pre_5m_recv,
                 "pre_crowding_15m": pre_15m_recv,
@@ -165,11 +183,19 @@ def build_coin_settlement_events_15m(
         return pd.DataFrame()
 
     bars: dict[int, tuple[float, float]] = {}
+    ntl_by_ts: list[tuple[int, float]] = []
     for c in candles_15m:
         t = int(c.get("t", 0))
         o, cl = _f(c.get("o")), _f(c.get("c"))
         if t > 0 and o > 0 and cl > 0:
             bars[t] = (o, cl)
+            v = _f(c.get("v"))
+            if v > 0:
+                ntl_by_ts.append((t, v * cl))
+
+    ntl_by_ts.sort(key=lambda x: x[0])
+    vol_ts = np.array([x[0] for x in ntl_by_ts], dtype=np.int64) if ntl_by_ts else np.empty(0, dtype=np.int64)
+    vol_cs = np.concatenate([[0.0], np.cumsum([x[1] for x in ntl_by_ts])]) if ntl_by_ts else np.zeros(1)
 
     fund_by_hour = _index_funding_by_hour(funding_history)
     rows: list[dict[str, Any]] = []
@@ -188,6 +214,8 @@ def build_coin_settlement_events_15m(
             continue
 
         p_m15, p_0, p_p15, p_p30 = b_m15[0], b_0[0], b_0[1], b_p15[1]
+        if not all(math.isfinite(px) and px > 0 for px in (p_m15, p_0, p_p15, p_p30)):
+            continue
         recv_sgn = -1.0 if prev_rate > 0 else 1.0
         fade_sgn = -recv_sgn
 
@@ -199,8 +227,16 @@ def build_coin_settlement_events_15m(
         payout_bps = (-recv_sgn) * actual_fund_bps
         naive_harvest_15m = recv_sgn * (p_p15 - p_m15) / p_m15 * 1e4 + payout_bps
 
-        if max(abs(pre_15m_recv), abs(post_15m_fade), abs(post_30m_fade)) > 800.0:
+        # Causally reject only pre-entry broken-feed >90% corrupt glitches; never filter on post-entry future returns.
+        if abs(pre_15m_recv) > 9000.0:
             continue
+
+        causal_vol = day_vol_usd
+        if len(vol_ts) > 0:
+            hi = int(np.searchsorted(vol_ts, t0, side="left"))
+            lo = int(np.searchsorted(vol_ts, t0 - 24 * HOUR_MS, side="left"))
+            if hi > lo:
+                causal_vol = float(vol_cs[hi] - vol_cs[lo])
 
         rows.append(
             {
@@ -209,7 +245,7 @@ def build_coin_settlement_events_15m(
                 "prev_funding_bps": prev_rate * 1e4,
                 "prev_apr_pct": prev_rate * 24.0 * 365.0 * 100.0,
                 "curr_funding_bps": actual_fund_bps,
-                "day_vol_usd": day_vol_usd,
+                "day_vol_usd": causal_vol,
                 "oi_usd": oi_usd,
                 "pre_crowding_15m": pre_15m_recv,
                 "post_unwind_fade_15m": post_15m_fade,

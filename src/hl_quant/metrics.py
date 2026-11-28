@@ -63,6 +63,26 @@ def _num(value: Any) -> float | None:
     return x if math.isfinite(x) else None
 
 
+def _obs_ms(payload: dict[str, Any] | None) -> float | None:
+    if not isinstance(payload, dict):
+        return None
+    ms = _num(payload.get("observed_at_ms"))
+    if ms is not None and ms > 0:
+        return ms
+    dt = _parse_utc_timestamp(payload.get("observed_at_utc"))
+    return dt.timestamp() * 1000.0 if dt is not None else None
+
+
+def _metamodel_position_gross(pos: dict[str, Any]) -> float:
+    hl_w = abs(_num(pos.get("hl_weight")) or 0.0)
+    legs = pos.get("cex_legs")
+    if isinstance(legs, dict) and legs:
+        cex_w = sum(abs(_num(v) or 0.0) for v in legs.values())
+    else:
+        cex_w = abs(_num(pos.get("cex_weight")) or 0.0)
+    return hl_w + cex_w
+
+
 class _PromBuilder:
     """Minimal Prometheus text-format builder.
 
@@ -267,6 +287,8 @@ def render_prometheus_metrics(
         for crow in attr.get("per_coin") or []:
             if not isinstance(crow, dict) or not crow.get("coin"):
                 continue
+            if abs(_num(crow.get("position_sz")) or 0.0) <= 1e-12 and (_num(crow.get("position_usd")) or 0.0) <= 0.0:
+                continue
             clbl = {"coin": str(crow["coin"]), "leverage_mode": str(crow.get("leverage_mode") or "cross")}
             b.emit("hl_testnet_position_usd", crow.get("position_usd"), help_text="Testnet open position notional USD", labels=clbl)
             b.emit("hl_testnet_position_net_pnl_usd", crow.get("net_pnl_usd"), help_text="Testnet per-coin net PnL USD", labels=clbl)
@@ -277,7 +299,12 @@ def render_prometheus_metrics(
     testnet_hwm_val: float | None = None
     audit_recent = overview.get("testnet_audit_recent")
     if isinstance(audit_recent, list) and audit_recent:
-        latest_audit = audit_recent[0]
+        dict_audits = [rec for rec in audit_recent if isinstance(rec, dict)]
+        latest_audit = (
+            next((rec for rec in dict_audits if str(rec.get("mode") or "") != "dry_run"), dict_audits[0])
+            if dict_audits
+            else None
+        )
         if isinstance(latest_audit, dict):
             testnet_last_ok = str(latest_audit.get("status")) == "ok"
             testnet_hwm_val = _num(latest_audit.get("high_water_mark_usd"))
@@ -340,6 +367,12 @@ def render_prometheus_metrics(
                 "hl_testnet_live_orphan_positions",
                 len(r_orphans),
                 help_text="Live Testnet positions without a two-sided book (unmanageable by ALO planner)",
+            )
+            unmanaged = _num(risk.get("unmanaged_orphan_positions"))
+            b.emit(
+                "hl_testnet_unmanaged_orphan_positions",
+                int(unmanaged) if unmanaged is not None else len(r_orphans),
+                help_text="Non-dust live Testnet orphan positions not retained in target weights and without a resting unwind order",
             )
         b.emit("hl_testnet_live_orphan_notional_usd", risk.get("orphan_notional_usd"), help_text="Gross USD notional of live Testnet orphan positions")
         b.emit(
@@ -483,6 +516,13 @@ def render_prometheus_metrics(
         b.emit("hl_metamodel_paper_return_pct", paper.get("return_pct"), help_text="Metamodel observation paper return %")
         b.emit("hl_metamodel_paper_active_positions", paper.get("active_positions"), help_text="Active metamodel paper positions")
         b.emit("hl_metamodel_paper_ticks_total", paper.get("ticks"), metric_type="counter", help_text="Total metamodel paper ticks")
+        if _num(paper.get("nav_guard_triggers")) is not None:
+            b.emit(
+                "hl_metamodel_nav_guard_triggers_total",
+                paper.get("nav_guard_triggers"),
+                metric_type="counter",
+                help_text="Metamodel paper bounded NAV sanity guard triggers",
+            )
 
     # 7. On-Chain Events (H2/H4/H5/H6), HLP Vault, Boros Fixed Funding & HyperEVM Chain 999
     ev = overview.get("onchain_events")
@@ -686,8 +726,8 @@ def render_prometheus_metrics(
                 asset = rid.removeprefix("bench_").upper()
                 blbl = {"asset": asset}
                 b.emit("hl_benchmark_price_usd", row.get("spot_price_usd"), help_text="Live benchmark spot price USD", labels=blbl)
-                b.emit("hl_benchmark_return_pct", (row.get("gross_returns") or {}).get("all_time"), help_text="Benchmark 90D cumulative return %", labels=blbl)
-                b.emit("hl_benchmark_max_dd_pct", row.get("max_dd_gross_pct"), help_text="Benchmark 90D max drawdown %", labels=blbl)
+                b.emit("hl_benchmark_return_pct", (row.get("gross_returns") or {}).get("all_time"), help_text="Benchmark trailing 1Y (370D) cumulative return %", labels=blbl)
+                b.emit("hl_benchmark_max_dd_pct", row.get("max_dd_gross_pct"), help_text="Benchmark trailing 1Y (370D) max drawdown %", labels=blbl)
         btc_exp = (analytics.get("market_exposure") or {}).get("BTC") or {}
         for erow in btc_exp.get("rows") or []:
             if isinstance(erow, dict) and erow.get("id") and _num(erow.get("beta")) is not None:
@@ -710,12 +750,21 @@ def render_prometheus_metrics(
         )
 
     s_meta = overview.get("settlement_last_attempt") or overview.get("settlement_meta")
-    if isinstance(s_meta, dict) and "degraded" in s_meta:
-        b.emit(
-            "hl_settlement_study_degraded",
-            bool(s_meta.get("degraded")),
-            help_text="1 if latest settlement study run collected <80% of requested coins",
-        )
+    if isinstance(s_meta, dict):
+        degraded_val: bool | None = None
+        if "degraded" in s_meta and s_meta.get("degraded") is not None:
+            degraded_val = bool(s_meta.get("degraded"))
+        req_c = _num(s_meta.get("coins_requested"))
+        col_c = _num(s_meta.get("coins_collected"))
+        if req_c is not None and req_c > 0 and col_c is not None:
+            ratio_degraded = bool(int(col_c) < math.ceil(0.8 * int(req_c)))
+            degraded_val = bool(degraded_val or ratio_degraded) if degraded_val is not None else ratio_degraded
+        if degraded_val is not None:
+            b.emit(
+                "hl_settlement_study_degraded",
+                degraded_val,
+                help_text="1 if latest settlement study run collected <80% of requested coins",
+            )
 
     # Pre-compute per-sleeve live APRs so Neutral Autopilot reports its true allocation-weighted APR
     sp_live_apr = (_num(sp.get("blended_portfolio_apr_pct")) or 0.0) if isinstance(sp, dict) else 0.0
@@ -786,7 +835,7 @@ def render_prometheus_metrics(
             strategy="neutral_autopilot",
             category="Master Vault",
             mode="paper",
-            status_ok=not bool(ap_rt.get("nav_guard_triggered")),
+            status_ok=not (bool(ap_st.get("nav_guard_triggered")) or bool(ap_rt.get("nav_guard_triggered"))),
             equity_usd=eq,
             starting_capital_usd=sc,
             return_pct=ret,
@@ -817,7 +866,7 @@ def render_prometheus_metrics(
             strategy="spot_perp_hlp",
             category="Market Neutral",
             mode="paper",
-            status_ok=not bool(sp_rt.get("nav_guard_triggered")),
+            status_ok=not (bool(sp.get("nav_guard_triggered")) or bool(sp_rt.get("nav_guard_triggered"))),
             equity_usd=eq,
             starting_capital_usd=sc,
             return_pct=ret,
@@ -855,7 +904,7 @@ def render_prometheus_metrics(
             strategy="cross_dex_v2",
             category="Market Neutral",
             mode="paper",
-            status_ok=True,
+            status_ok=not bool(cdp.get("nav_guard_triggered")),
             equity_usd=eq,
             starting_capital_usd=sc,
             return_pct=ret,
@@ -894,7 +943,7 @@ def render_prometheus_metrics(
             strategy="hip3_split_margin",
             category="Market Neutral",
             mode="paper",
-            status_ok=max_ora_div <= 30.0,
+            status_ok=(max_ora_div <= 30.0) and (not bool(hp.get("nav_guard_triggered"))),
             equity_usd=eq,
             starting_capital_usd=sc,
             return_pct=ret,
@@ -917,6 +966,16 @@ def render_prometheus_metrics(
         ret = _num(paper.get("return_pct")) or 0.0
         net_r, max_dd, sh90, beta = _lb_fields("metamodel", ret)
         pos_cnt = int(_num(paper.get("active_positions")) or 0)
+        paper_positions = overview.get("paper_positions")
+        raw_paper_pos = paper.get("positions")
+        if _num(paper.get("gross_hl")) is not None or _num(paper.get("gross_cex")) is not None:
+            mm_lev = round((_num(paper.get("gross_hl")) or 0.0) + (_num(paper.get("gross_cex")) or 0.0), 4)
+        elif isinstance(paper_positions, list) and paper_positions:
+            mm_lev = round(sum(_metamodel_position_gross(p) for p in paper_positions if isinstance(p, dict)), 4)
+        elif isinstance(raw_paper_pos, dict) and raw_paper_pos:
+            mm_lev = round(sum(_metamodel_position_gross(p) for p in raw_paper_pos.values() if isinstance(p, dict)), 4)
+        else:
+            mm_lev = 1.0 if pos_cnt > 0 else 0.0
         total_paper_eq += eq
         total_open_pos += pos_cnt
         _emit_strategy_row(
@@ -924,17 +983,17 @@ def render_prometheus_metrics(
             strategy="metamodel_5bps",
             category="Observation",
             mode="paper",
-            status_ok=True,
+            status_ok=not bool(paper.get("nav_guard_triggered")),
             equity_usd=eq,
             starting_capital_usd=sc,
             return_pct=ret,
             net_return_pct=net_r,
             net_pnl_usd=round(eq - sc, 2),
-            funding_pnl_usd=0.0,
-            costs_usd=0.0,
+            funding_pnl_usd=_num(paper.get("cum_funding_usd")) or 0.0,
+            costs_usd=abs(_num(paper.get("cum_costs_usd")) or 0.0),
             live_apr_pct=0.0,
             open_positions=pos_cnt,
-            leverage=1.0 if pos_cnt > 0 else 0.0,
+            leverage=mm_lev,
             max_dd_pct=max_dd,
             share_price=round(eq / sc, 6) if sc > 0 else 1.0,
             sharpe_90d=sh90,
@@ -942,21 +1001,46 @@ def render_prometheus_metrics(
         )
 
     if isinstance(attr, dict):
-        eq = _num(attr.get("equity_usd")) or 0.0
-        net_pnl = _num(attr.get("net_attributed_pnl_usd")) or 0.0
+        attr_ms = _obs_ms(attr)
+        risk_ms = _obs_ms(risk) if isinstance(risk, dict) else None
+        risk_newer = isinstance(risk, dict) and (
+            (risk_ms is not None and (attr_ms is None or risk_ms > attr_ms))
+            or (risk_ms is None and attr_ms is None)
+        )
+        eq_risk = _num(risk.get("equity_usd")) if (risk_newer and isinstance(risk, dict)) else None
+        eq = eq_risk if eq_risk is not None else (_num(attr.get("equity_usd")) or 0.0)
+        attr_net_pnl = _num(attr.get("net_attributed_pnl_usd")) or 0.0
         dep_sc = _num(attr.get("deposited_capital_usd"))
-        sc = dep_sc if (dep_sc is not None and dep_sc > 0.0) else max(eq - net_pnl, 1.0)
         acct_ret = _num(attr.get("account_return_pct"))
-        ret = round(acct_ret, 4) if acct_ret is not None else round(net_pnl / sc * 100.0, 4)
-        pos_cnt = int(_num(attr.get("open_positions_count")) or 0)
+        if dep_sc is not None and dep_sc > 0.0:
+            sc = round(dep_sc, 4)
+            net_pnl = round(eq - sc, 4)
+            ret = round(net_pnl / sc * 100.0, 4) if (risk_newer or acct_ret is None) else round(acct_ret, 4)
+        else:
+            attr_eq = _num(attr.get("equity_usd"))
+            base_eq = attr_eq if attr_eq is not None else eq
+            sc = round(max(base_eq - attr_net_pnl, 1.0), 4)
+            net_pnl = round(eq - sc, 4) if risk_newer else attr_net_pnl
+            ret = round(net_pnl / sc * 100.0, 4) if (risk_newer or acct_ret is None) else round(acct_ret, 4)
+        pos_cnt = (
+            int(_num(risk.get("open_positions")) or 0)
+            if (risk_newer and isinstance(risk, dict) and _num(risk.get("open_positions")) is not None)
+            else int(_num(attr.get("open_positions_count")) or 0)
+        )
         tot_notional = sum(abs(_num(c.get("position_usd")) or 0.0) for c in (attr.get("per_coin") or []) if isinstance(c, dict))
+        lev_risk = _num(risk.get("gross_leverage")) if (risk_newer and isinstance(risk, dict)) else None
+        lev_val = round(lev_risk, 4) if lev_risk is not None else (round(tot_notional / max(eq, 1.0), 3) if eq > 0 else 0.0)
         liq_w = len(attr.get("liq_warnings") or [])
         adl_w = len(attr.get("adl_warnings") or [])
-        testnet_dd = (
-            round(max(0.0, (1.0 - eq / testnet_hwm_val) * 100.0), 4)
-            if (testnet_hwm_val is not None and testnet_hwm_val > 0 and eq > 0)
-            else 0.0
-        )
+        dd_risk = _num(risk.get("drawdown_pct")) if (risk_newer and isinstance(risk, dict)) else None
+        if eq <= 0.0 and testnet_hwm_val is not None and testnet_hwm_val > 0.0:
+            testnet_dd = 100.0
+        elif dd_risk is not None:
+            testnet_dd = round(max(0.0, dd_risk), 4)
+        elif testnet_hwm_val is not None and testnet_hwm_val > 0.0:
+            testnet_dd = round(max(0.0, (1.0 - eq / testnet_hwm_val) * 100.0), 4)
+        else:
+            testnet_dd = 0.0
         total_open_pos += pos_cnt
         _emit_strategy_row(
             b,
@@ -965,7 +1049,7 @@ def render_prometheus_metrics(
             mode="testnet",
             status_ok=bool(testnet_last_ok and liq_w == 0 and adl_w == 0),
             equity_usd=eq,
-            starting_capital_usd=round(sc, 2),
+            starting_capital_usd=sc,
             return_pct=ret,
             net_return_pct=ret,
             net_pnl_usd=net_pnl,
@@ -973,7 +1057,7 @@ def render_prometheus_metrics(
             costs_usd=abs(_num(attr.get("fees_usd")) or 0.0),
             live_apr_pct=0.0,
             open_positions=pos_cnt,
-            leverage=round(tot_notional / max(eq, 1.0), 3),
+            leverage=lev_val,
             max_dd_pct=testnet_dd,
             share_price=round(eq / sc, 6) if sc > 0 else 1.0,
         )
@@ -1004,11 +1088,29 @@ def render_prometheus_metrics(
         if isinstance(analytics, dict)
         else 0
     )
-    mm_nav_guards = int(((overview.get("paper") or {}).get("nav_guard_triggers") or 0)) if isinstance(overview.get("paper"), dict) else 0
-    total_nav_guards = max(sp_nav_guards + ap_nav_guards + mm_nav_guards, analytics_nav_guards)
+    cdp_nav_guards = int((cdp.get("nav_guard_triggers") or 0)) if isinstance(cdp, dict) else 0
+    hp_nav_guards = int((hp.get("nav_guard_triggers") or 0)) if isinstance(hp, dict) else 0
+    mm_nav_guards = int((paper.get("nav_guard_triggers") or 0)) if isinstance(paper, dict) else 0
+    total_nav_guards = max(
+        sp_nav_guards + ap_nav_guards + cdp_nav_guards + hp_nav_guards + mm_nav_guards,
+        analytics_nav_guards,
+    )
+    nav_guard_active = any(
+        isinstance(ledger, dict)
+        and (
+            bool(ledger.get("nav_guard_triggered"))
+            or bool((ledger.get("risk_telemetry") or {}).get("nav_guard_triggered"))
+        )
+        for ledger in (sp, ap_st, cdp, hp, paper)
+    )
 
     b.emit("hl_desk_total_paper_equity_usd", round(total_paper_eq, 2), help_text="Sum of standalone paper sleeve equities USD (excludes Master Vault wrapper)")
     b.emit("hl_desk_total_open_positions", total_open_pos, help_text="Total open positions across all active strategies")
+    b.emit(
+        "hl_desk_nav_guard_active",
+        nav_guard_active,
+        help_text="1 if any desk strategy ledger currently has Bounded NAV Sanity Guard active",
+    )
     b.emit(
         "hl_desk_nav_guard_triggers_total",
         total_nav_guards,

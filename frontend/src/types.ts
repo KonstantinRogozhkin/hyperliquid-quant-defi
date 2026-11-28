@@ -23,6 +23,7 @@ export interface WorkerJobStatus {
   last_finished_at_utc: string | null;
   last_exit_code: number | null;
   last_duration_s: number | null;
+  last_error?: string | null;
   runs_ok: number;
   runs_failed: number;
   next_run_utc: string;
@@ -60,23 +61,71 @@ export interface PaperPositionRow {
   hl_weight: number;
   cex_weight: number;
   cex_venue: string;
+  cex_legs?: Record<string, number>;
   last_hl_px: number | null;
   l2_spread_bps: number | null;
   cum_pnl_usd: number;
 }
 
+export type MetamodelPosition = PaperPositionRow;
+
 export interface TestnetAuditRecord {
   ts_ms: number;
   observed_at_utc: string | null;
   status: string;
+  mode?: string;
+  derisk_mode?: string | null;
   violations: string[];
   cancelled_count: number;
   placed_count: number;
   total_notional_usd: number;
   high_water_mark_usd: number;
+  equity_usd?: number | null;
+  free_margin_usd?: number | null;
+  drawdown_pct?: number | null;
+  orphan_notional_usd?: number | null;
+  orphan_unwind_count?: number;
   blocked_isolated_coins: string[];
+  blocked_leverage_coins?: string[];
+  foreign_coins?: string[];
   skipped_unquoted_coins?: string[];
   orphan_positions?: Record<string, number>;
+}
+
+export interface TestnetRiskSnapshot {
+  observed_at_ms?: number;
+  observed_at_utc?: string | null;
+  equity_usd: number;
+  free_margin_usd: number;
+  high_water_mark_usd: number;
+  drawdown_pct: number;
+  kill_switch_drawdown_pct?: number;
+  drawdown_headroom_pct?: number;
+  open_positions: number;
+  gross_notional_usd: number;
+  gross_leverage: number | null;
+  unrealized_pnl_mark_usd?: number;
+  unrealized_pnl_oracle_usd?: number;
+  mark_oracle_pnl_gap_usd?: number;
+  mark_oracle_pnl_gap_pct?: number | null;
+  max_mark_oracle_dev_pct: number;
+  max_mark_oracle_dev_coin?: string | null;
+  orphan_positions:
+    | number
+    | Record<
+        string,
+        {
+          szi?: number;
+          notional_usd?: number;
+          unrealized_pnl_usd?: number;
+          book?: string;
+        }
+      >;
+  unmanaged_orphan_positions?: number;
+  orphan_notional_usd: number;
+  orphan_unrealized_pnl_usd?: number;
+  open_orders?: number;
+  per_coin?: Array<Record<string, unknown>>;
 }
 
 export interface CoinAttributionRow {
@@ -105,8 +154,8 @@ export interface Hip3Opp {
   oracle_divergence_bps: number;
   oracle_risk_warning: boolean;
   both_growth_mode: boolean;
-  l2_slip_5k_bps: number;
-  payback_hours_5k: number;
+  l2_slip_5k_bps: number | null;
+  payback_hours_5k: number | null;
   min_growth_lock_days_left?: number | null;
 }
 
@@ -144,7 +193,12 @@ export interface CrossDexOpp {
   other_apr_pct: number;
   spread_apr_pct: number;
   favorable_basis_bps: number;
-  breakeven_hours: number;
+  breakeven_hours: number | null;
+  exec_basis_10k_bps?: number | null;
+  l2_slip_10k_bps?: number | null;
+  l2_slip_50k_bps?: number | null;
+  depth_be_10k_h?: number | null;
+  depth_50k_ok?: boolean;
   hl_vol_m?: number;
 }
 
@@ -234,6 +288,8 @@ export interface CoinCalibration {
   arrival_a_per_sec: number;
   r2_fit: number;
   implied_min_half_spread_bps: number;
+  calibration_ok?: boolean;
+  calibration_reason?: string;
   depth_curve: CalibrationPoint[];
 }
 
@@ -253,6 +309,7 @@ export interface OverviewPayload {
   paper_ticks?: PaperTick[];
   paper_positions?: PaperPositionRow[];
   testnet_audit_recent?: TestnetAuditRecord[];
+  testnet_risk?: TestnetRiskSnapshot | null;
   latency_bench?: {
     iterations: number;
     p50_us: number;
@@ -311,6 +368,10 @@ export interface OverviewPayload {
     any_alert: boolean;
     active_alert_keys?: string[];
     new_alert_keys?: string[];
+    h2_events?: Array<Record<string, unknown>>;
+    h4_events?: Array<Record<string, unknown>>;
+    h5_events?: Array<Record<string, unknown>>;
+    h6_events?: Array<Record<string, unknown>>;
   } | null;
   liq_funding?: {
     whales_scanned: number;
@@ -493,11 +554,16 @@ export interface LeaderboardRow {
   dd_recovery_net_days?: number | null;
   current_underwater_net_days?: number;
   positive_days_pct: number | null;
+  positive_days_net_pct?: number | null;
   longest_win_streak: number;
   longest_loss_streak: number;
+  longest_win_streak_net?: number;
+  longest_loss_streak_net?: number;
   monthly_gross: MonthlyReturnRow[];
   monthly_net: MonthlyReturnRow[];
 }
+
+export type AnalyticsLeaderboardRow = LeaderboardRow;
 
 export interface AnalyticsCurve {
   id: string;

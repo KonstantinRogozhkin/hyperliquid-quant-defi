@@ -200,7 +200,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(hl_worker_job_ok)",
+          "expr": "hl_worker_jobs_healthy_ratio",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -225,21 +225,18 @@
       },
       "fieldConfig": {
         "defaults": {
+          "unit": "percentunit",
           "decimals": 0,
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "red",
+                "color": "blue",
                 "value": null
               },
               {
-                "color": "yellow",
-                "value": 13
-              },
-              {
                 "color": "green",
-                "value": 15
+                "value": 0.9
               }
             ]
           }
@@ -384,7 +381,7 @@
     {
       "id": 7,
       "type": "stat",
-      "title": "NAV Guard Triggers",
+      "title": "NAV Guard Active",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -398,7 +395,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "hl_desk_nav_guard_triggers_total",
+          "expr": "hl_desk_nav_guard_active",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -424,6 +421,21 @@
       "fieldConfig": {
         "defaults": {
           "decimals": 0,
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "0": {
+                  "text": "OK",
+                  "color": "green"
+                },
+                "1": {
+                  "text": "ACTIVE",
+                  "color": "red"
+                }
+              }
+            }
+          ],
           "thresholds": {
             "mode": "absolute",
             "steps": [
@@ -4404,7 +4416,7 @@
     {
       "id": 64,
       "type": "row",
-      "title": "8. Scheduler Jobs (15 UTC Crons) & Artifact Freshness",
+      "title": "8. Scheduler Jobs (16 UTC Crons) & Artifact Freshness",
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -4416,7 +4428,7 @@
     {
       "id": 65,
       "type": "table",
-      "title": "All 15 UTC Worker Jobs — Live Status, Runs & Duration",
+      "title": "All 16 UTC Worker Jobs — Live Status, Runs & Duration",
       "datasource": {
         "type": "prometheus",
         "uid": "${datasource}"
@@ -4430,7 +4442,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "max by (worker_job) (hl_worker_job_ok)",
+          "expr": "max by (worker_job) (hl_worker_job_enabled * (1 + hl_worker_job_ok + 2 * hl_worker_job_failed))",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4441,7 +4453,7 @@
         },
         {
           "refId": "B",
-          "expr": "max by (worker_job) (hl_worker_job_failed)",
+          "expr": "max by (worker_job) (hl_worker_job_enabled)",
           "datasource": {
             "type": "prometheus",
             "uid": "${datasource}"
@@ -4497,8 +4509,8 @@
             },
             "renameByName": {
               "worker_job": "Job",
-              "Value #A": "OK",
-              "Value #B": "Failed",
+              "Value #A": "Status",
+              "Value #B": "Enabled",
               "Value #C": "Total OK",
               "Value #D": "Total Fail",
               "Value #E": "Duration (s)"
@@ -4512,7 +4524,7 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "OK"
+              "options": "Status"
             },
             "properties": [
               {
@@ -4521,12 +4533,20 @@
                   {
                     "type": "value",
                     "options": {
+                      "0": {
+                        "text": "DISABLED",
+                        "color": "semi-dark-blue"
+                      },
                       "1": {
+                        "text": "IDLE / RUN",
+                        "color": "blue"
+                      },
+                      "2": {
                         "text": "OK",
                         "color": "green"
                       },
-                      "0": {
-                        "text": "WARN",
+                      "3": {
+                        "text": "FAIL",
                         "color": "red"
                       }
                     }
@@ -4545,12 +4565,20 @@
                   "mode": "absolute",
                   "steps": [
                     {
-                      "color": "red",
+                      "color": "semi-dark-blue",
                       "value": null
                     },
                     {
-                      "color": "green",
+                      "color": "blue",
                       "value": 1
+                    },
+                    {
+                      "color": "green",
+                      "value": 2
+                    },
+                    {
+                      "color": "red",
+                      "value": 3
                     }
                   ]
                 }

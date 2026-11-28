@@ -218,12 +218,13 @@ def build_dashboard() -> dict[str, Any]:
         _stat(
             next_id(),
             "Healthy Jobs",
-            "sum(hl_worker_job_ok)",
+            "hl_worker_jobs_healthy_ratio",
             6,
             1,
             3,
+            unit="percentunit",
             decimals=0,
-            thresholds=[{"color": "red", "value": None}, {"color": "yellow", "value": 13}, {"color": "green", "value": 15}],
+            thresholds=[{"color": "blue", "value": None}, {"color": "green", "value": 0.9}],
         )
     )
     panels.append(
@@ -255,12 +256,13 @@ def build_dashboard() -> dict[str, Any]:
     panels.append(
         _stat(
             next_id(),
-            "NAV Guard Triggers",
-            "hl_desk_nav_guard_triggers_total",
+            "NAV Guard Active",
+            "hl_desk_nav_guard_active",
             15,
             1,
             3,
             decimals=0,
+            mappings=[{"type": "value", "options": {"0": {"text": "OK", "color": "green"}, "1": {"text": "ACTIVE", "color": "red"}}}],
             thresholds=[{"color": "green", "value": None}, {"color": "red", "value": 1}],
             color_mode="background",
         )
@@ -1050,17 +1052,22 @@ def build_dashboard() -> dict[str, Any]:
     # =========================================================================
     # ROW 8: Scheduler Jobs & Artifact Freshness Audit (y=93..102)
     # =========================================================================
-    panels.append(_row(next_id(), "8. Scheduler Jobs (15 UTC Crons) & Artifact Freshness", 93))
+    panels.append(_row(next_id(), "8. Scheduler Jobs (16 UTC Crons) & Artifact Freshness", 93))
     panels.append(
         {
             "id": next_id(),
             "type": "table",
-            "title": "All 15 UTC Worker Jobs — Live Status, Runs & Duration",
+            "title": "All 16 UTC Worker Jobs — Live Status, Runs & Duration",
             "datasource": DS,
             "gridPos": {"h": 8, "w": 12, "x": 0, "y": 94},
             "targets": [
-                _target("A", "max by (worker_job) (hl_worker_job_ok)", instant=True, table=True),
-                _target("B", "max by (worker_job) (hl_worker_job_failed)", instant=True, table=True),
+                _target(
+                    "A",
+                    "max by (worker_job) (hl_worker_job_enabled * (1 + hl_worker_job_ok + 2 * hl_worker_job_failed))",
+                    instant=True,
+                    table=True,
+                ),
+                _target("B", "max by (worker_job) (hl_worker_job_enabled)", instant=True, table=True),
                 _target("C", "max by (worker_job) (hl_worker_job_runs_ok_total)", instant=True, table=True),
                 _target("D", "max by (worker_job) (hl_worker_job_runs_failed_total)", instant=True, table=True),
                 _target("E", "max by (worker_job) (hl_worker_job_last_duration_seconds)", instant=True, table=True),
@@ -1073,8 +1080,8 @@ def build_dashboard() -> dict[str, Any]:
                         "excludeByName": {"Time": True},
                         "renameByName": {
                             "worker_job": "Job",
-                            "Value #A": "OK",
-                            "Value #B": "Failed",
+                            "Value #A": "Status",
+                            "Value #B": "Enabled",
                             "Value #C": "Total OK",
                             "Value #D": "Total Fail",
                             "Value #E": "Duration (s)",
@@ -1086,11 +1093,35 @@ def build_dashboard() -> dict[str, Any]:
                 "defaults": {},
                 "overrides": [
                     _override(
-                        "OK",
+                        "Status",
                         [
-                            {"id": "mappings", "value": [{"type": "value", "options": {"1": {"text": "OK", "color": "green"}, "0": {"text": "WARN", "color": "red"}}}]},
+                            {
+                                "id": "mappings",
+                                "value": [
+                                    {
+                                        "type": "value",
+                                        "options": {
+                                            "0": {"text": "DISABLED", "color": "semi-dark-blue"},
+                                            "1": {"text": "IDLE / RUN", "color": "blue"},
+                                            "2": {"text": "OK", "color": "green"},
+                                            "3": {"text": "FAIL", "color": "red"},
+                                        },
+                                    }
+                                ],
+                            },
                             {"id": "custom.cellOptions", "value": {"type": "color-background"}},
-                            {"id": "thresholds", "value": {"mode": "absolute", "steps": [{"color": "red", "value": None}, {"color": "green", "value": 1}]}},
+                            {
+                                "id": "thresholds",
+                                "value": {
+                                    "mode": "absolute",
+                                    "steps": [
+                                        {"color": "semi-dark-blue", "value": None},
+                                        {"color": "blue", "value": 1},
+                                        {"color": "green", "value": 2},
+                                        {"color": "red", "value": 3},
+                                    ],
+                                },
+                            },
                         ],
                     ),
                     _override("Duration (s)", [{"id": "unit", "value": "s"}, {"id": "decimals", "value": 1}]),

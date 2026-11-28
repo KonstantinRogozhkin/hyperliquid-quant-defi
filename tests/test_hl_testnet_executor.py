@@ -193,7 +193,8 @@ def test_fetch_testnet_account_unified_vs_standard_equity():
     with httpx.Client(transport=httpx.MockTransport(standard_handler)) as client:
         snap_std = ex.fetch_testnet_account(client, "0xSTD")
     assert snap_std.equity_usd == pytest.approx(1000.0)
-    assert snap_std.free_margin_usd == pytest.approx(900.0)
+    # Standard Account: Spot USDC ($600) cannot margin Perps without usdClassTransfer -> free_margin == 400 - 100 = 300.
+    assert snap_std.free_margin_usd == pytest.approx(300.0)
 
 
 def test_only_isolated_coins_are_skipped_for_entry_and_unwound_if_held():

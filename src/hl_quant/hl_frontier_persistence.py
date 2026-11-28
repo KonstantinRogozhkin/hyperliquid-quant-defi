@@ -58,11 +58,18 @@ def compute_hip3_persistence_summary(
     *,
     min_apr_pct: float = 20.0,
     max_oracle_div_bps: float = 25.0,
+    latest_tick_ms: int | None = None,
+    tick_timestamps_ms: list[int] | None = None,
 ) -> list[dict[str, Any]]:
     """Summarize multi-tick persistence of HIP-3 cross-builder spreads (clean, same-direction, gap-aware)."""
     if hip3_df.empty or "base_symbol" not in hip3_df.columns:
         return []
-    all_ts = sorted(int(x) for x in hip3_df["ts_ms"].dropna().astype("int64").unique().tolist())
+    ts_set = {int(x) for x in hip3_df["ts_ms"].dropna().astype("int64").unique().tolist()}
+    if tick_timestamps_ms:
+        ts_set.update(int(x) for x in tick_timestamps_ms)
+    if latest_tick_ms is not None:
+        ts_set.add(int(latest_tick_ms))
+    all_ts = sorted(ts_set)
     if not all_ts:
         return []
     latest_global_ts = all_ts[-1]
@@ -177,7 +184,7 @@ def run_frontier_persistence_tick(
             "payback_hours_5k_taker": o.payback_hours_5k_taker,
             "any_only_isolated": o.any_only_isolated,
         }
-        for o in hip3_snap.cross_builder_opps[:15]
+        for o in hip3_snap.cross_builder_opps
     ]
     boros_rows = [
         {
@@ -211,13 +218,34 @@ def run_frontier_persistence_tick(
         for s in yield_snap.strategies
     ]
 
+    latest_summary_path = hist_dir / "latest_summary.json"
+    prior_ticks: list[int] = []
+    if latest_summary_path.is_file():
+        try:
+            prev_sum = json.loads(latest_summary_path.read_text(encoding="utf-8"))
+            if isinstance(prev_sum, dict):
+                raw_ticks = prev_sum.get("tick_timestamps_ms") or []
+                prior_ticks = [int(t) for t in raw_ticks if t is not None]
+                prev_last = prev_sum.get("last_tick_ms") or prev_sum.get("ts_ms")
+                if prev_last is not None:
+                    prior_ticks.append(int(prev_last))
+        except Exception:
+            prior_ticks = []
+
     hip3_df = _append_parquet(hist_dir / "hip3_history.parquet", hip3_rows)
     boros_df = _append_parquet(hist_dir / "boros_history.parquet", boros_rows)
     ys_df = _append_parquet(hist_dir / "yield_stack_history.parquet", ys_rows)
 
-    persistence = compute_hip3_persistence_summary(hip3_df)
+    all_tick_ts = sorted({*prior_ticks, ts_ms})[-5_000:]
+    persistence = compute_hip3_persistence_summary(
+        hip3_df,
+        latest_tick_ms=ts_ms,
+        tick_timestamps_ms=all_tick_ts,
+    )
     summary = {
         "ts_ms": ts_ms,
+        "last_tick_ms": ts_ms,
+        "tick_timestamps_ms": all_tick_ts,
         "observed_at_utc": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
         "ny_session": hip3_snap.ny_session,
         "total_logged": {

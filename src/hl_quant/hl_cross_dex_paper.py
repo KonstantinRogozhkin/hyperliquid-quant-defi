@@ -32,6 +32,9 @@ from hl_quant import cross_dex_scanner as cds
 from hl_quant.persistence_clock import streak_count, update_streak_map
 
 
+NAV_GUARD_CONFIRM_MS = 3_600_000
+
+
 @dataclass(frozen=True, slots=True)
 class CrossDexPaperConfig:
     starting_capital_usd: float = 50_000.0
@@ -61,6 +64,7 @@ class CrossDexPaperConfig:
     # Reject entries where the L2 book mid basis and the mark basis disagree by more than this:
     # the ledger marks on mark_px, so a book-only edge (stale/async snapshot) never realizes.
     max_book_mark_divergence_bps: float = 6.0
+    max_tick_nav_jump_pct: float = 8.0  # Bounded NAV sanity guard
 
     def other_fee_bps(self, dex: str) -> float:
         return self.lighter_fee_bps if dex == "lighter" else self.extended_fee_bps
@@ -74,6 +78,10 @@ def _load_or_init_state(state_path: Path, cfg: CrossDexPaperConfig) -> dict[str,
         st = json.loads(state_path.read_text(encoding="utf-8"))
         st.setdefault("spread_streaks", {})
         st.setdefault("combo_streaks", {})
+        st.setdefault("nav_guard_triggers", 0)
+        st.setdefault("nav_guard_triggered", False)
+        st.setdefault("nav_guard_reason", "")
+        st.setdefault("nav_guard_pending_ms", None)
         return st
     return {
         "starting_capital_usd": cfg.starting_capital_usd,
@@ -87,6 +95,10 @@ def _load_or_init_state(state_path: Path, cfg: CrossDexPaperConfig) -> dict[str,
         "combo_streaks": {},  # same keys, threshold combo_min_apr_pct (H1 combo persistence)
         "closed_pairs_count": 0,
         "payback_achieved_count": 0,
+        "nav_guard_triggers": 0,
+        "nav_guard_triggered": False,
+        "nav_guard_reason": "",
+        "nav_guard_pending_ms": None,
     }
 
 
@@ -138,6 +150,32 @@ def run_cross_dex_paper_tick(
     state_path = state_dir / "state.json"
     state = _load_or_init_state(state_path, cfg)
 
+    prev_ms = int(state.get("last_tick_ms", 0))
+    if prev_ms > 0 and (ts_ms // 3_600_000) <= (prev_ms // 3_600_000):
+        pos_snap = state.get("positions") or {}
+        return {
+            "status": "duplicate_hour_skipped",
+            "tick": {
+                "ts_ms": ts_ms,
+                "dt_hours": 0.0,
+                "equity_usd": state["equity_usd"],
+                "liquidation_equity_usd": state.get("liquidation_equity_usd", state["equity_usd"]),
+                "active_pairs": len(pos_snap),
+                "gross_notional_usd": round(sum(float(p["leg_notional_usd"]) * 2.0 for p in pos_snap.values()), 2),
+                "tick_funding_usd": 0.0,
+                "tick_basis_mtm_usd": 0.0,
+                "tick_costs_usd": 0.0,
+                "tick_net_pnl_usd": 0.0,
+                "opened_count": 0,
+                "closed_count": 0,
+                "nav_guard_triggered": bool(state.get("nav_guard_triggered", False)),
+            },
+            "state": state,
+            "trades": [],
+            "gated_stats": {},
+            "markets_scanned": {},
+        }
+
     hl_q = hl_quotes if hl_quotes is not None else cds.fetch_hyperliquid_quotes(client)
     lt_q = lighter_quotes if lighter_quotes is not None else cds.fetch_lighter_quotes(client)
     if extended_quotes is not None:
@@ -156,10 +194,16 @@ def run_cross_dex_paper_tick(
 
     get_book = book_fetcher or (lambda dex, sym: cds.fetch_dex_l2_book(client, dex, sym))
 
-    prev_ms = int(state.get("last_tick_ms", 0))
-    dt_hours = max(0.0, min(24.0, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
+    dt_cap_h = 168.0 if state.get("nav_guard_pending_ms") else 24.0
+    dt_hours = max(0.0, min(dt_cap_h, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
+    settled_hours = (
+        min(dt_cap_h, float(max(0, (ts_ms // 3_600_000) - (prev_ms // 3_600_000))))
+        if prev_ms > 0
+        else 0.0
+    )
 
     positions: dict[str, dict[str, Any]] = state.get("positions") or {}
+    positions_backup = {k: dict(v) for k, v in positions.items()}
     tick_funding_usd = 0.0
     tick_basis_mtm_usd = 0.0
     tick_costs_usd = 0.0
@@ -186,8 +230,8 @@ def run_cross_dex_paper_tick(
 
         hl_notional = hl_qty * h.mark_px
         oth_notional = oth_qty * oth.mark_px
-        hl_fund_pnl = hl_notional * (-hl_sgn) * h.funding_rate_h * dt_hours
-        oth_fund_pnl = oth_notional * (-oth_sgn) * oth.funding_rate_h * dt_hours
+        hl_fund_pnl = hl_notional * (-hl_sgn) * h.funding_rate_h * settled_hours
+        oth_fund_pnl = oth_notional * (-oth_sgn) * oth.funding_rate_h * settled_hours
         fund_pnl = hl_fund_pnl + oth_fund_pnl
 
         pos["other_dex"] = other_dex
@@ -221,8 +265,42 @@ def run_cross_dex_paper_tick(
         tick_funding_usd += fund_pnl
         tick_basis_mtm_usd += basis_pnl
 
+    # 1b. Bounded NAV Sanity Guard (clamp anomalous single-tick MTM jump until >= 1h confirmation)
+    prev_equity = float(state.get("equity_usd", cfg.starting_capital_usd))
+    raw_tick_pnl = tick_funding_usd + tick_basis_mtm_usd
+    pending_raw = state.get("nav_guard_pending_ms")
+    nav_guard_pending: int | None = int(pending_raw) if pending_raw else None
+    jump_exceeded = (
+        prev_ms > 0
+        and prev_equity > 0
+        and cfg.max_tick_nav_jump_pct > 0.0
+        and abs(raw_tick_pnl) / prev_equity * 100.0 > cfg.max_tick_nav_jump_pct
+    )
+    nav_guard_triggered = False
+    nav_guard_reason = ""
+    if jump_exceeded and nav_guard_pending is not None and ts_ms - nav_guard_pending >= NAV_GUARD_CONFIRM_MS:
+        nav_guard_reason = (
+            f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% persisted since the clamped tick; "
+            "accepted as genuine"
+        )
+        nav_guard_pending = None
+        jump_exceeded = False
+    elif not jump_exceeded:
+        nav_guard_pending = None
+    if jump_exceeded:
+        nav_guard_pending = nav_guard_pending if nav_guard_pending is not None else ts_ms
+        nav_guard_triggered = True
+        nav_guard_reason = (
+            f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% exceeded "
+            f"+/-{cfg.max_tick_nav_jump_pct:.1f}% guard; clamping MTM & freezing rebalance"
+        )
+        state["nav_guard_triggers"] = int(state.get("nav_guard_triggers", 0)) + 1
+        positions = positions_backup
+        tick_funding_usd = 0.0
+        tick_basis_mtm_usd = 0.0
+
     # 2. Exit pairs whose spread decayed below exit_apr_pct (or H1 combo once basis converged & carry low)
-    for coin in list(positions.keys()):
+    for coin in (list(positions.keys()) if not nav_guard_triggered else []):
         pos = positions[coin]
         other_dex = str(pos.get("other_dex") or "lighter")
         venue_online = bool(hl_q) and bool(venue_quotes.get(other_dex))
@@ -324,25 +402,29 @@ def run_cross_dex_paper_tick(
         for r in all_opps.itertuples(index=False):
             if float(r.spread_apr_pct) >= cfg.entry_apr_pct:
                 qualifying_keys.append(f"{r.coin}@{r.other_dex}:{r.direction}")
-    new_streaks = update_streak_map(
-        state.get("spread_streaks") or {},
-        qualifying_keys,
-        now_ms=ts_ms,
-        min_spacing_hours=cfg.min_streak_spacing_hours,
-    )
-    state["spread_streaks"] = new_streaks
-    combo_keys: list[str] = []
-    if cfg.enable_basis_carry_combo and not all_opps.empty:
-        for r in all_opps.itertuples(index=False):
-            if float(r.spread_apr_pct) >= cfg.combo_min_apr_pct:
-                combo_keys.append(f"{r.coin}@{r.other_dex}:{r.direction}")
-    combo_streaks = update_streak_map(
-        state.get("combo_streaks") or {},
-        combo_keys,
-        now_ms=ts_ms,
-        min_spacing_hours=cfg.min_streak_spacing_hours,
-    )
-    state["combo_streaks"] = combo_streaks
+    if nav_guard_triggered:
+        new_streaks = dict(state.get("spread_streaks") or {})
+        combo_streaks = dict(state.get("combo_streaks") or {})
+    else:
+        new_streaks = update_streak_map(
+            state.get("spread_streaks") or {},
+            qualifying_keys,
+            now_ms=ts_ms,
+            min_spacing_hours=cfg.min_streak_spacing_hours,
+        )
+        state["spread_streaks"] = new_streaks
+        combo_keys: list[str] = []
+        if cfg.enable_basis_carry_combo and not all_opps.empty:
+            for r in all_opps.itertuples(index=False):
+                if float(r.spread_apr_pct) >= cfg.combo_min_apr_pct:
+                    combo_keys.append(f"{r.coin}@{r.other_dex}:{r.direction}")
+        combo_streaks = update_streak_map(
+            state.get("combo_streaks") or {},
+            combo_keys,
+            now_ms=ts_ms,
+            min_spacing_hours=cfg.min_streak_spacing_hours,
+        )
+        state["combo_streaks"] = combo_streaks
 
     # 4. Evaluate candidates with Persistence Gate, Tight-L2 + Basis Gate, and H1 Basis+Carry Combo
     opened_coins: list[str] = []
@@ -353,10 +435,20 @@ def run_cross_dex_paper_tick(
         "skipped_breakeven": 0,
         "skipped_basis_source": 0,
     }
-    if not all_opps.empty and len(positions) < cfg.max_slots:
-        # Check top 30 candidates by spread (and any with big favorable mark basis for H1 combo)
+    if not nav_guard_triggered and not all_opps.empty and len(positions) < cfg.max_slots:
+        # Check top 30 candidates by spread UNIONED with any H1-combo candidates with strong favorable basis
         min_scan_apr = min(cfg.entry_apr_pct, cfg.combo_min_apr_pct) if cfg.enable_basis_carry_combo else cfg.entry_apr_pct
-        pool = all_opps[all_opps["spread_apr_pct"] >= min_scan_apr].head(30)
+        elig_opps = all_opps[all_opps["spread_apr_pct"] >= min_scan_apr]
+        top30 = elig_opps.head(30)
+        if cfg.enable_basis_carry_combo and "favorable_basis_bps" in elig_opps.columns:
+            combo_cands = elig_opps[
+                (elig_opps["spread_apr_pct"] >= cfg.combo_min_apr_pct)
+                & (elig_opps["favorable_basis_bps"] >= (cfg.combo_min_exec_basis_bps - 2.0))
+            ]
+            pool = pd.concat([top30, combo_cands], ignore_index=False)
+            pool = pool[~pool.index.duplicated(keep="first")]
+        else:
+            pool = top30
         for r in pool.itertuples(index=False):
             if len(positions) >= cfg.max_slots:
                 break
@@ -505,7 +597,10 @@ def run_cross_dex_paper_tick(
     state["cum_funding_usd"] = round(float(state["cum_funding_usd"]) + tick_funding_usd, 4)
     state["cum_basis_mtm_usd"] = round(float(state["cum_basis_mtm_usd"]) + tick_basis_mtm_usd, 4)
     state["cum_costs_usd"] = round(float(state["cum_costs_usd"]) + tick_costs_usd, 4)
-    state["last_tick_ms"] = ts_ms
+    state["last_tick_ms"] = prev_ms if nav_guard_triggered else ts_ms
+    state["nav_guard_triggered"] = nav_guard_triggered
+    state["nav_guard_reason"] = nav_guard_reason
+    state["nav_guard_pending_ms"] = nav_guard_pending
     state["positions"] = positions
     # Mark-to-liquidation NAV: what the book is worth if every open pair were closed now.
     est_exit_total = sum(float(p.get("est_exit_cost_usd", 0.0)) for p in positions.values())
@@ -529,6 +624,7 @@ def run_cross_dex_paper_tick(
         "tick_net_pnl_usd": round(tick_net_pnl, 4),
         "opened_count": len(opened_coins),
         "closed_count": sum(1 for t in trade_rows if t["action"] == "CLOSE"),
+        "nav_guard_triggered": nav_guard_triggered,
     }
     _append_parquet(state_dir / "ticks.parquet", [tick_row])
     _append_parquet(state_dir / "trades.parquet", trade_rows)

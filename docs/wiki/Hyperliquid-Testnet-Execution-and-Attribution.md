@@ -49,16 +49,16 @@ flowchart TD
 
 **Файлы:** `src/hl_quant/hl_post_trade_attribution.py`, `scripts/analytics/run_hl_testnet_attribution.py`, `scripts/ops/run_hl_testnet_attribution_daily.sh`, `scripts/ops/install_local_hl_attribution_cron.sh`.
 
-100% read-only модуль, ежедневно (в **09:00 UTC** по cron) собирающий `userFills`, `userFunding`, `clearinghouseState`, `spotClearinghouseState`, `openOrders`, `allMids`, `userAbstraction` и локальный `hl_testnet_audit.jsonl`:
+100% read-only модуль, запускаемый **каждые 4 часа (`22 */4 * * *`)** в контейнерном `worker` (и ежедневно в **09:00 UTC** в локальном cron, дополненный 15-минутным риск-зондом `testnet_risk_probe` `2-59/15 * * * *`), собирающий `userFills`, пагинированный `userFunding`, `userNonFundingLedgerUpdates`, `clearinghouseState`, `spotClearinghouseState`, `openOrders`, `allMids`, 1m `candleSnapshot`, `userAbstraction` и локальный `hl_testnet_audit.jsonl`:
 
-- **Полная раскладка PnL:** `Net PnL = Realized Price PnL + Unrealized PnL + Funding + Fees` (сходится с балансом Unified Account до цента).
+- **Полная раскладка PnL:** `Net PnL = Realized Price PnL + Unrealized PnL + Funding + Fees` (сходится с балансом Unified Account до цента, а внешний депозит считается по `userNonFundingLedgerUpdates` без двойного счёта `accountClassTransfer`).
 - **Метрики исполнения:**
   - Доля пассивного **Maker**-объёма (`crossed == False`);
   - Фактическая эффективная комиссия в б.п.;
-  - **Реальный ALO Fill Rate** (пересечение `oid` из аудит-лога с живыми `userFills` и `openOrders`);
-  - Объёмно-взвешенный **VW Markout** против текущих mid-цен.
+  - **Реальный ALO Fill Rate** (пересечение `oid` из аудит-лога с живыми `userFills` и `openOrders`, выровненное по окну при лимите `2000` сделок);
+  - Истинный пост-филл **VW Markout на горизонте `+60s`** (`vw_markout_bps` по закрытым 1-минутным свечам `candleSnapshot` после каждой сделки — чистая мера adverse selection), строго отделённый от направленного дрейфа **`vw_mark_drift_bps`** (цена исполнения против текущего `mid` спустя часы/дни).
 - **Аудит риска маржи, ADL-очереди и API Rate-Limit:**
-  - Рассчитывает дистанцию `(mid - liqPx) / mid` по каждой позиции и выдаёт предупреждения при `< 15%`;
+  - Рассчитывает дистанцию до ликвидации по биржевой `markPx` (с учётом знака позиции: `(markPx - liqPx) / markPx` для лонга и `(liqPx - markPx) / markPx` для шорта) и выдаёт предупреждения при `< 15%`;
   - Считает **`adl_rank_score`** строго по прибыльным (`uPnL > 0`) позициям с точным знаменателем: для `isolated` — изолированная `marginUsed` позиции, для `cross` — `accountValue` соответствующего DEX (у каждого HIP-3 деплоера своя очередь ADL);
   - Мониторит **`api_quota_health`** с учётом `-90%` веса объёма в `Growth Mode` (`0.1×`) и масштабирования безопасного порога `fill rate` под реальный средний размер ордера (`1%` при `100 USD`, `0.05%` при `2 000 USD`).
 - **Сверка Testnet vs Paper L2:** сравнивает накопленную доходность живого Testnet-счёта с параллельным Paper L2 трекером.

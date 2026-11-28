@@ -16,7 +16,6 @@ from datetime import datetime, timezone
 import html
 import json
 import math
-import os
 from pathlib import Path
 import time
 from typing import Any, Protocol
@@ -100,6 +99,7 @@ class AccountSnapshot:
     # read-only risk probe to re-price positions at the oracle on thin Testnet books.
     position_entry_px: dict[str, float] = field(default_factory=dict)
     position_unrealized_pnl_usd: dict[str, float] = field(default_factory=dict)
+    perps_equity_usd: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,9 +158,41 @@ def round_hl_size(sz: float, sz_decimals: int) -> float:
 # --------------------------------------------------------------------------- Testnet public readers
 
 
+def _post_testnet_info(
+    client: httpx.Client,
+    payload: dict[str, Any],
+    *,
+    max_attempts: int = 3,
+    retry_delay_s: float = 0.05,
+) -> httpx.Response:
+    """POST to Hyperliquid Testnet ``/info`` with bounded retry on HTTP 429 / 5xx / transport errors."""
+    last_exc: Exception | None = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = client.post(TESTNET_INFO_URL, json=payload)
+            status_code = int(getattr(resp, "status_code", 200))
+            if status_code == 429 or status_code >= 500:
+                if attempt < max_attempts:
+                    time.sleep(retry_delay_s * attempt)
+                    continue
+            resp.raise_for_status()
+            return resp
+        except httpx.HTTPError as exc:
+            if (
+                isinstance(exc, httpx.HTTPStatusError)
+                and 400 <= exc.response.status_code < 500
+                and exc.response.status_code != 429
+            ):
+                raise
+            last_exc = exc
+            if attempt < max_attempts:
+                time.sleep(retry_delay_s * attempt)
+    assert last_exc is not None
+    raise last_exc
+
+
 def fetch_testnet_meta(client: httpx.Client) -> dict[str, AssetSpec]:
-    resp = client.post(TESTNET_INFO_URL, json={"type": "meta"})
-    resp.raise_for_status()
+    resp = _post_testnet_info(client, {"type": "meta"})
     universe = (resp.json() or {}).get("universe") or []
     out: dict[str, AssetSpec] = {}
     for item in universe:
@@ -197,8 +229,7 @@ def fetch_testnet_book_tops(client: httpx.Client, coins: list[str]) -> dict[str,
     """Return ``{coin: (best_bid | None, best_ask | None, observed_ms)}`` including one-sided books."""
     out: dict[str, BookTop] = {}
     for coin in sorted(set(coins)):
-        resp = client.post(TESTNET_INFO_URL, json={"type": "l2Book", "coin": coin})
-        resp.raise_for_status()
+        resp = _post_testnet_info(client, {"type": "l2Book", "coin": coin})
         book = resp.json()
         levels = book.get("levels") if isinstance(book, dict) else None
         if not (isinstance(levels, list) and len(levels) == 2):
@@ -227,14 +258,14 @@ def fetch_testnet_bbo(client: httpx.Client, coins: list[str]) -> dict[str, tuple
 
 def fetch_testnet_account(client: httpx.Client, account_address: str) -> AccountSnapshot:
     """Read live Hyperliquid Testnet clearinghouse state & open orders (read-only)."""
-    st_resp = client.post(TESTNET_INFO_URL, json={"type": "clearinghouseState", "user": account_address})
-    st_resp.raise_for_status()
+    st_resp = _post_testnet_info(client, {"type": "clearinghouseState", "user": account_address})
     st = st_resp.json() or {}
     margin = st.get("marginSummary") or {}
     perps_eq = float(margin.get("accountValue", 0.0))
     used_margin = float(margin.get("totalMarginUsed", 0.0))
     withdrawable = float(st.get("withdrawable", 0.0))
     equity = perps_eq
+    perps_equity = perps_eq
     free_margin = max(0.0, perps_eq - used_margin)
 
     positions_sz: dict[str, float] = {}
@@ -268,34 +299,41 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
     # and open-order holds inside ``spot.USDC.hold``; avoid double-counting perps_eq.
     abstraction = ""
     try:
-        ua_resp = client.post(TESTNET_INFO_URL, json={"type": "userAbstraction", "user": account_address})
-        if ua_resp.status_code == 200 and isinstance(ua_resp.json(), str):
-            abstraction = str(ua_resp.json())
-    except Exception:
+        ua_resp = _post_testnet_info(client, {"type": "userAbstraction", "user": account_address})
+        ua_val = ua_resp.json()
+        if isinstance(ua_val, str):
+            abstraction = ua_val
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code not in {400, 404, 422}:
+            raise
+    except ValueError:
         abstraction = ""
 
-    spot_resp = client.post(TESTNET_INFO_URL, json={"type": "spotClearinghouseState", "user": account_address})
-    if spot_resp.status_code == 200:
-        for bal in (spot_resp.json() or {}).get("balances") or []:
-            if str(bal.get("coin")) == "USDC":
-                spot_total = float(bal.get("total", 0.0))
-                spot_hold = float(bal.get("hold", 0.0))
-                if spot_total > 0:
-                    if abstraction:
-                        is_unified = abstraction in {"unifiedAccount", "portfolioMargin"}
-                    else:
-                        is_unified = withdrawable <= 0.0 and (spot_hold > 0.0 or perps_eq <= 0.0)
-                    if is_unified:
-                        equity = spot_total
-                        free_margin = max(0.0, spot_total - spot_hold)
-                    else:
-                        # Standard Account: separate Perps and Spot wallets
-                        equity = perps_eq + spot_total
-                        free_margin = max(0.0, perps_eq - used_margin) + max(0.0, spot_total - spot_hold)
-                break
+    spot_resp = _post_testnet_info(client, {"type": "spotClearinghouseState", "user": account_address})
+    spot_payload = spot_resp.json()
+    spot_balances = (spot_payload.get("balances") or []) if isinstance(spot_payload, dict) else []
+    for bal in spot_balances:
+        if str(bal.get("coin")) == "USDC":
+            spot_total = float(bal.get("total", 0.0))
+            spot_hold = float(bal.get("hold", 0.0))
+            if spot_total > 0:
+                if abstraction:
+                    is_unified = abstraction in {"unifiedAccount", "portfolioMargin"}
+                else:
+                    is_unified = withdrawable <= 0.0 and (spot_hold > 0.0 or perps_eq <= 0.0)
+                if is_unified:
+                    equity = spot_total
+                    perps_equity = spot_total
+                    free_margin = max(0.0, spot_total - spot_hold)
+                else:
+                    # Standard Account: separate Perps and Spot wallets; Spot USDC cannot
+                    # margin Perps without an explicit usdClassTransfer.
+                    equity = perps_eq + spot_total
+                    perps_equity = perps_eq
+                    free_margin = max(0.0, perps_eq - used_margin)
+            break
 
-    oo_resp = client.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address})
-    oo_resp.raise_for_status()
+    oo_resp = _post_testnet_info(client, {"type": "openOrders", "user": account_address})
     open_orders = oo_resp.json() or []
     return AccountSnapshot(
         equity_usd=equity,
@@ -307,6 +345,7 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
         position_notional_usd=position_notional_usd,
         position_entry_px=position_entry_px,
         position_unrealized_pnl_usd=position_unrealized_pnl_usd,
+        perps_equity_usd=perps_equity,
     )
 
 
@@ -387,17 +426,21 @@ def check_kill_switch(
     if free_pct < limits.min_free_margin_pct:
         reasons.append(f"low_free_margin:{free_pct:.1f}%<{limits.min_free_margin_pct:.1f}%")
 
-    orphan_gross_w = 0.0
-    for c, sz in account.positions_sz.items():
-        if abs(sz) <= 1e-12 or c in target_weights:
-            continue
-        if c in bbo and c not in retained:
-            # Quoted non-target positions will be closed by plan_rebalance_orders this cycle.
-            continue
-        ntl = abs(float(account.position_notional_usd.get(c, 0.0) or 0.0))
-        orphan_gross_w += ntl / account.equity_usd
-
-    gross = sum(abs(w) for w in target_weights.values()) + orphan_gross_w
+    gross = 0.0
+    for c in set(target_weights.keys()) | set(account.positions_sz.keys()):
+        tw = abs(float(target_weights.get(c, 0.0) or 0.0))
+        sz = float(account.positions_sz.get(c, 0.0) or 0.0)
+        held_w = (
+            abs(float(account.position_notional_usd.get(c, 0.0) or 0.0)) / account.equity_usd
+            if abs(sz) > 1e-12
+            else 0.0
+        )
+        if c not in bbo or c in retained:
+            # Unquoted orphans and MM-retained coins cannot be rebalanced by the BBO planner;
+            # count whichever is larger between held notional and any target weight without double-counting.
+            gross += max(tw, held_w)
+        else:
+            gross += tw
     if gross > limits.max_gross_leverage + 1e-9:
         reasons.append(f"gross_leverage:{gross:.2f}x>{limits.max_gross_leverage:.2f}x")
 
@@ -420,9 +463,7 @@ def check_kill_switch(
 def fetch_testnet_funding_apr(client: httpx.Client) -> dict[str, float]:
     """Read current annualized funding APR (%) per coin from Hyperliquid Testnet ``metaAndAssetCtxs``."""
     try:
-        resp = client.post(TESTNET_INFO_URL, json={"type": "metaAndAssetCtxs"})
-        if resp.status_code != 200:
-            return {}
+        resp = _post_testnet_info(client, {"type": "metaAndAssetCtxs"})
         payload = resp.json()
         if not (isinstance(payload, list) and len(payload) == 2):
             return {}
@@ -463,11 +504,11 @@ def plan_rebalance_orders(
 ) -> list[PlannedOrder]:
     """Reconcile live Testnet positions vs target weights and emit sliced post-only ``ALO`` child orders.
 
-    ``exclude_coins`` are non-target coins owned by another engine on the shared address (e.g. MM
-    inventory); their positions are left untouched instead of being closed to zero.
+    ``exclude_coins`` are coins owned by another engine on the shared address (e.g. MM inventory);
+    their positions are left untouched even if they appear in ``target_weights``.
     """
-    excluded = set(exclude_coins or ()) - set(target_weights.keys())
-    all_coins = sorted((set(account.positions_sz.keys()) - excluded) | set(target_weights.keys()))
+    excluded = set(exclude_coins or ())
+    all_coins = sorted((set(account.positions_sz.keys()) | set(target_weights.keys())) - excluded)
     planned: list[PlannedOrder] = []
     ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     fund_map = funding_apr_by_coin or {}
@@ -532,40 +573,49 @@ def plan_rebalance_orders(
 ORPHAN_MIN_CLOSE_USD = 0.50
 
 
-def _orphan_close_px(side: str, bid: float | None, ask: float | None, ref_px: float | None, sz_decimals: int) -> float | None:
+def _orphan_close_px(
+    side: str,
+    bid: float | None,
+    ask: float | None,
+    ref_px: float | None,
+    sz_decimals: int,
+    *,
+    max_oracle_slip_pct: float = 2.0,
+) -> float | None:
     """Passive (post-only) closing price for a position whose book is one-sided or empty.
 
-    Sells never rest at/below the best bid and buys never at/above the best ask, so the ALO order
-    cannot cross. Within that bound the order prices at the oracle reference, improving (not
-    crossing) the surviving opposite quote when the oracle is beyond it.
+    Requires a finite positive ``ref_px`` (oracle) and bounds adverse slippage within
+    ``max_oracle_slip_pct`` of the oracle so a rogue Testnet quote on a thin book can never drag
+    an unwind order far away from fair value.
     """
+    if ref_px is None or not math.isfinite(ref_px) or ref_px <= 0:
+        return None
+    max_adverse_frac = max(0.0, float(max_oracle_slip_pct) / 100.0)
     tick_frac = 1e-4
     if side == "sell":
+        floor_px = ref_px * (1.0 - max_adverse_frac)
         preferred = ref_px
-        if ask is not None:
-            preferred = min(preferred, ask) if preferred is not None else ask
-        if preferred is None:
-            preferred = bid * (1.0 + tick_frac) if bid is not None else None
-        if preferred is None:
-            return None
+        if ask is not None and math.isfinite(ask) and ask >= floor_px:
+            preferred = min(preferred, ask)
         px = round_hl_price(preferred, sz_decimals, side="sell")
-        if bid is not None and px <= bid:
+        if bid is not None and math.isfinite(bid) and px <= bid:
             px = round_hl_price(bid * (1.0 + tick_frac), sz_decimals, side="sell")
             if px <= bid:
                 return None
+        if not math.isfinite(px) or px <= 0 or (px < floor_px and (bid is None or px <= bid)):
+            return None
         return px
+    ceil_px = ref_px * (1.0 + max_adverse_frac)
     preferred = ref_px
-    if bid is not None:
-        preferred = max(preferred, bid) if preferred is not None else bid
-    if preferred is None:
-        preferred = ask * (1.0 - tick_frac) if ask is not None else None
-    if preferred is None or preferred <= 0:
-        return None
+    if bid is not None and math.isfinite(bid) and bid <= ceil_px:
+        preferred = max(preferred, bid)
     px = round_hl_price(preferred, sz_decimals, side="buy")
-    if ask is not None and px >= ask:
+    if ask is not None and math.isfinite(ask) and px >= ask:
         px = round_hl_price(ask * (1.0 - tick_frac), sz_decimals, side="buy")
         if px >= ask:
             return None
+    if not math.isfinite(px) or px <= 0 or (px > ceil_px and (ask is None or px >= ask)):
+        return None
     return px
 
 
@@ -576,6 +626,7 @@ def plan_orphan_unwind_orders(
     book_tops: dict[str, BookTop] | None,
     reference_px: dict[str, float] | None,
     *,
+    limits: RiskLimits = RiskLimits(),
     exclude_coins: set[str] | None = None,
     target_weights: dict[str, float] | None = None,
 ) -> list[PlannedOrder]:
@@ -599,34 +650,45 @@ def plan_orphan_unwind_orders(
         bid, ask, _ = tops.get(coin, (None, None, 0))
         ref = refs.get(coin)
         ref_px = float(ref) if ref is not None and math.isfinite(float(ref)) and float(ref) > 0 else None
+        if ref_px is None:
+            continue  # require a valid oracle anchor before pricing an orphan unwind
         desired_w = float(targets.get(coin, 0.0) or 0.0)
-        if abs(desired_w) > 1e-12 and ref_px is None:
-            continue  # cannot size the excess of a still-targeted coin without a reference price
-        desired_sz = (account.equity_usd * desired_w / ref_px) if (ref_px and abs(desired_w) > 1e-12) else 0.0
+        desired_sz = (account.equity_usd * desired_w / ref_px) if abs(desired_w) > 1e-12 else 0.0
         if desired_sz * cur_sz > 0:
             excess = abs(cur_sz) - abs(desired_sz)
             if excess <= 0:
                 continue
         else:
             excess = abs(cur_sz)
+        is_full_close = abs(desired_sz) <= 1e-12 or excess >= abs(cur_sz) - 1e-12
+        min_notional = ORPHAN_MIN_CLOSE_USD if is_full_close else limits.min_order_usd
         side = "sell" if cur_sz > 0 else "buy"
         limit_px = _orphan_close_px(side, bid, ask, ref_px, spec.sz_decimals)
         if limit_px is None:
             continue
-        sz = round_hl_size(excess, spec.sz_decimals)
-        if sz <= 0 or sz * limit_px < ORPHAN_MIN_CLOSE_USD:
+        delta_usd = excess * limit_px
+        if delta_usd < min_notional:
             continue
-        planned.append(
-            PlannedOrder(
-                coin=coin,
-                side=side,
-                limit_px=limit_px,
-                sz=sz,
-                notional_usd=round(sz * limit_px, 2),
-                tif="Alo",
-                reduce_only=True,
+        n_slices = max(1, int(math.ceil(delta_usd / max(limits.max_child_usd, 1.0))))
+        slice_sz = round_hl_size(excess / n_slices, spec.sz_decimals)
+        if slice_sz <= 0 or slice_sz * limit_px < min_notional:
+            slice_sz = round_hl_size(excess, spec.sz_decimals)
+            n_slices = 1
+        if slice_sz <= 0 or slice_sz * limit_px < min_notional:
+            continue
+        for idx in range(n_slices):
+            planned.append(
+                PlannedOrder(
+                    coin=coin,
+                    side=side,
+                    limit_px=limit_px,
+                    sz=slice_sz,
+                    notional_usd=round(slice_sz * limit_px, 2),
+                    tif="Alo",
+                    reduce_only=True,
+                    child_index=idx,
+                )
             )
-        )
     return planned
 
 
@@ -637,6 +699,7 @@ def orphan_residual_notional_usd(
     book_tops: dict[str, BookTop] | None,
     reference_px: dict[str, float] | None,
     *,
+    limits: RiskLimits = RiskLimits(),
     exclude_coins: set[str] | None = None,
     target_weights: dict[str, float] | None = None,
 ) -> dict[str, float]:
@@ -645,12 +708,18 @@ def orphan_residual_notional_usd(
     Mirrors :func:`plan_orphan_unwind_orders`, so dollar-neutralization of the quoted book offsets
     the *residual* orphan exposure instead of exposure that is being closed in the same cycle.
     """
-    planned = {
-        o.coin: o.sz
-        for o in plan_orphan_unwind_orders(
-            account, meta, bbo, book_tops, reference_px, exclude_coins=exclude_coins, target_weights=target_weights
-        )
-    }
+    planned: dict[str, float] = {}
+    for o in plan_orphan_unwind_orders(
+        account,
+        meta,
+        bbo,
+        book_tops,
+        reference_px,
+        limits=limits,
+        exclude_coins=exclude_coins,
+        target_weights=target_weights,
+    ):
+        planned[o.coin] = planned.get(o.coin, 0.0) + o.sz
     out: dict[str, float] = {}
     for coin, cur_sz in account.positions_sz.items():
         cur = float(cur_sz or 0.0)
@@ -945,6 +1014,48 @@ def save_high_water_mark(path: Path, value: float) -> None:
     tmp.replace(path)
 
 
+def _order_record_succeeded(rec: Any) -> bool:
+    """Return True when an adapter order record was accepted (resting or filled, not rejected/errored)."""
+    if not isinstance(rec, dict):
+        return False
+    if rec.get("status") == "err" or rec.get("error"):
+        return False
+    resp = rec.get("response")
+    if resp is None:
+        return True
+    statuses, err_msg = extract_hl_order_statuses(resp)
+    if err_msg is not None:
+        return False
+    if any(isinstance(st, dict) and st.get("error") for st in statuses):
+        return False
+    return True
+
+
+def _submit_alo_orders(adapter: Any, orders: list[PlannedOrder]) -> list[dict[str, Any]]:
+    """Submit pure ALO batch via ``place_bulk_alo_orders`` when available, catching transport errors."""
+    if not orders:
+        return []
+    if hasattr(adapter, "place_bulk_alo_orders"):
+        try:
+            resps = adapter.place_bulk_alo_orders(orders)
+            if isinstance(resps, list) and len(resps) == len(orders):
+                return resps
+        except Exception as exc:
+            err_str = f"{type(exc).__name__}: {exc}"
+            return [
+                {"order": o.to_dict(), "status": "err", "response": {"status": "err", "response": err_str}}
+                for o in orders
+            ]
+    out: list[dict[str, Any]] = []
+    for o in orders:
+        try:
+            out.append(adapter.place_alo_order(o))
+        except Exception as exc:
+            err_str = f"{type(exc).__name__}: {exc}"
+            out.append({"order": o.to_dict(), "status": "err", "response": {"status": "err", "response": err_str}})
+    return out
+
+
 def execute_rebalance_cycle(
     account: AccountSnapshot,
     target_weights: dict[str, float],
@@ -972,7 +1083,7 @@ def execute_rebalance_cycle(
 
     Shared-address isolation: ``foreign_order_oids`` (e.g. ids logged by the MM in
     ``mm_audit.jsonl``) are never cancelled except on an account-risk kill-switch, and positions on
-    ``foreign_coins`` that are not rebalance targets are left to their owning engine.
+    ``foreign_coins`` (even if present in ``target_weights``) are left to their owning engine.
 
     Kill-switch behaviour (``summary["derisk_mode"]``):
 
@@ -980,9 +1091,10 @@ def execute_rebalance_cycle(
     * a ``missing_quote`` feed gap halts BBO rebalancing but still unwinds orphan positions
       (reduce-only, oracle-priced) — ``orphan_unwind_only``;
     * account-risk violations (drawdown, free margin, gross, coin cap) cancel every open order and
-      keep submitting reduce-only orders toward targets (``reduce_only``); a drawdown breach
-      flattens every position instead (``flatten``, ``limits.flatten_on_drawdown``).
+      keep submitting reduce-only orders toward de-risked targets (``reduce_only``); a drawdown
+      breach flattens every position instead (``flatten``, ``limits.flatten_on_drawdown``).
     """
+    cycle_mode = "dry_run" if isinstance(adapter, DryRunAdapter) else "testnet_live"
     hwm = max(float(high_water_mark_usd or 0.0), 0.0) or account.equity_usd
     foreign_oids = {int(o) for o in (foreign_order_oids or set())}
     foreign_order_coins = {
@@ -990,7 +1102,7 @@ def execute_rebalance_cycle(
         for o in account.open_orders
         if o.get("oid") is not None and safe_int(o.get("oid")) in foreign_oids
     }
-    foreign = (set(foreign_coins or ()) | foreign_order_coins) - set(target_weights.keys())
+    foreign = {c for c in (set(foreign_coins or ()) | foreign_order_coins) if c}
     skipped_unquoted = sorted(set(skipped_unquoted_coins or []))
     # Open positions on coins we cannot quote (whether dropped from targets or already target=0)
     # are unmanaged: neither rebalanced nor closable by the ALO planner. Surface all of them.
@@ -1042,6 +1154,7 @@ def execute_rebalance_cycle(
             bbo,
             book_tops,
             reference_px,
+            limits=limits,
             exclude_coins=set() if flatten else foreign,
             # Keep strategy-intended holdings on unquoted coins, except when flattening everything.
             target_weights={} if flatten else (orphan_target_weights if orphan_target_weights is not None else target_weights),
@@ -1062,13 +1175,40 @@ def execute_rebalance_cycle(
             if flatten:
                 plan_targets = {c: 0.0 for c in target_weights}
             else:
-                # A reversal target (opposite sign to the held position) would plan one non-reduce-only
-                # order through zero and be filtered out entirely; clamp it to 0 so the closing part
-                # still executes without opening the new side.
+                # 1) Clamp sign reversals to 0 so the closing leg executes without opening the new side.
                 plan_targets = {
                     c: (0.0 if float(account.positions_sz.get(c, 0.0) or 0.0) * float(w) < 0 else float(w))
                     for c, w in target_weights.items()
                 }
+                # 2) Enforce single-coin cap so a coin_cap violation trims down to max_single_coin_weight.
+                if limits.max_single_coin_weight > 0:
+                    plan_targets = {
+                        c: math.copysign(min(abs(w), limits.max_single_coin_weight), w)
+                        for c, w in plan_targets.items()
+                    }
+                # 3) On gross_leverage breach, scale quoted targets so total gross <= 0.95 * max_gross_leverage.
+                if any(v.startswith("gross_leverage") for v in violations) and account.equity_usd > 0:
+                    fixed_gross_w = sum(
+                        abs(float(account.position_notional_usd.get(c, 0.0) or 0.0)) / account.equity_usd
+                        for c, sz in account.positions_sz.items()
+                        if abs(float(sz or 0.0)) > 1e-12 and (c not in bbo or c in foreign)
+                    )
+                    avail_gross = max(0.0, limits.max_gross_leverage * 0.95 - fixed_gross_w)
+                    quoted_gross = sum(
+                        abs(w) for c, w in plan_targets.items() if c in bbo and c not in foreign
+                    )
+                    if quoted_gross > avail_gross and quoted_gross > 1e-9:
+                        g_scale = avail_gross / quoted_gross
+                        plan_targets = {c: w * g_scale for c, w in plan_targets.items()}
+                # 4) On low_free_margin breach, scale targets down so held==target positions still shed margin.
+                if any(v.startswith("low_free_margin") for v in violations) and account.equity_usd > 0:
+                    free_pct = (account.free_margin_usd / account.equity_usd) * 100.0
+                    m_scale = (
+                        0.0
+                        if free_pct <= 0.0
+                        else min(0.5, max(0.0, 1.0 - (limits.min_free_margin_pct - free_pct) / 50.0))
+                    )
+                    plan_targets = {c: w * m_scale for c, w in plan_targets.items()}
             derisk_orders = [
                 o
                 for o in plan_rebalance_orders(
@@ -1083,13 +1223,17 @@ def execute_rebalance_cycle(
                 )
                 if o.reduce_only
             ] + orphan_unwinds
-        placed = [adapter.place_alo_order(o) for o in derisk_orders]
+        placed = _submit_alo_orders(adapter, derisk_orders)
+        ok_count = sum(1 for r in placed if _order_record_succeeded(r))
+        rejected_count = len(placed) - ok_count
         summary = {
+            "mode": cycle_mode,
             "status": "kill_switch_triggered",
             "violations": violations,
             "derisk_mode": derisk_mode,
             "cancelled_count": len(cancelled),
-            "placed_count": len(placed),
+            "placed_count": ok_count,
+            "rejected_count": rejected_count,
             "total_notional_usd": round(sum(o.notional_usd for o in derisk_orders), 2),
             "orphan_unwind_count": len(orphan_unwinds),
             "high_water_mark_usd": hwm,
@@ -1136,12 +1280,17 @@ def execute_rebalance_cycle(
 
         blocked = blocked_isolated_coins | blocked_leverage_coins
         executable = [o for o in planned if o.reduce_only or o.coin not in blocked] + orphan_unwinds
-        placed = [adapter.place_alo_order(o) for o in executable]
+        placed = _submit_alo_orders(adapter, executable)
+        ok_count = sum(1 for r in placed if _order_record_succeeded(r))
+        rejected_count = len(placed) - ok_count
+        cycle_status = "order_rejected" if (executable and ok_count == 0 and rejected_count > 0) else "ok"
         summary = {
-            "status": "ok",
+            "mode": cycle_mode,
+            "status": cycle_status,
             "violations": [],
             "cancelled_count": len(cancelled),
-            "placed_count": len(placed),
+            "placed_count": ok_count,
+            "rejected_count": rejected_count,
             "total_notional_usd": round(sum(o.notional_usd for o in executable), 2),
             "orphan_unwind_count": len(orphan_unwinds),
             "high_water_mark_usd": hwm,
@@ -1177,10 +1326,14 @@ def neutralize_target_weights(
     """
     clean = {c: float(w) for c, w in weights.items() if math.isfinite(w) and abs(w) >= 1e-4}
     if len(clean) < 2:
-        if len(clean) == 1 and max_single_coin_weight > 0:
+        if len(clean) == 1:
+            if max_gross < 1e-4:
+                return {}
             c, w = next(iter(clean.items()))
-            if abs(w) > max_single_coin_weight:
-                return {c: round(math.copysign(max_single_coin_weight, w), 6)}
+            cap = min(max_gross, max_single_coin_weight) if max_single_coin_weight > 0 else max_gross
+            if abs(w) > cap:
+                w = math.copysign(cap, w)
+            return {c: round(w, 6)} if abs(w) >= 1e-4 else {}
         return clean
     eff_fixed = float(fixed_net_weight) if math.isfinite(fixed_net_weight) else 0.0
     mean_w = (sum(clean.values()) + eff_fixed) / len(clean)
@@ -1214,20 +1367,9 @@ def neutralize_target_weights(
 
 def update_high_water_mark(hwm_path: Path, equity_usd: float) -> float:
     """Persist and return peak Testnet equity for cross-run drawdown kill-switch."""
-    prev = equity_usd
-    if hwm_path.is_file():
-        try:
-            raw = json.loads(hwm_path.read_text())
-            prev = float(raw.get("high_water_mark_usd", equity_usd)) if isinstance(raw, dict) else equity_usd
-            if not math.isfinite(prev):
-                prev = equity_usd
-        except (ValueError, OSError, TypeError):
-            prev = equity_usd
-    hwm = max(prev, equity_usd)
-    hwm_path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = hwm_path.with_suffix(hwm_path.suffix + ".tmp")
-    tmp.write_text(json.dumps({"high_water_mark_usd": hwm, "updated_ms": int(time.time() * 1000)}, indent=2))
-    os.replace(tmp, hwm_path)
+    prev = load_high_water_mark(hwm_path)
+    hwm = max(prev, float(equity_usd) if math.isfinite(equity_usd) and equity_usd > 0 else 0.0)
+    save_high_water_mark(hwm_path, hwm)
     return hwm
 
 

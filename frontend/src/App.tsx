@@ -21,29 +21,41 @@ function num(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
 }
 
-function fx(v: unknown, digits = 2): string {
-  const n = num(v);
-  return n === null ? "—" : n.toFixed(digits);
-}
-
-function fmtUsd(v: unknown, digits = 2): string {
+export function fx(v: unknown, digits = 2, suffix = ""): string {
   const n = num(v);
   if (n === null) return "—";
-  if (Math.abs(n) >= 1_000_000_000) return `$${(n / 1_000_000_000).toFixed(2)}B`;
-  if (Math.abs(n) >= 1_000_000) return `$${(n / 1_000_000).toFixed(2)}M`;
-  return `$${n.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
+  const norm = Math.abs(n) < 0.5 * Math.pow(10, -digits) ? 0 : n;
+  return `${norm.toFixed(digits)}${suffix}`;
 }
 
-function fmtPct(v: unknown, digits = 2, signed = true): string {
+export function fmtUsd(v: unknown, digits = 2): string {
   const n = num(v);
   if (n === null) return "—";
-  return `${signed && n >= 0 ? "+" : ""}${n.toFixed(digits)}%`;
+  const abs = Math.abs(n);
+  const sign = n < 0 && abs >= 0.5 * Math.pow(10, -digits) ? "-" : "";
+  if (abs >= 1_000_000_000) return `${sign}$${(abs / 1_000_000_000).toFixed(2)}B`;
+  if (abs >= 1_000_000) return `${sign}$${(abs / 1_000_000).toFixed(2)}M`;
+  return `${sign}$${abs.toLocaleString("en-US", { minimumFractionDigits: digits, maximumFractionDigits: digits })}`;
 }
 
-function fmtBps(v: unknown, digits = 1): string {
+export function fmtPct(v: unknown, digits = 2, signed = true): string {
   const n = num(v);
   if (n === null) return "—";
-  return `${n.toFixed(digits)} bps`;
+  const norm = Math.abs(n) < 0.5 * Math.pow(10, -digits) ? 0 : n;
+  return `${signed && norm >= 0 ? "+" : ""}${norm.toFixed(digits)}%`;
+}
+
+export function fmtBps(v: unknown, digits = 1, signed = false): string {
+  const n = num(v);
+  if (n === null) return "—";
+  const norm = Math.abs(n) < 0.5 * Math.pow(10, -digits) ? 0 : n;
+  return `${signed && norm >= 0 ? "+" : ""}${norm.toFixed(digits)} bps`;
+}
+
+function signCls(v: unknown): string {
+  const n = num(v);
+  if (n === null) return "";
+  return n > 0 ? "pos" : n < 0 ? "neg" : "";
 }
 
 function shortSha(sha?: string | null): string {
@@ -55,12 +67,22 @@ const CASCADE_BIAS_LABELS: Record<string, Record<Lang, string>> = {
   downside_cascade: { en: "Downside Cascade (long liquidations)", ru: "Каскад вниз (ликвидации лонгов)" },
   upside_squeeze: { en: "Upside Squeeze (short liquidations)", ru: "Сквиз вверх (ликвидации шортов)" },
   balanced: { en: "Balanced", ru: "Сбалансировано" },
+  LONG_SQUEEZE: { en: "LONG_SQUEEZE", ru: "Лонг-сквиз" },
+  SHORT_SQUEEZE: { en: "SHORT_SQUEEZE", ru: "Шорт-сквиз" },
+  NEUTRAL: { en: "Balanced", ru: "Сбалансировано" },
 };
 
 function cascadeBiasLabel(bias: unknown, lang: Lang): string {
   if (bias === null || bias === undefined || bias === "") return "—";
   const key = String(bias);
   return CASCADE_BIAS_LABELS[key]?.[lang] ?? key;
+}
+
+function normalizeSplitLabel(split: unknown): { label: string; isOos: boolean } {
+  const sp = String(split ?? "").trim().toUpperCase();
+  if (sp === "OOS" || sp === "HOLDOUT") return { label: "OOS", isOos: true };
+  if (sp === "IS" || sp === "DEV") return { label: "IS", isOos: false };
+  return { label: sp || "—", isOos: false };
 }
 
 export default function App() {
@@ -76,6 +98,7 @@ function Desk() {
   const [tab, setTab] = useState<TabId>("overview");
   const [data, setData] = useState<OverviewPayload | null>(null);
   const [analytics, setAnalytics] = useState<AnalyticsPayload | null>(null);
+  const [analyticsError, setAnalyticsError] = useState<string | null>(null);
   const [feBuild, setFeBuild] = useState<BuildInfo | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -89,29 +112,58 @@ function Desk() {
   const [crossDexMinApr, setCrossDexMinApr] = useState<number>(0);
   const [settlementSplit, setSettlementSplit] = useState<string>("OOS");
   const reqSeqRef = useRef<number>(0);
+  const abortRef = useRef<AbortController | null>(null);
 
   const loadAll = useCallback(async () => {
+    abortRef.current?.abort();
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const { signal } = controller;
     const seq = ++reqSeqRef.current;
+
     try {
-      setError(null);
-      const [ovRes, feRes, anRes] = await Promise.all([
-        fetch("/api/v1/overview", { cache: "no-store" }),
-        fetch("/build-info.json", { cache: "no-store" }).catch(() => null),
-        fetch("/api/v1/analytics", { cache: "no-store" }).catch(() => null),
+      const [ovRes, feRes, anOutcome] = await Promise.all([
+        fetch("/api/v1/overview", { cache: "no-store", signal }),
+        fetch("/build-info.json", { cache: "no-store", signal }).catch(() => null),
+        fetch("/api/v1/analytics", { cache: "no-store", signal })
+          .then(async (res) => {
+            if (!res.ok) {
+              return { payload: null, error: `Backend /api/v1/analytics returned HTTP ${res.status}` };
+            }
+            const parsed = (await res.json()) as AnalyticsPayload;
+            return { payload: parsed, error: null };
+          })
+          .catch((anErr: unknown) => {
+            if (signal.aborted || (anErr instanceof DOMException && anErr.name === "AbortError")) {
+              return { payload: null, error: null, aborted: true };
+            }
+            return { payload: null, error: anErr instanceof Error ? anErr.message : String(anErr) };
+          }),
       ]);
+
+      if (signal.aborted || seq !== reqSeqRef.current) return;
+
       if (!ovRes.ok) {
         throw new Error(`Backend /api/v1/overview returned HTTP ${ovRes.status}`);
       }
       const ovJson = (await ovRes.json()) as OverviewPayload;
-      // Optional payloads: a non-JSON body (e.g. Vite's SPA index.html fallback for /build-info.json in dev)
-      // must not take down the whole dashboard.
-      const anJson = anRes && anRes.ok ? ((await anRes.json().catch(() => null)) as AnalyticsPayload | null) : null;
       const feJson = feRes && feRes.ok ? ((await feRes.json().catch(() => null)) as BuildInfo | null) : null;
-      if (seq !== reqSeqRef.current) return;
+
+      if (signal.aborted || seq !== reqSeqRef.current) return;
+
+      // Clear previous error banners only AFTER a successful fetch so banners never flicker during outages.
+      setError(null);
       setData(ovJson);
-      if (anJson) {
-        setAnalytics(anJson);
+
+      if (!("aborted" in anOutcome && anOutcome.aborted)) {
+        if (anOutcome.payload) {
+          setAnalytics(anOutcome.payload);
+          setAnalyticsError(null);
+        } else if (anOutcome.error) {
+          setAnalyticsError(anOutcome.error);
+        }
       }
+
       if (feJson) {
         setFeBuild(feJson);
       } else {
@@ -122,10 +174,12 @@ function Desk() {
         });
       }
     } catch (err) {
-      if (seq !== reqSeqRef.current) return;
+      if (signal.aborted || (err instanceof DOMException && err.name === "AbortError") || seq !== reqSeqRef.current) {
+        return;
+      }
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (seq === reqSeqRef.current) {
+      if (!signal.aborted && seq === reqSeqRef.current) {
         setLoading(false);
       }
     }
@@ -133,6 +187,9 @@ function Desk() {
 
   useEffect(() => {
     void loadAll();
+    return () => {
+      abortRef.current?.abort();
+    };
   }, [loadAll]);
 
   useEffect(() => {
@@ -171,25 +228,54 @@ function Desk() {
 
   const settlementFiltered = useMemo(() => {
     const rows = data?.settlement_stats ?? [];
-    if (settlementSplit === "ALL") return rows.slice(0, 20);
-    return rows
-      .filter((r) => {
-        const sp = String(r.split ?? "").trim().toUpperCase();
-        if (settlementSplit === "OOS") return sp === "OOS" || sp === "HOLDOUT";
-        if (settlementSplit === "IS") return sp === "IS" || sp === "DEV";
-        return sp === settlementSplit;
-      })
-      .slice(0, 20);
+    const filtered =
+      settlementSplit === "ALL"
+        ? rows
+        : rows.filter((r) => {
+            const sp = String(r.split ?? "").trim().toUpperCase();
+            if (settlementSplit === "OOS") return sp === "OOS" || sp === "HOLDOUT";
+            if (settlementSplit === "IS") return sp === "IS" || sp === "DEV";
+            return sp === settlementSplit;
+          });
+    return [...filtered]
+      .sort(
+        (a, b) =>
+          (num(b.net_maker_bps) ?? -Infinity) - (num(a.net_maker_bps) ?? -Infinity) ||
+          (num(b.t_stat) ?? -Infinity) - (num(a.t_stat) ?? -Infinity),
+      )
+      .slice(0, 16);
   }, [data, settlementSplit]);
 
   const beSha = data?.build_info?.sha ?? "dev";
   const feSha = feBuild?.sha ?? "dev";
-  const shaAligned = beSha === feSha || feSha === "dev" || beSha === "dev";
+  const shaAligned = (feSha === "dev" && beSha === "dev") || (feSha !== "dev" && beSha === feSha);
   const anyAlert = Boolean(data?.onchain_events?.any_alert);
-  const topHip3 = data?.frontier_history?.hip3_persistence?.[0];
-  const paperValues = (data?.paper_ticks ?? []).map((t) => t.equity_usd).filter((n) => Number.isFinite(n));
+  const topHip3 = (data?.frontier_history?.hip3_persistence ?? []).find(
+    (r) => r.active_in_latest_tick !== false && r.clean_streak >= 1,
+  );
+  const paperValues = (data?.paper_ticks ?? []).map((tk) => tk.equity_usd).filter((n) => Number.isFinite(n));
   const hip3OpenPairs = Object.keys(data?.hip3_paper?.positions ?? {}).length;
   const crossDexOpenPairs = Object.keys(data?.cross_dex_paper?.positions ?? {}).length;
+  const metaPosCount = data?.paper_positions?.length ?? 0;
+
+  const liveH2Events = data?.onchain_events?.h2_events ?? [];
+  const useLiveH2 = liveH2Events.length > 0;
+  const h2Rows = useLiveH2 ? liveH2Events : (data?.liq_funding?.clusters ?? []);
+  const h4Events = data?.onchain_events?.h4_events ?? [];
+  const h5Events = data?.onchain_events?.h5_events ?? [];
+  const h6Events = data?.onchain_events?.h6_events ?? [];
+
+  const mixedAccountWarn =
+    typeof data?.attribution?.mixed_account_warning === "string" && data.attribution.mixed_account_warning.trim()
+      ? data.attribution.mixed_account_warning.trim()
+      : "";
+  const liqWarnings = Array.isArray(data?.attribution?.liq_warnings)
+    ? (data.attribution.liq_warnings as string[]).filter(Boolean)
+    : [];
+  const adlWarnings = Array.isArray(data?.attribution?.adl_warnings)
+    ? (data.attribution.adl_warnings as string[]).filter(Boolean)
+    : [];
+  const tnRisk = data?.testnet_risk ?? null;
 
   return (
     <div className="app-shell">
@@ -231,23 +317,25 @@ function Desk() {
       </header>
 
       {error && (
-        <div className="error-box">
+        <div className="error-box" role="alert">
           <strong>{t("Backend unreachable:", "Бэкенд недоступен:")}</strong> {error}
         </div>
       )}
 
-      <nav className="tabs" aria-label={t("Dashboard sections", "Разделы дашборда")}>
+      <div className="tabs" role="tablist" aria-label={t("Dashboard sections", "Разделы дашборда")}>
         {TABS.map((tb) => (
           <button
             key={tb.id}
             type="button"
+            role="tab"
+            aria-selected={tab === tb.id}
             className={`tab ${tab === tb.id ? "tab-active" : ""}`}
             onClick={() => setTab(tb.id)}
           >
             {lang === "ru" ? tb.ru : tb.en}
           </button>
         ))}
-      </nav>
+      </div>
 
       {loading && !data ? (
         <div className="card muted">
@@ -255,7 +343,9 @@ function Desk() {
         </div>
       ) : (
         <>
-          {tab === "analytics" && <AnalyticsRiskTab analytics={analytics} overview={data} />}
+          {tab === "analytics" && (
+            <AnalyticsRiskTab analytics={analytics} overview={data} analyticsError={analyticsError} />
+          )}
 
           {tab === "overview" && (
             <div className="stack">
@@ -272,8 +362,8 @@ function Desk() {
                   <KpiLabel k="kpiTestnetEquity" />
                   <div className="kpi-value">{fmtUsd(data?.attribution?.equity_usd)}</div>
                   <div className="kpi-sub">
-                    Maker {fmtPct(data?.attribution?.maker_volume_share_pct, 1, false)} · ALO Fill{" "}
-                    {fmtPct(data?.attribution?.real_alo_fill_rate_pct, 1, false)}
+                    {t("Maker", "Мейкер")} {fmtPct(data?.attribution?.maker_volume_share_pct, 1, false)} ·{" "}
+                    {t("ALO Fill", "Исп. ALO")} {fmtPct(data?.attribution?.real_alo_fill_rate_pct, 1, false)}
                   </div>
                 </div>
                 <div className="card">
@@ -292,7 +382,7 @@ function Desk() {
                   </div>
                   <div className="kpi-sub">
                     {topHip3
-                      ? `Clean streak ${topHip3.clean_streak} · Flips ${topHip3.direction_flips ?? 0} · Div ${fmtBps(topHip3.median_oracle_div_bps)}`
+                      ? `${t("Clean streak", "Чистая серия")} ${topHip3.clean_streak} · ${t("Flips", "Развороты")} ${topHip3.direction_flips ?? 0} · ${t("Div", "Расх.")} ${fmtBps(topHip3.median_oracle_div_bps)}`
                       : t("Awaiting persistence tick", "Ожидание тика устойчивости")}
                   </div>
                 </div>
@@ -303,12 +393,10 @@ function Desk() {
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiLatency" />
-                  <div className="kpi-value">
-                    {data?.latency_bench ? `${fx(data.latency_bench.p50_us, 1)} µs` : "—"}
-                  </div>
+                  <div className="kpi-value">{fx(data?.latency_bench?.p50_us, 1, " µs")}</div>
                   <div className="kpi-sub">
                     {data?.latency_bench
-                      ? `p99 ${fx(data.latency_bench.p99_us, 1)} µs · ${Math.round(data.latency_bench.throughput_ticks_per_sec).toLocaleString()} tps`
+                      ? `p99 ${fx(data.latency_bench.p99_us, 1, " µs")} · ${Math.round(data.latency_bench.throughput_ticks_per_sec).toLocaleString()} tps`
                       : t("Benchmark not logged", "Бенчмарк не записан")}
                   </div>
                 </div>
@@ -318,9 +406,14 @@ function Desk() {
                 <section className="card">
                   <div className="section-header">
                     <SectionTitle k="secEquityCurve" />
-                    <span className="section-sub">{t("HL × Bybit Dollar-Neutral", "HL × Bybit, долларово-нейтрально")}</span>
+                    <span className="section-sub">
+                      {t(
+                        "Multi-CEX (Bybit/Binance/OKX) + HL XS · Observation-Only (5.0 bps)",
+                        "Мульти-CEX (Bybit/Binance/OKX) + HL XS · наблюдение (5.0 bps)",
+                      )}
+                    </span>
                   </div>
-                  <EquityCurveChart values={paperValues} />
+                  <EquityCurveChart values={paperValues} initialValue={data?.paper?.starting_capital_usd} />
                 </section>
 
                 <section className="card">
@@ -328,12 +421,13 @@ function Desk() {
                     <SectionTitle k="secSettlement" />
                     <div className="filter-row">
                       <span className="section-sub">
-                        {data?.settlement_meta?.span_days ?? "—"}
-                        {t("d", "д")} · {data?.settlement_meta?.total_settlement_events?.toLocaleString() ?? "—"}{" "}
+                        {fx(data?.settlement_meta?.span_days, 0, t("d", "д"))} ·{" "}
+                        {data?.settlement_meta?.total_settlement_events?.toLocaleString() ?? "—"}{" "}
                         {p(data?.settlement_meta?.total_settlement_events ?? 0, "event", "events", "событие", "события", "событий")}
                       </span>
                       <select
                         className="select"
+                        aria-label={t("Settlement study split", "Выборка исследования расчётов")}
                         value={settlementSplit}
                         onChange={(e) => setSettlementSplit(e.target.value)}
                       >
@@ -349,6 +443,7 @@ function Desk() {
                         <tr>
                           <Th k="colSettleStrategy" />
                           <Th k="colBucket" />
+                          <Th k="colSettleSplit" />
                           <Th k="colEvents" num />
                           <Th k="colGross" num />
                           <Th k="colTStat" num />
@@ -356,23 +451,29 @@ function Desk() {
                         </tr>
                       </thead>
                       <tbody>
-                        {settlementFiltered.slice(0, 8).map((row, idx) => (
-                          <tr key={idx}>
-                            <td>{row.strategy}</td>
-                            <td className="mono">{row.bucket}</td>
-                            <td className="num">{row.events}</td>
-                            <td className={`num ${row.mean_gross_bps >= 0 ? "pos" : "neg"}`}>
-                              {fmtBps(row.mean_gross_bps, 2)}
-                            </td>
-                            <td className="num">{fx(row.t_stat, 2)}</td>
-                            <td className={`num ${row.net_maker_bps >= 0 ? "pos" : "neg"}`}>
-                              {fmtBps(row.net_maker_bps, 2)}
-                            </td>
-                          </tr>
-                        ))}
+                        {settlementFiltered.map((row, idx) => {
+                          const sp = normalizeSplitLabel(row.split);
+                          return (
+                            <tr key={idx}>
+                              <td>{row.strategy}</td>
+                              <td className="mono">{row.bucket}</td>
+                              <td>
+                                <span className={`badge ${sp.isOos ? "badge-ok" : "badge-cyan"}`}>{sp.label}</span>
+                              </td>
+                              <td className="num">{row.events}</td>
+                              <td className={`num ${signCls(row.mean_gross_bps)}`}>
+                                {fmtBps(row.mean_gross_bps, 2)}
+                              </td>
+                              <td className="num">{fx(row.t_stat, 2)}</td>
+                              <td className={`num ${signCls(row.net_maker_bps)}`}>
+                                {fmtBps(row.net_maker_bps, 2)}
+                              </td>
+                            </tr>
+                          );
+                        })}
                         {settlementFiltered.length === 0 && (
                           <tr>
-                            <td colSpan={6} className="muted">
+                            <td colSpan={7} className="muted">
                               {t("No settlement study rows loaded yet.", "Строки исследования расчётов пока не загружены.")}
                             </td>
                           </tr>
@@ -388,10 +489,14 @@ function Desk() {
                   <div>
                     <SectionTitle k="secMetaPositions" />
                     <div className="section-sub">
-                      {data?.paper_positions?.length ?? 0}{" "}
-                      {t(
+                      {metaPosCount}{" "}
+                      {p(
+                        metaPosCount,
+                        "active HL × CEX position sorted by |HL weight|",
                         "active HL × CEX positions sorted by |HL weight|",
-                        `${p(data?.paper_positions?.length ?? 0, "", "", "активная позиция", "активные позиции", "активных позиций")} HL × CEX, отсортировано по |весу HL|`,
+                        "активная позиция HL × CEX, отсортировано по |весу HL|",
+                        "активные позиции HL × CEX, отсортировано по |весу HL|",
+                        "активных позиций HL × CEX, отсортировано по |весу HL|",
                       )}
                     </div>
                   </div>
@@ -416,25 +521,36 @@ function Desk() {
                       </tr>
                     </thead>
                     <tbody>
-                      {paperPositionsFiltered.map((p) => (
-                        <tr key={p.coin}>
-                          <td>
-                            <strong>{p.coin}</strong>
-                          </td>
-                          <td className={`num ${p.hl_weight >= 0 ? "pos" : "neg"}`}>
-                            {fmtPct(p.hl_weight * 100, 2)}
-                          </td>
-                          <td>
-                            {p.cex_venue ? <span className="badge badge-cyan">{p.cex_venue}</span> : <span className="muted">HL-only</span>}
-                          </td>
-                          <td className="num">{p.cex_weight ? fmtPct(p.cex_weight * 100, 2) : "—"}</td>
-                          <td className="num">{fmtUsd(p.last_hl_px, 4)}</td>
-                          <td className="num">{fmtBps(p.l2_spread_bps, 2)}</td>
-                          <td className={`num ${p.cum_pnl_usd >= 0 ? "pos" : "neg"}`}>
-                            {fmtUsd(p.cum_pnl_usd)}
-                          </td>
-                        </tr>
-                      ))}
+                      {paperPositionsFiltered.map((pos) => {
+                        const legEntries = pos.cex_legs ? Object.entries(pos.cex_legs) : [];
+                        const showCexWeight =
+                          num(pos.cex_weight) !== null &&
+                          (Math.abs(pos.cex_weight) > 0 || Boolean(pos.cex_venue) || legEntries.length > 0);
+                        return (
+                          <tr key={pos.coin}>
+                            <td>
+                              <strong>{pos.coin}</strong>
+                            </td>
+                            <td className={`num ${signCls(pos.hl_weight)}`}>{fmtPct(pos.hl_weight * 100, 2)}</td>
+                            <td>
+                              {pos.cex_venue ? (
+                                <span className="badge badge-cyan">{pos.cex_venue}</span>
+                              ) : (
+                                <span className="muted">{t("HL-only", "Только HL")}</span>
+                              )}
+                              {legEntries.length > 1 && (
+                                <div className="section-sub mono">
+                                  {legEntries.map(([v, w]) => `${v} ${fmtPct(w * 100, 1)}`).join(" · ")}
+                                </div>
+                              )}
+                            </td>
+                            <td className="num">{showCexWeight ? fmtPct(pos.cex_weight * 100, 2) : "—"}</td>
+                            <td className="num">{fmtUsd(pos.last_hl_px, 4)}</td>
+                            <td className="num">{fmtBps(pos.l2_spread_bps, 2)}</td>
+                            <td className={`num ${signCls(pos.cum_pnl_usd)}`}>{fmtUsd(pos.cum_pnl_usd)}</td>
+                          </tr>
+                        );
+                      })}
                       {paperPositionsFiltered.length === 0 && (
                         <tr>
                           <td colSpan={7} className="muted">
@@ -474,9 +590,7 @@ function Desk() {
                   <div className="card">
                     <KpiLabel k="kpiHip3Equity" />
                     <div className="kpi-value">{fmtUsd(data?.hip3_paper?.equity_usd)}</div>
-                    <div
-                      className={`kpi-sub ${(data?.hip3_paper?.return_pct ?? 0) >= 0 ? "pos" : "neg"}`}
-                    >
+                    <div className={`kpi-sub ${signCls(data?.hip3_paper?.return_pct)}`}>
                       {data?.hip3_paper ? fmtPct(data.hip3_paper.return_pct, 3) : "—"}
                     </div>
                   </div>
@@ -485,7 +599,7 @@ function Desk() {
                     <div className="kpi-value">{fmtUsd(data?.hip3_paper?.margin_locked_usd)}</div>
                     <div className="kpi-sub">
                       {data?.hip3_paper
-                        ? `${fx(data.hip3_paper.margin_utilization_pct, 1)}% util · ${hip3OpenPairs} ${p(hip3OpenPairs, "open pair", "open pairs", "открытая пара", "открытые пары", "открытых пар")}`
+                        ? `${fx(data.hip3_paper.margin_utilization_pct, 1, "%")} ${t("util", "исп.")} · ${hip3OpenPairs} ${p(hip3OpenPairs, "open pair", "open pairs", "открытая пара", "открытые пары", "открытых пар")}`
                         : "—"}
                     </div>
                   </div>
@@ -493,8 +607,10 @@ function Desk() {
                     <KpiLabel k="kpiHip3Pnl" />
                     <div className="kpi-value">{fmtUsd(data?.hip3_paper?.cum_funding_usd)}</div>
                     <div className="kpi-sub">
-                      {t("Basis", "Базис")} {fmtUsd(data?.hip3_paper?.cum_basis_mtm_usd)} · {t("Fees", "Комиссии")} −
-                      {fmtUsd(data?.hip3_paper?.cum_costs_usd)}
+                      {t("Basis", "Базис")} {fmtUsd(data?.hip3_paper?.cum_basis_mtm_usd)} · {t("Fees", "Комиссии")}{" "}
+                      {num(data?.hip3_paper?.cum_costs_usd) !== null
+                        ? fmtUsd(-Math.abs(data!.hip3_paper!.cum_costs_usd))
+                        : "—"}
                     </div>
                   </div>
                   <div className="card">
@@ -522,37 +638,30 @@ function Desk() {
                       </tr>
                     </thead>
                     <tbody>
-                      {Object.values(data?.hip3_paper?.positions ?? {}).map((p) => (
-                        <tr key={p.base_symbol}>
+                      {Object.values(data?.hip3_paper?.positions ?? {}).map((pos) => (
+                        <tr key={pos.base_symbol}>
                           <td>
-                            <strong>{p.base_symbol}</strong>
+                            <strong>{pos.base_symbol}</strong>
                           </td>
-                          <td className="mono">{`S ${p.short_symbol} / L ${p.long_symbol}`}</td>
+                          <td className="mono">{`S ${pos.short_symbol} / L ${pos.long_symbol}`}</td>
                           <td>
-                            <span className={`badge ${p.both_growth_mode ? "badge-cyan" : ""}`}>
-                              {p.both_growth_mode ? "⚡ GM" : "Std"}
+                            <span className={`badge ${pos.both_growth_mode ? "badge-cyan" : ""}`}>
+                              {pos.both_growth_mode ? "⚡ GM" : t("Std", "Станд.")}
                             </span>{" "}
-                            <span className={`badge ${p.any_only_isolated ? "badge-warn" : "badge-ok"}`}>
-                              {p.any_only_isolated ? "Isolated" : "Cross"}
+                            <span className={`badge ${pos.any_only_isolated ? "badge-warn" : "badge-ok"}`}>
+                              {pos.any_only_isolated ? t("Isolated", "Изол.") : t("Cross", "Кросс")}
                             </span>
                           </td>
-                          <td className="num">{fmtUsd(p.leg_notional_usd)}</td>
-                          <td className="num pos">{fmtPct(p.live_spread_apr_pct, 1)}</td>
-                          <td className={`num ${p.live_oracle_div_bps > 15 ? "warn" : ""}`}>
-                            {fmtBps(p.live_oracle_div_bps)}
+                          <td className="num">{fmtUsd(pos.leg_notional_usd)}</td>
+                          <td className={`num ${signCls(pos.live_spread_apr_pct)}`}>{fmtPct(pos.live_spread_apr_pct, 1)}</td>
+                          <td className={`num ${pos.live_oracle_div_bps > 15 ? "warn" : ""}`}>
+                            {fmtBps(pos.live_oracle_div_bps)}
                           </td>
-                          <td className="num">
-                            {fx(p.hours_held, 1)}
-                            {t("h", "ч")}
-                          </td>
-                          <td className={`num ${p.cum_funding_usd >= 0 ? "pos" : "neg"}`}>
-                            {fmtUsd(p.cum_funding_usd)}
-                          </td>
-                          <td className={`num ${p.cum_basis_mtm_usd >= 0 ? "pos" : "neg"}`}>
-                            {fmtUsd(p.cum_basis_mtm_usd)}
-                          </td>
-                          <td className={`num ${p.net_pnl_usd >= 0 ? "pos" : "neg"}`}>
-                            <strong>{fmtUsd(p.net_pnl_usd)}</strong>
+                          <td className="num">{fx(pos.hours_held, 1, t("h", "ч"))}</td>
+                          <td className={`num ${signCls(pos.cum_funding_usd)}`}>{fmtUsd(pos.cum_funding_usd)}</td>
+                          <td className={`num ${signCls(pos.cum_basis_mtm_usd)}`}>{fmtUsd(pos.cum_basis_mtm_usd)}</td>
+                          <td className={`num ${signCls(pos.net_pnl_usd)}`}>
+                            <strong>{fmtUsd(pos.net_pnl_usd)}</strong>
                           </td>
                         </tr>
                       ))}
@@ -633,8 +742,8 @@ function Desk() {
                           <td>
                             <span className={`badge ${r.active_in_latest_tick === false ? "badge-warn" : "badge-ok"}`}>
                               {r.active_in_latest_tick === false
-                                ? `Stale (-${r.ticks_since_last_seen ?? 1}t)`
-                                : "Active"}
+                                ? t(`Stale (-${r.ticks_since_last_seen ?? 1}t)`, `Устар. (-${r.ticks_since_last_seen ?? 1}т)`)
+                                : t("Active", "Активна")}
                             </span>
                           </td>
                           <td className="mono">{`S ${r.short_symbol} / L ${r.long_symbol}`}</td>
@@ -650,14 +759,14 @@ function Desk() {
                               {r.direction_flips ?? 0}
                             </span>
                           </td>
-                          <td className="num pos">{fmtPct(r.latest_apr_pct, 1)}</td>
+                          <td className={`num ${signCls(r.latest_apr_pct)}`}>{fmtPct(r.latest_apr_pct, 1)}</td>
                           <td className="num">{fmtPct(r.median_apr_pct, 1)}</td>
                           <td className={`num ${r.median_oracle_div_bps > 15 ? "warn" : ""}`}>
                             {fmtBps(r.median_oracle_div_bps)}
                           </td>
                           <td>
                             <span className={`badge ${r.both_growth_mode ? "badge-cyan" : ""}`}>
-                              {r.both_growth_mode ? "⚡ GM" : "Std"}
+                              {r.both_growth_mode ? "⚡ GM" : t("Std", "Станд.")}
                             </span>
                           </td>
                         </tr>
@@ -680,7 +789,14 @@ function Desk() {
                     <SectionTitle k="secBoros" />
                     <span className="section-sub">
                       {data?.boros?.hl_and_spread_count ?? 0}{" "}
-                      {p(data?.boros?.hl_and_spread_count ?? 0, "HL/Spread market", "HL/Spread markets", "рынок HL/спред", "рынка HL/спред", "рынков HL/спред")}
+                      {p(
+                        data?.boros?.hl_and_spread_count ?? 0,
+                        "HL/Spread market",
+                        "HL/Spread markets",
+                        "рынок HL/спред",
+                        "рынка HL/спред",
+                        "рынков HL/спред",
+                      )}
                     </span>
                   </div>
                   <div className="table-wrap">
@@ -697,11 +813,18 @@ function Desk() {
                       <tbody>
                         {(data?.boros?.markets ?? []).slice(0, 10).map((m) => (
                           <tr key={m.market_id}>
-                            <td className="mono">{m.symbol}</td>
-                            <td className="num">
-                              {fx(m.days_to_maturity, 0)}
-                              {t("d", "д")}
+                            <td>
+                              <div>
+                                <strong>{m.name || m.symbol}</strong>{" "}
+                                {m.is_spread_market && (
+                                  <span className="badge badge-cyan">{t("SPREAD", "СПРЕД")}</span>
+                                )}
+                              </div>
+                              {m.name && m.symbol && m.name !== m.symbol && (
+                                <div className="section-sub mono">{m.symbol}</div>
+                              )}
                             </td>
+                            <td className="num">{fx(m.days_to_maturity, 0, t("d", "д"))}</td>
                             <td className="num">{fmtPct(m.best_bid_apr_pct, 1)}</td>
                             <td className="num">{fmtPct(m.floating_apr_pct, 1)}</td>
                             <td>
@@ -737,11 +860,13 @@ function Desk() {
                             <td>
                               <span className="badge">{s.rate_type}</span>
                             </td>
-                            <td className="num pos">{fmtPct(s.net_deposit_apr_pct, 2)}</td>
-                            <td className={`num ${s.spread_vs_hlp_pct >= 0 ? "pos" : "neg"}`}>
+                            <td className={`num ${signCls(s.net_deposit_apr_pct)}`}>
+                              {fmtPct(s.net_deposit_apr_pct, 2)}
+                            </td>
+                            <td className={`num ${signCls(s.spread_vs_hlp_pct)}`}>
                               {fmtPct(s.spread_vs_hlp_pct, 2)}
                             </td>
-                            <td className="num">{fx(s.liq_buffer_pct, 0)}%</td>
+                            <td className="num">{fx(s.liq_buffer_pct, 0, "%")}</td>
                           </tr>
                         ))}
                       </tbody>
@@ -764,8 +889,12 @@ function Desk() {
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiCumFunding" />
-                  <div className="kpi-value pos">{fmtUsd(data?.cross_dex_paper?.cum_funding_usd)}</div>
-                  <div className="kpi-sub">Basis MTM {fmtUsd(data?.cross_dex_paper?.cum_basis_mtm_usd)}</div>
+                  <div className={`kpi-value ${signCls(data?.cross_dex_paper?.cum_funding_usd)}`}>
+                    {fmtUsd(data?.cross_dex_paper?.cum_funding_usd)}
+                  </div>
+                  <div className="kpi-sub">
+                    {t("Basis MTM", "Базис MTM")} {fmtUsd(data?.cross_dex_paper?.cum_basis_mtm_usd)}
+                  </div>
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiExecCosts" />
@@ -795,22 +924,19 @@ function Desk() {
                       </tr>
                     </thead>
                     <tbody>
-                      {Object.values(data?.cross_dex_paper?.positions ?? {}).map((p) => (
-                        <tr key={p.coin}>
+                      {Object.values(data?.cross_dex_paper?.positions ?? {}).map((pos) => (
+                        <tr key={pos.coin}>
                           <td>
-                            <strong>{p.coin}</strong>
+                            <strong>{pos.coin}</strong>
                           </td>
-                          <td className="mono">{p.direction}</td>
-                          <td className="num">{fmtUsd(p.leg_notional_usd, 0)}</td>
-                          <td className="num">
-                            {fx(p.hours_held, 1)}
-                            {t("h", "ч")}
+                          <td className="mono">{pos.direction}</td>
+                          <td className="num">{fmtUsd(pos.leg_notional_usd, 0)}</td>
+                          <td className="num">{fx(pos.hours_held, 1, t("h", "ч"))}</td>
+                          <td className="num">{fmtPct(pos.entry_spread_apr_pct, 1)}</td>
+                          <td className={`num ${pos.live_spread_apr_pct >= 10 ? "pos" : pos.live_spread_apr_pct < 0 ? "neg" : "warn"}`}>
+                            {fmtPct(pos.live_spread_apr_pct, 1)}
                           </td>
-                          <td className="num">{fmtPct(p.entry_spread_apr_pct, 1)}</td>
-                          <td className={`num ${p.live_spread_apr_pct >= 10 ? "pos" : "warn"}`}>
-                            {fmtPct(p.live_spread_apr_pct, 1)}
-                          </td>
-                          <td className="num">{fmtBps(p.entry_exec_basis_bps, 2)}</td>
+                          <td className="num">{fmtBps(pos.entry_exec_basis_bps, 2)}</td>
                         </tr>
                       ))}
                       {Object.keys(data?.cross_dex_paper?.positions ?? {}).length === 0 && (
@@ -832,6 +958,7 @@ function Desk() {
                     <span className="section-sub">{t("Min Spread APR:", "Мин. спред APR:")}</span>
                     <select
                       className="select"
+                      aria-label={t("Minimum Spread APR filter", "Фильтр минимального спреда APR")}
                       value={crossDexMinApr}
                       onChange={(e) => setCrossDexMinApr(Number(e.target.value))}
                     >
@@ -853,29 +980,41 @@ function Desk() {
                         <Th k="colOtherApr" num />
                         <Th k="colSpreadApr" num />
                         <Th k="colFavBasis" num />
+                        <Th k="colDexL2Slip10k" num />
                         <Th k="colBreakeven" num />
                       </tr>
                     </thead>
                     <tbody>
-                      {crossDexFiltered.map((o, idx) => (
-                        <tr key={idx}>
-                          <td>
-                            <strong>{o.coin}</strong>
-                          </td>
-                          <td>
-                            <span className="badge badge-cyan">{o.other_dex}</span>
-                          </td>
-                          <td className="mono">{o.direction}</td>
-                          <td className="num">{fmtPct(o.hl_apr_pct, 1)}</td>
-                          <td className="num">{fmtPct(o.other_apr_pct, 1)}</td>
-                          <td className="num pos">{fmtPct(o.spread_apr_pct, 1)}</td>
-                          <td className="num">{fmtBps(o.favorable_basis_bps, 1)}</td>
-                          <td className="num">
-                            {fx(o.breakeven_hours, 1)}
-                            {t("h", "ч")}
+                      {crossDexFiltered.map((o, idx) => {
+                        const execBasis = o.exec_basis_10k_bps ?? o.favorable_basis_bps;
+                        const beHours = o.depth_be_10k_h !== undefined ? o.depth_be_10k_h : o.breakeven_hours;
+                        return (
+                          <tr key={idx}>
+                            <td>
+                              <strong>{o.coin}</strong>
+                            </td>
+                            <td>
+                              <span className="badge badge-cyan">{o.other_dex}</span>
+                            </td>
+                            <td className="mono">{o.direction}</td>
+                            <td className="num">{fmtPct(o.hl_apr_pct, 1)}</td>
+                            <td className="num">{fmtPct(o.other_apr_pct, 1)}</td>
+                            <td className={`num ${signCls(o.spread_apr_pct)}`}>{fmtPct(o.spread_apr_pct, 1)}</td>
+                            <td className={`num ${signCls(execBasis)}`}>{fmtBps(execBasis, 1, true)}</td>
+                            <td className={`num ${(num(o.l2_slip_10k_bps) ?? 0) > 10 ? "warn" : ""}`}>
+                              {fmtBps(o.l2_slip_10k_bps, 1)}
+                            </td>
+                            <td className="num">{fx(beHours, 1, t("h", "ч"))}</td>
+                          </tr>
+                        );
+                      })}
+                      {crossDexFiltered.length === 0 && (
+                        <tr>
+                          <td colSpan={9} className="muted">
+                            {t("No cross-DEX opportunities matching filter.", "Нет возможностей 5-DEX под этот фильтр.")}
                           </td>
                         </tr>
-                      ))}
+                      )}
                     </tbody>
                   </table>
                 </div>
@@ -907,7 +1046,7 @@ function Desk() {
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiHlpDelta" />
-                  <div className="kpi-value">
+                  <div className={`kpi-value ${signCls(data?.onchain_events?.hlp_mm_pnl?.hlp_pnl_delta_usd)}`}>
                     {fmtUsd(data?.onchain_events?.hlp_mm_pnl?.hlp_pnl_delta_usd)}
                   </div>
                   <div className="kpi-sub">
@@ -938,6 +1077,11 @@ function Desk() {
                 <section className="card">
                   <div className="section-header">
                     <SectionTitle k="secLiqClusters" />
+                    <span className="section-sub">
+                      {useLiveH2
+                        ? `${t("15m live feed", "15м поток")} (${data?.onchain_events?.observed_at_utc ?? ""})`
+                        : t("4h deep whale scan", "4ч скан китов")}
+                    </span>
                   </div>
                   <div className="table-wrap">
                     <table>
@@ -945,28 +1089,45 @@ function Desk() {
                         <tr>
                           <Th k="colCoin" />
                           <Th k="colMark" num />
+                          {useLiveH2 ? <Th k="colTotal05" num /> : null}
                           <Th k="colTotal010" num />
-                          <Th k="colNearestL" num />
-                          <Th k="colNearestS" num />
+                          {useLiveH2 ? (
+                            <Th k="colNearestWall" num />
+                          ) : (
+                            <>
+                              <Th k="colNearestL" num />
+                              <Th k="colNearestS" num />
+                            </>
+                          )}
                           <Th k="colBias" />
                         </tr>
                       </thead>
                       <tbody>
-                        {(data?.liq_funding?.clusters ?? []).map((c, idx) => (
+                        {h2Rows.map((c, idx) => (
                           <tr key={idx}>
                             <td>
-                              <strong>{String(c.coin)}</strong>
+                              <strong>{String(c.coin)}</strong>{" "}
+                              {Boolean(c.alert) && (
+                                <span className="badge badge-danger">{t("ALERT", "АЛЕРТ")}</span>
+                              )}
                             </td>
                             <td className="num">{fmtUsd(c.mark_px)}</td>
+                            {useLiveH2 ? <td className="num">{fmtUsd(c.total_0_5_usd, 0)}</td> : null}
                             <td className="num warn">{fmtUsd(c.total_0_10_usd, 0)}</td>
-                            <td className="num">{fmtPct(c.nearest_long_dist_pct, 1, false)}</td>
-                            <td className="num">{fmtPct(c.nearest_short_dist_pct, 1, false)}</td>
+                            {useLiveH2 ? (
+                              <td className="num">{fmtPct(c.nearest_wall_pct, 1, false)}</td>
+                            ) : (
+                              <>
+                                <td className="num">{fmtPct(c.nearest_long_dist_pct, 1, false)}</td>
+                                <td className="num">{fmtPct(c.nearest_short_dist_pct, 1, false)}</td>
+                              </>
+                            )}
                             <td>
                               <span className="badge">{cascadeBiasLabel(c.cascade_bias, lang)}</span>
                             </td>
                           </tr>
                         ))}
-                        {(data?.liq_funding?.clusters ?? []).length === 0 && (
+                        {h2Rows.length === 0 && (
                           <tr>
                             <td colSpan={6} className="muted">
                               {t(
@@ -1013,11 +1174,187 @@ function Desk() {
                   </div>
                 </section>
               </div>
+
+              {(h5Events.length > 0 || h6Events.length > 0) && (
+                <div className="grid-2">
+                  {h5Events.length > 0 && (
+                    <section className="card">
+                      <div className="section-header">
+                        <SectionTitle k="secH5Skew" />
+                      </div>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <Th k="colCoin" />
+                              <Th k="colHlpSide" />
+                              <Th k="colHlpNetUsd" num />
+                              <Th k="colHlpTvlShare" num />
+                              <Th k="colVaultsCount" num />
+                              <Th k="colAlert" />
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {h5Events.map((ev, idx) => (
+                              <tr key={idx}>
+                                <td>
+                                  <strong>{String(ev.coin)}</strong>
+                                </td>
+                                <td>
+                                  <span
+                                    className={`badge ${String(ev.hlp_side) === "HLP_LONG" ? "badge-ok" : "badge-warn"}`}
+                                  >
+                                    {String(ev.hlp_side ?? "—")}
+                                  </span>
+                                </td>
+                                <td className={`num ${signCls(ev.hlp_net_usd)}`}>{fmtUsd(ev.hlp_net_usd, 0)}</td>
+                                <td className="num">{fmtPct(ev.hlp_tvl_share_pct, 3, false)}</td>
+                                <td className="num">{num(ev.vaults_holding) ?? "—"}</td>
+                                <td>
+                                  {Boolean(ev.alert) ? (
+                                    <span className="badge badge-danger">{t("ALERT", "АЛЕРТ")}</span>
+                                  ) : (
+                                    <span className="muted">—</span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+                  )}
+
+                  {h6Events.length > 0 && (
+                    <section className="card">
+                      <div className="section-header">
+                        <SectionTitle k="secH6Stress" />
+                      </div>
+                      <div className="table-wrap">
+                        <table>
+                          <thead>
+                            <tr>
+                              <Th k="colCoin" />
+                              <Th k="colMidMarkBps" num />
+                              <Th k="colMarkOracleBps" num />
+                              <Th k="colFundingApr" num />
+                              <Th k="colStressType" />
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {h6Events.map((ev, idx) => {
+                              const st = String(ev.stress_type ?? "—");
+                              const badgeCls =
+                                st === "CRASH_BOOK_STRESS"
+                                  ? "badge-danger"
+                                  : st === "ORACLE_DECOUPLING"
+                                    ? "badge-warn"
+                                    : "badge-cyan";
+                              return (
+                                <tr key={idx}>
+                                  <td>
+                                    <strong>{String(ev.coin)}</strong>{" "}
+                                    {Boolean(ev.alert) && (
+                                      <span className="badge badge-danger">{t("ALERT", "АЛЕРТ")}</span>
+                                    )}
+                                  </td>
+                                  <td className={`num ${Math.abs(num(ev.mid_vs_mark_bps) ?? 0) >= 50 ? "neg" : ""}`}>
+                                    {fmtBps(ev.mid_vs_mark_bps, 2, true)}
+                                  </td>
+                                  <td className={`num ${Math.abs(num(ev.mark_vs_oracle_bps) ?? 0) >= 50 ? "warn" : ""}`}>
+                                    {fmtBps(ev.mark_vs_oracle_bps, 2, true)}
+                                  </td>
+                                  <td className={`num ${signCls(ev.funding_apr_pct)}`}>
+                                    {fmtPct(ev.funding_apr_pct, 1)}
+                                  </td>
+                                  <td>
+                                    <span className={`badge ${badgeCls}`}>{st}</span>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </section>
+                  )}
+                </div>
+              )}
+
+              {h4Events.length > 0 && (
+                <section className="card">
+                  <div className="section-header">
+                    <SectionTitle k="secH4Disloc" />
+                  </div>
+                  <div className="table-wrap">
+                    <table>
+                      <thead>
+                        <tr>
+                          <Th k="colDex" />
+                          <Th k="colPool" />
+                          <Th k="colPegAdjSpread" num />
+                          <Th k="colNetArb" num />
+                          <Th k="colSlip25k" num />
+                          <Th k="colV3Depth" num />
+                          <Th k="colAlert" />
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {h4Events.slice(0, 8).map((ev, idx) => (
+                          <tr key={idx}>
+                            <td>
+                              <span className="badge badge-cyan">{String(ev.dex ?? "—")}</span>
+                            </td>
+                            <td className="mono">
+                              <strong>{String(ev.pool ?? "—")}</strong>
+                            </td>
+                            <td className={`num ${signCls(ev.peg_adjusted_spread_bps)}`}>
+                              {fmtBps(ev.peg_adjusted_spread_bps, 2, true)}
+                            </td>
+                            <td className={`num ${signCls(ev.net_arb_bps)}`}>
+                              {fmtBps(ev.net_arb_bps, 2, true)}
+                            </td>
+                            <td className="num">{fmtBps(ev.slippage_25k_bps, 1)}</td>
+                            <td className="num">{fmtUsd(ev.virtual_depth_usd, 0)}</td>
+                            <td>
+                              {Boolean(ev.alert) ? (
+                                <span className="badge badge-danger">{t("ALERT", "АЛЕРТ")}</span>
+                              ) : (
+                                <span className="muted">—</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </section>
+              )}
             </div>
           )}
 
           {tab === "execution" && (
             <div className="stack">
+              {(mixedAccountWarn || liqWarnings.length > 0 || adlWarnings.length > 0) && (
+                <div className="alert-banner" role="alert">
+                  {mixedAccountWarn && (
+                    <div>
+                      <strong>{t("Account Hygiene:", "Гигиена аккаунта:")}</strong> {mixedAccountWarn}
+                    </div>
+                  )}
+                  {liqWarnings.length > 0 && (
+                    <div>
+                      <strong>{t("Liquidation Warnings:", "Риск ликвидации:")}</strong> {liqWarnings.join(" · ")}
+                    </div>
+                  )}
+                  {adlWarnings.length > 0 && (
+                    <div>
+                      <strong>{t("ADL Queue Warnings:", "Очередь ADL:")}</strong> {adlWarnings.join(" · ")}
+                    </div>
+                  )}
+                </div>
+              )}
+
               <section className="kpi-grid">
                 <div className="card">
                   <KpiLabel k="kpiTnEquity" />
@@ -1033,22 +1370,22 @@ function Desk() {
                     {fmtPct(data?.attribution?.maker_volume_share_pct, 1, false)}
                   </div>
                   <div className="kpi-sub">
-                    ALO fill {fmtPct(data?.attribution?.real_alo_fill_rate_pct, 1, false)} · {t("Fee", "Комиссия")}{" "}
-                    {fmtBps(data?.attribution?.effective_fee_bps, 2)}
+                    {t("ALO fill", "Исп. ALO")} {fmtPct(data?.attribution?.real_alo_fill_rate_pct, 1, false)} ·{" "}
+                    {t("Fee", "Комиссия")} {fmtBps(data?.attribution?.effective_fee_bps, 2)}
                   </div>
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiNetAttr" />
-                  <div className="kpi-value">{fmtUsd(data?.attribution?.net_attributed_pnl_usd)}</div>
+                  <div className={`kpi-value ${signCls(data?.attribution?.net_attributed_pnl_usd)}`}>
+                    {fmtUsd(data?.attribution?.net_attributed_pnl_usd)}
+                  </div>
                   <div className="kpi-sub">
-                    VW Markout {fmtBps(data?.attribution?.vw_markout_bps, 2)}
+                    {t("VW Markout", "VW маркаут")} {fmtBps(data?.attribution?.vw_markout_bps, 2)}
                   </div>
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiApiQuota" />
-                  <div className="kpi-value">
-                    {String(data?.attribution?.api_quota_health ?? "—")}
-                  </div>
+                  <div className="kpi-value">{String(data?.attribution?.api_quota_health ?? "—")}</div>
                   <div className="kpi-sub">
                     {t("Min liq dist", "Мин. до ликв.")} {fmtPct(data?.attribution?.min_liq_distance_pct, 1, false)} ·{" "}
                     {t("Volume", "Объём")} {fmtUsd(data?.attribution?.total_volume_usd)}
@@ -1056,12 +1393,68 @@ function Desk() {
                 </div>
               </section>
 
+              {tnRisk && (
+                <section className="kpi-grid">
+                  <div className="card">
+                    <KpiLabel k="kpiTnDrawdown" />
+                    <div className={`kpi-value ${(num(tnRisk.drawdown_pct) ?? 0) >= 3 ? "neg" : ""}`}>
+                      {fmtPct(tnRisk.drawdown_pct, 2, false)}
+                    </div>
+                    <div className="kpi-sub">
+                      HWM {fmtUsd(tnRisk.high_water_mark_usd)}
+                      {num(tnRisk.kill_switch_drawdown_pct) !== null
+                        ? ` · ${t("Limit", "Лимит")} ${fmtPct(tnRisk.kill_switch_drawdown_pct, 1, false)}`
+                        : ""}
+                    </div>
+                  </div>
+                  <div className="card">
+                    <KpiLabel k="kpiTnFreeMargin" />
+                    <div className="kpi-value">{fmtUsd(tnRisk.free_margin_usd)}</div>
+                    <div className="kpi-sub">
+                      {t("Gross lev", "Валовое плечо")} {fx(tnRisk.gross_leverage, 2, "x")}
+                    </div>
+                  </div>
+                  <div className="card">
+                    <KpiLabel k="kpiTnOrphanRisk" />
+                    <div className={`kpi-value ${(num(tnRisk.orphan_notional_usd) ?? 0) > 0 ? "warn" : ""}`}>
+                      {fmtUsd(tnRisk.orphan_notional_usd)}
+                    </div>
+                    <div className="kpi-sub">
+                      {t("Orphan pos", "Сирот")}:{" "}
+                      {typeof tnRisk.orphan_positions === "number"
+                        ? tnRisk.orphan_positions
+                        : tnRisk.orphan_positions && typeof tnRisk.orphan_positions === "object"
+                          ? Object.keys(tnRisk.orphan_positions).length
+                          : 0}
+                    </div>
+                  </div>
+                  <div className="card">
+                    <KpiLabel k="kpiTnMarkOracle" />
+                    <div className={`kpi-value ${Math.abs(num(tnRisk.max_mark_oracle_dev_pct) ?? 0) >= 2.0 ? "warn" : ""}`}>
+                      {fmtPct(tnRisk.max_mark_oracle_dev_pct, 2, false)}
+                    </div>
+                    <div className="kpi-sub">
+                      {tnRisk.max_mark_oracle_dev_coin
+                        ? `${t("Coin", "Монета")}: ${tnRisk.max_mark_oracle_dev_coin}`
+                        : t("All marks aligned", "Марк и оракул синхронны")}
+                    </div>
+                  </div>
+                </section>
+              )}
+
               <section className="card">
                 <div className="section-header">
                   <SectionTitle k="secPerCoin" />
                   <span className="section-sub">
                     {perCoinAttribution.length}{" "}
-                    {p(perCoinAttribution.length, "tracked coin", "tracked coins", "отслеживаемая монета", "отслеживаемые монеты", "отслеживаемых монет")}
+                    {p(
+                      perCoinAttribution.length,
+                      "tracked coin",
+                      "tracked coins",
+                      "отслеживаемая монета",
+                      "отслеживаемые монеты",
+                      "отслеживаемых монет",
+                    )}
                   </span>
                 </div>
                 <div className="table-wrap">
@@ -1080,34 +1473,41 @@ function Desk() {
                       </tr>
                     </thead>
                     <tbody>
-                      {perCoinAttribution.map((c) => (
-                        <tr key={c.coin}>
-                          <td>
-                            <strong>{c.coin}</strong>
-                          </td>
-                          <td className={`num ${c.position_sz >= 0 ? "pos" : "neg"}`}>
-                            {c.position_sz >= 0 ? "L " : "S "}
-                            {fmtUsd(c.position_usd)}
-                          </td>
-                          <td className="mono">{c.leverage_mode}</td>
-                          <td className="num">{c.fills_count}</td>
-                          <td className="num">{fmtPct(c.maker_share_pct, 0, false)}</td>
-                          <td className={`num ${c.net_pnl_usd >= 0 ? "pos" : "neg"}`}>{fmtUsd(c.net_pnl_usd)}</td>
-                          <td className="num">{fmtBps(c.vw_markout_bps, 1)}</td>
-                          <td className={`num ${(c.liq_distance_pct ?? 999) < 20 ? "warn" : ""}`}>
-                            {c.liq_distance_pct !== null ? fmtPct(c.liq_distance_pct, 1, false) : "—"}
-                          </td>
-                          <td className="num">
-                            {c.adl_rank_score !== null ? (
-                              <span className={`badge ${c.adl_rank_score >= 2.0 ? "badge-warn" : "badge-ok"}`}>
-                                {fx(c.adl_rank_score, 2)}
-                              </span>
-                            ) : (
-                              "—"
-                            )}
-                          </td>
-                        </tr>
-                      ))}
+                      {perCoinAttribution.map((c) => {
+                        const isFlat = Math.abs(c.position_sz) <= 1e-12;
+                        const isLong = c.position_sz > 1e-12;
+                        return (
+                          <tr key={c.coin}>
+                            <td>
+                              <strong>{c.coin}</strong>
+                            </td>
+                            <td className={`num ${isFlat ? "muted" : isLong ? "pos" : "neg"}`}>
+                              {isFlat
+                                ? t("Flat", "Закрыта")
+                                : `${isLong ? "L " : "S "}${fmtUsd(c.position_usd)}`}
+                            </td>
+                            <td className="mono">{c.leverage_mode}</td>
+                            <td className="num">{c.fills_count}</td>
+                            <td className={`num ${c.fills_count === 0 ? "muted" : ""}`}>
+                              {c.fills_count === 0 ? "—" : fmtPct(c.maker_share_pct, 0, false)}
+                            </td>
+                            <td className={`num ${signCls(c.net_pnl_usd)}`}>{fmtUsd(c.net_pnl_usd)}</td>
+                            <td className="num">{fmtBps(c.vw_markout_bps, 1)}</td>
+                            <td className={`num ${(c.liq_distance_pct ?? 999) < 20 ? "warn" : ""}`}>
+                              {c.liq_distance_pct !== null ? fmtPct(c.liq_distance_pct, 1, false) : "—"}
+                            </td>
+                            <td className="num">
+                              {c.adl_rank_score !== null ? (
+                                <span className={`badge ${c.adl_rank_score >= 2.0 ? "badge-warn" : "badge-ok"}`}>
+                                  {fx(c.adl_rank_score, 2)}
+                                </span>
+                              ) : (
+                                "—"
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
                       {perCoinAttribution.length === 0 && (
                         <tr>
                           <td colSpan={9} className="muted">
@@ -1148,6 +1548,12 @@ function Desk() {
                             <span className={`badge ${rec.status === "ok" ? "badge-ok" : "badge-danger"}`}>
                               {rec.status}
                             </span>
+                            {rec.derisk_mode && rec.derisk_mode !== "none" && (
+                              <>
+                                {" "}
+                                <span className="badge badge-warn">{rec.derisk_mode}</span>
+                              </>
+                            )}
                           </td>
                           <td className="num">{rec.cancelled_count}</td>
                           <td className="num">{rec.placed_count}</td>
@@ -1156,11 +1562,20 @@ function Desk() {
                           <td className="mono">
                             {[
                               rec.violations.length ? rec.violations.join(", ") : "",
+                              rec.blocked_isolated_coins?.length
+                                ? `${t("isolated blocked", "блок isolated")}: ${rec.blocked_isolated_coins.join(", ")}`
+                                : "",
+                              rec.blocked_leverage_coins?.length
+                                ? `${t("leverage blocked", "блок плеча")}: ${rec.blocked_leverage_coins.join(", ")}`
+                                : "",
                               rec.skipped_unquoted_coins?.length
                                 ? `${t("skipped (no BBO)", "пропущено (нет BBO)")}: ${rec.skipped_unquoted_coins.join(", ")}`
                                 : "",
                               rec.orphan_positions && Object.keys(rec.orphan_positions).length
                                 ? `${t("orphans", "сироты")}: ${Object.keys(rec.orphan_positions).join(", ")}`
+                                : "",
+                              rec.foreign_coins?.length
+                                ? `${t("MM/foreign", "MM/чужие")}: ${rec.foreign_coins.join(", ")}`
                                 : "",
                             ]
                               .filter(Boolean)
@@ -1185,12 +1600,19 @@ function Desk() {
                   <section className="card" key={cal.coin}>
                     <div className="section-header">
                       <SectionTitle k="secKappa" suffix={` (${cal.coin})`} />
-                      <span className="badge badge-cyan">R² = {fx(cal.r2_fit, 3)}</span>
+                      <div className="filter-row">
+                        {cal.calibration_ok === false && (
+                          <span className="badge badge-warn">
+                            {t("Low sample / fallback", "Малая выборка")}
+                          </span>
+                        )}
+                        <span className="badge badge-cyan">R² = {fx(cal.r2_fit, 3)}</span>
+                      </div>
                     </div>
                     <KappaCalibrationChart cal={cal} />
                     <div className="kpi-sub" style={{ marginTop: 8 }}>
-                      κ = {fx(cal.kappa_per_bp, 3)}/bp · σ_τ = {fx(cal.empirical_sigma_tau_bps, 2)} bps ·{" "}
-                      {t("Min half-spread", "Мин. полуспред")} = {fx(cal.implied_min_half_spread_bps, 2)} bps ·{" "}
+                      κ = {fx(cal.kappa_per_bp, 3, "/bp")} · σ_τ = {fmtBps(cal.empirical_sigma_tau_bps, 2)} ·{" "}
+                      {t("Min half-spread", "Мин. полуспред")} = {fmtBps(cal.implied_min_half_spread_bps, 2)} ·{" "}
                       {cal.trades_count} {p(cal.trades_count, "trade", "trades", "сделка", "сделки", "сделок")}
                     </div>
                   </section>
@@ -1205,17 +1627,17 @@ function Desk() {
                 <div className="card">
                   <KpiLabel k="kpiFeSha" />
                   <div className="kpi-value">{shortSha(feSha)}</div>
-                  <div className="kpi-sub">{feBuild?.built_at || "local / dev"}</div>
+                  <div className="kpi-sub">{feBuild?.built_at || t("local / dev", "локально / dev")}</div>
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiBeSha" />
                   <div className="kpi-value">{shortSha(beSha)}</div>
-                  <div className="kpi-sub">{data?.build_info?.built_at || "local / dev"}</div>
+                  <div className="kpi-sub">{data?.build_info?.built_at || t("local / dev", "локально / dev")}</div>
                 </div>
                 <div className="card">
                   <KpiLabel k="kpiHeartbeat" />
                   <div className="kpi-value">
-                    {data?.worker_status ? "ONLINE" : "EXTERNAL / CRON"}
+                    {data?.worker_status ? t("ONLINE", "ОНЛАЙН") : t("EXTERNAL / CRON", "ВНЕШНИЙ / CRON")}
                   </div>
                   <div className="kpi-sub">
                     {data?.worker_status?.heartbeat_utc ??
@@ -1228,10 +1650,12 @@ function Desk() {
                 <div className="card">
                   <KpiLabel k="kpiExecGate" />
                   <div className="kpi-value">
-                    {data?.worker_status?.testnet_execution_enabled ? "ENABLED" : "READ-ONLY"}
+                    {data?.worker_status?.testnet_execution_enabled
+                      ? t("ENABLED", "ВКЛЮЧЕН")
+                      : t("READ-ONLY", "ТОЛЬКО ЧТЕНИЕ")}
                   </div>
                   <div className="kpi-sub">
-                    Telegram: {data?.worker_status?.telegram_enabled ? "ON" : "OFF"}
+                    Telegram: {data?.worker_status?.telegram_enabled ? t("ON", "ВКЛ") : t("OFF", "ВЫКЛ")}
                   </div>
                 </div>
               </section>
@@ -1276,11 +1700,14 @@ function Desk() {
                               {j.state}
                             </span>
                             {!j.enabled && <div className="section-sub">{j.status_reason}</div>}
+                            {j.last_error && (
+                              <div className="section-sub neg mono" style={{ whiteSpace: "normal", maxWidth: 320 }}>
+                                {j.last_error}
+                              </div>
+                            )}
                           </td>
                           <td className="mono">{j.last_finished_at_utc ?? "—"}</td>
-                          <td className="num">
-                            {num(j.last_duration_s) !== null ? `${fx(j.last_duration_s, 1)}${t("s", "с")}` : "—"}
-                          </td>
+                          <td className="num">{fx(j.last_duration_s, 1, t("s", "с"))}</td>
                           <td className="num">
                             {j.runs_ok} / {j.runs_failed}
                           </td>
@@ -1326,11 +1753,11 @@ function Desk() {
                           <td className="mono">{info.path}</td>
                           <td>
                             <span className={`badge ${info.exists ? "badge-ok" : "badge-warn"}`}>
-                              {info.exists ? "present" : "pending"}
+                              {info.exists ? t("present", "есть") : t("pending", "ожидание")}
                             </span>
                           </td>
                           <td className="mono">{info.updated_at_utc ?? "—"}</td>
-                          <td className="num">{num(info.age_minutes) !== null ? fx(info.age_minutes, 1) : "—"}</td>
+                          <td className="num">{fx(info.age_minutes, 1)}</td>
                         </tr>
                       ))}
                     </tbody>

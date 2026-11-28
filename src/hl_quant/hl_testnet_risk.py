@@ -65,18 +65,16 @@ def parse_asset_ctxs(payload: Any) -> dict[str, AssetCtx]:
 
 
 def fetch_testnet_asset_ctxs(client: httpx.Client) -> dict[str, AssetCtx]:
-    resp = client.post(ex.TESTNET_INFO_URL, json={"type": "metaAndAssetCtxs"})
-    resp.raise_for_status()
+    resp = ex._post_testnet_info(client, {"type": "metaAndAssetCtxs"})
     return parse_asset_ctxs(resp.json())
 
 
 def fetch_book_sides(client: httpx.Client, coins: list[str]) -> dict[str, str]:
-    """Return ``{coin: "two_sided" | "bid_only" | "ask_only" | "empty"}`` from Testnet ``l2Book``."""
+    """Return ``{coin: "two_sided" | "bid_only" | "ask_only" | "empty" | "unknown"}`` from Testnet ``l2Book``."""
     out: dict[str, str] = {}
     for coin in sorted(set(coins)):
         try:
-            resp = client.post(ex.TESTNET_INFO_URL, json={"type": "l2Book", "coin": coin})
-            resp.raise_for_status()
+            resp = ex._post_testnet_info(client, {"type": "l2Book", "coin": coin})
             levels = (resp.json() or {}).get("levels")
         except (httpx.HTTPError, ValueError, AttributeError):
             out[coin] = "unknown"
@@ -91,6 +89,27 @@ def fetch_book_sides(client: httpx.Client, coins: list[str]) -> dict[str, str]:
     return out
 
 
+def oracle_adjusted_equity_usd(account: ex.AccountSnapshot, asset_ctxs: dict[str, AssetCtx]) -> float:
+    """Cap account equity at oracle-repriced equity so thin-book mark spikes cannot inflate HWM."""
+    equity = float(account.equity_usd)
+    if not asset_ctxs or not math.isfinite(equity):
+        return equity
+    upnl_mark = 0.0
+    upnl_oracle = 0.0
+    for coin, raw_szi in account.positions_sz.items():
+        szi = float(raw_szi or 0.0)
+        if abs(szi) <= 1e-12:
+            continue
+        u_mark = float(account.position_unrealized_pnl_usd.get(coin, 0.0) or 0.0)
+        entry = account.position_entry_px.get(coin)
+        ctx = asset_ctxs.get(coin)
+        oracle_px = ctx.oracle_px if ctx else None
+        u_oracle = szi * (oracle_px - entry) if (oracle_px and entry) else u_mark
+        upnl_mark += u_mark
+        upnl_oracle += u_oracle
+    return min(equity, equity - max(0.0, upnl_mark - upnl_oracle))
+
+
 def build_risk_snapshot(
     account: ex.AccountSnapshot,
     *,
@@ -98,16 +117,35 @@ def build_risk_snapshot(
     asset_ctxs: dict[str, AssetCtx],
     book_sides: dict[str, str],
     max_drawdown_pct: float = ex.RiskLimits().max_drawdown_pct,
+    target_weights: dict[str, float] | None = None,
+    min_orphan_alert_usd: float = 10.0,
     now_ms: int | None = None,
 ) -> dict[str, Any]:
     """Pure function: combine an account snapshot, HWM, asset contexts and book sides into a risk record.
 
     A position is an orphan when its Testnet book is not two-sided: the ALO planner cannot price,
     rebalance or close it, matching ``execute_rebalance_cycle``'s ``coin not in bbo`` rule.
+    ``unmanaged_orphan_positions`` counts non-dust orphans that are not retained same-side target
+    holdings and do not already have a resting reduce-only unwind order working on the book.
     """
     equity = float(account.equity_usd)
     hwm = max(float(high_water_mark_usd or 0.0), equity if math.isfinite(equity) else 0.0)
     dd = ex.drawdown_pct(equity, hwm)
+
+    resting_unwind_coins: set[str] = set()
+    for oo in account.open_orders:
+        if not isinstance(oo, dict):
+            continue
+        c_oo = str(oo.get("coin") or "")
+        if not c_oo:
+            continue
+        szi_oo = float(account.positions_sz.get(c_oo, 0.0) or 0.0)
+        if abs(szi_oo) <= 1e-12:
+            continue
+        oo_side = str(oo.get("side") or "").upper()
+        closes_dir = (szi_oo > 0 and oo_side in {"A", "SELL"}) or (szi_oo < 0 and oo_side in {"B", "BUY"})
+        if closes_dir and bool(oo.get("reduceOnly", True)):
+            resting_unwind_coins.add(c_oo)
 
     per_coin: list[dict[str, Any]] = []
     gross = 0.0
@@ -116,6 +154,8 @@ def build_risk_snapshot(
     orphan_notional = 0.0
     orphan_upnl = 0.0
     orphans: dict[str, dict[str, Any]] = {}
+    unmanaged_orphans = 0
+    unknown_books = 0
     max_dev_pct = 0.0
     max_dev_coin = ""
     for coin in sorted(account.positions_sz):
@@ -132,7 +172,9 @@ def build_risk_snapshot(
         u_oracle = szi * (oracle_px - entry) if (oracle_px and entry) else u_mark
         dev_pct = ((mark_px / oracle_px) - 1.0) * 100.0 if (mark_px and oracle_px) else 0.0
         book = book_sides.get(coin, "unknown")
-        is_orphan = book != "two_sided"
+        if book == "unknown":
+            unknown_books += 1
+        is_orphan = book in {"empty", "bid_only", "ask_only"}
 
         gross += abs(notional)
         upnl_mark += u_mark
@@ -142,11 +184,22 @@ def build_risk_snapshot(
         if is_orphan:
             orphan_notional += abs(notional)
             orphan_upnl += u_mark
+            tgt_w = float((target_weights or {}).get(coin, 0.0) or 0.0)
+            retained_target = target_weights is not None and (tgt_w * szi > 0.0)
+            has_unwind_order = coin in resting_unwind_coins
+            is_unmanaged = (
+                abs(notional) >= float(min_orphan_alert_usd)
+                and not retained_target
+                and not has_unwind_order
+            )
+            if is_unmanaged:
+                unmanaged_orphans += 1
             orphans[coin] = {
                 "szi": szi,
                 "notional_usd": round(notional, 4),
                 "unrealized_pnl_usd": round(u_mark, 4),
                 "book": book,
+                "unmanaged": is_unmanaged,
             }
         per_coin.append(
             {
@@ -184,8 +237,10 @@ def build_risk_snapshot(
         "max_mark_oracle_dev_pct": round(max_dev_pct, 4),
         "max_mark_oracle_dev_coin": max_dev_coin,
         "orphan_positions": orphans,
+        "unmanaged_orphan_positions": unmanaged_orphans,
         "orphan_notional_usd": round(orphan_notional, 4),
         "orphan_unrealized_pnl_usd": round(orphan_upnl, 4),
+        "unknown_books": unknown_books,
         "open_orders": len(account.open_orders),
         "per_coin": per_coin,
     }

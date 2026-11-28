@@ -48,6 +48,28 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+_TS_PARQUET_CACHE: dict[Path, tuple[int, int, pd.DataFrame]] = {}
+_TS_PARQUET_LOCK = threading.Lock()
+
+
+def _read_parquet_cached(path: Path) -> pd.DataFrame:
+    key = path.resolve()
+    try:
+        st = path.stat()
+        with _TS_PARQUET_LOCK:
+            cached = _TS_PARQUET_CACHE.get(key)
+            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+                return cached[2]
+        df = pd.read_parquet(path)
+        with _TS_PARQUET_LOCK:
+            if len(_TS_PARQUET_CACHE) > 32:
+                _TS_PARQUET_CACHE.clear()
+            _TS_PARQUET_CACHE[key] = (st.st_mtime_ns, st.st_size, df)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
 def collect_tear_sheet_data(data_root: Path) -> dict[str, Any]:
     """Load all available live JSON/Parquet outputs under ``data_root`` (e.g. ``data/paper``)."""
     attr = _read_json(data_root / "hl_testnet_attribution" / "attribution.json")
@@ -60,20 +82,65 @@ def collect_tear_sheet_data(data_root: Path) -> dict[str, Any]:
     ticks_p = data_root / "hl_metamodel" / "ticks.parquet"
     state_p = data_root / "hl_metamodel" / "state.json"
     if ticks_p.is_file() and state_p.is_file():
-        try:
-            ticks = pd.read_parquet(ticks_p)
-        except Exception:
-            ticks = pd.DataFrame()
+        ticks = _read_parquet_cached(ticks_p)
         st = _read_json(state_p) or {}
         if not ticks.empty and "equity_usd" in ticks.columns:
             start_cap = float(st.get("starting_capital_usd") or 100_000.0)
             last_eq = float(ticks["equity_usd"].iloc[-1])
+            pos_map = st.get("positions") or {}
+            cum_fund = (
+                round(float(st["cum_funding_usd"]), 4)
+                if st.get("cum_funding_usd") is not None
+                else (round(float(ticks["fund_pnl_usd"].sum()), 4) if "fund_pnl_usd" in ticks.columns else 0.0)
+            )
+            cum_costs = (
+                round(float(st["cum_costs_usd"]), 4)
+                if st.get("cum_costs_usd") is not None
+                else (
+                    round(float((-ticks["cost_pnl_usd"]).clip(lower=0.0).sum()), 4)
+                    if "cost_pnl_usd" in ticks.columns
+                    else 0.0
+                )
+            )
+            nav_triggered = (
+                bool(st["nav_guard_triggered"])
+                if "nav_guard_triggered" in st
+                else (bool(ticks["nav_guard_triggered"].iloc[-1]) if "nav_guard_triggered" in ticks.columns else False)
+            )
+            gross_hl = (
+                round(float(ticks["gross_hl"].iloc[-1]), 6)
+                if "gross_hl" in ticks.columns
+                else round(
+                    sum(abs(float(p.get("hl_weight") or 0.0)) for p in pos_map.values() if isinstance(p, dict)),
+                    6,
+                )
+            )
+            gross_cex = (
+                round(float(ticks["gross_cex"].iloc[-1]), 6)
+                if "gross_cex" in ticks.columns
+                else round(
+                    sum(
+                        sum(abs(float(w)) for w in p["cex_legs"].values())
+                        if isinstance(p.get("cex_legs"), dict)
+                        else abs(float(p.get("cex_weight") or 0.0))
+                        for p in pos_map.values()
+                        if isinstance(p, dict)
+                    ),
+                    6,
+                )
+            )
             paper_info = {
                 "ticks": int(len(ticks)),
                 "starting_capital_usd": start_cap,
                 "equity_usd": round(last_eq, 2),
                 "return_pct": round((last_eq / start_cap - 1.0) * 100.0, 4) if start_cap > 0 else 0.0,
-                "active_positions": len(st.get("positions") or {}),
+                "active_positions": len(pos_map),
+                "cum_funding_usd": cum_fund,
+                "cum_costs_usd": cum_costs,
+                "nav_guard_triggers": int(st.get("nav_guard_triggers") or 0),
+                "nav_guard_triggered": nav_triggered,
+                "gross_hl": gross_hl,
+                "gross_cex": gross_cex,
             }
 
     cross_dex_top: list[dict[str, Any]] = []

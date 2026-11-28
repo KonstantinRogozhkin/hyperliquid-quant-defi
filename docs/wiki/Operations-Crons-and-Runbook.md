@@ -10,7 +10,7 @@
 - Секреты хранятся строго в локальном gitignored `.env` (см. шаблон `.env.example`):
   - `HL_TESTNET_PRIVATE_KEY` / `HL_TESTNET_ACCOUNT_ADDRESS` — API-кошелёк Testnet без права вывода;
   - `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` / `TELEGRAM_THREAD_ID` — уведомления Telegram Bot API 10.1+ (`sendRichMessage` с нативными HTML-таблицами).
-- Все cron-обёртки используют lock-директории `.neira/state/*.lock` с проверкой живого PID — параллельные дубли невозможны.
+- Все cron-обёртки используют атомарный ядровый `flock` через `python -m hl_quant.ops_lock` (`${TMPDIR:-/tmp}/*.flock`, автоматически освобождаемый ядром при `SIGKILL`/падении) — параллельные дубли и залипшие lock-файлы невозможны.
 
 ---
 
@@ -59,8 +59,8 @@ make bench-mm
 .venv/bin/python scripts/analytics/run_hl_frontier_persistence_tick.py
 .venv/bin/python scripts/analytics/run_hl_hip3_paper_tick.py
 
-# Безопасный перенос локальных macOS-кронов на 13-джобовый Dokploy worker (с бэкапом)
-python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl-quant.95-217-163-111.sslip.io --apply
+# Безопасный перенос локальных macOS-кронов на 16-джобовый Dokploy worker (с бэкапом)
+python3 scripts/ops/cutover_local_crons_to_dokploy.py --public-url https://hl-quant.example.com --apply
 
 # Пересборка автономного 6-вкладочного HTML-дашборда
 make dashboard
