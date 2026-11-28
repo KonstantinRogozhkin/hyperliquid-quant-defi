@@ -94,8 +94,14 @@ def build_hyperevm_yield_strategies(
     perp_leverage: float = 2.0,
     loop_ltv: float = 0.50,
     assumed_stable_borrow_apr_pct: float = 3.5,
+    stable_market_utilization: float = 0.80,
 ) -> list[YieldStackStrategyRow]:
-    """Compute realistic capital-adjusted net APRs and liquidation buffers for 5 HyperEVM stacks."""
+    """Compute realistic capital-adjusted net APRs and liquidation buffers for 5 HyperEVM stacks.
+
+    Borrow cost for the loop is never below what the live stable market implies: lenders earn
+    ``supply = borrow * utilization`` (before reserve fees), so ``borrow >= supply / utilization``.
+    A hard-coded 3.5% borrow under a 5.38% Morpho feUSD supply APY made the loop look best.
+    """
     # Split-capital delta-neutral: 1 unit spot LST + (1 / perp_leverage) unit USDC perp margin
     # -> hedged notional as share of total deposit = 1 / (1 + 1/L) = L / (L + 1)
     lev = max(1.0, float(perp_leverage))
@@ -144,7 +150,10 @@ def build_hyperevm_yield_strategies(
     # Here 100% of deposit buys kHYPE; borrowing 50% LTV funds the 2x short HYPE perp margin!
     # Net = kHYPE_APY + HYPE_funding_or_Boros - LTV * borrow_apr + idle_stable_carry
     ref_fund = inp.boros_hype_fixed_bid_apr_pct if inp.boros_hype_fixed_bid_apr_pct is not None else inp.hype_funding_apr_pct
-    borrow_drag = loop_ltv * assumed_stable_borrow_apr_pct
+    util = min(max(float(stable_market_utilization), 0.05), 1.0)
+    implied_borrow_apr = (inp.morpho_feusd_apy_pct / util) if inp.morpho_feusd_apy_pct > 0 else 0.0
+    borrow_apr = max(float(assumed_stable_borrow_apr_pct), implied_borrow_apr)
+    borrow_drag = loop_ltv * borrow_apr
     # Excess borrowed stables (if any) earn Morpho FEUSDCV2 APY; at LTV=50% and 2x perp, 100% of borrow funds perp margin
     gross_loop = inp.khype_apy_pct + ref_fund
     net_loop = gross_loop - borrow_drag
