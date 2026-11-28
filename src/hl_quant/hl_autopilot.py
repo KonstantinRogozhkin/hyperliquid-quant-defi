@@ -948,7 +948,11 @@ def run_autopilot_tick(
         pending_ret_raw = state.get("nav_guard_pending_ret_pct")
         nav_guard_pending_ret: float | None = float(pending_ret_raw) if pending_ret_raw is not None else None
         raw_ret_pct = (raw_pnl_total / prev_gross * 100.0) if prev_gross > 0 else 0.0
-        jump_exceeded = prev_gross > 0 and abs(raw_ret_pct) > cfg.max_tick_nav_jump_pct
+        jump_exceeded = (
+            prev_gross > 0
+            and cfg.max_tick_nav_jump_pct > 0.0
+            and abs(raw_ret_pct) > cfg.max_tick_nav_jump_pct
+        )
         if jump_exceeded and nav_guard_pending is not None and ts_ms - nav_guard_pending >= NAV_GUARD_CONFIRM_MS:
             confirmed = nav_guard_pending_ret is None or (
                 (raw_ret_pct * nav_guard_pending_ret) > 0.0

@@ -177,7 +177,9 @@ def settled_funding_by_position(
     out: dict[Any, float] = {}
     for start, syms in by_start.items():
         try:
-            fetched = fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms, info_url=info_url)
+            fetched = fetch_settled_funding_sum(
+                client, sorted(syms), start + 1, ts_ms, info_url=info_url, max_window_hours=cap_hours
+            )
             for sym, val in fetched.items():
                 out[sym] = val
                 out[(start, sym)] = val

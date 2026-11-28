@@ -134,7 +134,7 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
         study_dir = legacy_52d_dir
     else:
         study_dir = live_study_dir
-    settlement_stats = _read_parquet_records(study_dir / "stats.parquet")
+    settlement_stats = _ensure_settlement_fdr_pass(_read_parquet_records(study_dir / "stats.parquet"))
     settlement_meta = _read_json(study_dir / "meta.json")
     settlement_last_attempt = _read_json(study_dir / "last_attempt.json")
     onchain_events = _read_json(data_root / "hl_onchain_events" / "latest_snapshot.json")
@@ -254,6 +254,89 @@ def _ni(v: Any, default: int = 0) -> int:
 
 def _e(val: object) -> str:
     return html.escape(str(val))
+
+
+def _finite_opt(val: Any) -> float | None:
+    if val is None or pd.isna(val):
+        return None
+    try:
+        fv = float(val)
+    except (TypeError, ValueError):
+        return None
+    return fv if math.isfinite(fv) else None
+
+
+def _settlement_row_net_t_stat(hv_row: Any) -> float:
+    has_get = hasattr(hv_row, "get")
+    if has_get and ("net_t_stat" in hv_row):
+        explicit = _finite_opt(hv_row.get("net_t_stat"))
+        return explicit if explicit is not None else -math.inf
+    net_val = _nf(hv_row.get("net_maker_bps") if has_get else None, 0.0)
+    ev_n = _nf(hv_row.get("events") if has_get else None, 0.0)
+    sh_ev = _finite_opt(hv_row.get("sharpe_event") if has_get else None)
+    if sh_ev is not None and ev_n >= 2.0:
+        return sh_ev * math.sqrt(ev_n)
+    sd_val = _finite_opt(hv_row.get("std_bps") if has_get else None)
+    if sd_val is not None and sd_val > 1e-9 and ev_n >= 2.0:
+        return net_val / (sd_val / math.sqrt(ev_n))
+    gross_val = _nf(hv_row.get("mean_gross_bps") if has_get else None, 0.0)
+    gross_t = _finite_opt(hv_row.get("t_stat") if has_get else None)
+    if gross_t is not None and abs(gross_val) > 1e-9 and abs(gross_t) > 1e-9:
+        se = abs(gross_val / gross_t)
+        return net_val / se if se > 1e-12 else 0.0
+    return -math.inf if net_val <= 0.0 else (gross_t if gross_t is not None else -math.inf)
+
+
+def _settlement_row_net_t_clustered(hv_row: Any) -> float:
+    has_get = hasattr(hv_row, "get")
+    if has_get and ("clusters" in hv_row):
+        cl_raw = hv_row.get("clusters")
+        if cl_raw is not None and not pd.isna(cl_raw) and _nf(cl_raw, 0.0) < 2.0:
+            return -math.inf
+    if has_get and ("net_t_stat_clustered" in hv_row):
+        v = _finite_opt(hv_row.get("net_t_stat_clustered"))
+        return v if v is not None else -math.inf
+    v = _finite_opt(hv_row.get("t_stat_clustered") if has_get else None)
+    return v if v is not None else -math.inf
+
+
+def _settlement_row_holdout_p(hv_row: Any) -> float:
+    has_get = hasattr(hv_row, "get")
+    t_net = _settlement_row_net_t_stat(hv_row)
+    t_cl_val = _settlement_row_net_t_clustered(hv_row)
+    ev_n = _nf(hv_row.get("events") if has_get else None, 0.0)
+    cl_n = _nf(hv_row.get("clusters") if has_get else None, 0.0)
+    df_ev = (ev_n - 1.0) if ev_n >= 2.0 else None
+    df_cl = (cl_n - 1.0) if cl_n >= 2.0 else df_ev
+    return max(fss.one_sided_p_value(t_net, df_ev), fss.one_sided_p_value(t_cl_val, df_cl))
+
+
+def _ensure_settlement_fdr_pass(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if not rows:
+        return rows
+    holdout_idxs = [
+        i
+        for i, r in enumerate(rows)
+        if isinstance(r, dict) and str(r.get("split") or "").strip().lower() in ("holdout", "oos")
+    ]
+    if not holdout_idxs:
+        return rows
+    needs_fdr = any(
+        ("fdr_pass" not in rows[i]) or rows[i].get("fdr_pass") is None or pd.isna(rows[i].get("fdr_pass"))
+        for i in holdout_idxs
+    )
+    if not needs_fdr:
+        return rows
+    out = [dict(r) if isinstance(r, dict) else r for r in rows]
+    for r in out:
+        if isinstance(r, dict) and (("fdr_pass" not in r) or r.get("fdr_pass") is None or pd.isna(r.get("fdr_pass"))):
+            r["fdr_pass"] = False
+    p_vals = [_settlement_row_holdout_p(out[i]) for i in holdout_idxs]
+    bh_flags = fss.benjamini_hochberg(p_vals, fss.SETTLEMENT_FDR_Q)
+    for idx, passed in zip(holdout_idxs, bh_flags, strict=False):
+        if ("fdr_pass" not in rows[idx]) or rows[idx].get("fdr_pass") is None or pd.isna(rows[idx].get("fdr_pass")):
+            out[idx]["fdr_pass"] = bool(passed)
+    return out
 
 
 def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
@@ -508,60 +591,27 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
     s_rows = ""
     st_list = d.get("settlement_stats") or []
     if st_list:
-        sdf = pd.DataFrame(st_list)
-        dev_m = sdf[sdf["split"] == "dev"].set_index(["bucket", "strategy"])
-        dev_m = dev_m[~dev_m.index.duplicated(keep="last")]
-        hld_m = sdf[sdf["split"] == "holdout"].set_index(["bucket", "strategy"])
-        hld_m = hld_m[~hld_m.index.duplicated(keep="last")]
-        common_keys = [k for k in dev_m.index if k in hld_m.index]
-
-        def _finite_opt(val: Any) -> float | None:
-            if val is None or pd.isna(val):
-                return None
-            try:
-                fv = float(val)
-            except (TypeError, ValueError):
-                return None
-            return fv if math.isfinite(fv) else None
-
-        def _row_net_t_stat(hv_row: Any) -> float:
-            explicit = _finite_opt(hv_row.get("net_t_stat") if hasattr(hv_row, "get") else None)
-            if explicit is not None:
-                return explicit
-            net_val = _nf(hv_row.get("net_maker_bps") if hasattr(hv_row, "get") else None, 0.0)
-            ev_n = _nf(hv_row.get("events") if hasattr(hv_row, "get") else None, 0.0)
-            sh_ev = _finite_opt(hv_row.get("sharpe_event") if hasattr(hv_row, "get") else None)
-            if sh_ev is not None and ev_n >= 2.0:
-                return sh_ev * math.sqrt(ev_n)
-            sd_val = _finite_opt(hv_row.get("std_bps") if hasattr(hv_row, "get") else None)
-            if sd_val is not None and sd_val > 1e-9 and ev_n >= 2.0:
-                return net_val / (sd_val / math.sqrt(ev_n))
-            gross_val = _nf(hv_row.get("mean_gross_bps") if hasattr(hv_row, "get") else None, 0.0)
-            gross_t = _finite_opt(hv_row.get("t_stat") if hasattr(hv_row, "get") else None)
-            if gross_t is not None and abs(gross_val) > 1e-9 and abs(gross_t) > 1e-9:
-                se = abs(gross_val / gross_t)
-                return net_val / se if se > 1e-12 else 0.0
-            return -math.inf if net_val <= 0.0 else (gross_t if gross_t is not None else -math.inf)
-
-        def _row_holdout_p(hv_row: Any) -> float:
-            t_net = _row_net_t_stat(hv_row)
-            t_cl_raw = (
-                _finite_opt(hv_row.get("t_stat_clustered_net") if hasattr(hv_row, "get") else None)
-                if (hasattr(hv_row, "get") and hv_row.get("t_stat_clustered_net") is not None)
-                else _finite_opt(hv_row.get("t_stat_clustered") if hasattr(hv_row, "get") else None)
-            )
-            t_cl_val = t_cl_raw if t_cl_raw is not None else -math.inf
-            ev_n = _nf(hv_row.get("events") if hasattr(hv_row, "get") else None, 0.0)
-            cl_n = _nf(hv_row.get("clusters") if hasattr(hv_row, "get") else None, 0.0)
-            df_ev = (ev_n - 1.0) if ev_n >= 2.0 else None
-            df_cl = (cl_n - 1.0) if cl_n >= 2.0 else df_ev
-            return max(fss.one_sided_p_value(t_net, df_ev), fss.one_sided_p_value(t_cl_val, df_cl))
+        dev_m: dict[tuple[str, str], dict[str, Any]] = {}
+        hld_m: dict[tuple[str, str], dict[str, Any]] = {}
+        dev_order: list[tuple[str, str]] = []
+        for raw_r in st_list:
+            if not isinstance(raw_r, dict):
+                continue
+            key_pair = (str(raw_r.get("bucket") or ""), str(raw_r.get("strategy") or ""))
+            sp_lbl = str(raw_r.get("split") or "").strip().lower()
+            if sp_lbl in ("dev", "is"):
+                if key_pair not in dev_m:
+                    dev_order.append(key_pair)
+                dev_m[key_pair] = raw_r
+            elif sp_lbl in ("holdout", "oos"):
+                hld_m[key_pair] = raw_r
+        common_keys = [k for k in dev_order if k in hld_m]
 
         computed_bh = dict(
             zip(
                 common_keys,
                 fss.benjamini_hochberg(
-                    [_row_holdout_p(hld_m.loc[k]) for k in common_keys],
+                    [_settlement_row_holdout_p(hld_m[k]) for k in common_keys],
                     fss.SETTLEMENT_FDR_Q,
                 ),
                 strict=False,
@@ -570,19 +620,19 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
 
         for key in common_keys:
             b_n, st_n = key
-            dv, hv = dev_m.loc[key], hld_m.loc[key]
+            dv, hv = dev_m[key], hld_m[key]
             net_m = float(hv["net_maker_bps"])
             t_v = float(hv["t_stat"])
-            t_net_v = _row_net_t_stat(hv)
-            t_clust_opt = _finite_opt(hv.get("t_stat_clustered") if hasattr(hv, "get") else None)
-            # Never fall back to naive t_stat when clustered t-stat is NaN/None: treat as -inf.
-            t_clust = t_clust_opt if t_clust_opt is not None else -math.inf
-            fdr_raw = hv.get("fdr_pass") if hasattr(hv, "get") else None
+            t_net_v = _settlement_row_net_t_stat(hv)
+            # Gate on net_t_stat_clustered >= 2.0 (falling back to t_stat_clustered ONLY if
+            # net_t_stat_clustered key is completely absent in a legacy dict, NEVER on NaN/None/<2.0).
+            t_clust = _settlement_row_net_t_clustered(hv)
+            fdr_raw = hv.get("fdr_pass")
             if fdr_raw is not None and not pd.isna(fdr_raw):
                 fdr_ok = bool(fdr_raw)
             else:
                 fdr_ok = bool(computed_bh.get(key, False))
-            ex_top1_raw = hv.get("ex_top1_gross_bps") if hasattr(hv, "get") else None
+            ex_top1_raw = hv.get("ex_top1_gross_bps")
             if ex_top1_raw is not None and pd.notna(ex_top1_raw):
                 cost_bps = float(hv["mean_gross_bps"]) - net_m
                 ex_top1_net_ok = (float(ex_top1_raw) - cost_bps) > 0.0

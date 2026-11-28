@@ -862,6 +862,20 @@ def render_prometheus_metrics(
                 help_text="1 if latest settlement study run collected <80% of requested coins",
             )
 
+    def _cross_dex_pair_gross(pos: dict[str, Any]) -> float:
+        hl_n = _num(pos.get("hl_notional_usd"))
+        oth_n = _num(pos.get("other_notional_usd"))
+        if hl_n is not None and oth_n is not None and hl_n > 0.0 and oth_n > 0.0:
+            return hl_n + oth_n
+        return 2.0 * (_num(pos.get("leg_notional_usd")) or 0.0)
+
+    def _hip3_pair_gross(pos: dict[str, Any]) -> float:
+        s_n = _num(pos.get("short_notional_usd"))
+        l_n = _num(pos.get("long_notional_usd"))
+        if s_n is not None and l_n is not None and s_n > 0.0 and l_n > 0.0:
+            return s_n + l_n
+        return 2.0 * (_num(pos.get("leg_notional_usd")) or 0.0)
+
     # Pre-compute per-sleeve live APRs so Neutral Autopilot reports its true allocation-weighted APR
     sp_live_apr = (_num(sp.get("blended_portfolio_apr_pct")) or 0.0) if isinstance(sp, dict) else 0.0
     cd_live_apr = 0.0
@@ -871,7 +885,7 @@ def render_prometheus_metrics(
         if isinstance(cpos_tmp, dict):
             cd_live_apr = round(
                 sum(
-                    (_num(p.get("leg_notional_usd")) or 0.0) * (_num(p.get("live_spread_apr_pct")) or 0.0)
+                    (0.5 * _cross_dex_pair_gross(p)) * (_num(p.get("live_spread_apr_pct")) or 0.0)
                     for p in cpos_tmp.values()
                     if isinstance(p, dict)
                 )
@@ -885,7 +899,7 @@ def render_prometheus_metrics(
         if isinstance(hpos_tmp, dict):
             hp_live_apr = round(
                 sum(
-                    (_num(p.get("leg_notional_usd")) or 0.0) * (_num(p.get("live_spread_apr_pct")) or 0.0)
+                    (0.5 * _hip3_pair_gross(p)) * (_num(p.get("live_spread_apr_pct")) or 0.0)
                     for p in hpos_tmp.values()
                     if isinstance(p, dict)
                 )
@@ -988,9 +1002,9 @@ def render_prometheus_metrics(
         net_r, max_dd, sh90, beta = _lb_fields("cross_dex", ret)
         cpos = cdp.get("positions") or {}
         pos_cnt = len(cpos) if isinstance(cpos, dict) else 0
-        gross_ntl = sum(2.0 * (_num(p.get("leg_notional_usd")) or 0.0) for p in cpos.values() if isinstance(p, dict)) if isinstance(cpos, dict) else 0.0
+        gross_ntl = sum(_cross_dex_pair_gross(p) for p in cpos.values() if isinstance(p, dict)) if isinstance(cpos, dict) else 0.0
         weighted_apr = (
-            sum((_num(p.get("leg_notional_usd")) or 0.0) * (_num(p.get("live_spread_apr_pct")) or 0.0) for p in cpos.values() if isinstance(p, dict))
+            sum((0.5 * _cross_dex_pair_gross(p)) * (_num(p.get("live_spread_apr_pct")) or 0.0) for p in cpos.values() if isinstance(p, dict))
             / max(eq, 1.0)
             if isinstance(cpos, dict)
             else 0.0
@@ -1027,9 +1041,9 @@ def render_prometheus_metrics(
         net_r, max_dd, sh90, beta = _lb_fields("hip3_paper", ret)
         hpos = hp.get("positions") or {}
         pos_cnt = len(hpos) if isinstance(hpos, dict) else 0
-        gross_ntl = sum(2.0 * (_num(p.get("leg_notional_usd")) or 0.0) for p in hpos.values() if isinstance(p, dict)) if isinstance(hpos, dict) else 0.0
+        gross_ntl = sum(_hip3_pair_gross(p) for p in hpos.values() if isinstance(p, dict)) if isinstance(hpos, dict) else 0.0
         weighted_apr = (
-            sum((_num(p.get("leg_notional_usd")) or 0.0) * (_num(p.get("live_spread_apr_pct")) or 0.0) for p in hpos.values() if isinstance(p, dict))
+            sum((0.5 * _hip3_pair_gross(p)) * (_num(p.get("live_spread_apr_pct")) or 0.0) for p in hpos.values() if isinstance(p, dict))
             / max(eq, 1.0)
             if isinstance(hpos, dict)
             else 0.0

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import sys
 import threading
+import time
 
 import httpx
 import typer
@@ -76,10 +77,11 @@ def main(
 
     eff_mm_audit = mm_audit_log if mm_audit_log is not None else (hwm_state.parent / "hl_mm_testnet" / "mm_audit.jsonl")
     mm_order_oids = ex.load_logged_order_oids(eff_mm_audit)
+    mm_recent_min_ts = int(account.observed_at_ms or time.time() * 1000) - 6 * 3_600_000
     raw_mm_coins = os.getenv("HL_MM_COINS", "")
     mm_coin_set = (
         {c.strip() for c in raw_mm_coins.split(",") if c.strip()}
-        | ex.load_logged_order_coins(eff_mm_audit)
+        | ex.load_logged_order_coins(eff_mm_audit, min_ts_ms=mm_recent_min_ts)
         | {str(o.get("coin") or "") for o in account.open_orders if ex.safe_int(o.get("oid")) in mm_order_oids}
     )
     mm_coin_set.discard("")
@@ -124,22 +126,30 @@ def main(
     oracle_eq = risk.oracle_adjusted_equity_usd(account, asset_ctxs)
     stored_hwm = ex.load_high_water_mark(hwm_state)
     raw_prev_net_flow = ex.load_hwm_net_flow(hwm_state)
+    prev_last_eq = ex.load_hwm_last_equity(hwm_state)
     if stored_hwm <= 0.0 and not hwm_state.is_file():
         if math.isfinite(oracle_eq) and oracle_eq > 0.0:
-            ex.save_high_water_mark(hwm_state, oracle_eq, net_external_flow_usd=cur_net_flow)
+            ex.save_high_water_mark(
+                hwm_state, oracle_eq, net_external_flow_usd=cur_net_flow, last_equity_usd=oracle_eq
+            )
             stored_hwm = oracle_eq
     else:
         prev_net_flow = raw_prev_net_flow
         if prev_net_flow is None and cur_net_flow is not None and stored_hwm > 0:
             prev_net_flow = cur_net_flow
         stored_hwm = ex.flow_adjusted_high_water_mark(
-            stored_hwm, prev_net_flow, cur_net_flow, current_equity_usd=oracle_eq
+            stored_hwm,
+            prev_net_flow,
+            cur_net_flow,
+            current_equity_usd=oracle_eq,
+            pre_flow_equity_usd=prev_last_eq,
         )
         eff_audit_log = audit_log if audit_log is not None else (hwm_state.parent / "hl_testnet_audit.jsonl")
         gross_ntl = ex.account_gross_notional_usd(
             account, reference_px={c: ctx.oracle_px for c, ctx in asset_ctxs.items()}
         )
-        stored_hwm, _ = ex.reanchor_hwm_after_flatten(
+        persist_ok = ex.hwm_persist_allowed(cur_net_flow, raw_prev_net_flow)
+        stored_hwm, did_reanchor = ex.reanchor_hwm_after_flatten(
             hwm_state,
             eff_audit_log,
             stored_hwm=stored_hwm,
@@ -147,8 +157,28 @@ def main(
             gross_notional_usd=gross_ntl,
             now_ms=account.observed_at_ms,
             net_external_flow_usd=cur_net_flow,
-            persist=ex.hwm_persist_allowed(cur_net_flow, raw_prev_net_flow),
+            persist=persist_ok,
         )
+        if (
+            not did_reanchor
+            and cur_net_flow is not None
+            and raw_prev_net_flow is not None
+            and persist_ok
+            and stored_hwm > 0.0
+        ):
+            flow_changed = abs(cur_net_flow - raw_prev_net_flow) > 1e-6
+            eq_changed = (
+                math.isfinite(oracle_eq)
+                and oracle_eq > 0.0
+                and (prev_last_eq is None or abs(oracle_eq - prev_last_eq) > 1e-6)
+            )
+            if flow_changed or eq_changed:
+                ex.save_high_water_mark(
+                    hwm_state,
+                    stored_hwm,
+                    net_external_flow_usd=cur_net_flow,
+                    last_equity_usd=oracle_eq if (math.isfinite(oracle_eq) and oracle_eq > 0.0) else prev_last_eq,
+                )
 
     snapshot = risk.build_risk_snapshot(
         account,

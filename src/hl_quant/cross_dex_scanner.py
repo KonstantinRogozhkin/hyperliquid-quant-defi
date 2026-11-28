@@ -543,28 +543,36 @@ def enrich_opportunities_with_l2_depth(
         hb, ha = hl_cache[hl_sym]
         ob, oa = fetch_dex_l2_book(client, str(r.other_dex), str(r.other_raw_symbol), info_url=info_url)
         short_hl = str(r.direction).startswith("Short HL")
-        eb10, sl10, _ = compute_executable_cross_dex_entry_bps(hb, ha, ob, oa, short_hl=short_hl, clip_usd=10_000.0)
+        eb10, sl10, ok10 = compute_executable_cross_dex_entry_bps(hb, ha, ob, oa, short_hl=short_hl, clip_usd=10_000.0)
         _, sl50, ok50 = compute_executable_cross_dex_entry_bps(hb, ha, ob, oa, short_hl=short_hl, clip_usd=50_000.0)
-        exec_10k.append(eb10)
-        slip_10k.append(sl10)
-        slip_50k.append(sl50)
+        slip_50k.append(sl50 if ok50 else None)
         depth_ok_50k.append(ok50)
         hourly_bps = float(r.spread_apr_pct) / (HOURS_PER_YEAR * 100.0) * 1e4
         mid_b = compute_book_mid_basis_bps(hb, ha, ob, oa, short_hl=short_hl)
         book_mid.append(mid_b)
         mark_b = float(r.favorable_basis_bps) if hasattr(r, "favorable_basis_bps") else None
-        credit = credited_entry_basis_bps(eb10, mark_b)
-        credited.append(round(credit, 2))
         row_rt_bps = (
             float(round_trip_fee_bps)
             if round_trip_fee_bps is not None
             else default_round_trip_fee_bps(str(r.other_dex), bridge_drag_bps=bridge_drag_bps)
         )
         rt_cost_list.append(round(row_rt_bps, 2))
-        # Entry slippage is already inside the VWAP exec basis; sl10 is charged once more as the
-        # symmetric exit-side slippage estimate.
-        eff_cost = row_rt_bps + (sl10 if sl10 is not None else 0.0) - credit
-        be_10k_h.append(round(max(0.0, eff_cost) / hourly_bps, 1) if hourly_bps > 1e-9 else float("inf"))
+        if ok10 and sl10 is not None and eb10 is not None:
+            exec_10k.append(eb10)
+            slip_10k.append(sl10)
+            raw_credit = credited_entry_basis_bps(eb10, mark_b)
+            eff_credit = (0.5 * raw_credit) if raw_credit > 0 else raw_credit
+            credit = min(max(float(eff_credit), -50.0), 0.5 * row_rt_bps)
+            credited.append(round(credit, 2))
+            # Entry slippage is already inside the VWAP exec basis; sl10 is charged once more as the
+            # symmetric exit-side slippage estimate.
+            eff_cost = max(1.0, row_rt_bps + sl10 - credit)
+            be_10k_h.append(round(eff_cost / hourly_bps, 1) if hourly_bps > 1e-9 else float("inf"))
+        else:
+            exec_10k.append(None)
+            slip_10k.append(None)
+            credited.append(0.0)
+            be_10k_h.append(float("nan"))
 
     sub["round_trip_fee_bps"] = rt_cost_list
     sub["exec_basis_10k_bps"] = exec_10k

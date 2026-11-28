@@ -473,6 +473,172 @@ def fetch_open_orders_checked(http: httpx.Client, account_address: str) -> list[
     return [o for o in payload if isinstance(o, dict)]
 
 
+def fetch_user_fills_checked(http: httpx.Client, account_address: str) -> list[dict[str, Any]] | None:
+    """``userFills`` for ``account_address``, or ``None`` when the response is not a valid HTTP 200 list."""
+    try:
+        resp = http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address})
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        return None
+    if not isinstance(payload, list):
+        return None
+    return [fl for fl in payload if isinstance(fl, dict)]
+
+
+def fetch_clearinghouse_state_checked(
+    http: httpx.Client,
+    account_address: str,
+    *,
+    retries: int = 3,
+    backoff_sec: float = 0.05,
+) -> dict[str, Any] | None:
+    """Fetch verified ``clearinghouseState`` (requiring HTTP 200 and ``assetPositions`` list)."""
+    attempts = max(1, int(retries))
+    for attempt in range(attempts):
+        try:
+            resp = http.post(TESTNET_INFO_URL, json={"type": "clearinghouseState", "user": account_address})
+            if resp.status_code == 200:
+                payload = resp.json()
+                if isinstance(payload, dict) and isinstance(payload.get("assetPositions"), list):
+                    return payload
+        except Exception:
+            pass
+        if attempt + 1 < attempts and backoff_sec > 0:
+            time.sleep(backoff_sec)
+    return None
+
+
+def _is_ambiguous_order_status(status: str) -> bool:
+    """True when an order response did not carry a definite acceptance OID or explicit exchange error."""
+    s = str(status or "").strip()
+    return (
+        not s
+        or s in {"unknown", "invalid_response", "err"}
+        or s.startswith("ambiguous_exception")
+    )
+
+
+def _adopt_matching_open_orders_for_cleanup(
+    coin: str,
+    ambiguous: list[dict[str, Any]],
+    oo: list[dict[str, Any]],
+    all_mm_oids: set[int],
+) -> None:
+    """Ensure any untracked resting order from an ambiguous submission is added to ``all_mm_oids``."""
+    if not ambiguous or not oo:
+        return
+    for o in oo:
+        if not isinstance(o, dict) or str(o.get("coin") or "") != coin or o.get("oid") is None:
+            continue
+        try:
+            oid = int(o["oid"])
+        except (TypeError, ValueError):
+            continue
+        if oid in all_mm_oids:
+            continue
+        raw_side = str(o.get("side") or "").upper()
+        o_side = "buy" if raw_side in {"B", "BUY"} else ("sell" if raw_side in {"A", "S", "SELL"} else "")
+        try:
+            o_px = float(o.get("limitPx", o.get("px", o.get("limit_px", 0.0))) or 0.0)
+            o_sz = float(o.get("sz", o.get("origSz", 0.0)) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        o_ts = o.get("timestamp")
+        for sub in ambiguous:
+            if o_side != sub["side"]:
+                continue
+            if isinstance(o_ts, (int, float)) and o_ts > 0 and int(o_ts) < int(sub["ts_ms"]) - 5_000:
+                continue
+            if abs(o_px - sub["px"]) <= max(1e-8, 1e-5 * sub["px"]) and 0 < o_sz <= sub["sz"] * (1.0 + 1e-4):
+                all_mm_oids.add(oid)
+                break
+
+
+def _reconcile_ambiguous_submissions(
+    coin: str,
+    ambiguous: list[dict[str, Any]],
+    *,
+    oo: list[dict[str, Any]],
+    uf: list[dict[str, Any]],
+    active_orders: dict[str, dict[str, Any]],
+    all_mm_oids: set[int],
+    started_ms: int,
+) -> int:
+    """Reconcile timed-out/ambiguous ALO placements against verified ``openOrders`` and ``userFills``."""
+    if not ambiguous:
+        return 0
+    adopted = 0
+    for sub in ambiguous:
+        side_k = str(sub["side"])
+        sub_px = float(sub["px"])
+        sub_sz = float(sub["sz"])
+        sub_ts = int(sub["ts_ms"])
+        matched_oid: int | None = None
+        for o in oo:
+            if not isinstance(o, dict) or str(o.get("coin") or "") != coin or o.get("oid") is None:
+                continue
+            try:
+                oid = int(o["oid"])
+            except (TypeError, ValueError):
+                continue
+            if oid in all_mm_oids:
+                continue
+            raw_side = str(o.get("side") or "").upper()
+            o_side = "buy" if raw_side in {"B", "BUY"} else ("sell" if raw_side in {"A", "S", "SELL"} else "")
+            if o_side != side_k:
+                continue
+            o_ts = o.get("timestamp")
+            if isinstance(o_ts, (int, float)) and o_ts > 0 and int(o_ts) < sub_ts - 5_000:
+                continue
+            try:
+                o_px = float(o.get("limitPx", o.get("px", o.get("limit_px", 0.0))) or 0.0)
+                o_sz = float(o.get("sz", o.get("origSz", 0.0)) or 0.0)
+                o_orig = float(o.get("origSz", o_sz) or o_sz)
+            except (TypeError, ValueError):
+                continue
+            if (
+                abs(o_px - sub_px) <= max(1e-8, 1e-5 * sub_px)
+                and 0 < o_sz <= sub_sz * (1.0 + 1e-4)
+                and o_orig <= sub_sz * (1.0 + 1e-4)
+            ):
+                matched_oid = oid
+                all_mm_oids.add(oid)
+                active_orders[side_k] = {
+                    "oid": oid,
+                    "px": o_px,
+                    "sz": o_sz,
+                    "reduce_only": bool(o.get("reduceOnly", sub["reduce_only"])),
+                }
+                adopted += 1
+                break
+        if matched_oid is not None:
+            continue
+        min_fill_ms = max(started_ms - 5_000, sub_ts - 2_000)
+        for fl in uf:
+            if not isinstance(fl, dict) or str(fl.get("coin") or "") != coin or fl.get("oid") is None:
+                continue
+            try:
+                f_oid = int(fl["oid"])
+                f_time = int(fl.get("time", 0) or 0)
+                f_px = float(fl.get("px", 0.0) or 0.0)
+                f_sz = abs(float(fl.get("sz", 0.0) or 0.0))
+            except (TypeError, ValueError):
+                continue
+            if f_oid in all_mm_oids or f_time < min_fill_ms or f_px <= 0 or f_sz <= 0:
+                continue
+            f_side = "buy" if str(fl.get("side") or "").upper() in {"B", "BUY"} else "sell"
+            if f_side != side_k or f_sz > sub_sz * (1.0 + 1e-4):
+                continue
+            px_ok = (f_px <= sub_px * (1.0 + 1e-5)) if side_k == "buy" else (f_px >= sub_px * (1.0 - 1e-5))
+            if px_ok:
+                all_mm_oids.add(f_oid)
+                adopted += 1
+                break
+    ambiguous.clear()
+    return adopted
+
+
 MAX_BOOK_STALENESS_FOR_DMS_SEC = 10.0
 
 
@@ -1176,6 +1342,50 @@ def run_live_mm_session(
         except Exception:
             return
 
+    ticks_observed = 0
+    quotes_placed = 0
+    quotes_cancelled = 0
+    requotes_skipped = 0
+    halt_events: list[str] = []
+    quote_rows: list[dict[str, Any]] = []
+    mids_series: list[tuple[int, float]] = []
+    half_spreads: list[float] = []
+    sigmas: list[float] = []
+    ambiguous_subs: list[dict[str, Any]] = []
+    live_init_ok = True
+
+    def _ingest_rest_fills(uf_rows: list[dict[str, Any]]) -> None:
+        assert ledger is not None
+        for fl in uf_rows:
+            if not isinstance(fl, dict) or str(fl.get("coin")) != coin:
+                continue
+            try:
+                f_oid = int(fl.get("oid", -1))
+                f_time = int(fl.get("time", 0))
+            except (TypeError, ValueError):
+                continue
+            if f_oid not in all_mm_oids or f_time < started_ms - 5_000:
+                continue
+            f_sz = abs(float(fl.get("sz", 0.0)))
+            f_px = float(fl.get("px", 0.0))
+            f_side = "buy" if str(fl.get("side")) == "B" else "sell"
+            key = _fill_dedup_key(fl, coin, f_oid, f_side, f_sz, f_time)
+            if key in seen_fill_keys:
+                continue
+            seen_fill_keys.add(key)
+            ledger.on_fill(f_side, f_px, f_sz, fee_usd=float(fl.get("fee", 0.0)))
+            fills.append(
+                {
+                    "ts_ms": f_time,
+                    "oid": f_oid,
+                    "side": f_side,
+                    "px": f_px,
+                    "sz": f_sz,
+                    "notional_usd": f_px * f_sz,
+                    "crossed": bool(fl.get("crossed", False)),
+                }
+            )
+
     try:
         meta = fetch_testnet_meta(http)
         if coin not in meta:
@@ -1184,17 +1394,25 @@ def run_live_mm_session(
         if spec.only_isolated:
             raise ValueError(f"refusing to market-make onlyIsolated asset {coin!r} ({spec.margin_mode})")
 
-        # Read starting position on this coin so MM tracks only its own delta inventory
+        # Read starting position on this coin so MM tracks only its own delta inventory.
+        # Fail closed if live account state cannot be verified so we never quote against a fictitious 0 baseline.
         start_inv_sz = 0.0
-        if execute_live and account_address:
-            ch = http.post(TESTNET_INFO_URL, json={"type": "clearinghouseState", "user": account_address}).json() or {}
-            for entry in ch.get("assetPositions") or []:
-                p = entry.get("position") or {}
-                if str(p.get("coin")) == coin:
-                    start_inv_sz = float(p.get("szi", 0.0))
-                    break
-            # Ensure safe cross leverage (<=3x) before quoting
-            adapter.set_leverage(coin, max(1, min(3, spec.max_leverage)), is_cross=True)
+        if execute_live:
+            ch = fetch_clearinghouse_state_checked(http, account_address) if account_address else None
+            if ch is None:
+                halt_events.append("init_clearinghouse_unavailable")
+                live_init_ok = False
+            else:
+                for entry in ch.get("assetPositions") or []:
+                    p = (entry.get("position") or {}) if isinstance(entry, dict) else {}
+                    if str(p.get("coin")) == coin:
+                        start_inv_sz = float(p.get("szi", 0.0))
+                        break
+                # Ensure safe cross leverage (<=3x) before quoting
+                try:
+                    adapter.set_leverage(coin, max(1, min(3, spec.max_leverage)), is_cross=True)
+                except Exception:
+                    pass
 
         vol_est = EWMAVolatilityEstimator(
             horizon_sec=params.horizon_sec,
@@ -1203,24 +1421,14 @@ def run_live_mm_session(
         )
         ledger = _InventoryLedger(start_sz=start_inv_sz, maker_fee_bps=params.maker_fee_bps)
 
-        if enable_dead_man_switch:
+        if live_init_ok and enable_dead_man_switch:
             _refresh_rest_dms(started_ms)
         dms_refresh_sec = max(3.0, (dead_man_timeout_ms / 1000.0) * 0.4)
         last_dms_mono = time.monotonic()
         last_book_ok_mono = time.monotonic()
 
-        ticks_observed = 0
-        quotes_placed = 0
-        quotes_cancelled = 0
-        requotes_skipped = 0
-        halt_events: list[str] = []
-        quote_rows: list[dict[str, Any]] = []
-        mids_series: list[tuple[int, float]] = []
-        half_spreads: list[float] = []
-        sigmas: list[float] = []
-
         deadline = time.monotonic() + max(1.0, duration_sec)
-        while True:
+        while live_init_ok:
             loop_start = time.monotonic()
             now_ms = int(time.time() * 1000)
             # Stale market data must not keep quotes alive: only extend the exchange-side Dead Man's
@@ -1251,6 +1459,8 @@ def run_live_mm_session(
                         if _cancel_response_ok(c_resps):
                             quotes_cancelled += len(to_cancel_none)
                             active_orders.clear()
+                        elif _cancel_response_confirmed_gone(c_resps):
+                            active_orders.clear()
                     else:
                         active_orders.clear()
                     halt_events.append("empty_or_invalid_book")
@@ -1263,43 +1473,33 @@ def run_live_mm_session(
             last_mid = book.mid_px
             _append_monotonic_mid(mids_series, now_ms, book.mid_px)
 
-            # 1. Reconcile fills (live userFills vs paper touch simulation)
+            # 1. Reconcile fills & ambiguous placements BEFORE popping vanished open orders or quoting
+            fill_sync_halt: str | None = None
             if execute_live and account_address:
+                uf = fetch_user_fills_checked(http, account_address)
                 oo = fetch_open_orders_checked(http, account_address)
-                if oo is not None:  # invalid response -> keep tracking as-is this tick
-                    live_oids = {int(o["oid"]) for o in oo if o.get("oid") is not None}
-                    for side_k in list(active_orders.keys()):
-                        oid = active_orders[side_k].get("oid")
-                        if oid is not None and oid not in live_oids:
-                            active_orders.pop(side_k, None)
-
-                uf = http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json() or []
-                for fl in uf:
-                    if str(fl.get("coin")) != coin:
-                        continue
-                    f_oid = int(fl.get("oid", -1))
-                    f_time = int(fl.get("time", 0))
-                    if f_oid not in all_mm_oids or f_time < started_ms - 5_000:
-                        continue
-                    f_sz = abs(float(fl.get("sz", 0.0)))
-                    f_px = float(fl.get("px", 0.0))
-                    f_side = "buy" if str(fl.get("side")) == "B" else "sell"
-                    key = _fill_dedup_key(fl, coin, f_oid, f_side, f_sz, f_time)
-                    if key in seen_fill_keys:
-                        continue
-                    seen_fill_keys.add(key)
-                    ledger.on_fill(f_side, f_px, f_sz, fee_usd=float(fl.get("fee", 0.0)))
-                    fills.append(
-                        {
-                            "ts_ms": f_time,
-                            "oid": f_oid,
-                            "side": f_side,
-                            "px": f_px,
-                            "sz": f_sz,
-                            "notional_usd": f_px * f_sz,
-                            "crossed": bool(fl.get("crossed", False)),
-                        }
+                if ambiguous_subs and oo is not None and uf is not None:
+                    quotes_placed += _reconcile_ambiguous_submissions(
+                        coin,
+                        ambiguous_subs,
+                        oo=oo,
+                        uf=uf,
+                        active_orders=active_orders,
+                        all_mm_oids=all_mm_oids,
+                        started_ms=started_ms,
                     )
+                if uf is None:
+                    fill_sync_halt = "user_fills_unavailable"
+                else:
+                    _ingest_rest_fills(uf)
+                    if oo is not None:
+                        live_oids = {int(o["oid"]) for o in oo if o.get("oid") is not None}
+                        for side_k in list(active_orders.keys()):
+                            oid = active_orders[side_k].get("oid")
+                            if oid is not None and oid not in live_oids:
+                                active_orders.pop(side_k, None)
+                if ambiguous_subs:
+                    fill_sync_halt = fill_sync_halt or "ambiguous_placement_unreconciled"
             else:
                 # Dry-run paper touch fills
                 for side_k in list(active_orders.keys()):
@@ -1347,7 +1547,7 @@ def run_live_mm_session(
                 toxicity_mult=tox_mult,
                 account_position_sz=ledger.start_sz + ledger.net_sz,
             )
-            eff_halt = adverse_halt or dec.halt_reason
+            eff_halt = fill_sync_halt or adverse_halt or dec.halt_reason
             if eff_halt:
                 halt_events.append(eff_halt)
                 to_cancel = [{"coin": coin, "oid": o["oid"]} for o in active_orders.values() if o.get("oid") is not None]
@@ -1358,6 +1558,8 @@ def run_live_mm_session(
                         c_resps = [{"status": "err", "response": str(exc)}]
                     if _cancel_response_ok(c_resps):
                         quotes_cancelled += len(to_cancel)
+                        active_orders.clear()
+                    elif _cancel_response_confirmed_gone(c_resps):
                         active_orders.clear()
                 else:
                     active_orders.clear()
@@ -1390,10 +1592,17 @@ def run_live_mm_session(
                                 c_resps = adapter.cancel_all_open_orders([{"coin": coin, "oid": cur_ord["oid"]}])
                             except Exception as exc:
                                 c_resps = [{"status": "err", "response": str(exc)}]
-                            if not _cancel_response_ok(c_resps):
+                            if _cancel_response_ok(c_resps):
+                                quotes_cancelled += 1
+                                active_orders.pop(side_k, None)
+                            elif _cancel_response_confirmed_gone(c_resps):
+                                active_orders.pop(side_k, None)
                                 continue
-                        quotes_cancelled += 1
-                        active_orders.pop(side_k, None)
+                            else:
+                                continue
+                        else:
+                            quotes_cancelled += 1
+                            active_orders.pop(side_k, None)
                     # Place new passive ALO quote
                     if d_px is not None and d_sz > 0:
                         order = PlannedOrder(
@@ -1405,13 +1614,32 @@ def run_live_mm_session(
                             tif="Alo",
                             reduce_only=d_red,
                         )
-                        resp = adapter.place_alo_order(order)
+                        try:
+                            resp = adapter.place_alo_order(order)
+                        except Exception as exc:
+                            resp = {
+                                "status": f"ambiguous_exception:{type(exc).__name__}",
+                                "response": f"{type(exc).__name__}: {exc}",
+                            }
                         oid, status = _extract_order_oid(resp)
-                        quotes_placed += 1
+                        is_ambig = execute_live and oid is None and _is_ambiguous_order_status(status)
+                        if not _is_ambiguous_order_status(status) and not status.startswith("err"):
+                            quotes_placed += 1
                         if oid is not None:
                             all_mm_oids.add(oid)
                         if status in {"resting", "simulated_alo"}:
                             active_orders[side_k] = {"oid": oid, "px": d_px, "sz": d_sz, "reduce_only": bool(d_red)}
+                        elif is_ambig:
+                            ambiguous_subs.append(
+                                {
+                                    "side": side_k,
+                                    "px": float(d_px),
+                                    "sz": float(d_sz),
+                                    "reduce_only": bool(d_red),
+                                    "ts_ms": now_ms,
+                                }
+                            )
+                            halt_events.append(f"ambiguous_placement:{side_k}")
                         if audit_log_path is not None:
                             is_dry = isinstance(adapter, DryRunAdapter) or (
                                 isinstance(resp, dict) and resp.get("mode") == "dry_run"
@@ -1460,13 +1688,14 @@ def run_live_mm_session(
         # Guaranteed cleanup: cancel every MM order created in this session so nothing is left orphaned.
         cancel_list: list[dict[str, Any]] = []
         if execute_live and account_address:
-            try:
-                oo_final = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address}).json() or []
+            oo_final = fetch_open_orders_checked(http, account_address)
+            if oo_final is not None:
+                _adopt_matching_open_orders_for_cleanup(coin, ambiguous_subs, oo_final, all_mm_oids)
                 for o in oo_final:
                     if isinstance(o, dict) and str(o.get("coin")) == coin and o.get("oid") is not None:
                         if int(o["oid"]) in all_mm_oids:
                             cancel_list.append({"coin": coin, "oid": int(o["oid"])})
-            except Exception:
+            else:
                 cancel_list = [{"coin": coin, "oid": o["oid"]} for o in active_orders.values() if o.get("oid") is not None]
         else:
             cancel_list = [{"coin": coin, "oid": o.get("oid")} for o in active_orders.values()]
@@ -1481,14 +1710,10 @@ def run_live_mm_session(
         if execute_live and account_address:
             mm_orders_cleared = False
             for _attempt in range(2):
-                try:
-                    oo_resp = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address})
-                    oo_resp.raise_for_status()
-                    oo_check = oo_resp.json()
-                    if not isinstance(oo_check, list):
-                        break
-                except Exception:
+                oo_check = fetch_open_orders_checked(http, account_address)
+                if oo_check is None:
                     break
+                _adopt_matching_open_orders_for_cleanup(coin, ambiguous_subs, oo_check, all_mm_oids)
                 leftovers = [
                     {"coin": coin, "oid": int(o["oid"])}
                     for o in oo_check
@@ -1505,7 +1730,34 @@ def run_live_mm_session(
                 except Exception:
                     pass
 
-        if flatten_on_exit and spec is not None and ledger is not None and last_mid > 0 and abs(ledger.net_sz) > 1e-12:
+        final_fills_synced = True
+        if execute_live and account_address and ledger is not None and (all_mm_oids or ambiguous_subs):
+            uf_fin = fetch_user_fills_checked(http, account_address)
+            oo_fin_chk = fetch_open_orders_checked(http, account_address) if ambiguous_subs else []
+            if uf_fin is None or oo_fin_chk is None:
+                final_fills_synced = False
+            else:
+                if ambiguous_subs:
+                    quotes_placed += _reconcile_ambiguous_submissions(
+                        coin,
+                        ambiguous_subs,
+                        oo=oo_fin_chk,
+                        uf=uf_fin,
+                        active_orders=active_orders,
+                        all_mm_oids=all_mm_oids,
+                        started_ms=started_ms,
+                    )
+                _ingest_rest_fills(uf_fin)
+
+        if (
+            flatten_on_exit
+            and live_init_ok
+            and final_fills_synced
+            and spec is not None
+            and ledger is not None
+            and last_mid > 0
+            and abs(ledger.net_sz) > 1e-12
+        ):
             unwind_sz = round_hl_size(abs(ledger.net_sz), spec.sz_decimals)
             unwind_side = "sell" if ledger.net_sz > 0 else "buy"
             acct_pos = ledger.start_sz + ledger.net_sz
@@ -1889,6 +2141,9 @@ async def _binance_lead_reader(
                 continue
 
 
+_MM_CANCEL_GONE_MARKERS = ("already canceled", "already cancelled", "filled", "never placed")
+
+
 def _cancel_response_ok(cancel_resps: Any) -> bool:
     """Return True when an explicit cancel confirmed the order was removed without error.
 
@@ -1920,6 +2175,38 @@ def _cancel_response_ok(cancel_resps: Any) -> bool:
     return True
 
 
+def _cancel_response_confirmed_gone(cancel_resps: Any) -> bool:
+    """Return True when every cancel status indicates the order was already filled/cancelled/gone.
+
+    Distinguishes an order that is verifiably no longer resting on the book (safe to drop from
+    ``active_orders``, unsafe to immediately re-quote before fill ingestion) from an HTTP 429 or
+    transport timeout where ``prev_oid`` may STILL rest live on the book (must keep ``prev_oid`` in
+    ``active_orders`` so subsequent ticks never stack duplicate orders).
+    """
+    if not isinstance(cancel_resps, list) or not cancel_resps:
+        return False
+    saw_gone = False
+    for item in cancel_resps:
+        if not isinstance(item, dict) or item.get("status") == "err" or item.get("error"):
+            return False
+        sdk_resp = _unwrap_sdk_response(item)
+        if sdk_resp is None:
+            return False
+        statuses, err_msg = extract_hl_order_statuses(sdk_resp)
+        if err_msg is not None or not statuses:
+            return False
+        for st in statuses:
+            if st == "success":
+                continue
+            if isinstance(st, dict) and st.get("error"):
+                err_l = str(st.get("error")).lower()
+                if any(m in err_l for m in _MM_CANCEL_GONE_MARKERS):
+                    saw_gone = True
+                    continue
+            return False
+    return saw_gone
+
+
 async def _sync_coin_quotes_atomic(
     coin: str,
     dec: MMQuoteDecision,
@@ -1932,6 +2219,8 @@ async def _sync_coin_quotes_atomic(
     recv_ms: int,
     audit_log_path: Path | None,
     prefer_explicit_cancel: bool = False,
+    execute_live: bool = False,
+    ambiguous_out: list[dict[str, Any]] | None = None,
 ) -> tuple[int, int, int, int]:
     """Synchronize bid/ask for one coin using HyperCore priority-aware cancel/modify/place.
 
@@ -2023,10 +2312,25 @@ async def _sync_coin_quotes_atomic(
                 active_orders.pop(side_k, None)
             cancelled += len(to_cancel)
             to_place.extend(deferred_after_cancel)
+        elif _cancel_response_confirmed_gone(cancel_resps):
+            for side_k in cancel_sides:
+                active_orders.pop(side_k, None)
 
     modified = 0
     if to_modify:
-        mod_resps = await asyncio.to_thread(adapter.modify_bulk_alo_orders, [(oid, o) for _, oid, o in to_modify])
+        try:
+            mod_resps = await asyncio.to_thread(adapter.modify_bulk_alo_orders, [(oid, o) for _, oid, o in to_modify])
+            if not isinstance(mod_resps, list):
+                mod_resps = [{"status": "invalid_response", "response": "invalid_modify_response"} for _ in to_modify]
+        except Exception as exc:
+            mod_resps = [
+                {"status": f"ambiguous_exception:{type(exc).__name__}", "response": f"{type(exc).__name__}: {exc}"}
+                for _ in to_modify
+            ]
+        if len(mod_resps) < len(to_modify):
+            mod_resps = list(mod_resps) + [
+                {"status": "unknown", "response": "missing_modify_status"} for _ in range(len(to_modify) - len(mod_resps))
+            ]
         for (side_k, prev_oid, order), resp in zip(to_modify, mod_resps, strict=False):
             new_oid, status = _extract_order_oid(resp)
             if status in {"resting", "simulated_alo"} and new_oid is not None:
@@ -2039,19 +2343,39 @@ async def _sync_coin_quotes_atomic(
                     "reduce_only": bool(order.reduce_only),
                 }
             else:
-                # Modify rejected/failed: prev_oid may still be resting on the book OR may have just
-                # filled. Explicitly cancel prev_oid first; only re-place if cancel confirmed removal.
-                active_orders.pop(side_k, None)
+                # Modify rejected/failed: prev_oid may STILL rest live on the book (e.g. ALO cross
+                # rejection, HTTP 429, or transport timeout) OR may have already filled/cancelled.
+                # Never pop active_orders[side_k] before cancel confirms removal; otherwise a failed
+                # cancel leaves prev_oid resting invisibly and the next tick stacks a duplicate order!
+                if new_oid is not None:
+                    all_mm_oids.add(new_oid)
                 cancel_req = [{"coin": coin, "oid": prev_oid}]
                 try:
                     cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_req, fast=True)
                 except TypeError:
-                    cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_req)
+                    try:
+                        cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_req)
+                    except Exception as exc:
+                        cancel_resps = [{"status": "err", "response": f"{type(exc).__name__}: {exc}"}]
                 except Exception as exc:
-                    cancel_resps = [{"status": "err", "response": str(exc)}]
+                    cancel_resps = [{"status": "err", "response": f"{type(exc).__name__}: {exc}"}]
                 if _cancel_response_ok(cancel_resps):
+                    active_orders.pop(side_k, None)
                     cancelled += 1
                     to_place.append((side_k, order))
+                elif _cancel_response_confirmed_gone(cancel_resps):
+                    # Order already filled/cancelled (or replaced by a timed-out modify): drop prev_oid and reconcile before re-quoting.
+                    active_orders.pop(side_k, None)
+                    if execute_live and new_oid is None and _is_ambiguous_order_status(status) and ambiguous_out is not None:
+                        ambiguous_out.append(
+                            {
+                                "side": side_k,
+                                "px": float(order.limit_px),
+                                "sz": float(order.sz),
+                                "reduce_only": bool(order.reduce_only),
+                                "ts_ms": recv_ms,
+                            }
+                        )
             if audit_log_path is not None:
                 is_dry = isinstance(adapter, DryRunAdapter) or (
                     isinstance(resp, dict) and resp.get("mode") == "dry_run"
@@ -2078,12 +2402,33 @@ async def _sync_coin_quotes_atomic(
     placed = 0
     if to_place:
         if hasattr(adapter, "place_bulk_alo_orders"):
-            pl_resps = await asyncio.to_thread(adapter.place_bulk_alo_orders, [o for _, o in to_place])
+            try:
+                pl_resps = await asyncio.to_thread(adapter.place_bulk_alo_orders, [o for _, o in to_place])
+                if not isinstance(pl_resps, list):
+                    pl_resps = [{"status": "invalid_response", "response": "invalid_bulk_response"} for _ in to_place]
+            except Exception as exc:
+                pl_resps = [
+                    {"status": f"ambiguous_exception:{type(exc).__name__}", "response": f"{type(exc).__name__}: {exc}"}
+                    for _ in to_place
+                ]
         else:
-            pl_resps = [await asyncio.to_thread(adapter.place_alo_order, o) for _, o in to_place]
+            pl_resps = []
+            for _, o in to_place:
+                try:
+                    pl_resps.append(await asyncio.to_thread(adapter.place_alo_order, o))
+                except Exception as exc:
+                    pl_resps.append(
+                        {"status": f"ambiguous_exception:{type(exc).__name__}", "response": f"{type(exc).__name__}: {exc}"}
+                    )
+        if len(pl_resps) < len(to_place):
+            pl_resps = list(pl_resps) + [
+                {"status": "unknown", "response": "missing_bulk_status"} for _ in range(len(to_place) - len(pl_resps))
+            ]
         for (side_k, order), resp in zip(to_place, pl_resps, strict=False):
             oid, status = _extract_order_oid(resp)
-            placed += 1
+            is_ambig = execute_live and oid is None and _is_ambiguous_order_status(status)
+            if not _is_ambiguous_order_status(status) and not status.startswith("err"):
+                placed += 1
             if oid is not None:
                 all_mm_oids.add(oid)
             if status in {"resting", "simulated_alo"}:
@@ -2093,6 +2438,16 @@ async def _sync_coin_quotes_atomic(
                     "sz": order.sz,
                     "reduce_only": bool(order.reduce_only),
                 }
+            elif is_ambig and ambiguous_out is not None:
+                ambiguous_out.append(
+                    {
+                        "side": side_k,
+                        "px": float(order.limit_px),
+                        "sz": float(order.sz),
+                        "reduce_only": bool(order.reduce_only),
+                        "ts_ms": recv_ms,
+                    }
+                )
             if audit_log_path is not None:
                 is_dry = isinstance(adapter, DryRunAdapter) or (
                     isinstance(resp, dict) and resp.get("mode") == "dry_run"
@@ -2269,24 +2624,40 @@ async def run_multi_coin_mm_ws_session(
             funding_apr_by_coin = {}
 
         mempool_priority_ok = True
-        if execute_live and account_address:
-            # HyperCore mempool cancel/ALO prioritization is ONLY active in Standard account mode;
-            # Unified Account / Portfolio Margin disables mempool priority!
-            try:
-                ua_r = http.post(TESTNET_INFO_URL, json={"type": "userAbstraction", "user": account_address})
-                if ua_r.status_code == 200 and isinstance(ua_r.json(), str):
-                    ua_mode = str(ua_r.json())
-                    if ua_mode in {"unifiedAccount", "portfolioMargin"}:
-                        mempool_priority_ok = False
-                        for c in coin_list:
-                            stats[c]["halt_events"].append(f"mempool_priority_disabled:{ua_mode}")
-            except Exception:
-                pass
-            ch = http.post(TESTNET_INFO_URL, json={"type": "clearinghouseState", "user": account_address}).json() or {}
-            pos_by_coin = {str((e.get("position") or {}).get("coin")): float((e.get("position") or {}).get("szi", 0.0)) for e in (ch.get("assetPositions") or [])}
-            for c in coin_list:
-                ledgers[c] = _InventoryLedger(start_sz=pos_by_coin.get(c, 0.0), maker_fee_bps=params.maker_fee_bps)
-                await asyncio.to_thread(adapter.set_leverage, c, max(1, min(3, specs[c].max_leverage)), is_cross=True)
+        ambiguous_by_coin: dict[str, list[dict[str, Any]]] = {c: [] for c in coin_list}
+        ws_fills_unsynced = False
+        ws_live_init_ok = True
+        if execute_live:
+            if account_address:
+                # HyperCore mempool cancel/ALO prioritization is ONLY active in Standard account mode;
+                # Unified Account / Portfolio Margin disables mempool priority!
+                try:
+                    ua_r = http.post(TESTNET_INFO_URL, json={"type": "userAbstraction", "user": account_address})
+                    if ua_r.status_code == 200 and isinstance(ua_r.json(), str):
+                        ua_mode = str(ua_r.json())
+                        if ua_mode in {"unifiedAccount", "portfolioMargin"}:
+                            mempool_priority_ok = False
+                            for c in coin_list:
+                                stats[c]["halt_events"].append(f"mempool_priority_disabled:{ua_mode}")
+                except Exception:
+                    pass
+            ch = fetch_clearinghouse_state_checked(http, account_address) if account_address else None
+            if ch is None:
+                ws_live_init_ok = False
+                for c in coin_list:
+                    stats[c]["halt_events"].append("init_clearinghouse_unavailable")
+            else:
+                pos_by_coin = {
+                    str((e.get("position") or {}).get("coin")): float((e.get("position") or {}).get("szi", 0.0))
+                    for e in (ch.get("assetPositions") or [])
+                    if isinstance(e, dict)
+                }
+                for c in coin_list:
+                    ledgers[c] = _InventoryLedger(start_sz=pos_by_coin.get(c, 0.0), maker_fee_bps=params.maker_fee_bps)
+                    try:
+                        await asyncio.to_thread(adapter.set_leverage, c, max(1, min(3, specs[c].max_leverage)), is_cross=True)
+                    except Exception:
+                        pass
 
         async def _refresh_dead_man(now_ms: int) -> None:
             nonlocal dead_man_refreshes, dead_man_armed
@@ -2301,10 +2672,10 @@ async def run_multi_coin_mm_ws_session(
             except Exception:
                 return
 
-        if enable_dead_man_switch:
+        if ws_live_init_ok and enable_dead_man_switch:
             await _refresh_dead_man(int(time.time() * 1000))
 
-        if enable_lead_lag and ws_messages is None:
+        if ws_live_init_ok and enable_lead_lag and ws_messages is None:
             lead_task = asyncio.create_task(_binance_lead_reader(coin_list, lead_ests, lead_stop))
 
         init_mono = time.monotonic()
@@ -2355,10 +2726,13 @@ async def run_multi_coin_mm_ws_session(
                 return True
 
             if channel == "userFills" and isinstance(data, dict) and execute_live:
+                nonlocal ws_fills_unsynced
                 # Process both streaming and reconnect isSnapshot=True fills strictly filtered by all_mm_oids + seen_fill_keys.
                 for fl in data.get("fills") or []:
                     if isinstance(fl, dict):
                         _ingest_live_fill(fl, default_ts_ms=recv_ms, check_session_window=False)
+                if data.get("isSnapshot") is True:
+                    ws_fills_unsynced = False
                 return True
 
             if channel == "orderUpdates" and isinstance(data, list) and execute_live:
@@ -2502,7 +2876,33 @@ async def run_multi_coin_mm_ws_session(
             if not can_act and eff_interval_ms > min_action_interval_ms and elapsed_ms >= min_action_interval_ms:
                 st["rate_limit_throttles"] += 1
 
-            eff_halt = adverse_halt or dec.halt_reason
+            ws_reconcile_halt: str | None = None
+            if execute_live and (ambiguous_by_coin[c_name] or ws_fills_unsynced):
+                if not account_address:
+                    st["halt_events"].append("ambiguous_placement_halt")
+                    return False
+                oo_chk = await asyncio.to_thread(fetch_open_orders_checked, http, account_address)
+                uf_chk = await asyncio.to_thread(fetch_user_fills_checked, http, account_address)
+                if uf_chk is not None:
+                    if oo_chk is not None and ambiguous_by_coin[c_name]:
+                        st["placed"] += _reconcile_ambiguous_submissions(
+                            c_name,
+                            ambiguous_by_coin[c_name],
+                            oo=oo_chk,
+                            uf=uf_chk,
+                            active_orders=active_orders[c_name],
+                            all_mm_oids=all_mm_oids[c_name],
+                            started_ms=started_ms,
+                        )
+                    for fl in uf_chk:
+                        _ingest_live_fill(fl, default_ts_ms=recv_ms, check_session_window=True)
+                    ws_fills_unsynced = False
+                if ambiguous_by_coin[c_name]:
+                    ws_reconcile_halt = "ambiguous_placement_unreconciled"
+                elif ws_fills_unsynced:
+                    ws_reconcile_halt = "user_fills_unavailable"
+
+            eff_halt = ws_reconcile_halt or adverse_halt or dec.halt_reason
             if eff_halt:
                 st["halt_events"].append(eff_halt)
                 to_c = [{"coin": c_name, "oid": o["oid"]} for o in active_orders[c_name].values() if o.get("oid") is not None]
@@ -2514,6 +2914,8 @@ async def run_multi_coin_mm_ws_session(
                     if _cancel_response_ok(c_resps):
                         st["cancelled"] += len(to_c)
                         active_orders[c_name].clear()
+                    elif _cancel_response_confirmed_gone(c_resps):
+                        active_orders[c_name].clear()
                 else:
                     active_orders[c_name].clear()
                 last_action_mono[c_name] = now_mono
@@ -2523,6 +2925,7 @@ async def run_multi_coin_mm_ws_session(
                 # HyperCore grants in-block cancel priority ahead of taker IOCs ONLY to explicit
                 # cancel (not modify). Force explicit cancel on Binance lead-lag shocks or toxic flow.
                 use_explicit_cancel = bool(urgent_pull or tox_mult > 1.0)
+                prev_ambig_len = len(ambiguous_by_coin[c_name])
                 pl, md, cn, sk = await _sync_coin_quotes_atomic(
                     c_name,
                     dec,
@@ -2534,7 +2937,11 @@ async def run_multi_coin_mm_ws_session(
                     recv_ms=recv_ms,
                     audit_log_path=audit_log_path,
                     prefer_explicit_cancel=use_explicit_cancel,
+                    execute_live=execute_live,
+                    ambiguous_out=ambiguous_by_coin[c_name],
                 )
+                for sub_new in ambiguous_by_coin[c_name][prev_ambig_len:]:
+                    st["halt_events"].append(f"ambiguous_placement:{sub_new['side']}")
                 st["placed"] += pl
                 st["modified"] += md
                 st["cancelled"] += cn
@@ -2564,7 +2971,9 @@ async def run_multi_coin_mm_ws_session(
             )
             return True
 
-        if ws_messages is not None:
+        if not ws_live_init_ok:
+            pass
+        elif ws_messages is not None:
             for idx, msg in enumerate(ws_messages):
                 keep = await _handle_message(msg, started_ms + idx * 500)
                 if not keep:
@@ -2641,48 +3050,66 @@ async def run_multi_coin_mm_ws_session(
                     if reconnects > max_reconnects or time.monotonic() >= deadline:
                         break
                     if execute_live and account_address:
-                        try:
-                            oo_rc_checked = await asyncio.to_thread(fetch_open_orders_checked, http, account_address)
-                            if oo_rc_checked is None:
-                                raise ValueError("openOrders unavailable; keep order tracking")
-                            oo_rc = oo_rc_checked
-                            live_by_coin: dict[str, set[int]] = {c: set() for c in coin_list}
-                            for o in oo_rc:
-                                if isinstance(o, dict) and o.get("oid") is not None:
-                                    cn = str(o.get("coin") or "")
-                                    if cn in live_by_coin:
-                                        live_by_coin[cn].add(int(o["oid"]))
-                            any_vanished = False
-                            for cn in coin_list:
-                                for sk in list(active_orders[cn].keys()):
-                                    oid_v = active_orders[cn][sk].get("oid")
-                                    if oid_v is not None and int(oid_v) not in live_by_coin[cn]:
-                                        active_orders[cn].pop(sk, None)
-                                        any_vanished = True
-                            if any_vanished and any(all_mm_oids.values()):
-                                uf_rc = (
-                                    await asyncio.to_thread(
-                                        lambda: http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json()
-                                    )
-                                    or []
-                                )
-                                now_rc_ms = int(time.time() * 1000)
-                                for fl in uf_rc:
-                                    if isinstance(fl, dict):
-                                        _ingest_live_fill(fl, default_ts_ms=now_rc_ms, check_session_window=True)
-                        except Exception:
-                            pass
+                        oo_rc = await asyncio.to_thread(fetch_open_orders_checked, http, account_address)
+                        uf_rc = await asyncio.to_thread(fetch_user_fills_checked, http, account_address)
+                        if uf_rc is None and any(all_mm_oids.values()):
+                            ws_fills_unsynced = True
+                        elif uf_rc is not None:
+                            now_rc_ms = int(time.time() * 1000)
+                            if oo_rc is not None:
+                                for cn in coin_list:
+                                    if ambiguous_by_coin[cn]:
+                                        stats[cn]["placed"] += _reconcile_ambiguous_submissions(
+                                            cn,
+                                            ambiguous_by_coin[cn],
+                                            oo=oo_rc,
+                                            uf=uf_rc,
+                                            active_orders=active_orders[cn],
+                                            all_mm_oids=all_mm_oids[cn],
+                                            started_ms=started_ms,
+                                        )
+                            for fl in uf_rc:
+                                _ingest_live_fill(fl, default_ts_ms=now_rc_ms, check_session_window=True)
+                            ws_fills_unsynced = False
+                            if oo_rc is not None:
+                                live_by_coin: dict[str, set[int]] = {c: set() for c in coin_list}
+                                for o in oo_rc:
+                                    if isinstance(o, dict) and o.get("oid") is not None:
+                                        cn = str(o.get("coin") or "")
+                                        if cn in live_by_coin:
+                                            live_by_coin[cn].add(int(o["oid"]))
+                                for cn in coin_list:
+                                    for sk in list(active_orders[cn].keys()):
+                                        oid_v = active_orders[cn][sk].get("oid")
+                                        if oid_v is not None and int(oid_v) not in live_by_coin[cn]:
+                                            active_orders[cn].pop(sk, None)
                     backoff_s = min(0.5 * reconnects, max(0.0, deadline - time.monotonic()))
                     if backoff_s > 0:
                         await asyncio.sleep(backoff_s)
 
             # Final REST fill reconciliation for any fill arriving right at socket close
-            if execute_live and account_address and any(all_mm_oids.values()):
-                uf = http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json() or []
-                now_fin_ms = int(time.time() * 1000)
-                for fl in uf:
-                    if isinstance(fl, dict):
+            if execute_live and account_address and (any(all_mm_oids.values()) or any(ambiguous_by_coin.values())):
+                uf_fin = await asyncio.to_thread(fetch_user_fills_checked, http, account_address)
+                oo_fin = await asyncio.to_thread(fetch_open_orders_checked, http, account_address)
+                if uf_fin is None:
+                    ws_fills_unsynced = True
+                else:
+                    now_fin_ms = int(time.time() * 1000)
+                    if oo_fin is not None:
+                        for cn in coin_list:
+                            if ambiguous_by_coin[cn]:
+                                stats[cn]["placed"] += _reconcile_ambiguous_submissions(
+                                    cn,
+                                    ambiguous_by_coin[cn],
+                                    oo=oo_fin,
+                                    uf=uf_fin,
+                                    active_orders=active_orders[cn],
+                                    all_mm_oids=all_mm_oids[cn],
+                                    started_ms=started_ms,
+                                )
+                    for fl in uf_fin:
                         _ingest_live_fill(fl, default_ts_ms=now_fin_ms, check_session_window=True)
+                    ws_fills_unsynced = False
     finally:
         lead_stop.set()
         if lead_task is not None:
@@ -2695,14 +3122,18 @@ async def run_multi_coin_mm_ws_session(
         # 1. Cancel all resting MM orders across all coins atomically
         cancel_all: list[dict[str, Any]] = []
         if execute_live and account_address:
-            try:
-                oo_final = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address}).json() or []
+            oo_final = fetch_open_orders_checked(http, account_address)
+            if oo_final is not None:
+                for c_name in coin_list:
+                    _adopt_matching_open_orders_for_cleanup(
+                        c_name, ambiguous_by_coin[c_name], oo_final, all_mm_oids[c_name]
+                    )
                 for o in oo_final:
                     c_name = str(o.get("coin") or "")
                     if c_name in all_mm_oids and o.get("oid") is not None and int(o["oid"]) in all_mm_oids[c_name]:
                         cancel_all.append({"coin": c_name, "oid": int(o["oid"])})
                         stats[c_name]["cleanup_cancelled"] += 1
-            except Exception:
+            else:
                 for c_name in coin_list:
                     for o in active_orders[c_name].values():
                         if o.get("oid") is not None:
@@ -2726,14 +3157,13 @@ async def run_multi_coin_mm_ws_session(
         if execute_live and account_address:
             mm_orders_cleared = False
             for _attempt in range(2):
-                try:
-                    oo_resp = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address})
-                    oo_resp.raise_for_status()
-                    oo_check = oo_resp.json()
-                    if not isinstance(oo_check, list):
-                        break
-                except Exception:
+                oo_check = fetch_open_orders_checked(http, account_address)
+                if oo_check is None:
                     break
+                for c_name in coin_list:
+                    _adopt_matching_open_orders_for_cleanup(
+                        c_name, ambiguous_by_coin[c_name], oo_check, all_mm_oids[c_name]
+                    )
                 leftovers = [
                     {"coin": str(o.get("coin") or ""), "oid": int(o["oid"])}
                     for o in oo_check
@@ -2750,8 +3180,8 @@ async def run_multi_coin_mm_ws_session(
                 except Exception:
                     pass
 
-        # 2. Optional flatten-on-exit per coin
-        if flatten_on_exit:
+        # 2. Optional flatten-on-exit per coin (only when initial position & fills are verified)
+        if flatten_on_exit and ws_live_init_ok and not ws_fills_unsynced:
             for c_name in coin_list:
                 sp = specs.get(c_name)
                 mid = last_mids.get(c_name, 0.0)

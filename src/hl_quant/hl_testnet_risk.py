@@ -144,7 +144,7 @@ def build_risk_snapshot(
 
     resting_unwind_coins: set[str] = set()
     for oo in account.open_orders:
-        if not isinstance(oo, dict):
+        if not isinstance(oo, dict) or oo.get("isTrigger") is True:
             continue
         c_oo = str(oo.get("coin") or "")
         if not c_oo:
@@ -230,6 +230,8 @@ def build_risk_snapshot(
         )
 
     eq_pos = equity if math.isfinite(equity) and equity > 0 else 0.0
+    perp_eq_raw = ex.effective_perp_equity_usd(account)
+    perp_eq_pos = perp_eq_raw if math.isfinite(perp_eq_raw) and perp_eq_raw > 0 else eq_pos
     gap = upnl_mark - upnl_oracle
     return {
         "observed_at_ms": int(now_ms if now_ms is not None else time.time() * 1000),
@@ -242,7 +244,7 @@ def build_risk_snapshot(
         "drawdown_headroom_pct": round(max(0.0, float(max_drawdown_pct) - dd), 4),
         "open_positions": len(per_coin),
         "gross_notional_usd": round(gross, 4),
-        "gross_leverage": round(gross / eq_pos, 6) if eq_pos else None,
+        "gross_leverage": round(gross / perp_eq_pos, 6) if perp_eq_pos else None,
         "unrealized_pnl_mark_usd": round(upnl_mark, 4),
         "unrealized_pnl_oracle_usd": round(upnl_oracle, 4),
         "mark_oracle_pnl_gap_usd": round(gap, 4),

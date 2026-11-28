@@ -105,17 +105,25 @@ def build_wide_market(bundle: pd.DataFrame) -> WideMarket:
     bn_close = piv("binance_close").replace(0.0, np.nan)
     okx_close = piv("okx_close").replace(0.0, np.nan)
 
-    # Forward-fill short 1-2h candle gaps before computing close-to-close returns so resumption moves are not deleted.
-    hl_close_ff = hl_close.ffill(limit=2)
-    by_close_ff = by_close.ffill(limit=2)
-    bn_close_ff = bn_close.ffill(limit=2)
-    okx_close_ff = okx_close.ffill(limit=2)
+    # Normalize unscaled OKX k* kline closes (~1000x below HL k* perp price) right inside WideMarket
+    # so okx_close, okx_ret_next, build_funding_carry_weights, and paper_tracker._cur_cex_px share 1:1 scale.
+    for c in coins:
+        if c.startswith("k") and len(c) > 1 and c[1].isupper():
+            ratio = (hl_close[c] / okx_close[c]).dropna()
+            if not ratio.empty and 500.0 <= float(ratio.median()) <= 2000.0:
+                okx_close[c] = okx_close[c] * 1000.0
+
+    # Gap-preserving close-to-close returns: missing bars accrue 0.0 while resumption captures 100% of the move
+    # across ANY gap length (even >= 3h).
+    def _gap_preserving_ret(clean_close: pd.DataFrame) -> pd.DataFrame:
+        ff_close = clean_close.ffill()
+        return (ff_close / ff_close.shift(1) - 1.0).where(clean_close.notna(), 0.0).fillna(0.0)
 
     # Close of bar opening at h_t is price at h_{t+1}; return over (h_t, h_{t+1}] is close_t / close_{t-1} - 1.
-    hl_ret_next = (hl_close_ff / hl_close_ff.shift(1) - 1.0).fillna(0.0)
-    by_ret_next = (by_close_ff / by_close_ff.shift(1) - 1.0).fillna(0.0)
-    bn_ret_next = (bn_close_ff / bn_close_ff.shift(1) - 1.0).fillna(0.0)
-    okx_ret_next = (okx_close_ff / okx_close_ff.shift(1) - 1.0).fillna(0.0)
+    hl_ret_next = _gap_preserving_ret(hl_close)
+    by_ret_next = _gap_preserving_ret(by_close)
+    bn_ret_next = _gap_preserving_ret(bn_close)
+    okx_ret_next = _gap_preserving_ret(okx_close)
 
     return WideMarket(
         hours=hours,
@@ -422,7 +430,7 @@ def build_funding_carry_weights(market: WideMarket, params: dict[str, Any]) -> t
         if k_cols:
             okx_k = okx_px[k_cols]
             ratio_k = hl_px[k_cols] / okx_k.replace(0.0, np.nan)
-            unscaled_k = (ratio_k >= 900.0) & (ratio_k <= 1100.0)
+            unscaled_k = (ratio_k >= 500.0) & (ratio_k <= 2000.0)
             okx_px[k_cols] = okx_k.where(~unscaled_k, okx_k * 1000.0)
         bn_parity = np.log((hl_px / bn_px).clip(lower=1e-9)).abs() <= 0.10
         okx_parity = np.log((hl_px / okx_px).clip(lower=1e-9)).abs() <= 0.10

@@ -253,6 +253,13 @@ def write_frozen_contract(path: Path, contract: MicroExecutionContract) -> dict[
     return payload
 
 
+def _contract_gross_tolerance_usdc(contract: MicroExecutionContract) -> Decimal:
+    """Small spread + base-fee tolerance so a normal +0.5..5 bps spot-perp ask-bid spread never falsely aborts."""
+    return contract.per_asset_gross * (
+        contract.max_adverse_execution_bps / Decimal("10000") + contract.max_delta_mismatch_fraction
+    )
+
+
 def plan_spot_buy_quantity_for_base_fee(
     target_net_qty: Decimal,
     *,
@@ -261,12 +268,28 @@ def plan_spot_buy_quantity_for_base_fee(
     spot_price: Decimal | None = None,
     max_spot_notional: Decimal | None = None,
     max_delta_fraction: Decimal = Decimal("0.001"),
+    can_pay_fee_in_bnb: bool = False,
 ) -> Decimal:
-    """Choose a lot-rounded Binance Spot buy quantity accounting for base-asset commission."""
+    """Choose a lot-rounded Binance Spot buy quantity accounting for base-asset commission.
+
+    Only grosses up when commission is actually deducted from the purchased base asset (skipped when
+    ``can_pay_fee_in_bnb=True`` or ``fee_rate == 0`` on 0-fee promo pairs), and caps to
+    ``max_spot_notional`` rather than returning an unbudgeted quantity when constrained.
+    """
+    if target_net_qty <= 0:
+        return Decimal("0")
     q_base = round_to_step(target_net_qty, step)
-    if fee_rate <= 0 or fee_rate >= Decimal("0.05") or target_net_qty <= 0:
+    eff_fee = Decimal("0") if can_pay_fee_in_bnb else fee_rate
+    if eff_fee <= 0 or eff_fee >= Decimal("0.05"):
+        if max_spot_notional is not None and spot_price is not None and spot_price > 0:
+            if q_base * spot_price > max_spot_notional:
+                return (
+                    round_to_step(max_spot_notional / spot_price, step, up=False)
+                    if max_spot_notional >= step * spot_price
+                    else Decimal("0")
+                )
         return q_base
-    raw_gross = target_net_qty / (Decimal("1") - fee_rate)
+    raw_gross = target_net_qty / (Decimal("1") - eff_fee)
     q_down = round_to_step(raw_gross, step, up=False)
     q_up = round_to_step(raw_gross, step, up=True)
     candidates: list[Decimal] = []
@@ -277,10 +300,16 @@ def plan_spot_buy_quantity_for_base_fee(
                     continue
             candidates.append(cand)
     if not candidates:
+        if max_spot_notional is not None and spot_price is not None and spot_price > 0:
+            return (
+                round_to_step(max_spot_notional / spot_price, step, up=False)
+                if max_spot_notional >= step * spot_price
+                else Decimal("0")
+            )
         return q_base
 
     def _post_fee_delta(q: Decimal) -> Decimal:
-        net_q = q * (Decimal("1") - fee_rate)
+        net_q = q * (Decimal("1") - eff_fee)
         denom = max(net_q, target_net_qty)
         return abs(net_q - target_net_qty) / denom if denom > 0 else Decimal("1")
 
@@ -299,6 +328,7 @@ def plan_entry_quantities(
     bybit_step: Decimal,
     hyperliquid_step: Decimal,
     binance_base_fee_rate: Decimal = Decimal("0"),
+    can_pay_fee_in_bnb: bool = False,
 ) -> dict[str, Decimal]:
     """Build one lot-aware entry plan shared by preflight and live execution.
 
@@ -319,15 +349,18 @@ def plan_entry_quantities(
     bybit_notional = bybit_quantity * bybit_price
     hyperliquid_notional = hyperliquid_quantity * hyperliquid_price
     short_notional = bybit_notional + hyperliquid_notional
-    max_spot_ntl = max(Decimal("0"), contract.per_asset_gross - short_notional)
+    gross_tol = _contract_gross_tolerance_usdc(contract)
+    max_spot_ntl = max(Decimal("0"), contract.per_asset_gross + gross_tol - short_notional)
+    eff_fee_rate = Decimal("0") if can_pay_fee_in_bnb else binance_base_fee_rate
     if contract.spot_quantity_mode == "match_rounded_perps":
         binance_quantity = plan_spot_buy_quantity_for_base_fee(
             bybit_quantity + hyperliquid_quantity,
             step=binance_step,
-            fee_rate=binance_base_fee_rate,
+            fee_rate=eff_fee_rate,
             spot_price=binance_price,
             max_spot_notional=max_spot_ntl,
             max_delta_fraction=contract.max_delta_mismatch_fraction,
+            can_pay_fee_in_bnb=can_pay_fee_in_bnb,
         )
     else:
         binance_quantity = round_to_step(
@@ -337,8 +370,8 @@ def plan_entry_quantities(
 
     binance_notional = binance_quantity * binance_price
     eff_net_spot = (
-        binance_quantity * (Decimal("1") - binance_base_fee_rate)
-        if Decimal("0") < binance_base_fee_rate < Decimal("0.05")
+        binance_quantity * (Decimal("1") - eff_fee_rate)
+        if Decimal("0") < eff_fee_rate < Decimal("0.05")
         else binance_quantity
     )
     short_qty = bybit_quantity + hyperliquid_quantity
@@ -451,6 +484,14 @@ class BinanceClient:
 
     def account(self) -> dict[str, Any]:
         return self._signed("GET", "/api/v3/account")
+
+    def bnb_burn_status(self) -> dict[str, Any] | None:
+        """Read-only check of Binance ``/sapi/v1/bnbBurn`` (returns ``None`` if SAPI scope is unavailable)."""
+        try:
+            payload = self._signed("GET", "/sapi/v1/bnbBurn")
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
 
     def instrument(self, symbol: str) -> dict[str, Any]:
         response = self.client.get(f"{BINANCE}/api/v3/exchangeInfo", params={"symbol": symbol})
@@ -865,6 +906,33 @@ def _binance_spot_taker_fee_rate(account: Mapping[str, Any]) -> Decimal:
     return rate
 
 
+def _binance_effective_base_fee_rate(
+    account: Mapping[str, Any],
+    *,
+    bnb_burn: Mapping[str, Any] | None = None,
+    pair_taker_fee_rate: Decimal | None = None,
+) -> Decimal:
+    """Return base-asset commission rate deducted from Spot buys.
+
+    Returns ``0`` only when the pair/VIP fee rate is ``0`` OR BNB fee payment is explicitly
+    verified active (via ``/sapi/v1/bnbBurn`` ``spotBNBBurn: True`` or explicit account flag)
+    with sufficient free BNB balance. Never infers BNB fee burn from BNB balance alone.
+    """
+    rate = pair_taker_fee_rate if pair_taker_fee_rate is not None else _binance_spot_taker_fee_rate(account)
+    if rate <= 0 or rate >= Decimal("0.05"):
+        return Decimal("0")
+    if account.get("canPayFeeInBnb") is True:
+        return Decimal("0")
+    spot_bnb_burn_enabled = (
+        (isinstance(bnb_burn, Mapping) and bnb_burn.get("spotBNBBurn") is True)
+        or account.get("spotBNBBurn") is True
+        or account.get("bnbBurnSpot") is True
+    )
+    if spot_bnb_burn_enabled and _binance_free_balance(account, "BNB") >= Decimal("0.001"):
+        return Decimal("0")
+    return rate
+
+
 def _hyperliquid_available_usdc(
     state: Mapping[str, Any],
     *,
@@ -1061,8 +1129,14 @@ class MicroExecutionRunner:
                 "hyperliquid_marks": self.hyperliquid.mark_prices,
             })
             binance_account = responses["binance_account"]
+            binance_bnb_burn = (
+                self.binance.bnb_burn_status() if hasattr(self.binance, "bnb_burn_status") else None
+            )
             binance_available_usdc = _binance_free_balance(binance_account, "USDC")
-            binance_taker_fee_rate = _binance_spot_taker_fee_rate(binance_account)
+            binance_taker_fee_rate = _binance_effective_base_fee_rate(
+                binance_account,
+                bnb_burn=binance_bnb_burn,
+            )
             bybit_permissions = responses["bybit_api"].get("result", {}).get("permissions") or []
             expected_agent = self.hyperliquid.api_wallet_address.lower()
             now_ms = int(time.time() * 1000)
@@ -1147,7 +1221,7 @@ class MicroExecutionRunner:
                     adverse_bps=self.contract.max_adverse_execution_bps,
                     sz_decimals=hyper_sz_decimals,
                 )
-                protected_limit(
+                binance_protected_px = protected_limit(
                     binance_price,
                     side="buy",
                     adverse_bps=self.contract.max_adverse_execution_bps,
@@ -1168,8 +1242,10 @@ class MicroExecutionRunner:
                 delta_ratio = quantities["delta_fraction"]
                 spot_coverage_passed = quantities["spot_target_coverage_fraction"] >= self.contract.minimum_actual_spot_notional_fraction
                 short_weight_passed = quantities["bybit_short_weight_deviation_fraction"] <= self.contract.max_bybit_short_weight_deviation_fraction
-                gross_passed = quantities["actual_gross_usdc"] <= self.contract.per_asset_gross
-                binance_required_usdc = quantities["binance"] * binance_price
+                gross_passed = quantities["actual_gross_usdc"] <= (
+                    self.contract.per_asset_gross + _contract_gross_tolerance_usdc(self.contract)
+                )
+                binance_required_usdc = quantities["binance"] * binance_protected_px
                 binance_balance_ratio = (
                     binance_available_usdc / binance_required_usdc
                     if binance_required_usdc > 0
@@ -1464,7 +1540,8 @@ class MicroExecutionRunner:
             if pf.get("status") != "passed":
                 raise PreflightBlocked("preflight_blocked")
         b_account = self.binance.account()
-        b_fee_rate = _binance_spot_taker_fee_rate(b_account)
+        b_bnb_burn = self.binance.bnb_burn_status() if hasattr(self.binance, "bnb_burn_status") else None
+        b_fee_rate = _binance_effective_base_fee_rate(b_account, bnb_burn=b_bnb_burn)
         b_avail_usdc = _binance_free_balance(b_account, "USDC")
         b_instrument = self.binance.instrument(symbol)
         b_step, b_min, b_min_notional = _binance_constraints(b_instrument)
@@ -1477,33 +1554,6 @@ class MicroExecutionRunner:
         b_price = _best_price(books["binance"], venue="binance", side="buy")
         y_price = _best_price(books["bybit"], venue="bybit", side="sell")
         h_price = _best_price(books["hyperliquid"], venue="hyperliquid", side="sell")
-        plan = plan_entry_quantities(
-            self.contract,
-            binance_price=b_price,
-            bybit_price=y_price,
-            hyperliquid_price=h_price,
-            binance_step=b_step,
-            bybit_step=y_step,
-            hyperliquid_step=h_step,
-            binance_base_fee_rate=b_fee_rate,
-        )
-        b_qty, y_qty, h_qty = plan["binance"], plan["bybit"], plan["hyperliquid"]
-        if b_qty < b_min or y_qty < y_min or b_qty * b_price < b_min_notional or y_qty * y_price < y_min_notional or h_qty * h_price < h_min_notional:
-            raise PreflightBlocked("minimum_notional_or_lot_size_failed")
-        if plan["spot_target_coverage_fraction"] < self.contract.minimum_actual_spot_notional_fraction:
-            raise PreflightBlocked("actual_spot_notional_below_floor")
-        if plan["bybit_short_weight_deviation_fraction"] > self.contract.max_bybit_short_weight_deviation_fraction:
-            raise PreflightBlocked("rounded_short_weight_mismatch")
-        if plan["actual_gross_usdc"] > self.contract.per_asset_gross:
-            raise PreflightBlocked("actual_gross_exceeds_contract")
-        if plan["delta_fraction"] > self.contract.max_delta_mismatch_fraction:
-            raise PreflightBlocked("rounded_delta_mismatch")
-        if hasattr(self.bybit, "set_leverage"):
-            self.bybit.set_leverage(perp, self.contract.required_perp_leverage)
-        if hasattr(self.hyperliquid, "set_leverage"):
-            self.hyperliquid.set_leverage(asset, int(self.contract.required_perp_leverage), is_cross=True)
-        start_ms = int(time.time() * 1000)
-        tag = f"micro-{self.contract.run_id[-10:]}-{asset.lower()}"
         protected = {
             "binance": protected_limit(
                 b_price,
@@ -1524,6 +1574,37 @@ class MicroExecutionRunner:
                 sz_decimals=h_sz_decimals,
             ),
         }
+        plan = plan_entry_quantities(
+            self.contract,
+            binance_price=b_price,
+            bybit_price=y_price,
+            hyperliquid_price=h_price,
+            binance_step=b_step,
+            bybit_step=y_step,
+            hyperliquid_step=h_step,
+            binance_base_fee_rate=b_fee_rate,
+        )
+        b_qty, y_qty, h_qty = plan["binance"], plan["bybit"], plan["hyperliquid"]
+        gross_tol = _contract_gross_tolerance_usdc(self.contract)
+        if b_qty < b_min or y_qty < y_min or b_qty * b_price < b_min_notional or y_qty * y_price < y_min_notional or h_qty * h_price < h_min_notional:
+            raise PreflightBlocked("minimum_notional_or_lot_size_failed")
+        if plan["spot_target_coverage_fraction"] < self.contract.minimum_actual_spot_notional_fraction:
+            raise PreflightBlocked("actual_spot_notional_below_floor")
+        if plan["bybit_short_weight_deviation_fraction"] > self.contract.max_bybit_short_weight_deviation_fraction:
+            raise PreflightBlocked("rounded_short_weight_mismatch")
+        if plan["actual_gross_usdc"] > self.contract.per_asset_gross + gross_tol:
+            raise PreflightBlocked("actual_gross_exceeds_contract")
+        if plan["delta_fraction"] > self.contract.max_delta_mismatch_fraction:
+            raise PreflightBlocked("rounded_delta_mismatch")
+        # Verify Binance Spot free USDC covers the protected limit buy BEFORE submitting live perp shorts!
+        if b_avail_usdc < b_qty * protected["binance"]:
+            raise PreflightBlocked("insufficient_binance_spot_usdc")
+        if hasattr(self.bybit, "set_leverage"):
+            self.bybit.set_leverage(perp, self.contract.required_perp_leverage)
+        if hasattr(self.hyperliquid, "set_leverage"):
+            self.hyperliquid.set_leverage(asset, int(self.contract.required_perp_leverage), is_cross=True)
+        start_ms = int(time.time() * 1000)
+        tag = f"micro-{self.contract.run_id[-10:]}-{asset.lower()}"
         known_open: dict[str, Decimal] = {"binance": Decimal("0")}
         exit_books: dict[str, Any] | None = None
         try:
@@ -1554,7 +1635,7 @@ class MicroExecutionRunner:
                 return {"asset": asset, "status": "failed_safe_unwind" if unwound else "failed_manual_intervention", "entry_span_ms": int(time.time() * 1000) - start_ms, "delta_mismatch_fraction": None, "entry": {"fills": {"bybit": _aggregate_fills(perp_fills["bybit"], venue="bybit", side="sell", symbol=perp)[1], "hyperliquid": _aggregate_fills(perp_fills["hyperliquid"], venue="hyperliquid", side="sell", symbol=asset)[1]}}, "safe_unwind_attempted": True}
             short_filled_qty = y_filled + h_filled
             max_spot_budget = min(
-                max(Decimal("0"), self.contract.per_asset_gross - y_filled * y_price - h_filled * h_price),
+                max(Decimal("0"), self.contract.per_asset_gross + gross_tol - y_filled * y_price - h_filled * h_price),
                 b_avail_usdc * (b_price / protected["binance"]) if protected["binance"] > 0 else b_avail_usdc,
             )
             spot_qty = (
@@ -1576,7 +1657,11 @@ class MicroExecutionRunner:
                 if est_net_spot > 0 and prospective_denom > 0
                 else Decimal("1")
             )
-            if prospective_delta > self.contract.max_delta_mismatch_fraction:
+            if (
+                spot_qty <= 0
+                or spot_qty * protected["binance"] > b_avail_usdc
+                or prospective_delta > self.contract.max_delta_mismatch_fraction
+            ):
                 unwound = self._safe_unwind(asset, filled=filled, books=books, client_tag=tag)
                 return {"asset": asset, "status": "failed_safe_unwind" if unwound else "failed_manual_intervention", "entry_span_ms": int(time.time() * 1000) - start_ms, "delta_mismatch_fraction": None, "safe_unwind_attempted": True}
             known_open = {"bybit": y_filled, "hyperliquid": h_filled}

@@ -121,12 +121,13 @@ def main(
                 observed_at_ms=int(time.time() * 1000),
             )
         mm_order_oids = ex.load_logged_order_oids(mm_audit_log)
+        mm_recent_min_ts = int(account.observed_at_ms or time.time() * 1000) - 6 * 3_600_000
         raw_mm_coins = mm_coins if mm_coins is not None else os.getenv("HL_MM_COINS", "")
-        foreign_coin_set = {c.strip() for c in raw_mm_coins.split(",") if c.strip()} | {
-            str(o.get("coin") or "")
-            for o in account.open_orders
-            if ex.safe_int(o.get("oid")) in mm_order_oids
-        }
+        foreign_coin_set = (
+            {c.strip() for c in raw_mm_coins.split(",") if c.strip()}
+            | ex.load_logged_order_coins(mm_audit_log, min_ts_ms=mm_recent_min_ts)
+            | {str(o.get("coin") or "") for o in account.open_orders if ex.safe_int(o.get("oid")) in mm_order_oids}
+        )
         foreign_coin_set.discard("")
         if foreign_coin_set:
             valid_targets = {c: w for c, w in valid_targets.items() if c not in foreign_coin_set}
@@ -239,11 +240,16 @@ def main(
         except Exception:  # noqa: BLE001 - ledger outage: keep the stored HWM unchanged
             cur_net_flow = None
         raw_prev_net_flow = ex.load_hwm_net_flow(hwm_state)
+        prev_last_eq = ex.load_hwm_last_equity(hwm_state)
         prev_net_flow = raw_prev_net_flow
         if prev_net_flow is None and cur_net_flow is not None and stored_hwm > 0:
             prev_net_flow = cur_net_flow  # first run with flow tracking: baseline, no adjustment
         stored_hwm = ex.flow_adjusted_high_water_mark(
-            stored_hwm, prev_net_flow, cur_net_flow, current_equity_usd=oracle_eq
+            stored_hwm,
+            prev_net_flow,
+            cur_net_flow,
+            current_equity_usd=oracle_eq,
+            pre_flow_equity_usd=prev_last_eq,
         )
         reanchor_audit_path = audit_log if audit_log is not None else (hwm_state.parent / "hl_testnet_audit.jsonl")
         gross_ntl = ex.account_gross_notional_usd(account, reference_px=reference_px, bbo=bbo)
@@ -276,10 +282,13 @@ def main(
         foreign_order_oids=mm_order_oids,
         foreign_coins=foreign_coin_set,
         orphan_target_weights=intended_targets,
+        oracle_equity_usd=oracle_eq,
     )
     if execute_testnet and account_addr and math.isfinite(account.equity_usd) and account.equity_usd > 0.0 and hwm > 0.0:
         if ex.hwm_persist_allowed(cur_net_flow, ex.load_hwm_net_flow(hwm_state)):
-            ex.save_high_water_mark(hwm_state, hwm, net_external_flow_usd=cur_net_flow)
+            ex.save_high_water_mark(
+                hwm_state, hwm, net_external_flow_usd=cur_net_flow, last_equity_usd=oracle_eq
+            )
     tg_resp = None
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(
