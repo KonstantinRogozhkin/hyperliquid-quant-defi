@@ -171,6 +171,7 @@ def main(
                 valid_targets,
                 bbo,
                 max_missing_fraction=limits.max_unquoted_coin_fraction,
+                book_tops=book_tops,
             )
             if neutralize_net:
                 orphan_net_w = 0.0

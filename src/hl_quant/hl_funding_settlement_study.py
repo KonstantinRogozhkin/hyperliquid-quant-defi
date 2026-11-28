@@ -394,6 +394,7 @@ async def fetch_settlement_dataset(
     min_vol_usd: float = 500_000.0,
     lookback_days: int | None = None,
     info_url: str = HYPERCORE_INFO_URL,
+    weight_budget_per_min: float = 900.0,
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Concurrently collect 5m (~17.4d) or 15m (~52.1d) candles + paginated ``fundingHistory``."""
     iv = bar_interval if bar_interval in ("5m", "15m") else "5m"
@@ -421,20 +422,27 @@ async def fetch_settlement_dataset(
         # end-of-window funding magnitude, which introduces lookahead selection bias.
         selected = sorted(candidates, key=lambda x: (-x["oi_usd"], -x["vol_usd"], x["coin"]))[:max_coins]
 
-        # Hyperliquid IP budget is ~1,200 weight/min (weight 20 per candleSnapshot/fundingHistory
-        # call). Pace requests gently and coordinate backoff across workers on HTTP 429 so all
-        # requested coins collect cleanly instead of silently dropping half the universe.
+        # Hyperliquid info rate limit is ~1,200 weight/min per IP: candleSnapshot / fundingHistory
+        # cost 20 each PLUS +1 per 60 candles / +1 per 20 funding rows returned (a 5,000-bar
+        # snapshot is ~103 weight). Pace on a shared weight budget (headroom left for the other
+        # worker jobs on the same IP) so the whole universe collects without HTTP 429.
         sem = asyncio.Semaphore(2)
         rate_lock = asyncio.Lock()
         next_allowed_at = 0.0
-        min_request_interval_s = 0.25
+        weight_per_s = max(1.0, float(weight_budget_per_min) / 60.0)
+        base_weight = 20.0
 
-        async def _wait_pacing_slot() -> None:
+        async def _charge(weight: float) -> float:
+            """Reserve ``weight`` on the shared budget; return seconds to wait before sending."""
             nonlocal next_allowed_at
             async with rate_lock:
                 now_mono = time.monotonic()
-                wait_s = max(0.0, next_allowed_at - now_mono)
-                next_allowed_at = max(now_mono, next_allowed_at) + min_request_interval_s
+                start = max(now_mono, next_allowed_at)
+                next_allowed_at = start + weight / weight_per_s
+                return max(0.0, start - now_mono)
+
+        async def _wait_pacing_slot() -> None:
+            wait_s = await _charge(base_weight)
             if wait_s > 0:
                 await asyncio.sleep(wait_s)
 
@@ -443,7 +451,7 @@ async def fetch_settlement_dataset(
             async with rate_lock:
                 next_allowed_at = max(next_allowed_at, time.monotonic() + delay_s)
 
-        async def _post_with_retry(payload: dict[str, Any], *, max_attempts: int = 6) -> Any:
+        async def _post_with_retry(payload: dict[str, Any], *, max_attempts: int = 6, items_per_weight: int = 20) -> Any:
             for attempt in range(max_attempts):
                 await _wait_pacing_slot()
                 try:
@@ -454,7 +462,12 @@ async def fetch_settlement_dataset(
                     await asyncio.sleep(delay)
                     continue
                 if r_p.status_code == 200:
-                    return r_p.json() or []
+                    body = r_p.json() or []
+                    if isinstance(body, list) and items_per_weight > 0:
+                        extra = len(body) // items_per_weight
+                        if extra > 0:
+                            await _charge(float(extra))
+                    return body
                 if r_p.status_code in (429, 500, 502, 503, 504):
                     retry_after = _f(r_p.headers.get("Retry-After"), 0.0)
                     delay = max(retry_after, min(20.0, 1.5 * (2**attempt)))
@@ -487,7 +500,8 @@ async def fetch_settlement_dataset(
             async with sem:
                 try:
                     candles = await _post_with_retry(
-                        {"type": "candleSnapshot", "req": {"coin": coin, "interval": iv, "startTime": start_ms, "endTime": now_ms}}
+                        {"type": "candleSnapshot", "req": {"coin": coin, "interval": iv, "startTime": start_ms, "endTime": now_ms}},
+                        items_per_weight=60,
                     )
                     if not candles:
                         return coin, pd.DataFrame()

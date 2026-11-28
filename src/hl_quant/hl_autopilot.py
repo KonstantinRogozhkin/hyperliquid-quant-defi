@@ -899,6 +899,12 @@ def run_autopilot_tick(
     gross_equity = round(sum(alloc_usd.values()), 2)
     gross_share = round(gross_equity / start_cap, 6) if start_cap > 0 else 1.0
     gross_ret_pct = round((gross_share - 1.0) * 100.0, 4)
+    # ``max_drift_pct`` above is the PRE-rebalance drift that drove the decision; telemetry and the
+    # HLAutopilotRiskLimitBreach alert must see the drift that remains AFTER this tick's rebalance.
+    pre_rebalance_drift_pct = max_drift_pct
+    post_drift_pct = round(
+        max((abs(actual_weights.get(k, 0.0) - target_weights[k]) * 100.0 for k in target_weights), default=0.0), 3
+    )
 
     # 4. Gross vs Net-of-Fee HWM Share Price Accounting
     # ``pre_perf_net`` = net NAV after management fees but before the (accrued) performance fee.
@@ -1014,7 +1020,8 @@ def run_autopilot_tick(
                 "cta_directional_exposure_pct": cta_dir_pct,
                 "directional_sleeve_pct": round(actual_weights.get("crisis_cta", 0.0) * 100.0, 2),
                 "reserve_sleeve_pct": round(actual_weights.get("hlp_savings_reserve", 0.0) * 100.0, 2),
-                "max_weight_drift_pct": max_drift_pct,
+                "max_weight_drift_pct": post_drift_pct,
+                "pre_rebalance_max_drift_pct": pre_rebalance_drift_pct,
                 "rebalanced_this_tick": bool(should_rebalance and not is_initial),
                 "rebalance_reason": rebal_reason,
                 "venue_breakdown_usd": venue_breakdown,
@@ -1040,7 +1047,8 @@ def run_autopilot_tick(
                 "gross_leverage": weighted_lev,
                 "net_directional_exposure_pct": net_dir_pct,
                 "cta_directional_exposure_pct": cta_dir_pct,
-                "max_weight_drift_pct": max_drift_pct,
+                "max_weight_drift_pct": post_drift_pct,
+                "pre_rebalance_max_drift_pct": pre_rebalance_drift_pct,
                 "rebalanced": bool(should_rebalance and not is_initial),
                 "rebalance_cost_usd": rebal_cost_usd,
                 "nav_guard_triggered": nav_guard_triggered,
