@@ -1,7 +1,9 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
-import App, { fmtUsd, fx } from "../App";
+import App, { FETCH_TIMEOUT_MS, fmtPct, fmtUsd, fx, parseUtcTs, signCls, workerLiveness } from "../App";
+import { signCls as riskSignCls } from "../components/AnalyticsRiskTab";
+import { ErrorBoundary } from "../components/ErrorBoundary";
 import type { BuildInfo, OverviewPayload } from "../types";
 
 const BASE_SHA = "3b4d8f21aa5fa13082fec5635eedd0252989f3a1";
@@ -1085,7 +1087,7 @@ describe("App", () => {
     expect(screen.getByText("11d / 3d")).toBeInTheDocument();
 
     // 1x1 correlation matrix triggers the >= 2 strategies guard instead of rendering self-correlation
-    expect(screen.getByText(/Waiting for at least 2 strategies with ≥ 3 overlapping days/i)).toBeInTheDocument();
+    expect(screen.getByText(/Waiting for at least 2 strategies with ≥ 10 overlapping days/i)).toBeInTheDocument();
 
     // Switch to Gross mode -> shows gross positive days (82.0%) and gross streaks (14d / 2d)
     await user.click(screen.getByRole("button", { name: "Gross" }));
@@ -1280,7 +1282,7 @@ describe("App", () => {
           [1.0, null],
           [0.02, 1.0],
         ],
-        overlap_days: 7,
+        overlap_days: 12,
       },
       market_exposure: {},
       risk_exposure: {
@@ -1429,5 +1431,125 @@ describe("i18n & tooltips", () => {
     expect(within(dualSec).getByText("$19.80")).toBeInTheDocument();
     expect(within(dualSec).getByText("-$4.20")).toBeInTheDocument();
     expect(within(dualSec).getByText("$11.40")).toBeInTheDocument();
+  });
+});
+
+describe("Audit 2026-11-28 regressions", () => {
+  it("signCls treats values that display as 0.00 as neutral (no red +0.00%)", () => {
+    expect(signCls(-0.001)).toBe("");
+    expect(signCls(0.004)).toBe("");
+    expect(signCls(-0.006)).toBe("neg");
+    expect(signCls(-0.04, 1)).toBe("");
+    expect(signCls(-0.4, 0)).toBe("");
+    expect(signCls(-0.6, 0)).toBe("neg");
+    expect(signCls(0.0004, 3)).toBe("");
+    expect(signCls(0.0006, 3)).toBe("pos");
+    expect(riskSignCls(-0.001)).toBe("");
+    expect(riskSignCls(-0.02, 1)).toBe("");
+    expect(riskSignCls(-0.2, 1)).toBe("neg");
+    expect(fmtPct(-0.001)).toBe("+0.00%");
+  });
+
+  it("parses worker heartbeat stamps and classifies liveness with the 300 s hl_worker_up threshold", () => {
+    expect(parseUtcTs("2026-11-26 21:59:45 UTC")).toBe(Date.parse("2026-11-26T21:59:45Z"));
+    expect(parseUtcTs("2026-11-26 22:00 UTC")).toBe(Date.parse("2026-11-26T22:00:00Z"));
+    expect(parseUtcTs("2026-11-26T21:59:45Z")).toBe(Date.parse("2026-11-26T21:59:45Z"));
+    expect(parseUtcTs("garbage")).toBeNull();
+    expect(workerLiveness("2026-11-26 21:56:00 UTC", "2026-11-26 22:00 UTC")).toBe("online");
+    expect(workerLiveness("2026-11-26 21:54:59 UTC", "2026-11-26 22:00 UTC")).toBe("stale");
+    expect(workerLiveness(null, "2026-11-26 22:00 UTC")).toBe("stale");
+    expect(workerLiveness(undefined, "2026-11-26 22:00 UTC")).toBe("external");
+    // Falls back to the browser clock when the API snapshot time is unparseable.
+    expect(workerLiveness("2026-11-26 21:59:00 UTC", "", Date.parse("2026-11-26T22:30:00Z"))).toBe("stale");
+  });
+
+  it("shows STALE instead of ONLINE when the worker heartbeat is older than 300 s", async () => {
+    const base = makeOverview();
+    mockFetch(
+      makeOverview({
+        generated_at_utc: "2026-11-26 22:00 UTC",
+        worker_status: { ...base.worker_status!, heartbeat_utc: "2026-11-26 21:40:00 UTC" },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+    await user.click(screen.getByRole("tab", { name: "Scheduler & Ops" }));
+    expect(screen.getByText("STALE")).toBeInTheDocument();
+    expect(screen.queryByText("ONLINE")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "RU" }));
+    expect(screen.getByText("УСТАРЕЛ")).toBeInTheDocument();
+  });
+
+  it("shows ONLINE for a fresh worker heartbeat", async () => {
+    mockFetch(makeOverview());
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+    await user.click(screen.getByRole("tab", { name: "Scheduler & Ops" }));
+    expect(screen.getByText("ONLINE")).toBeInTheDocument();
+  });
+
+  it("ErrorBoundary renders the persisted language (RU) outside LangProvider", () => {
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    window.localStorage.setItem("hl_desk_lang", "ru");
+    function Boom(): never {
+      throw new Error("kaboom");
+    }
+    render(
+      <ErrorBoundary>
+        <Boom />
+      </ErrorBoundary>,
+    );
+    expect(screen.getByRole("alert")).toHaveTextContent("Ошибка отрисовки дашборда");
+    expect(screen.getByRole("button", { name: "Повторить" })).toBeInTheDocument();
+  });
+
+  it("skips polling while the tab is hidden and refreshes on becoming visible", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let visibility: DocumentVisibilityState = "visible";
+    vi.spyOn(document, "visibilityState", "get").mockImplementation(() => visibility);
+    try {
+      const fetchSpy = mockFetch(makeOverview());
+      render(<App />);
+      await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+      const overviewCalls = () =>
+        fetchSpy.mock.calls.filter(([input]) => String(input).includes("/api/v1/overview")).length;
+      const initial = overviewCalls();
+
+      visibility = "hidden";
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(130_000);
+      });
+      expect(overviewCalls()).toBe(initial);
+
+      visibility = "visible";
+      await act(async () => {
+        document.dispatchEvent(new Event("visibilitychange"));
+        await vi.advanceTimersByTimeAsync(10);
+      });
+      expect(overviewCalls()).toBe(initial + 1);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("aborts a hung refresh after the fetch timeout and surfaces an error", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      vi.spyOn(globalThis, "fetch").mockImplementation(
+        (_input, init) =>
+          new Promise<Response>((_resolve, reject) => {
+            init?.signal?.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")));
+          }),
+      );
+      render(<App />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(FETCH_TIMEOUT_MS + 100);
+      });
+      expect(await screen.findByText(/Request timed out after 25 s/)).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

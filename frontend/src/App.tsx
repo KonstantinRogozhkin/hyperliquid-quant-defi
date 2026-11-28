@@ -52,10 +52,47 @@ export function fmtBps(v: unknown, digits = 1, signed = false): string {
   return `${signed && norm >= 0 ? "+" : ""}${norm.toFixed(digits)} bps`;
 }
 
-function signCls(v: unknown): string {
+/** Sign colour class; values that round to zero at `digits` (as displayed) are neutral. */
+export function signCls(v: unknown, digits = 2): string {
   const n = num(v);
   if (n === null) return "";
+  if (Math.abs(n) < 0.5 * Math.pow(10, -digits)) return "";
   return n > 0 ? "pos" : n < 0 ? "neg" : "";
+}
+
+/** Per-refresh-cycle fetch timeout for the API calls. */
+export const FETCH_TIMEOUT_MS = 25_000;
+
+/** Same threshold as the backend `hl_worker_up` metric (heartbeat <= 300 s). */
+export const WORKER_STALE_AFTER_S = 300;
+
+/** Parse backend UTC stamps: "YYYY-MM-DD HH:MM[:SS] UTC" (worker/API) or ISO-8601. */
+export function parseUtcTs(v: unknown): number | null {
+  if (typeof v !== "string") return null;
+  const raw = v.trim();
+  const m = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?)\s*(UTC|Z|[+-]\d{2}:?\d{2})?$/i.exec(raw);
+  if (!m) return null;
+  const time = m[2].length === 5 ? `${m[2]}:00` : m[2];
+  const tz = !m[3] || /^(utc|z)$/i.test(m[3]) ? "Z" : m[3];
+  const ms = Date.parse(`${m[1]}T${time}${tz}`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Worker liveness: "online" only when the heartbeat is <= 300 s old relative to the API snapshot time
+ * (server clock, falls back to the browser clock); "stale" otherwise; "external" when no worker reports.
+ */
+export function workerLiveness(
+  heartbeatUtc: unknown,
+  referenceUtc: unknown,
+  nowMs: number = Date.now(),
+): "online" | "stale" | "external" {
+  if (heartbeatUtc === undefined) return "external";
+  const hb = parseUtcTs(heartbeatUtc);
+  if (hb === null) return "stale";
+  const ref = parseUtcTs(referenceUtc) ?? nowMs;
+  const ageS = Math.max(0, (ref - hb) / 1000);
+  return ageS <= WORKER_STALE_AFTER_S ? "online" : "stale";
 }
 
 function shortSha(sha?: string | null): string {
@@ -120,6 +157,12 @@ function Desk() {
     abortRef.current = controller;
     const { signal } = controller;
     const seq = ++reqSeqRef.current;
+    // Hard per-cycle timeout so a hung backend surfaces as an error instead of an endless spinner.
+    let timedOut = false;
+    const timeoutId = window.setTimeout(() => {
+      timedOut = true;
+      controller.abort();
+    }, FETCH_TIMEOUT_MS);
 
     try {
       const [ovRes, feRes, anOutcome] = await Promise.all([
@@ -141,6 +184,7 @@ function Desk() {
           }),
       ]);
 
+      if (timedOut) throw new Error("timeout");
       if (signal.aborted || seq !== reqSeqRef.current) return;
 
       if (!ovRes.ok) {
@@ -149,6 +193,7 @@ function Desk() {
       const ovJson = (await ovRes.json()) as OverviewPayload;
       const feJson = feRes && feRes.ok ? ((await feRes.json().catch(() => null)) as BuildInfo | null) : null;
 
+      if (timedOut) throw new Error("timeout");
       if (signal.aborted || seq !== reqSeqRef.current) return;
 
       // Clear previous error banners only AFTER a successful fetch so banners never flicker during outages.
@@ -174,12 +219,17 @@ function Desk() {
         });
       }
     } catch (err) {
+      if (timedOut && seq === reqSeqRef.current) {
+        setError(`Request timed out after ${FETCH_TIMEOUT_MS / 1000} s`);
+        return;
+      }
       if (signal.aborted || (err instanceof DOMException && err.name === "AbortError") || seq !== reqSeqRef.current) {
         return;
       }
       setError(err instanceof Error ? err.message : String(err));
     } finally {
-      if (!signal.aborted && seq === reqSeqRef.current) {
+      window.clearTimeout(timeoutId);
+      if ((timedOut || !signal.aborted) && seq === reqSeqRef.current) {
         setLoading(false);
       }
     }
@@ -195,9 +245,18 @@ function Desk() {
   useEffect(() => {
     if (refreshSec <= 0) return;
     const id = window.setInterval(() => {
+      // Background tabs do not poll; a fresh load runs as soon as the tab becomes visible again.
+      if (document.visibilityState === "hidden") return;
       void loadAll();
     }, refreshSec * 1000);
-    return () => window.clearInterval(id);
+    const onVisibility = () => {
+      if (document.visibilityState === "visible") void loadAll();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    return () => {
+      window.clearInterval(id);
+      document.removeEventListener("visibilitychange", onVisibility);
+    };
   }, [refreshSec, loadAll]);
 
   const hip3PersistenceFiltered = useMemo(() => {
@@ -590,7 +649,7 @@ function Desk() {
                   <div className="card">
                     <KpiLabel k="kpiHip3Equity" />
                     <div className="kpi-value">{fmtUsd(data?.hip3_paper?.equity_usd)}</div>
-                    <div className={`kpi-sub ${signCls(data?.hip3_paper?.return_pct)}`}>
+                    <div className={`kpi-sub ${signCls(data?.hip3_paper?.return_pct, 3)}`}>
                       {data?.hip3_paper ? fmtPct(data.hip3_paper.return_pct, 3) : "—"}
                     </div>
                   </div>
@@ -653,7 +712,7 @@ function Desk() {
                             </span>
                           </td>
                           <td className="num">{fmtUsd(pos.leg_notional_usd)}</td>
-                          <td className={`num ${signCls(pos.live_spread_apr_pct)}`}>{fmtPct(pos.live_spread_apr_pct, 1)}</td>
+                          <td className={`num ${signCls(pos.live_spread_apr_pct, 1)}`}>{fmtPct(pos.live_spread_apr_pct, 1)}</td>
                           <td className={`num ${pos.live_oracle_div_bps > 15 ? "warn" : ""}`}>
                             {fmtBps(pos.live_oracle_div_bps)}
                           </td>
@@ -759,7 +818,7 @@ function Desk() {
                               {r.direction_flips ?? 0}
                             </span>
                           </td>
-                          <td className={`num ${signCls(r.latest_apr_pct)}`}>{fmtPct(r.latest_apr_pct, 1)}</td>
+                          <td className={`num ${signCls(r.latest_apr_pct, 1)}`}>{fmtPct(r.latest_apr_pct, 1)}</td>
                           <td className="num">{fmtPct(r.median_apr_pct, 1)}</td>
                           <td className={`num ${r.median_oracle_div_bps > 15 ? "warn" : ""}`}>
                             {fmtBps(r.median_oracle_div_bps)}
@@ -1012,8 +1071,8 @@ function Desk() {
                             <td className="mono">{o.direction}</td>
                             <td className="num">{fmtPct(o.hl_apr_pct, 1)}</td>
                             <td className="num">{fmtPct(o.other_apr_pct, 1)}</td>
-                            <td className={`num ${signCls(o.spread_apr_pct)}`}>{fmtPct(o.spread_apr_pct, 1)}</td>
-                            <td className={`num ${signCls(execBasis)}`}>{fmtBps(execBasis, 1, true)}</td>
+                            <td className={`num ${signCls(o.spread_apr_pct, 1)}`}>{fmtPct(o.spread_apr_pct, 1)}</td>
+                            <td className={`num ${signCls(execBasis, 1)}`}>{fmtBps(execBasis, 1, true)}</td>
                             <td className={`num ${(num(o.l2_slip_10k_bps) ?? 0) > 10 ? "warn" : ""}`}>
                               {fmtBps(o.l2_slip_10k_bps, 1)}
                             </td>
@@ -1220,7 +1279,7 @@ function Desk() {
                                     {String(ev.hlp_side ?? "—")}
                                   </span>
                                 </td>
-                                <td className={`num ${signCls(ev.hlp_net_usd)}`}>{fmtUsd(ev.hlp_net_usd, 0)}</td>
+                                <td className={`num ${signCls(ev.hlp_net_usd, 0)}`}>{fmtUsd(ev.hlp_net_usd, 0)}</td>
                                 <td className="num">{fmtPct(ev.hlp_tvl_share_pct, 3, false)}</td>
                                 <td className="num">{num(ev.vaults_holding) ?? "—"}</td>
                                 <td>
@@ -1277,7 +1336,7 @@ function Desk() {
                                   <td className={`num ${Math.abs(num(ev.mark_vs_oracle_bps) ?? 0) >= 50 ? "warn" : ""}`}>
                                     {fmtBps(ev.mark_vs_oracle_bps, 2, true)}
                                   </td>
-                                  <td className={`num ${signCls(ev.funding_apr_pct)}`}>
+                                  <td className={`num ${signCls(ev.funding_apr_pct, 1)}`}>
                                     {fmtPct(ev.funding_apr_pct, 1)}
                                   </td>
                                   <td>
@@ -1660,7 +1719,15 @@ function Desk() {
                 <div className="card">
                   <KpiLabel k="kpiHeartbeat" />
                   <div className="kpi-value">
-                    {data?.worker_status ? t("ONLINE", "ОНЛАЙН") : t("EXTERNAL / CRON", "ВНЕШНИЙ / CRON")}
+                    {(() => {
+                      if (!data?.worker_status) return t("EXTERNAL / CRON", "ВНЕШНИЙ / CRON");
+                      const live = workerLiveness(data.worker_status.heartbeat_utc ?? null, data.generated_at_utc);
+                      return live === "online" ? (
+                        t("ONLINE", "ОНЛАЙН")
+                      ) : (
+                        <span className="warn">{t("STALE", "УСТАРЕЛ")}</span>
+                      );
+                    })()}
                   </div>
                   <div className="kpi-sub">
                     {data?.worker_status?.heartbeat_utc ??

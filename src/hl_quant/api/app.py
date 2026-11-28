@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -22,6 +23,8 @@ import pandas as pd
 from hl_quant.hl_analytics_risk import build_desk_analytics_payload
 from hl_quant.hl_portfolio_dashboard import collect_dashboard_payload, normalize_autopilot_state
 from hl_quant.metrics import PROMETHEUS_CONTENT_TYPE, render_prometheus_metrics
+
+logger = logging.getLogger(__name__)
 
 ARTIFACT_FILES: dict[str, str] = {
     "frontier_history": "hl_frontier_history/latest_summary.json",
@@ -189,7 +192,8 @@ def _audit_record(rec: dict[str, Any]) -> dict[str, Any]:
         "blocked_leverage_coins": list(rec.get("blocked_leverage_coins") or []),
         "foreign_coins": list(rec.get("foreign_coins") or []),
         "skipped_unquoted_coins": list(rec.get("skipped_unquoted_coins") or []),
-        "orphan_positions": dict(rec.get("orphan_positions") or {}),
+        # None = field absent (pre-field record), {} = executor reported no orphans.
+        "orphan_positions": dict(rec.get("orphan_positions") or {}) if "orphan_positions" in rec else None,
         "equity_usd": _opt_float(rec.get("equity_usd")),
         "free_margin_usd": _opt_float(rec.get("free_margin_usd")),
         "drawdown_pct": _opt_float(rec.get("drawdown_pct")),
@@ -276,11 +280,13 @@ def create_app(
     @app.get("/api/v1/healthz")
     def healthz(response: Response) -> dict[str, Any]:
         _no_store(response)
+        data_root_exists = resolved_data_root.is_dir()
+        # Stays HTTP 200 (container liveness); "degraded" tells deploy/cutover checks that no data is mounted.
         return {
-            "status": "ok",
+            "status": "ok" if data_root_exists else "degraded",
             "service": "hl-backend",
             "sha": resolved_sha,
-            "data_root_exists": resolved_data_root.is_dir(),
+            "data_root_exists": data_root_exists,
         }
 
     @app.get("/build-info.json")
@@ -303,8 +309,30 @@ def create_app(
     @app.get("/api/v1/metrics")
     def prometheus_metrics() -> PlainTextResponse:
         overview_payload = _build_overview_payload()
-        analytics_payload = build_desk_analytics_payload(resolved_data_root)
-        body = render_prometheus_metrics(overview_payload, analytics=analytics_payload)
+        render_errors = 0
+        # Analytics-derived gauges are best-effort: a failure there must not turn the whole scrape into a 500
+        # (that would also fire HLWorkerDown via absent(hl_worker_up)).
+        try:
+            analytics_payload: dict[str, Any] | None = build_desk_analytics_payload(resolved_data_root)
+        except Exception:
+            logger.exception("metrics: build_desk_analytics_payload failed; emitting overview-only metrics")
+            analytics_payload = None
+            render_errors += 1
+        try:
+            body = render_prometheus_metrics(overview_payload, analytics=analytics_payload)
+        except Exception:
+            if analytics_payload is None:
+                raise
+            logger.exception("metrics: analytics-derived rendering failed; emitting overview-only metrics")
+            render_errors += 1
+            body = render_prometheus_metrics(overview_payload, analytics=None)
+        if body and not body.endswith("\n"):
+            body += "\n"
+        body += (
+            "# HELP hl_metrics_render_errors Analytics sections that failed during this /metrics render\n"
+            "# TYPE hl_metrics_render_errors gauge\n"
+            f"hl_metrics_render_errors {render_errors}\n"
+        )
         return PlainTextResponse(
             content=body,
             media_type=PROMETHEUS_CONTENT_TYPE,

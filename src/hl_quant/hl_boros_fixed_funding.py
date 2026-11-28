@@ -83,8 +83,10 @@ def _f(v: object, default: float = 0.0) -> float:
     return x if math.isfinite(x) else default
 
 
-MIN_ACTIONABLE_VOLUME_24H_USD = 1.0  # strictly no trades in 24h -> stale quotes
-MIN_ACTIONABLE_OI_USD = 1_000.0  # dust OI (e.g. $1.50) -> not a market
+MIN_ACTIONABLE_VOLUME_24H_USD = 10_000.0  # < $10k traded in 24h -> quotes are indications, not executable size
+MIN_ACTIONABLE_OI_USD = 100_000.0  # < $100k open interest -> too thin to hedge a real position
+# Perp hedge round trip (HL taker ~4.5 bps in + out) amortized over the Boros term when judging a fixed lock.
+DEFAULT_PERP_ROUND_TRIP_COST_BPS = 9.0
 
 
 def _opt_pct(v: object) -> float | None:
@@ -101,8 +103,15 @@ def parse_boros_market(
     raw: dict[str, Any],
     *,
     lighter_quotes: dict[str, cds.DexMarketQuote] | None = None,
+    min_volume_24h_usd: float = MIN_ACTIONABLE_VOLUME_24H_USD,
+    min_oi_usd: float = MIN_ACTIONABLE_OI_USD,
+    perp_round_trip_cost_bps: float = DEFAULT_PERP_ROUND_TRIP_COST_BPS,
 ) -> BorosActiveMarket | None:
-    """Parse one raw Boros API market JSON object into a normalized active market row."""
+    """Parse one raw Boros API market JSON object into a normalized active market row.
+
+    A fixed-rate "Lock" is only recommended when the executable Boros bid beats the live floating APR
+    by more than the perp-hedge round-trip cost amortized over the remaining term.
+    """
     d = raw.get("data") or {}
     ttm_sec = _f(d.get("timeToMaturity"))
     if ttm_sec <= 0:
@@ -140,7 +149,9 @@ def parse_boros_market(
         else:
             action = "Watch Spread"
     else:
-        if bid_pct is not None and bid_pct >= 6.0 and days >= 7.0:
+        hedge_cost_apr_pct = (perp_round_trip_cost_bps / 100.0) * (365.0 / days) if days > 0 else math.inf
+        lock_beats_float = fixed_minus_float is not None and (fixed_minus_float - hedge_cost_apr_pct) > 0.0
+        if bid_pct is not None and bid_pct >= 6.0 and days >= 7.0 and lock_beats_float:
             action = f"Short Perp + Short Boros (Lock {bid_pct:+.2f}%)"
         elif ask_pct is not None and ask_pct <= -10.0 and days >= 7.0:
             action = f"Long Perp + Long Boros (Lock {-ask_pct:+.2f}%)"
@@ -154,7 +165,7 @@ def parse_boros_market(
     oi_usd = _f(d.get("notionalOI"))
     vol_usd = _f(d.get("volume24h"))
     has_liq_fields = "volume24h" in d or "notionalOI" in d  # absent fields are unknown, not zero
-    illiquid = has_liq_fields and (vol_usd < MIN_ACTIONABLE_VOLUME_24H_USD or oi_usd < MIN_ACTIONABLE_OI_USD)
+    illiquid = has_liq_fields and (vol_usd < min_volume_24h_usd or oi_usd < min_oi_usd)
     is_actionable = (not illiquid) and (bid_pct is not None or ask_pct is not None)
     if illiquid:
         action = f"Illiquid (vol24h ${vol_usd:,.0f}, OI ${oi_usd:,.0f}) - no action"
@@ -200,6 +211,9 @@ def fetch_boros_active_markets(
     markets_url: str = BOROS_MARKETS_URL,
     lighter_quotes: dict[str, cds.DexMarketQuote] | None = None,
     max_pages: int = 15,
+    min_volume_24h_usd: float = MIN_ACTIONABLE_VOLUME_24H_USD,
+    min_oi_usd: float = MIN_ACTIONABLE_OI_USD,
+    perp_round_trip_cost_bps: float = DEFAULT_PERP_ROUND_TRIP_COST_BPS,
 ) -> tuple[int, list[BorosActiveMarket]]:
     """Paginate through Boros Open API via ``resumeToken`` and return all active markets."""
     token: str | None = None
@@ -215,7 +229,13 @@ def fetch_boros_active_markets(
         res = body.get("results") or []
         total_seen += len(res)
         for item in res:
-            parsed = parse_boros_market(item, lighter_quotes=lighter_quotes)
+            parsed = parse_boros_market(
+                item,
+                lighter_quotes=lighter_quotes,
+                min_volume_24h_usd=min_volume_24h_usd,
+                min_oi_usd=min_oi_usd,
+                perp_round_trip_cost_bps=perp_round_trip_cost_bps,
+            )
             if parsed is not None:
                 active.append(parsed)
         token = body.get("resumeToken")
@@ -229,6 +249,9 @@ def run_boros_fixed_funding_scan(
     *,
     include_lighter_comparison: bool = True,
     markets_url: str = BOROS_MARKETS_URL,
+    min_volume_24h_usd: float = MIN_ACTIONABLE_VOLUME_24H_USD,
+    min_oi_usd: float = MIN_ACTIONABLE_OI_USD,
+    perp_round_trip_cost_bps: float = DEFAULT_PERP_ROUND_TRIP_COST_BPS,
 ) -> BorosScannerSnapshot:
     """Scan all active Pendle Boros Hyperliquid & Spread markets."""
     now_ms = int(time.time() * 1000)
@@ -241,7 +264,14 @@ def run_boros_fixed_funding_scan(
                 lt_q = cds.fetch_lighter_quotes(c)
             except Exception:
                 lt_q = {}
-        total_seen, all_active = fetch_boros_active_markets(c, markets_url=markets_url, lighter_quotes=lt_q)
+        total_seen, all_active = fetch_boros_active_markets(
+            c,
+            markets_url=markets_url,
+            lighter_quotes=lt_q,
+            min_volume_24h_usd=min_volume_24h_usd,
+            min_oi_usd=min_oi_usd,
+            perp_round_trip_cost_bps=perp_round_trip_cost_bps,
+        )
     finally:
         if own:
             c.close()

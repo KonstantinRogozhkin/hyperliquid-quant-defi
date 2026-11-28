@@ -48,11 +48,11 @@ Critical alerts covered (11):
 - `HLHIP3OracleDivergenceCritical` (`> 30 bps`)
 - `HLSpotPerpDeltaOrMarginCritical` (`|Δ| > 2%` or perp liq distance `< 15%`)
 - `HLAutopilotRiskLimitBreach` (CTA sleeve `> 6%` or drift `> 6%`)
-- `HLStrategyDrawdownOrApiQuotaCritical` (`Max DD > 5%` or API `> 0.85 req/$`)
+- `HLStrategyDrawdownOrApiQuotaCritical` (current drawdown `hl_strategy_current_dd_pct > 5%` or API `> 0.85 req/$`)
 
-Warning alerts covered (9):
+Warning alerts covered (11):
 - `HLArtifactStale`, `HLSettlementStudyDegraded`, `HLTestnetALOFillRateLow`
 - `HLTestnetDrawdownWarning`, `HLTestnetOrphanPositions`, `HLTestnetMarkOracleDislocation`, `HLTestnetCoinMarkOracleDislocation`
-- `HLTestnetRiskProbeStale`, `HLTestnetAttributionStale`
+- `HLTestnetRiskProbeStale`, `HLTestnetAttributionStale`, `HLTestnetExecutorStale` (audit log > 300 min), `HLOnchainEventsStale` (> 45 min)
 
 > **Note on Telegram delivery in Grafana:** Ensure either Grafana's built-in **Contact points** has a Telegram bot token + `chat_id`, or fix `telegram_configs[].chat_id` on external `Alertmanager Telegram` (`http://host.docker.internal:19093`).

@@ -308,8 +308,8 @@ export const GLOSSARY = {
   kpiHeartbeat: e(
     "Worker Heartbeat",
     "Пульс воркера",
-    "Whether the background worker that runs scheduled jobs is alive. ONLINE = it reported recently; otherwise jobs run from external cron.",
-    "Жив ли фоновый воркер, запускающий задачи по расписанию. ONLINE — он недавно отчитался; иначе задачи запускаются внешним cron.",
+    "Whether the background worker that runs scheduled jobs is alive. ONLINE = it reported within the last 5 minutes; STALE = the worker exists but its last heartbeat is older than 5 minutes (it may be stuck or stopped); EXTERNAL / CRON = no worker, jobs run from external cron.",
+    "Жив ли фоновый воркер, запускающий задачи по расписанию. ОНЛАЙН — он отчитался за последние 5 минут; УСТАРЕЛ — воркер есть, но последний пульс старше 5 минут (возможно, завис или остановлен); ВНЕШНИЙ / CRON — воркера нет, задачи запускаются внешним cron.",
   ),
   kpiExecGate: e(
     "Testnet Execution Gate",

@@ -176,7 +176,7 @@ def test_m2_grafana_16_jobs_and_prometheus_grafana_alert_parity():
     prom_by_name = {r["alert"]: r for g in prom["groups"] for r in g["rules"]}
     graf_by_uid = {r["uid"]: r for g in graf["groups"] for r in g["rules"]}
 
-    assert len(prom_by_name) == len(graf_by_uid) == 20
+    assert len(prom_by_name) == len(graf_by_uid) == 22
     assert prom_by_name["HLBoundedNavGuardTriggered"]["expr"] == "hl_desk_nav_guard_active > 0"
     assert graf_by_uid["hl-crit-nav-guard"]["data"][0]["model"]["expr"] == "hl_desk_nav_guard_active"
     assert "hl_artifact_exists" in prom_by_name["HLArtifactStale"]["expr"]
@@ -264,6 +264,9 @@ def test_m3_cutover_required_jobs_testnet_executor_verification_and_stray_python
                 "last_exit_code": 1 if te_state == "failed" else 0,
             }
         )
+        jobs.append(
+            {"name": "testnet_risk_probe", "enabled": True, "status_reason": "active", "state": "ok", "last_exit_code": 0}
+        )
 
         def _fetch(url: str) -> dict[str, Any]:
             if url.endswith("/api/v1/healthz"):
@@ -284,9 +287,11 @@ def test_m3_cutover_required_jobs_testnet_executor_verification_and_stray_python
 
         return _fetch
 
-    # Worker claims testnet_execution_enabled=true, but testnet_executor job is disabled -> downgraded to False
-    res = cutover.verify_dokploy_stack("https://hl.example.com", fetcher=_build_fetcher(te_enabled=False, te_state="disabled"), now_utc=now)
-    assert res.testnet_execution_enabled is False
+    # Worker claims testnet_execution_enabled=true, but testnet_executor job is disabled -> refuse (2026-11-28 audit)
+    with pytest.raises(RuntimeError, match="testnet_executor disabled"):
+        cutover.verify_dokploy_stack(
+            "https://hl.example.com", fetcher=_build_fetcher(te_enabled=False, te_state="disabled"), now_utc=now
+        )
     with pytest.raises(RuntimeError, match="testnet_executor disabled"):
         cutover.verify_dokploy_stack(
             "https://hl.example.com",
@@ -665,8 +670,8 @@ def test_h19_m18_l4_analytics_net_streaks_risk_exposure_and_single_parquet_read(
     assert by_strat["Cross-DEX (HL×Lighter×Ext)"]["net_exposure_pct"] == pytest.approx(-1.0, abs=0.01)
     assert by_strat["Cross-DEX (HL×Lighter×Ext)"]["nav_guard_triggers"] == 3
     # HIP-3: 10400 - 9900 = +500 USD on ~100,010 eq -> ~ +0.5%
-    assert by_strat["HIP-3 Split-Margin"]["net_exposure_pct"] == pytest.approx(0.5, abs=0.01)
-    assert by_strat["HIP-3 Split-Margin"]["nav_guard_triggers"] == 2
+    assert by_strat["HIP-3 Growth Split-Margin"]["net_exposure_pct"] == pytest.approx(0.5, abs=0.01)
+    assert by_strat["HIP-3 Growth Split-Margin"]["nav_guard_triggers"] == 2
 
     tiers = {r["label"]: r["usd"] for r in rx["asset_tier_concentration"]}
     assert "Crypto - Cross-DEX Neutral" in tiers

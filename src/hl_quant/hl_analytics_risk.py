@@ -40,6 +40,16 @@ def _f(v: object, default: float = 0.0) -> float:
     return x if math.isfinite(x) else default
 
 
+# Single source of truth for strategy display names (leaderboard rows and risk-exposure leverage rows).
+STRATEGY_NAMES: dict[str, str] = {
+    "autopilot": "Neutral Autopilot",
+    "spot_perp": "HyperCore Spot+Perp (+10% HLP)",
+    "cross_dex": "Cross-DEX (HL×Lighter×Ext)",
+    "hip3_paper": "HIP-3 Growth Split-Margin",
+    "metamodel": "6-Family Metamodel (Obs)",
+}
+
+
 def _read_json(path: Path) -> dict[str, Any] | None:
     if not path.is_file():
         return None
@@ -184,14 +194,21 @@ def _window_return(
         assert days_back is not None
         target = datetime.fromtimestamp(end_dt.timestamp() - days_back * 86_400.0, tz=end_dt.tzinfo)
 
-    if dates_dt[0] > target:
+    # YTD base is the last close strictly BEFORE Jan 1 (the prior year-end close, as in the monthly table);
+    # a close stamped Jan 1 already contains Jan 1 performance.
+    def _before_target(d: datetime) -> bool:
+        return d < target if ytd else d <= target
+
+    if not _before_target(dates_dt[0]):
         # History is shorter than the requested window
         if ytd and inception_share is not None and inception_share > 0 and dates_dt[0].year == end_dt.year:
             return (end_val / inception_share - 1.0) * 100.0, first_span
-        return None, 0.0
+        if not (ytd and dates_dt[0] == target):
+            return None, 0.0
+        # Un-anchored series starting exactly on Jan 1: base on its first close (mirrors compute_monthly_returns).
     idx = 0
     for i, d in enumerate(dates_dt):
-        if d <= target:
+        if _before_target(d):
             idx = i
         else:
             break
@@ -277,6 +294,18 @@ def _compute_drawdown_stats(
     underwater = (dates_dt[-1] - dd_start_dt).total_seconds() / 86_400.0 if in_dd else 0.0
     rec_out = round(max_rec_days, 1) if max_rec_days is not None else None
     return round(max_dd, 2), rec_out, round(max(0.0, underwater), 1)
+
+
+def _current_drawdown_pct(shares: list[float], *, inception_share: float | None = None) -> float:
+    """Current (open) drawdown of the last observation below the running peak, in percent (0.0 at a HWM)."""
+    if not shares:
+        return 0.0
+    peak = max(shares)
+    if inception_share is not None:
+        peak = max(peak, inception_share)
+    if peak <= 0:
+        return 0.0
+    return round(max(0.0, (peak - shares[-1]) / peak * 100.0), 2)
 
 
 def _compute_streaks(log_rets: np.ndarray) -> tuple[float | None, int, int]:
@@ -448,6 +477,8 @@ def compute_series_performance(
         "sortino_net": sortino_n,
         "max_dd_gross_pct": max_dd_g,
         "max_dd_net_pct": max_dd_n,
+        "current_dd_gross_pct": _current_drawdown_pct(gross_shares, inception_share=inception_share),
+        "current_dd_net_pct": _current_drawdown_pct(net_s, inception_share=inception_share),
         "dd_recovery_days": dd_rec_days,
         "current_underwater_days": underwater_days,
         "dd_recovery_net_days": dd_rec_net_days,
@@ -466,7 +497,12 @@ def compute_series_performance(
 def compute_monthly_returns(
     dates_dt: list[datetime], shares: list[float], *, inception_share: float | None = None
 ) -> list[dict[str, Any]]:
-    """Compute Year × Month return table (``jan..dec`` + ``ytd``) from share-price observations."""
+    """Compute Year × Month return table (``jan..dec`` + ``ytd``) from share-price observations.
+
+    Every year row carries ``partial_first_month``: the month key (e.g. ``"9"``) of the series' first
+    calendar month when history starts after the 1st of that month (that cell covers only part of the
+    month), otherwise ``None``.
+    """
     if len(dates_dt) != len(shares) or not dates_dt or (len(dates_dt) < 2 and inception_share is None):
         return []
     df = pd.DataFrame({"dt": dates_dt, "share": shares})
@@ -497,8 +533,11 @@ def compute_monthly_returns(
         prev_val = cur_val
         year_last[yr] = cur_val
         if yr not in rows_by_year:
-            rows_by_year[yr] = {"year": yr, "months": {}, "ytd": None}
+            rows_by_year[yr] = {"year": yr, "months": {}, "ytd": None, "partial_first_month": None}
         rows_by_year[yr]["months"][str(mo)] = r_pct
+
+    if first_dt.day != 1 and first_dt.year in rows_by_year:
+        rows_by_year[first_dt.year]["partial_first_month"] = str(first_dt.month)
 
     # YTD from unrounded year-start / year-end closes (compounding rounded months drifts by 0.01%).
     for yr, entry in rows_by_year.items():
@@ -509,10 +548,14 @@ def compute_monthly_returns(
     return [rows_by_year[y] for y in sorted(rows_by_year.keys(), reverse=True)]
 
 
+# Minimum overlapping daily log returns before a Pearson rho or OLS beta is reported (3 points is noise).
+MIN_STAT_OVERLAP_DAYS = 10
+
+
 def compute_correlation_matrix(
     series_map: dict[str, pd.Series],
     *,
-    min_overlap: int = 3,
+    min_overlap: int = MIN_STAT_OVERLAP_DAYS,
 ) -> dict[str, Any]:
     """Compute lower-triangular Pearson correlation matrix (ρ) of daily log returns."""
     ids = list(series_map.keys())
@@ -542,7 +585,7 @@ def compute_correlation_matrix(
                     s1 = pair[id_i].to_numpy(dtype=float)
                     s2 = pair[id_j].to_numpy(dtype=float)
                     if np.std(s1) <= 1e-12 or np.std(s2) <= 1e-12:
-                        row.append(0.0)
+                        row.append(None)  # rho is undefined for a constant series (not "uncorrelated")
                     else:
                         c = float(np.corrcoef(s1, s2)[0, 1])
                         row.append(round(c, 3) if math.isfinite(c) else None)
@@ -556,7 +599,7 @@ def compute_ols_market_exposure(
     factor_series: pd.Series,
     *,
     factor_name: str,
-    min_overlap: int = 3,
+    min_overlap: int = MIN_STAT_OVERLAP_DAYS,
     max_scatter: int = 120,
 ) -> dict[str, Any]:
     """OLS regression of strategy daily log returns against a market benchmark factor."""
@@ -1051,7 +1094,8 @@ def build_consolidated_risk_exposure(
         total_nav_guard_triggers += int(ap.get("nav_guard_triggers", 0) or 0)
         leverage_rows.append(
             {
-                "strategy": "Neutral Autopilot",
+                "id": "autopilot",
+                "strategy": STRATEGY_NAMES["autopilot"],
                 "current_leverage": _f(rt.get("gross_leverage")),
                 "leverage_30d_avg": _f(rt.get("leverage_30d_avg")),
                 "leverage_30d_max": _f(rt.get("leverage_30d_max")),
@@ -1067,7 +1111,8 @@ def build_consolidated_risk_exposure(
         total_nav_guard_triggers += int(sp.get("nav_guard_triggers", 0) or 0)
         leverage_rows.append(
             {
-                "strategy": "HyperCore Spot+Perp (+10% HLP)",
+                "id": "spot_perp",
+                "strategy": STRATEGY_NAMES["spot_perp"],
                 "current_leverage": _f(rt.get("gross_leverage")),
                 "leverage_30d_avg": _f(rt.get("leverage_30d_avg")),
                 "leverage_30d_max": _f(rt.get("leverage_30d_max")),
@@ -1106,7 +1151,8 @@ def build_consolidated_risk_exposure(
         cd_net_pct = _clean_zero(round(cd_net_usd / cd_eq * 100.0, 3))
         leverage_rows.append(
             {
-                "strategy": "Cross-DEX (HL×Lighter×Ext)",
+                "id": "cross_dex",
+                "strategy": STRATEGY_NAMES["cross_dex"],
                 "current_leverage": lev,
                 "leverage_30d_avg": cd_avg,
                 "leverage_30d_max": cd_max,
@@ -1153,7 +1199,8 @@ def build_consolidated_risk_exposure(
         h3_net_pct = _clean_zero(round(h3_net_usd / h3_eq * 100.0, 3))
         leverage_rows.append(
             {
-                "strategy": "HIP-3 Split-Margin",
+                "id": "hip3_paper",
+                "strategy": STRATEGY_NAMES["hip3_paper"],
                 "current_leverage": lev,
                 "leverage_30d_avg": h3_avg,
                 "leverage_30d_max": h3_max,
@@ -1185,7 +1232,8 @@ def build_consolidated_risk_exposure(
         )
         leverage_rows.append(
             {
-                "strategy": "Metamodel (HL x CEX)",
+                "id": "metamodel",
+                "strategy": STRATEGY_NAMES["metamodel"],
                 "current_leverage": mm_lev,
                 "leverage_30d_avg": mm_avg,
                 "leverage_30d_max": mm_max,
@@ -1255,7 +1303,7 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
     strategy_specs = [
         {
             "id": "autopilot",
-            "name": "Neutral Autopilot",
+            "name": STRATEGY_NAMES["autopilot"],
             "category": "Master Vault",
             "ticks": data_root / "hl_autopilot" / "ticks.parquet",
             "state": data_root / "hl_autopilot" / "state.json",
@@ -1265,7 +1313,7 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
         },
         {
             "id": "spot_perp",
-            "name": "HyperCore Spot+Perp (+10% HLP)",
+            "name": STRATEGY_NAMES["spot_perp"],
             "category": "Market Neutral",
             "ticks": data_root / "hl_spot_perp_paper" / "ticks.parquet",
             "state": data_root / "hl_spot_perp_paper" / "state.json",
@@ -1275,7 +1323,7 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
         },
         {
             "id": "cross_dex",
-            "name": "Cross-DEX (HL×Lighter×Ext)",
+            "name": STRATEGY_NAMES["cross_dex"],
             "category": "Market Neutral",
             "ticks": data_root / "hl_cross_dex_paper" / "ticks.parquet",
             "state": data_root / "hl_cross_dex_paper" / "state.json",
@@ -1285,7 +1333,7 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
         },
         {
             "id": "hip3_paper",
-            "name": "HIP-3 Growth Split-Margin",
+            "name": STRATEGY_NAMES["hip3_paper"],
             "category": "Market Neutral",
             "ticks": data_root / "hl_hip3_paper" / "ticks.parquet",
             "state": data_root / "hl_hip3_paper" / "state.json",
@@ -1295,7 +1343,7 @@ def build_desk_analytics_payload(data_root: Path) -> dict[str, Any]:
         },
         {
             "id": "metamodel",
-            "name": "6-Family Metamodel (Obs)",
+            "name": STRATEGY_NAMES["metamodel"],
             "category": "Market Neutral (Obs)",
             "ticks": data_root / "hl_metamodel" / "ticks.parquet",
             "state": data_root / "hl_metamodel" / "state.json",

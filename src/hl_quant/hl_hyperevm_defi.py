@@ -230,14 +230,21 @@ def compute_v3_virtual_depth_and_slippage(
     dec0: int,
     token0_usd: float,
     clips_usd: tuple[float, ...] = (5_000.0, 25_000.0, 100_000.0),
+    side: str = "sell",
 ) -> tuple[float, dict[float, float]]:
     """Compute concentrated-liquidity active-tick virtual depth (USD) and exact average slippage (bps).
 
     In Uniswap V3, virtual token0 reserve inside the active tick is ``x_virt = L / sqrtP``
     (in raw units), so one-side virtual USD depth is ``V_virt = (L / sqrtP) / 10^dec0 * p0_usd``.
     Under constant-product virtual reserves ``x_virt * y_virt = L^2``, the exact in-tick average
-    execution price impact for a clip ``dV`` vs initial mid price is ``dV / (V_virt + dV) * 1e4`` bps.
+    execution price impact for a clip of ``dV`` USD of token0 (valued at the initial mid) is:
+
+    - ``side="sell"`` (token0 into the pool): ``dV / (V_virt + dV) * 1e4`` bps;
+    - ``side="buy"`` (token0 out of the pool): ``dV / (V_virt - dV) * 1e4`` bps, capped at 9999 when
+      ``dV >= V_virt`` (the clip would drain the active tick's virtual reserve).
     """
+    if side not in ("sell", "buy"):
+        raise ValueError(f"side must be 'sell' or 'buy', got {side!r}")
     if liquidity_raw <= 0 or sqrt_price_x96 <= 0 or token0_usd <= 0:
         return 0.0, {c: 9999.0 for c in clips_usd}
     sqrt_p = float(sqrt_price_x96) / float(1 << 96)
@@ -247,7 +254,14 @@ def compute_v3_virtual_depth_and_slippage(
     v_depth_usd = x_virt_human * token0_usd
     if v_depth_usd <= 0 or not math.isfinite(v_depth_usd):
         return 0.0, {c: 9999.0 for c in clips_usd}
-    impacts = {c: round(min((c / (v_depth_usd + c)) * 1e4, 9999.0), 2) for c in clips_usd}
+    def _impact_bps(clip: float) -> float:
+        if side == "sell":
+            return min((clip / (v_depth_usd + clip)) * 1e4, 9999.0)
+        if clip >= v_depth_usd:
+            return 9999.0
+        return min((clip / (v_depth_usd - clip)) * 1e4, 9999.0)
+
+    impacts = {c: round(_impact_bps(c), 2) for c in clips_usd}
     return round(v_depth_usd, 2), impacts
 
 
@@ -598,11 +612,16 @@ def scan_hyperevm_vs_hypercore_arb(
             extra_stable_fee = 0.0
 
         token0_usd = base_usd if st["t0_is_base"] else quote_usd
+        # EVM leg sells the base when EVM is rich (peg_adj_bps > 0), buys it otherwise; token0 flows into the
+        # pool (sell) when it is the base being sold or the quote being paid, out of it (buy) otherwise.
+        sell_base_on_evm = peg_adj_bps > 0
+        token0_side = "sell" if sell_base_on_evm == bool(st["t0_is_base"]) else "buy"
         v_depth_usd, slips = compute_v3_virtual_depth_and_slippage(
             liq,
             int(st["sqrt_x96"]),
             dec0=int(st["dec0"]),
             token0_usd=token0_usd,
+            side=token0_side,
         )
         net_bps = abs(peg_adj_bps) - pool.fee_bps - eff_core_fee_bps - extra_stable_fee
         net_5k = net_bps - slips[5_000.0]
