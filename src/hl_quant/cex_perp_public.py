@@ -217,6 +217,8 @@ def collect_klines_1h(
     *,
     now_ms: int | None = None,
     max_pages: int = 10_000,
+    price_scale: float | None = None,
+    hl_coin: str | None = None,
 ) -> Collected:
     """Closed 1h perp klines; the still-open bar is dropped."""
     observed = now_ms if now_ms is not None else current_time_ms()
@@ -226,7 +228,7 @@ def collect_klines_1h(
     elif venue == "bybit":
         pages, bars = _bybit_klines(client, symbol, start_ms, end_ms, max_pages)
     elif venue == "okx":
-        pages, bars = _okx_klines(client, symbol, start_ms, end_ms, max_pages)
+        pages, bars = _okx_klines(client, symbol, start_ms, end_ms, max_pages, price_scale=price_scale, hl_coin=hl_coin)
     else:
         raise CexDataError(f"unknown venue {venue!r}")
     closed = [b for t, b in sorted(bars.items()) if start_ms <= t <= end_ms and b["close_time_ms"] < observed]
@@ -367,7 +369,10 @@ def _okx_funding(client, symbol, start_ms, end_ms, max_pages):
     return pages, events
 
 
-OKX_KILO_BASES: set[str] = {"PEPE", "SHIB", "BONK", "FLOKI", "LUNC", "DOGS", "NEIRO", "MOG", "CAT", "SATS", "RATS", "XEC", "BTT"}
+# Immutable Hyperliquid k*-listed bases (kPEPE, kSHIB, kBONK, kFLOKI, kLUNC, kDOGS, kNEIRO).
+# 1-token HL coins such as CAT or MOG are intentionally excluded and okx_symbol NEVER mutates this!
+OKX_DEFAULT_HL_KILO_BASES: frozenset[str] = frozenset({"PEPE", "SHIB", "BONK", "FLOKI", "LUNC", "DOGS", "NEIRO"})
+OKX_KILO_BASES: frozenset[str] = OKX_DEFAULT_HL_KILO_BASES
 
 
 def is_hl_kilo_coin(coin: str) -> bool:
@@ -375,21 +380,34 @@ def is_hl_kilo_coin(coin: str) -> bool:
     return len(coin) > 1 and coin.startswith("k") and coin[1].isupper()
 
 
-def okx_price_scale(symbol: str) -> float:
-    """Price multiplier aligning OKX 1-token swaps (``PEPE-USDT-SWAP``) to HL 1,000-token ``k*`` perps."""
-    sym_u = str(symbol or "").upper()
-    if sym_u.endswith("-USDT-SWAP"):
-        base = sym_u[: -len("-USDT-SWAP")]
-        if base in OKX_KILO_BASES:
-            return 1_000.0
-    return 1.0
+def okx_price_scale(symbol: str, *, hl_coin: str | None = None) -> float:
+    """Price multiplier aligning OKX 1-token swaps (``PEPE-USDT-SWAP``) to HL 1,000-token ``k*`` perps.
+
+    When ``hl_coin`` (or a raw HL coin symbol such as ``"kPEPE"`` vs ``"CAT"``) is supplied,
+    scaling is determined strictly by :func:`is_hl_kilo_coin` so 1-token HL coins (``"CAT"``,
+    ``"MOG"``) are never scaled by 1,000x.
+    """
+    if hl_coin is not None:
+        return 1_000.0 if is_hl_kilo_coin(str(hl_coin).strip()) else 1.0
+    raw = str(symbol or "").strip()
+    if not raw:
+        return 1.0
+    sym_u = raw.upper()
+    if not sym_u.endswith("-USDT-SWAP"):
+        return 1_000.0 if is_hl_kilo_coin(raw) else 1.0
+    base = sym_u[: -len("-USDT-SWAP")]
+    return 1_000.0 if base in OKX_DEFAULT_HL_KILO_BASES else 1.0
 
 
-def _okx_klines(client, symbol, start_ms, end_ms, max_pages):
+def _okx_klines(client, symbol, start_ms, end_ms, max_pages, *, price_scale: float | None = None, hl_coin: str | None = None):
     pages: list[Any] = []
     bars: dict[int, dict[str, Any]] = {}
     after_cursor: int | None = end_ms + 1
-    px_scale = okx_price_scale(symbol)
+    px_scale = (
+        float(price_scale)
+        if (price_scale is not None and price_scale > 0.0)
+        else okx_price_scale(symbol, hl_coin=hl_coin)
+    )
     while True:
         _page_guard(pages, max_pages, symbol)
         params: dict[str, Any] = {"instId": symbol, "bar": "1H", "limit": OKX_KLINE_LIMIT}
@@ -424,12 +442,8 @@ def _okx_klines(client, symbol, start_ms, end_ms, max_pages):
 
 
 def okx_symbol(coin: str) -> str:
-    """Map Hyperliquid perp coin name to OKX USDT linear swap ``instId``."""
-    if is_hl_kilo_coin(coin):
-        base = coin[1:].upper()
-        OKX_KILO_BASES.add(base)
-    else:
-        base = coin.upper()
+    """Map Hyperliquid perp coin name to OKX USDT linear swap ``instId`` (pure, side-effect-free)."""
+    base = coin[1:].upper() if is_hl_kilo_coin(coin) else coin.upper()
     return f"{base}-USDT-SWAP"
 
 
@@ -444,16 +458,45 @@ def _pos_float(val: Any) -> float:
 def fetch_live_mid_prices(
     client: Any,
     venue: str,
-    symbols: list[str] | set[str] | tuple[str, ...] | None = None,
+    symbols: list[str] | set[str] | tuple[str, ...] | dict[str, str] | None = None,
+    *,
+    hl_coins: list[str] | set[str] | tuple[str, ...] | None = None,
 ) -> dict[str, float]:
     """Fetch synchronous live BBO mid prices (``symbol -> mid_px``) for a CEX linear perp venue.
 
     Used by ``run_hl_metamodel_paper_tick`` so CEX hedge legs are marked to market at the same
     wall-clock instant as Hyperliquid's live L2 quotes rather than a stale ``:00`` candle close.
+    When ``symbols`` is a ``{hl_coin: inst_id}`` dict or ``hl_coins`` is provided on OKX, scaling
+    is keyed directly off :func:`is_hl_kilo_coin` per HL coin.
     """
-    want = {str(s) for s in symbols} if symbols is not None else None
-    out: dict[str, float] = {}
     v = venue.lower()
+    scale_by_sym: dict[str, float] = {}
+    if isinstance(symbols, dict):
+        want: set[str] | None = {str(val) for val in symbols.values()}
+        if v == "okx":
+            for hc, inst in symbols.items():
+                scale_by_sym[str(inst)] = 1_000.0 if is_hl_kilo_coin(str(hc)) else 1.0
+    elif symbols is not None:
+        if v == "okx":
+            want = set()
+            for raw_s in symbols:
+                s_str = str(raw_s)
+                if s_str.upper().endswith("-USDT-SWAP"):
+                    want.add(s_str)
+                else:
+                    inst = okx_symbol(s_str)
+                    want.add(inst)
+                    scale_by_sym[inst] = 1_000.0 if is_hl_kilo_coin(s_str) else 1.0
+        else:
+            want = {str(s) for s in symbols}
+    else:
+        want = None
+    if v == "okx" and hl_coins is not None:
+        for hc in hl_coins:
+            hc_str = str(hc)
+            scale_by_sym[okx_symbol(hc_str)] = 1_000.0 if is_hl_kilo_coin(hc_str) else 1.0
+
+    out: dict[str, float] = {}
     if v == "binance":
         body = client.get("/fapi/v1/ticker/bookTicker", {})
         rows = body if isinstance(body, list) else ([body] if isinstance(body, dict) else [])
@@ -491,7 +534,7 @@ def fetch_live_mid_prices(
             sym = str(item.get("instId") or "")
             if not sym or (want is not None and sym not in want):
                 continue
-            px_scale = okx_price_scale(sym)
+            px_scale = scale_by_sym.get(sym, okx_price_scale(sym))
             bid = _pos_float(item.get("bidPx"))
             ask = _pos_float(item.get("askPx"))
             if bid > 0.0 and ask > 0.0:

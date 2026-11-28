@@ -193,7 +193,9 @@ def settled_funding_by_position(
     out: dict[Any, float] = {}
     for start, syms in by_start.items():
         try:
-            fetched = fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms, info_url=info_url)
+            fetched = fetch_settled_funding_sum(
+                client, sorted(syms), start + 1, ts_ms, info_url=info_url, max_window_hours=cap_hours
+            )
             for sym, val in fetched.items():
                 out[sym] = val
                 out[(start, sym)] = val
@@ -328,7 +330,11 @@ def run_hip3_paper_tick(
             s_sym, l_sym = str(pos["short_symbol"]), str(pos["long_symbol"])
             s_rate_sum = float(settled.get((eff_start, s_sym), settled.get(s_sym, s_mkt.funding_rate_h * pos_settled_hours)))
             l_rate_sum = float(settled.get((eff_start, l_sym), settled.get(l_sym, l_mkt.funding_rate_h * pos_settled_hours)))
-            fund_pnl = s_notional * s_rate_sum - l_notional * l_rate_sum
+            short_fund_pnl = s_notional * s_rate_sum
+            long_fund_pnl = -l_notional * l_rate_sum
+            fund_pnl = short_fund_pnl + long_fund_pnl
+            cum_short_fund = float(pos.get("cum_short_funding_usd", 0.0) or 0.0) + short_fund_pnl
+            cum_long_fund = float(pos.get("cum_long_funding_usd", 0.0) or 0.0) + long_fund_pnl
 
             live_spread_apr = round(s_mkt.funding_apr_pct - l_mkt.funding_apr_pct, 2)
             live_mark_basis = round((s_mkt.mark_px - l_mkt.mark_px) / l_mkt.mark_px * 1e4, 2) if l_mkt.mark_px > 0 else 0.0
@@ -344,8 +350,8 @@ def run_hip3_paper_tick(
             s_mmr = 0.5 / max(1.0, float(s_mkt.max_leverage or 10))
             l_mmr = 0.5 / max(1.0, float(l_mkt.max_leverage or 10))
             leg_liquidated = (
-                (init_leg_m + short_upnl) <= s_notional * s_mmr
-                or (init_leg_m + long_upnl) <= l_notional * l_mmr
+                (init_leg_m + short_upnl + cum_short_fund) <= s_notional * s_mmr
+                or (init_leg_m + long_upnl + cum_long_fund) <= l_notional * l_mmr
             )
             # Do NOT count unrealized profit (> 0) on the winning leg as locked margin!
             dyn_margin = max(0.0, max(init_leg_m + min(0.0, short_upnl), s_notional / lev_p)) + max(
@@ -363,6 +369,8 @@ def run_hip3_paper_tick(
             pos["last_long_px"] = l_mkt.mark_px
             pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + pos_dt_hours, 2)
             pos["cum_funding_usd"] = round(float(pos.get("cum_funding_usd", 0.0)) + fund_pnl, 4)
+            pos["cum_short_funding_usd"] = round(cum_short_fund, 4)
+            pos["cum_long_funding_usd"] = round(cum_long_fund, 4)
             pos["cum_basis_mtm_usd"] = round(float(pos.get("cum_basis_mtm_usd", 0.0)) + basis_pnl, 4)
             pos["live_spread_apr_pct"] = live_spread_apr
             pos["live_mark_basis_bps"] = live_mark_basis
@@ -676,6 +684,8 @@ def run_hip3_paper_tick(
                 "entry_cost_usd": round(entry_cost_usd, 4),
                 "cum_cost_usd": round(entry_cost_usd, 4),
                 "cum_funding_usd": 0.0,
+                "cum_short_funding_usd": 0.0,
+                "cum_long_funding_usd": 0.0,
                 "cum_basis_mtm_usd": 0.0,
                 "net_pnl_usd": round(-entry_cost_usd, 4),
                 "payback_achieved": False,

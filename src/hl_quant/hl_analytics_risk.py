@@ -1096,6 +1096,32 @@ def _leverage_history_stats(
     return round(sum(vals) / len(vals), 3), round(max(vals), 3)
 
 
+def _cross_dex_pair_gross(pos: dict[str, Any]) -> float:
+    hl_n = _f(pos.get("hl_notional_usd"))
+    oth_n = _f(pos.get("other_notional_usd"))
+    if (
+        pos.get("hl_notional_usd") is not None
+        and pos.get("other_notional_usd") is not None
+        and hl_n > 0.0
+        and oth_n > 0.0
+    ):
+        return hl_n + oth_n
+    return 2.0 * _f(pos.get("leg_notional_usd"))
+
+
+def _hip3_pair_gross(pos: dict[str, Any]) -> float:
+    s_n = _f(pos.get("short_notional_usd"))
+    l_n = _f(pos.get("long_notional_usd"))
+    if (
+        pos.get("short_notional_usd") is not None
+        and pos.get("long_notional_usd") is not None
+        and s_n > 0.0
+        and l_n > 0.0
+    ):
+        return s_n + l_n
+    return 2.0 * _f(pos.get("leg_notional_usd"))
+
+
 def _cross_dex_hl_sign(pos: dict[str, Any]) -> float:
     raw = pos.get("hl_sign")
     if raw is not None:
@@ -1169,7 +1195,7 @@ def build_consolidated_risk_exposure(
         total_nav_guard_triggers += cd_nav_guards
         cd_pos = cd.get("positions") or {}
         cd_eq = max(_f(cd.get("equity_usd"), 100_000.0), 1.0)
-        cd_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in cd_pos.values() if isinstance(p, dict))
+        cd_gross = sum(_cross_dex_pair_gross(p) for p in cd_pos.values() if isinstance(p, dict))
         lev = round(cd_gross / cd_eq, 3)
         cd_avg, cd_max = _leverage_history_stats(
             data_root / "hl_cross_dex_paper" / "ticks.parquet",
@@ -1219,7 +1245,7 @@ def build_consolidated_risk_exposure(
         total_nav_guard_triggers += h3_nav_guards
         h3_pos = h3.get("positions") or {}
         h3_eq = max(_f(h3.get("equity_usd"), 50_000.0), 1.0)
-        h3_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in h3_pos.values() if isinstance(p, dict))
+        h3_gross = sum(_hip3_pair_gross(p) for p in h3_pos.values() if isinstance(p, dict))
         lev = round(h3_gross / h3_eq, 3)
         h3_avg, h3_max = _leverage_history_stats(
             data_root / "hl_hip3_paper" / "ticks.parquet",

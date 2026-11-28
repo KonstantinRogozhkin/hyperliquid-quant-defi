@@ -387,13 +387,31 @@ def run_paper_tick(
     prev_pos: dict[str, dict[str, Any]] = dict(prev_pos_full)
     nav_guard_triggers = int(state.get("nav_guard_triggers", 0) or 0)
 
+    def _normalize_okx_k_px(venue: str, coin_name: str, px_val: float) -> float:
+        if (
+            venue.lower() == "okx"
+            and coin_name.startswith("k")
+            and len(coin_name) > 1
+            and coin_name[1].isupper()
+            and math.isfinite(px_val)
+            and px_val > 0
+        ):
+            hl_ref = (
+                quotes[coin_name].mid_px
+                if coin_name in quotes
+                else _last_known(market.hl_close, coin_name, tick_hour_ms)
+            )
+            if math.isfinite(hl_ref) and hl_ref > 0 and 500.0 <= (hl_ref / px_val) <= 2000.0:
+                return px_val * 1000.0
+        return px_val
+
     def _cur_cex_px(venue: str, coin_name: str) -> float:
         if cex_mid_prices:
             v_map = cex_mid_prices.get(venue.lower()) or cex_mid_prices.get(venue) or {}
             live_px = v_map.get(coin_name)
             if live_px is not None and math.isfinite(float(live_px)) and float(live_px) > 0:
-                return float(live_px)
-        return _last_known(_cex_frames(market, venue)[0], coin_name, tick_hour_ms)
+                return _normalize_okx_k_px(venue, coin_name, float(live_px))
+        return _normalize_okx_k_px(venue, coin_name, _last_known(_cex_frames(market, venue)[0], coin_name, tick_hour_ms))
 
     # A held coin or held CEX leg missing a valid synchronous price/funding feed cannot be marked
     # to market safely; skip the tick without mutating state.json rather than mixing asynchronous

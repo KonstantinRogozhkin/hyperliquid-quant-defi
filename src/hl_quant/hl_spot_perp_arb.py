@@ -789,15 +789,16 @@ def run_spot_perp_paper_tick(
         # own ``last_accrual_ms``, so its settled-funding window starts where it last accrued.
         pos_start_ms = {base: pc.position_accrual_start_ms(pos, prev_ms) for base, pos in positions.items()}
         settled_rates: dict[Any, float] = {}
+        cap_window_ms = int(dt_cap_h * 3_600_000)
         if prev_ms > 0 and positions and markets is None and http_client is not None:
             by_start: dict[int, list[str]] = {}
             for base, start in pos_start_ms.items():
-                eff_s = max(start, ts_ms - 24 * 3_600_000)
+                eff_s = max(start, ts_ms - cap_window_ms) if dt_cap_h > 0 else start
                 if eff_s > 0 and (ts_ms // 3_600_000) - (eff_s // 3_600_000) > 0:
                     by_start.setdefault(eff_s, []).append(base)
             for start, bases in by_start.items():
                 fetched = fetch_settled_funding_sum(
-                    http_client, bases, start + 1, ts_ms, info_url=info_url, max_window_hours=24.0
+                    http_client, bases, start + 1, ts_ms, info_url=info_url, max_window_hours=dt_cap_h
                 )
                 for b_sym, r_val in fetched.items():
                     settled_rates[(start, b_sym)] = r_val
@@ -820,7 +821,7 @@ def run_spot_perp_paper_tick(
             perp_notional = qty * cur_perp
             spot_notional = qty * cur_spot
             p_start = pos_start_ms.get(base, prev_ms)
-            eff_p_start = max(p_start, ts_ms - 24 * 3_600_000)
+            eff_p_start = max(p_start, ts_ms - cap_window_ms) if dt_cap_h > 0 else p_start
             # Same cap as the global clock (168h while a NAV-guard confirmation is pending).
             pos_dt_hours = max(0.0, min(dt_cap_h, (ts_ms - p_start) / 3_600_000.0)) if p_start > 0 else dt_hours
             pos_settlements = (ts_ms // 3_600_000) - (p_start // 3_600_000) if p_start > 0 else 0
@@ -880,7 +881,11 @@ def run_spot_perp_paper_tick(
         nav_guard_pending: int | None = int(pending_raw) if pending_raw else None
         pending_ret_raw = state.get("nav_guard_pending_ret_pct")
         nav_guard_pending_ret: float | None = float(pending_ret_raw) if pending_ret_raw is not None else None
-        jump_exceeded = prev_equity > 0 and abs(raw_ret_pct) > cfg.max_tick_nav_jump_pct
+        jump_exceeded = (
+            prev_equity > 0
+            and cfg.max_tick_nav_jump_pct > 0.0
+            and abs(raw_ret_pct) > cfg.max_tick_nav_jump_pct
+        )
         if jump_exceeded and nav_guard_pending is not None and ts_ms - nav_guard_pending >= NAV_GUARD_CONFIRM_MS:
             confirmed = nav_guard_pending_ret is None or (
                 (raw_ret_pct * nav_guard_pending_ret) > 0.0

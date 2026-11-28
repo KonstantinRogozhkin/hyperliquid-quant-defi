@@ -123,13 +123,39 @@ function normalizeSplitLabel(split: unknown): { label: string; isOos: boolean } 
 }
 
 function settlementEffectiveTStat(r: SettlementStat): number {
-  return (
-    num(r.net_t_stat_clustered) ??
-    num(r.t_stat_clustered) ??
-    num(r.net_t_stat) ??
-    num(r.t_stat) ??
-    -Infinity
-  );
+  const clusterCount = num(r.clusters) ?? num(r.n_clusters);
+  if (clusterCount !== null && clusterCount < 2) return -Infinity;
+  const hasNetClustered = "net_t_stat_clustered" in r && r.net_t_stat_clustered !== undefined;
+  const hasGrossClustered = "t_stat_clustered" in r && r.t_stat_clustered !== undefined;
+  let clT: number;
+  if (hasNetClustered) {
+    clT = num(r.net_t_stat_clustered) ?? -Infinity;
+  } else if (hasGrossClustered) {
+    clT = num(r.t_stat_clustered) ?? -Infinity;
+  } else if ("net_t_stat" in r && r.net_t_stat !== undefined) {
+    return num(r.net_t_stat) ?? -Infinity;
+  } else {
+    return num(r.t_stat) ?? -Infinity;
+  }
+  if ("net_t_stat" in r && r.net_t_stat !== undefined) {
+    return Math.min(clT, num(r.net_t_stat) ?? -Infinity);
+  }
+  return clT;
+}
+
+function settlementExTop1Bps(r: SettlementStat): number | null {
+  const rec = r as unknown as Record<string, unknown>;
+  const directBps = num(rec.ex_top1_bps) ?? num(rec.ex_top1_net_bps);
+  if (directBps !== null) return directBps;
+  const exGross = num(r.ex_top1_gross_bps);
+  if (exGross !== null) {
+    const gross = num(r.mean_gross_bps);
+    const netMaker = num(r.net_maker_bps);
+    const makerRt =
+      num(rec.maker_rt_bps) ?? (gross !== null && netMaker !== null ? gross - netMaker : 3.0);
+    return exGross - makerRt;
+  }
+  return null;
 }
 
 export default function App() {
@@ -300,7 +326,7 @@ function Desk() {
     return (data?.cross_dex_all ?? []).filter((r) => r.spread_apr_pct >= crossDexMinApr);
   }, [data, crossDexMinApr]);
 
-  const settlementFiltered = useMemo(() => {
+  const { settlementFiltered, verifiedSettlementSet } = useMemo(() => {
     const rows = data?.settlement_stats ?? [];
     const devByKey = new Map<string, SettlementStat>();
     for (const r of rows) {
@@ -326,18 +352,25 @@ function Desk() {
       if ((num(r.net_maker_bps) ?? -Infinity) <= 0) return false;
       if (r.fdr_pass === false) return false;
       if (settlementEffectiveTStat(r) < 2.0) return false;
+      const exTop1Bps = settlementExTop1Bps(r);
+      if (exTop1Bps !== null && exTop1Bps <= 0) return false;
       const devRow = devByKey.get(`${r.bucket}::${r.strategy}`);
       if (devRow && (num(devRow.net_maker_bps) ?? -Infinity) <= 0) return false;
       return true;
     };
-    return [...filtered]
+    const verified = new Set<SettlementStat>();
+    for (const r of filtered) {
+      if (isVerified(r)) verified.add(r);
+    }
+    const sorted = [...filtered]
       .sort(
         (a, b) =>
-          Number(isVerified(b)) - Number(isVerified(a)) ||
+          Number(verified.has(b)) - Number(verified.has(a)) ||
           (num(b.net_maker_bps) ?? -Infinity) - (num(a.net_maker_bps) ?? -Infinity) ||
           settlementEffectiveTStat(b) - settlementEffectiveTStat(a),
       )
       .slice(0, 16);
+    return { settlementFiltered: sorted, verifiedSettlementSet: verified };
   }, [data, settlementSplit]);
 
   const settlementDegradedMeta = data?.settlement_last_attempt?.degraded
@@ -574,14 +607,20 @@ function Desk() {
                       <tbody>
                         {settlementFiltered.map((row, idx) => {
                           const sp = normalizeSplitLabel(row.split);
-                          const clusteredT = num(row.net_t_stat_clustered) ?? num(row.t_stat_clustered);
                           const rawNetCls = signCls(row.net_maker_bps);
                           const netMakerCls =
-                            rawNetCls === "pos" && (row.fdr_pass === false || (clusteredT !== null && clusteredT < 2.0))
-                              ? ""
-                              : rawNetCls;
-                          const displayT =
-                            row.net_t_stat_clustered ?? row.t_stat_clustered ?? row.net_t_stat ?? row.t_stat;
+                            rawNetCls === "pos" && !verifiedSettlementSet.has(row) ? "" : rawNetCls;
+                          const hasNetClust =
+                            "net_t_stat_clustered" in row && row.net_t_stat_clustered !== undefined;
+                          const hasGrossClust =
+                            "t_stat_clustered" in row && row.t_stat_clustered !== undefined;
+                          const displayT = hasNetClust
+                            ? num(row.net_t_stat_clustered)
+                            : hasGrossClust
+                              ? num(row.t_stat_clustered)
+                              : ("net_t_stat" in row && row.net_t_stat !== undefined
+                                  ? num(row.net_t_stat)
+                                  : num(row.t_stat));
                           return (
                             <tr key={idx}>
                               <td>{row.strategy}</td>

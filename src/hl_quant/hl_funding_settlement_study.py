@@ -59,6 +59,7 @@ class StrategyBucketStats:
     # Net after a stressed passive-execution cost (live alt fills measured ~5 bps one-way).
     net_maker_stress_bps: float = 0.0
     stress_rt_bps: float = 10.0
+    fdr_pass: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -281,25 +282,45 @@ def one_sided_p_value(t_stat: float, df: float | None = None) -> float:
     return 0.5 * math.erfc(t_stat / math.sqrt(2.0))
 
 
+def _opt_finite_float(v: object) -> float | None:
+    if v is None or pd.isna(v):
+        return None
+    try:
+        x = float(v)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
 def conservative_holdout_p_value(row: Any) -> float:
     """Larger of the naive (df = events - 1) and clustered (df = clusters - 1) Student-t p-values.
 
     Tests H0: net_maker_mean <= 0 via ``net_t_stat`` / ``net_t_stat_clustered`` when present,
-    falling back to ``t_stat`` / ``t_stat_clustered`` for legacy rows.
+    falling back to ``t_stat`` / ``t_stat_clustered`` only for legacy rows where the net key is absent.
     """
-    t_naive_raw = row.get("net_t_stat") if row.get("net_t_stat") is not None else row.get("t_stat", float("nan"))
-    t_naive = float(t_naive_raw)
-    t_cl_raw = (
-        row.get("net_t_stat_clustered")
-        if row.get("net_t_stat_clustered") is not None
-        else row.get("t_stat_clustered", t_naive)
-    )
-    t_cl = float(t_cl_raw)
-    events = float(row.get("events", 0) or 0)
-    clusters = float(row.get("clusters", 0) or 0)
+    if "net_t_stat" in row:
+        t_naive_opt = _opt_finite_float(row.get("net_t_stat"))
+        t_naive = t_naive_opt if t_naive_opt is not None else -math.inf
+    else:
+        t_naive_opt = _opt_finite_float(row.get("t_stat"))
+        t_naive = t_naive_opt if t_naive_opt is not None else -math.inf
+
+    if "net_t_stat_clustered" in row:
+        t_cl_opt = _opt_finite_float(row.get("net_t_stat_clustered"))
+        t_cl = t_cl_opt if t_cl_opt is not None else -math.inf
+    elif "t_stat_clustered" in row:
+        t_cl_opt = _opt_finite_float(row.get("t_stat_clustered"))
+        t_cl = t_cl_opt if t_cl_opt is not None else -math.inf
+    else:
+        t_cl = t_naive
+
+    events = _f(row.get("events"), 0.0)
+    clusters = _f(row.get("clusters"), 0.0)
+    if "clusters" in row and row.get("clusters") is not None and not pd.isna(row.get("clusters")) and clusters < 2:
+        t_cl = -math.inf
     p_naive = one_sided_p_value(t_naive, events - 1 if events >= 2 else None)
     p_cl = one_sided_p_value(
-        t_cl if math.isfinite(t_cl) else -math.inf,
+        t_cl,
         clusters - 1 if clusters >= 2 else (events - 1 if events >= 2 else None),
     )
     return max(p_naive, p_cl)
@@ -453,6 +474,14 @@ def evaluate_settlement_strategies(
                         stress_rt_bps=float(stress_rt_bps),
                     ).to_dict()
                 )
+    holdout_idxs = [i for i, r in enumerate(out_rows) if r["split"] == "holdout"]
+    if holdout_idxs:
+        bh_flags = benjamini_hochberg(
+            [conservative_holdout_p_value(out_rows[i]) for i in holdout_idxs],
+            SETTLEMENT_FDR_Q,
+        )
+        for idx, passed in zip(holdout_idxs, bh_flags, strict=False):
+            out_rows[idx]["fdr_pass"] = bool(passed)
     return pd.DataFrame(out_rows)
 
 
@@ -645,15 +674,21 @@ def _is_go_maker(d: Any, h: Any, *, maker_rt: float, fdr_ok: bool) -> bool:
     if d is None:
         return False
     ex_g = float(h.get("ex_top1_gross_bps", h["mean_gross_bps"]))
-    h_net_t_raw = h.get("net_t_stat") if h.get("net_t_stat") is not None else h["t_stat"]
-    h_net_t = float(h_net_t_raw)
-    h_net_t_cl_raw = (
-        h.get("net_t_stat_clustered")
-        if h.get("net_t_stat_clustered") is not None
-        else h.get("t_stat_clustered", h_net_t)
-    )
-    h_net_t_cl = float(h_net_t_cl_raw)
-    if not math.isfinite(h_net_t_cl):
+    if "net_t_stat" in h:
+        h_net_t_opt = _opt_finite_float(h.get("net_t_stat"))
+        h_net_t = h_net_t_opt if h_net_t_opt is not None else -math.inf
+    else:
+        h_net_t_opt = _opt_finite_float(h.get("t_stat"))
+        h_net_t = h_net_t_opt if h_net_t_opt is not None else -math.inf
+    if "net_t_stat_clustered" in h:
+        h_cl_opt = _opt_finite_float(h.get("net_t_stat_clustered"))
+        h_net_t_cl = h_cl_opt if h_cl_opt is not None else -math.inf
+    elif "t_stat_clustered" in h:
+        h_cl_opt = _opt_finite_float(h.get("t_stat_clustered"))
+        h_net_t_cl = h_cl_opt if h_cl_opt is not None else -math.inf
+    else:
+        h_net_t_cl = h_net_t
+    if "clusters" in h and h.get("clusters") is not None and not pd.isna(h.get("clusters")) and _f(h.get("clusters")) < 2:
         h_net_t_cl = -math.inf
     return bool(
         (float(d["net_maker_bps"]) > 0.0)

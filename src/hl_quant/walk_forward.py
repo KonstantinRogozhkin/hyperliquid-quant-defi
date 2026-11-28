@@ -101,12 +101,12 @@ def simulate_portfolio_weights(
                 p_end = max(int(src_panel.index.max()), int(hours.max()))
                 if (p_end - p_start) // fa.HOUR_MS <= 200_000:
                     full_grid = pd.Index(np.arange(p_start, p_end + 1, fa.HOUR_MS, dtype="int64"), name="hour_ms")
-                    hl_ff = hl_raw.reindex(full_grid).ffill(limit=2)
-                    cex_ff = cex_raw.reindex(full_grid).ffill(limit=2)
-                    hl_ff = hl_ff.where(full_grid <= last_valid_ms)
-                    cex_ff = cex_ff.where(full_grid <= last_valid_ms)
-                    hl_ret_full = (hl_ff / hl_ff.shift(1) - 1.0).fillna(0.0)
-                    cex_ret_full = (cex_ff / cex_ff.shift(1) - 1.0).fillna(0.0)
+                    hl_clean = hl_raw.reindex(full_grid).where(full_grid <= last_valid_ms)
+                    cex_clean = cex_raw.reindex(full_grid).where(full_grid <= last_valid_ms)
+                    hl_ff = hl_clean.ffill()
+                    cex_ff = cex_clean.ffill()
+                    hl_ret_full = (hl_ff / hl_ff.shift(1) - 1.0).where(hl_clean.notna(), 0.0).fillna(0.0)
+                    cex_ret_full = (cex_ff / cex_ff.shift(1) - 1.0).where(cex_clean.notna(), 0.0).fillna(0.0)
                     next_hl = hl_ret_full.reindex(hours).fillna(0.0).to_numpy(dtype=float)
                     next_cex = cex_ret_full.reindex(hours).fillna(0.0).to_numpy(dtype=float)
                 else:

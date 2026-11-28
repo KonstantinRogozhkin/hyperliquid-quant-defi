@@ -1187,14 +1187,21 @@ def run_live_mm_session(
         # Read starting position on this coin so MM tracks only its own delta inventory
         start_inv_sz = 0.0
         if execute_live and account_address:
-            ch = http.post(TESTNET_INFO_URL, json={"type": "clearinghouseState", "user": account_address}).json() or {}
+            try:
+                ch_raw = http.post(TESTNET_INFO_URL, json={"type": "clearinghouseState", "user": account_address}).json()
+            except Exception:
+                ch_raw = {}
+            ch = ch_raw if isinstance(ch_raw, dict) else {}
             for entry in ch.get("assetPositions") or []:
-                p = entry.get("position") or {}
+                p = (entry.get("position") or {}) if isinstance(entry, dict) else {}
                 if str(p.get("coin")) == coin:
                     start_inv_sz = float(p.get("szi", 0.0))
                     break
             # Ensure safe cross leverage (<=3x) before quoting
-            adapter.set_leverage(coin, max(1, min(3, spec.max_leverage)), is_cross=True)
+            try:
+                adapter.set_leverage(coin, max(1, min(3, spec.max_leverage)), is_cross=True)
+            except Exception:
+                pass
 
         vol_est = EWMAVolatilityEstimator(
             horizon_sec=params.horizon_sec,
@@ -1273,9 +1280,13 @@ def run_live_mm_session(
                         if oid is not None and oid not in live_oids:
                             active_orders.pop(side_k, None)
 
-                uf = http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json() or []
+                try:
+                    uf_raw = http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json()
+                except Exception:
+                    uf_raw = []
+                uf = uf_raw if isinstance(uf_raw, list) else []
                 for fl in uf:
-                    if str(fl.get("coin")) != coin:
+                    if not isinstance(fl, dict) or str(fl.get("coin")) != coin:
                         continue
                     f_oid = int(fl.get("oid", -1))
                     f_time = int(fl.get("time", 0))
@@ -1405,9 +1416,13 @@ def run_live_mm_session(
                             tif="Alo",
                             reduce_only=d_red,
                         )
-                        resp = adapter.place_alo_order(order)
+                        try:
+                            resp = adapter.place_alo_order(order)
+                        except Exception as exc:
+                            resp = {"status": "err", "response": f"{type(exc).__name__}: {exc}"}
                         oid, status = _extract_order_oid(resp)
-                        quotes_placed += 1
+                        if not status.startswith("err") and status != "unknown":
+                            quotes_placed += 1
                         if oid is not None:
                             all_mm_oids.add(oid)
                         if status in {"resting", "simulated_alo"}:
@@ -1889,6 +1904,9 @@ async def _binance_lead_reader(
                 continue
 
 
+_MM_CANCEL_GONE_MARKERS = ("already canceled", "already cancelled", "filled", "never placed")
+
+
 def _cancel_response_ok(cancel_resps: Any) -> bool:
     """Return True when an explicit cancel confirmed the order was removed without error.
 
@@ -1918,6 +1936,38 @@ def _cancel_response_ok(cancel_resps: Any) -> bool:
                 if isinstance(st, str) and "error" in st.lower():
                     return False
     return True
+
+
+def _cancel_response_confirmed_gone(cancel_resps: Any) -> bool:
+    """Return True when every cancel status indicates the order was already filled/cancelled/gone.
+
+    Distinguishes an order that is verifiably no longer resting on the book (safe to drop from
+    ``active_orders``, unsafe to immediately re-quote before fill ingestion) from an HTTP 429 or
+    transport timeout where ``prev_oid`` may STILL rest live on the book (must keep ``prev_oid`` in
+    ``active_orders`` so subsequent ticks never stack duplicate orders).
+    """
+    if not isinstance(cancel_resps, list) or not cancel_resps:
+        return False
+    saw_gone = False
+    for item in cancel_resps:
+        if not isinstance(item, dict) or item.get("status") == "err" or item.get("error"):
+            return False
+        sdk_resp = _unwrap_sdk_response(item)
+        if sdk_resp is None:
+            return False
+        statuses, err_msg = extract_hl_order_statuses(sdk_resp)
+        if err_msg is not None or not statuses:
+            return False
+        for st in statuses:
+            if st == "success":
+                continue
+            if isinstance(st, dict) and st.get("error"):
+                err_l = str(st.get("error")).lower()
+                if any(m in err_l for m in _MM_CANCEL_GONE_MARKERS):
+                    saw_gone = True
+                    continue
+            return False
+    return saw_gone
 
 
 async def _sync_coin_quotes_atomic(
@@ -2023,10 +2073,22 @@ async def _sync_coin_quotes_atomic(
                 active_orders.pop(side_k, None)
             cancelled += len(to_cancel)
             to_place.extend(deferred_after_cancel)
+        elif _cancel_response_confirmed_gone(cancel_resps):
+            for side_k in cancel_sides:
+                active_orders.pop(side_k, None)
 
     modified = 0
     if to_modify:
-        mod_resps = await asyncio.to_thread(adapter.modify_bulk_alo_orders, [(oid, o) for _, oid, o in to_modify])
+        try:
+            mod_resps = await asyncio.to_thread(adapter.modify_bulk_alo_orders, [(oid, o) for _, oid, o in to_modify])
+            if not isinstance(mod_resps, list):
+                mod_resps = [{"status": "err", "response": "invalid_modify_response"} for _ in to_modify]
+        except Exception as exc:
+            mod_resps = [{"status": "err", "response": f"{type(exc).__name__}: {exc}"} for _ in to_modify]
+        if len(mod_resps) < len(to_modify):
+            mod_resps = list(mod_resps) + [
+                {"status": "err", "response": "missing_modify_status"} for _ in range(len(to_modify) - len(mod_resps))
+            ]
         for (side_k, prev_oid, order), resp in zip(to_modify, mod_resps, strict=False):
             new_oid, status = _extract_order_oid(resp)
             if status in {"resting", "simulated_alo"} and new_oid is not None:
@@ -2039,19 +2101,29 @@ async def _sync_coin_quotes_atomic(
                     "reduce_only": bool(order.reduce_only),
                 }
             else:
-                # Modify rejected/failed: prev_oid may still be resting on the book OR may have just
-                # filled. Explicitly cancel prev_oid first; only re-place if cancel confirmed removal.
-                active_orders.pop(side_k, None)
+                # Modify rejected/failed: prev_oid may STILL rest live on the book (e.g. ALO cross
+                # rejection, HTTP 429, or transport timeout) OR may have already filled/cancelled.
+                # Never pop active_orders[side_k] before cancel confirms removal; otherwise a failed
+                # cancel leaves prev_oid resting invisibly and the next tick stacks a duplicate order!
+                if new_oid is not None:
+                    all_mm_oids.add(new_oid)
                 cancel_req = [{"coin": coin, "oid": prev_oid}]
                 try:
                     cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_req, fast=True)
                 except TypeError:
-                    cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_req)
+                    try:
+                        cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, cancel_req)
+                    except Exception as exc:
+                        cancel_resps = [{"status": "err", "response": f"{type(exc).__name__}: {exc}"}]
                 except Exception as exc:
-                    cancel_resps = [{"status": "err", "response": str(exc)}]
+                    cancel_resps = [{"status": "err", "response": f"{type(exc).__name__}: {exc}"}]
                 if _cancel_response_ok(cancel_resps):
+                    active_orders.pop(side_k, None)
                     cancelled += 1
                     to_place.append((side_k, order))
+                elif _cancel_response_confirmed_gone(cancel_resps):
+                    # Order already filled/cancelled: drop from active_orders, wait for fill ingestion before re-quoting.
+                    active_orders.pop(side_k, None)
             if audit_log_path is not None:
                 is_dry = isinstance(adapter, DryRunAdapter) or (
                     isinstance(resp, dict) and resp.get("mode") == "dry_run"
@@ -2078,12 +2150,23 @@ async def _sync_coin_quotes_atomic(
     placed = 0
     if to_place:
         if hasattr(adapter, "place_bulk_alo_orders"):
-            pl_resps = await asyncio.to_thread(adapter.place_bulk_alo_orders, [o for _, o in to_place])
+            try:
+                pl_resps = await asyncio.to_thread(adapter.place_bulk_alo_orders, [o for _, o in to_place])
+                if not isinstance(pl_resps, list):
+                    pl_resps = [{"status": "err", "response": "invalid_bulk_response"} for _ in to_place]
+            except Exception as exc:
+                pl_resps = [{"status": "err", "response": f"{type(exc).__name__}: {exc}"} for _ in to_place]
         else:
-            pl_resps = [await asyncio.to_thread(adapter.place_alo_order, o) for _, o in to_place]
+            pl_resps = []
+            for _, o in to_place:
+                try:
+                    pl_resps.append(await asyncio.to_thread(adapter.place_alo_order, o))
+                except Exception as exc:
+                    pl_resps.append({"status": "err", "response": f"{type(exc).__name__}: {exc}"})
         for (side_k, order), resp in zip(to_place, pl_resps, strict=False):
             oid, status = _extract_order_oid(resp)
-            placed += 1
+            if not status.startswith("err") and status != "unknown":
+                placed += 1
             if oid is not None:
                 all_mm_oids.add(oid)
             if status in {"resting", "simulated_alo"}:
@@ -2282,11 +2365,22 @@ async def run_multi_coin_mm_ws_session(
                             stats[c]["halt_events"].append(f"mempool_priority_disabled:{ua_mode}")
             except Exception:
                 pass
-            ch = http.post(TESTNET_INFO_URL, json={"type": "clearinghouseState", "user": account_address}).json() or {}
-            pos_by_coin = {str((e.get("position") or {}).get("coin")): float((e.get("position") or {}).get("szi", 0.0)) for e in (ch.get("assetPositions") or [])}
+            try:
+                ch_raw = http.post(TESTNET_INFO_URL, json={"type": "clearinghouseState", "user": account_address}).json()
+            except Exception:
+                ch_raw = {}
+            ch = ch_raw if isinstance(ch_raw, dict) else {}
+            pos_by_coin = {
+                str((e.get("position") or {}).get("coin")): float((e.get("position") or {}).get("szi", 0.0))
+                for e in (ch.get("assetPositions") or [])
+                if isinstance(e, dict)
+            }
             for c in coin_list:
                 ledgers[c] = _InventoryLedger(start_sz=pos_by_coin.get(c, 0.0), maker_fee_bps=params.maker_fee_bps)
-                await asyncio.to_thread(adapter.set_leverage, c, max(1, min(3, specs[c].max_leverage)), is_cross=True)
+                try:
+                    await asyncio.to_thread(adapter.set_leverage, c, max(1, min(3, specs[c].max_leverage)), is_cross=True)
+                except Exception:
+                    pass
 
         async def _refresh_dead_man(now_ms: int) -> None:
             nonlocal dead_man_refreshes, dead_man_armed
@@ -2660,12 +2754,12 @@ async def run_multi_coin_mm_ws_session(
                                         active_orders[cn].pop(sk, None)
                                         any_vanished = True
                             if any_vanished and any(all_mm_oids.values()):
-                                uf_rc = (
-                                    await asyncio.to_thread(
-                                        lambda: http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json()
-                                    )
-                                    or []
+                                uf_rc_raw = await asyncio.to_thread(
+                                    lambda: http.post(
+                                        TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}
+                                    ).json()
                                 )
+                                uf_rc = uf_rc_raw if isinstance(uf_rc_raw, list) else []
                                 now_rc_ms = int(time.time() * 1000)
                                 for fl in uf_rc:
                                     if isinstance(fl, dict):
@@ -2678,7 +2772,13 @@ async def run_multi_coin_mm_ws_session(
 
             # Final REST fill reconciliation for any fill arriving right at socket close
             if execute_live and account_address and any(all_mm_oids.values()):
-                uf = http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json() or []
+                try:
+                    uf_fin_raw = await asyncio.to_thread(
+                        lambda: http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json()
+                    )
+                except Exception:
+                    uf_fin_raw = []
+                uf = uf_fin_raw if isinstance(uf_fin_raw, list) else []
                 now_fin_ms = int(time.time() * 1000)
                 for fl in uf:
                     if isinstance(fl, dict):

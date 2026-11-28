@@ -88,15 +88,15 @@ def build_panel(
     # Close of the bar opening at h_k is the price at h_{k+1}; the return over
     # (h_k, h_{k+1}] is close_k / close_{k-1} - 1.
     for name, bars in (("hl", hl_bars), ("cex", cex_bars)):
-        close = bars.set_index("open_time_ms")["close"].astype(float).replace(0.0, np.nan)
-        close = close[~close.index.duplicated(keep="last")].reindex(grid)
-        close_ff = close.ffill(limit=2)
-        panel[f"{name}_close"] = close
-        panel[f"{name}_ret"] = (close_ff / close_ff.shift(1) - 1.0).fillna(0.0)
+        clean_close = bars.set_index("open_time_ms")["close"].astype(float).replace(0.0, np.nan)
+        clean_close = clean_close[~clean_close.index.duplicated(keep="last")].reindex(grid)
+        ff_close = clean_close.ffill()
+        panel[f"{name}_close"] = clean_close
+        panel[f"{name}_ret"] = (ff_close / ff_close.shift(1) - 1.0).where(clean_close.notna(), 0.0).fillna(0.0)
         if "volume" in bars.columns:
             vol = bars.set_index("open_time_ms")["volume"].astype(float)
             vol = vol[~vol.index.duplicated(keep="last")].reindex(grid)
-            panel[f"{name}_notional_usd"] = close * vol
+            panel[f"{name}_notional_usd"] = clean_close * vol
 
     for name, events in (("hl", hl_funding), ("cex", cex_funding)):
         settle = (events["time_ms"].astype("int64") // HOUR_MS) * HOUR_MS

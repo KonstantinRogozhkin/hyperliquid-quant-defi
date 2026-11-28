@@ -604,7 +604,12 @@ def compute_gross_deposited_capital_usd(
     ledger_updates: list[dict[str, Any]] | None,
     account_address: str,
 ) -> float | None:
-    """Cumulative positive external USDC inflows (deposits, incoming transfers, vault withdrawals)."""
+    """Cumulative positive external USDC inflows (external L1 deposits and incoming transfers).
+
+    Excludes ``vaultWithdraw`` / ``vaultDistribution`` because ``vaultDeposit`` moved internal
+    account capital into a vault; counting vault returns as fresh external deposits would inflate
+    the return denominator on every vault round-trip.
+    """
     if not ledger_updates:
         return None
     me = account_address.strip().lower()
@@ -617,11 +622,6 @@ def compute_gross_deposited_capital_usd(
         dtype = str(delta.get("type") or "").strip()
         if dtype == "deposit":
             amt = abs(_f(delta.get("usdc")))
-            if amt > 0:
-                gross_in += amt
-                found = True
-        elif dtype in {"vaultWithdraw", "vaultDistribution"}:
-            amt = abs(_f(delta.get("netWithdrawnUsd"), _f(delta.get("usdc"))))
             if amt > 0:
                 gross_in += amt
                 found = True
@@ -727,14 +727,12 @@ def load_paper_comparison(
     start_cap = float(state.get("starting_capital_usd", 100_000.0))
     paper_eq = float(ticks["equity_usd"].iloc[-1])
     paper_ret_pct = (paper_eq / start_cap - 1.0) * 100.0 if start_cap > 0 else 0.0
-    if deposited_capital_usd is not None and deposited_capital_usd > 0.0:
-        testnet_start = float(deposited_capital_usd)
+    base_cap = max(float(deposited_capital_usd or 0.0), float(gross_deposited_usd or 0.0))
+    if base_cap > 0.0:
+        testnet_start = base_cap
         attributed_ret_pct = (testnet_net_pnl_usd / testnet_start) * 100.0
-        testnet_ret_pct = (testnet_equity_usd - testnet_start) / testnet_start * 100.0
-    elif net_flow_usd is not None and net_flow_usd <= 0.0 and gross_deposited_usd is not None and gross_deposited_usd > 0.0:
-        testnet_start = float(gross_deposited_usd)
-        attributed_ret_pct = (testnet_net_pnl_usd / testnet_start) * 100.0
-        testnet_ret_pct = (testnet_equity_usd - net_flow_usd) / testnet_start * 100.0
+        eff_flow = float(net_flow_usd) if net_flow_usd is not None else float(deposited_capital_usd or base_cap)
+        testnet_ret_pct = ((testnet_equity_usd - eff_flow) / testnet_start) * 100.0
     else:
         implied_start = testnet_equity_usd - testnet_net_pnl_usd
         testnet_start = implied_start if implied_start > 1.0 else max(1.0, abs(testnet_equity_usd))
@@ -1027,14 +1025,14 @@ def compute_post_trade_attribution(
     net_flow = net_external_usdc_flow_usd(ledger_rows, acct_addr_str)
     dep_cap = compute_net_deposited_capital_usd(ledger_rows, acct_addr_str)
     gross_dep = compute_gross_deposited_capital_usd(ledger_rows, acct_addr_str)
-    if dep_cap is not None and dep_cap > 0.0:
-        eff_dep_cap = dep_cap
-        acct_ret_pct = (total_eq - eff_dep_cap) / eff_dep_cap * 100.0
-    elif net_flow is not None and net_flow <= 0.0 and gross_dep is not None and gross_dep > 0.0:
-        # House-money account (withdrawals >= deposits): anchor return denominator to gross deposits
-        # instead of max(1.0, total_eq - net_attr) which exploded to +50,000%+.
-        eff_dep_cap = gross_dep
-        acct_ret_pct = ((total_eq - net_flow) / gross_dep) * 100.0
+    base_dep_cap = max(float(dep_cap or 0.0), float(gross_dep or 0.0))
+    if base_dep_cap > 0.0:
+        # Anchor return denominator to max(net_deposited, gross_deposited) so partial withdrawals
+        # approaching 0+ net_flow (e.g. withdrawing $999 of $1,000) transition smoothly to
+        # house-money accounts without a +50,000% singularity at net_flow -> 0+.
+        eff_dep_cap = base_dep_cap
+        eff_flow = float(net_flow) if net_flow is not None else float(dep_cap or base_dep_cap)
+        acct_ret_pct = ((total_eq - eff_flow) / eff_dep_cap) * 100.0
     else:
         implied_cap = total_eq - net_attr
         if implied_cap > 1.0:

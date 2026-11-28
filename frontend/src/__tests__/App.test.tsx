@@ -2001,4 +2001,116 @@ describe("Wave 4 UI-01..UI-04 regressions", () => {
     // Trailing window return is (11220 - 11000) / 11000 = +2.000% over 2 / 1200 ticks (not +12.200% from 10000)
     expect(screen.getByText("+2.000% (2 / 1200 ticks)")).toBeInTheDocument();
   });
+
+  it("Pass-5: does not fall back to unclustered t_stat when clustered key is null, gates ex_top1, and suppresses .pos whenever !isVerified", async () => {
+    mockFetch(
+      makeOverview({
+        settlement_stats: [
+          // 1. Explicitly null clustered t-stat (< 2 clusters) with huge naive t_stat = 6.0 -> MUST fail verification & suppress .pos!
+          {
+            strategy: "null_clustered_t_15m",
+            bucket: "APR>=+50% (pos)",
+            split: "holdout",
+            events: 30,
+            mean_gross_bps: 45.0,
+            t_stat: 6.0,
+            net_t_stat: 5.5,
+            t_stat_clustered: null,
+            net_t_stat_clustered: null,
+            fdr_pass: true,
+            win_rate_pct: 70,
+            net_maker_bps: 42.0,
+            net_taker_bps: 36.0,
+          },
+          // 2. Single-coin outlier (ex_top1_gross_bps - maker_rt = 2.0 - 3.0 = -1.0 <= 0) -> MUST fail verification & suppress .pos!
+          {
+            strategy: "single_coin_outlier_15m",
+            bucket: "|APR|>=50% (all)",
+            split: "holdout",
+            events: 50,
+            mean_gross_bps: 38.0,
+            t_stat: 4.5,
+            t_stat_clustered: 3.2,
+            net_t_stat_clustered: 2.8,
+            ex_top1_gross_bps: 2.0,
+            fdr_pass: true,
+            win_rate_pct: 62,
+            net_maker_bps: 35.0,
+            net_taker_bps: 29.0,
+          },
+          // 3. Dev loser with valid clustered t and fdr_pass -> MUST also suppress .pos on net_maker_bps!
+          {
+            strategy: "dev_neg_suppress_pos",
+            bucket: "APR<=-25% (neg)",
+            split: "dev",
+            events: 90,
+            mean_gross_bps: 1.0,
+            t_stat: 0.8,
+            win_rate_pct: 50,
+            net_maker_bps: -2.0,
+            net_taker_bps: -8.0,
+          },
+          {
+            strategy: "dev_neg_suppress_pos",
+            bucket: "APR<=-25% (neg)",
+            split: "holdout",
+            events: 45,
+            mean_gross_bps: 29.0,
+            t_stat: 3.2,
+            t_stat_clustered: 2.6,
+            net_t_stat_clustered: 2.4,
+            ex_top1_gross_bps: 15.0,
+            fdr_pass: true,
+            win_rate_pct: 60,
+            net_maker_bps: 26.0,
+            net_taker_bps: 20.0,
+          },
+          // 4. Fully verified row (lower net_maker_bps = 12.0, but passes all gates -> ranks #1 AND keeps .pos!)
+          {
+            strategy: "clean_verified_15m",
+            bucket: "APR>=+25% (pos)",
+            split: "dev",
+            events: 150,
+            mean_gross_bps: 14.0,
+            t_stat: 3.5,
+            win_rate_pct: 61,
+            net_maker_bps: 11.0,
+            net_taker_bps: 5.0,
+          },
+          {
+            strategy: "clean_verified_15m",
+            bucket: "APR>=+25% (pos)",
+            split: "holdout",
+            events: 80,
+            mean_gross_bps: 15.0,
+            t_stat: 3.3,
+            t_stat_clustered: 2.8,
+            net_t_stat_clustered: 2.45,
+            ex_top1_gross_bps: 11.5,
+            fdr_pass: true,
+            win_rate_pct: 62,
+            net_maker_bps: 12.0,
+            net_taker_bps: 6.0,
+          },
+        ],
+      }),
+    );
+
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    const settleSection = screen.getByText(":00 Funding Settlement OOS Study").closest("section")!;
+    const bodyRows = within(settleSection).getAllByRole("row").slice(1);
+    expect(bodyRows[0]).toHaveTextContent("clean_verified_15m");
+    expect(within(bodyRows[0]).getByText("12.00 bps").closest("td")).toHaveClass("pos");
+
+    // Null clustered t renders "—" in t-stat column (never naive 6.00/5.50) and has NO .pos class
+    const nullClRow = within(settleSection).getByText("null_clustered_t_15m").closest("tr")!;
+    expect(within(nullClRow).getAllByRole("cell")[5]).toHaveTextContent("—");
+    expect(within(nullClRow).getByText("42.00 bps").closest("td")).not.toHaveClass("pos");
+
+    // Ex-top1 net <= 0 and Dev loser both suppress .pos
+    expect(within(settleSection).getByText("35.00 bps").closest("td")).not.toHaveClass("pos");
+    expect(within(settleSection).getByText("26.00 bps").closest("td")).not.toHaveClass("pos");
+  });
 });

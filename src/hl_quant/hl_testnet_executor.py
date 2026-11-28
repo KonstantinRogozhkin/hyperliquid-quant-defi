@@ -280,7 +280,7 @@ def strip_own_orders_from_l2_levels(
 
     own_by_side: tuple[list[tuple[float, float]], list[tuple[float, float]]] = ([], [])
     for oo in open_orders:
-        if not isinstance(oo, dict) or str(oo.get("coin") or "").strip() != coin:
+        if not isinstance(oo, dict) or oo.get("isTrigger") is True or str(oo.get("coin") or "").strip() != coin:
             continue
         side_raw = str(oo.get("side") or "").strip().upper()
         if side_raw in {"B", "BUY"}:
@@ -462,14 +462,16 @@ def fetch_testnet_account(client: httpx.Client, account_address: str) -> Account
             break
 
     open_orders: list[dict[str, Any]] = []
+    got_open_orders = False
     try:
         foo_resp = _post_testnet_info(client, {"type": "frontendOpenOrders", "user": account_address})
         foo_val = foo_resp.json()
-        if isinstance(foo_val, list) and foo_val:
+        if isinstance(foo_val, list):
             open_orders = [o for o in foo_val if isinstance(o, dict)]
+            got_open_orders = True
     except Exception:
         open_orders = []
-    if not open_orders:
+    if not got_open_orders:
         oo_resp = _post_testnet_info(client, {"type": "openOrders", "user": account_address})
         oo_val = oo_resp.json()
         if isinstance(oo_val, list):
@@ -551,6 +553,7 @@ def check_kill_switch(
     high_water_mark_usd: float,
     now_ms: int | None = None,
     retained_coins: set[str] | None = None,
+    oracle_equity_usd: float | None = None,
 ) -> list[str]:
     """Return list of risk violations; non-empty list halts new entries and cancels open orders.
 
@@ -569,12 +572,16 @@ def check_kill_switch(
         reasons.append("non_finite_target_weight")
         return reasons
 
-    if account.equity_usd <= 0:
+    eff_dd_eq = account.equity_usd
+    if oracle_equity_usd is not None and math.isfinite(oracle_equity_usd):
+        eff_dd_eq = min(eff_dd_eq, float(oracle_equity_usd))
+
+    if eff_dd_eq <= 0:
         reasons.append("zero_or_negative_equity")
         return reasons
 
     if high_water_mark_usd > 0:
-        dd_pct = drawdown_pct(account.equity_usd, high_water_mark_usd)
+        dd_pct = drawdown_pct(eff_dd_eq, high_water_mark_usd)
         if dd_pct >= limits.max_drawdown_pct:
             reasons.append(f"drawdown_limit:{dd_pct:.2f}%>={limits.max_drawdown_pct:.2f}%")
 
@@ -997,11 +1004,23 @@ def orphan_residual_notional_usd(
     return out
 
 
-def load_logged_order_coins(audit_log_path: Path | None) -> set[str]:
-    """Collect coin symbols recorded in a live MM JSONL audit log (skipping dry-run records)."""
+def load_logged_order_coins(
+    audit_log_path: Path | None,
+    *,
+    min_ts_ms: int | None = None,
+    max_age_ms: int | None = 24 * 3_600_000,
+    now_ms: int | None = None,
+) -> set[str]:
+    """Collect recent coin symbols recorded in a live MM JSONL audit log (skipping dry-run & stale records)."""
     coins: set[str] = set()
     if audit_log_path is None or not audit_log_path.is_file():
         return coins
+    cutoff_ms: int | None = None
+    if min_ts_ms is not None:
+        cutoff_ms = int(min_ts_ms)
+    elif max_age_ms is not None and max_age_ms > 0:
+        ref_now = int(now_ms if now_ms is not None else time.time() * 1000)
+        cutoff_ms = ref_now - int(max_age_ms)
     for line in audit_log_path.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line:
@@ -1012,6 +1031,13 @@ def load_logged_order_coins(audit_log_path: Path | None) -> set[str]:
             continue
         if not isinstance(rec, dict) or rec.get("mode") == "dry_run":
             continue
+        if cutoff_ms is not None:
+            rec_ts = safe_int(rec.get("ts_ms"))
+            if rec_ts is None:
+                if min_ts_ms is not None:
+                    continue
+            elif rec_ts < cutoff_ms:
+                continue
         c = str(rec.get("coin") or "").strip()
         if c:
             coins.add(c)
@@ -1306,7 +1332,13 @@ def _atomic_write_json(path: Path, payload: dict[str, Any]) -> None:
             tmp.unlink(missing_ok=True)
 
 
-def save_high_water_mark(path: Path, value: float, *, net_external_flow_usd: float | None = None) -> None:
+def save_high_water_mark(
+    path: Path,
+    value: float,
+    *,
+    net_external_flow_usd: float | None = None,
+    last_equity_usd: float | None = None,
+) -> None:
     payload: dict[str, Any] = {}
     if path.is_file():
         try:
@@ -1320,6 +1352,8 @@ def save_high_water_mark(path: Path, value: float, *, net_external_flow_usd: flo
     payload["high_water_mark_usd"] = float(value)
     if net_external_flow_usd is not None and math.isfinite(net_external_flow_usd):
         payload["net_external_flow_usd"] = float(net_external_flow_usd)
+    if last_equity_usd is not None and math.isfinite(last_equity_usd) and last_equity_usd > 0.0:
+        payload["last_equity_usd"] = float(last_equity_usd)
     _atomic_write_json(path, payload)
 
 
@@ -1331,6 +1365,19 @@ def load_hwm_net_flow(path: Path) -> float | None:
         raw = json.loads(path.read_text())
         value = raw.get("net_external_flow_usd") if isinstance(raw, dict) else None
         return float(value) if value is not None and math.isfinite(float(value)) else None
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+def load_hwm_last_equity(path: Path) -> float | None:
+    """Last observed oracle-adjusted equity stored alongside the HWM (``None`` if never stored)."""
+    if not path.is_file():
+        return None
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        value = raw.get("last_equity_usd") if isinstance(raw, dict) else None
+        val_f = float(value) if value is not None else float("nan")
+        return val_f if math.isfinite(val_f) and val_f > 0.0 else None
     except (OSError, ValueError, TypeError):
         return None
 
@@ -1351,17 +1398,20 @@ def flow_adjusted_high_water_mark(
     cur_net_flow_usd: float | None,
     *,
     current_equity_usd: float | None = None,
+    pre_flow_equity_usd: float | None = None,
 ) -> float:
     """Adjust the HWM for external capital moved since it was stored.
 
-    When ``current_equity_usd`` is supplied and positive:
     * Deposits (``delta >= 0``) add dollar-for-dollar (``stored_hwm + delta``) so fresh capital is
       never treated as trading profit.
-    * Withdrawals (``delta < 0``, ``W = -delta``) scale multiplicatively by
-      ``current_equity_usd / (current_equity_usd + W)`` so percentage drawdown ``(H - E) / H``
-      stays strictly invariant across arbitrarily large capital withdrawals.
-
-    When ``current_equity_usd`` is omitted, falls back to ``max(0.0, stored_hwm + delta)``.
+    * Withdrawals (``delta < 0``, ``W = -delta``):
+      - When ``pre_flow_equity_usd`` (recorded before the withdrawal) is known and ``> W``, scales
+        by ``(pre_flow_equity_usd - W) / pre_flow_equity_usd`` so BOTH pre-withdrawal percentage
+        drawdown AND any subsequent post-withdrawal trading loss are measured accurately without
+        canceling ``E_now`` out of ``drawdown_pct``.
+      - Otherwise when ``current_equity_usd`` is positive, scales by
+        ``current_equity_usd / (current_equity_usd + W)``.
+      - Otherwise falls back to ``max(0.0, stored_hwm + delta)``.
     """
     if stored_hwm <= 0 or prev_net_flow_usd is None or cur_net_flow_usd is None:
         return stored_hwm
@@ -1370,10 +1420,12 @@ def flow_adjusted_high_water_mark(
         return stored_hwm
     if abs(delta) <= 1e-12:
         return stored_hwm
+    if delta >= 0.0:
+        return max(0.0, stored_hwm + delta)
+    withdrawal = -delta
+    if pre_flow_equity_usd is not None and math.isfinite(pre_flow_equity_usd) and pre_flow_equity_usd > withdrawal:
+        return max(0.0, stored_hwm * ((pre_flow_equity_usd - withdrawal) / pre_flow_equity_usd))
     if current_equity_usd is not None and math.isfinite(current_equity_usd) and current_equity_usd > 0:
-        if delta >= 0.0:
-            return max(0.0, stored_hwm + delta)
-        withdrawal = -delta
         pre_withdrawal_eq = current_equity_usd + withdrawal
         if pre_withdrawal_eq > 0:
             return max(0.0, stored_hwm * (current_equity_usd / pre_withdrawal_eq))
@@ -1386,7 +1438,7 @@ def _is_drawdown_flatten_record(rec: dict[str, Any]) -> bool:
     violations = rec.get("violations")
     if not isinstance(violations, list) or not violations:
         return False
-    return all(isinstance(v, str) and v.startswith("drawdown_limit:") for v in violations)
+    return any(isinstance(v, str) and v.startswith("drawdown_limit:") for v in violations)
 
 
 def reanchor_hwm_after_flatten(
@@ -1462,6 +1514,7 @@ def reanchor_hwm_after_flatten(
     if persist:
         payload: dict[str, Any] = {
             "high_water_mark_usd": new_hwm,
+            "last_equity_usd": new_hwm,
             "pre_reanchor_hwm_usd": float(stored_hwm),
             "reanchored_at_ms": int(now_ms),
             "reanchored_streak_ms": int(streak_start_ms),
@@ -1621,6 +1674,7 @@ def execute_rebalance_cycle(
     foreign_order_oids: set[int] | None = None,
     foreign_coins: set[str] | None = None,
     orphan_target_weights: dict[str, float] | None = None,
+    oracle_equity_usd: float | None = None,
 ) -> dict[str, Any]:
     """Run one complete Testnet rebalance cycle: kill-switch -> cancel stale -> place sliced ALO orders.
 
@@ -1659,15 +1713,27 @@ def execute_rebalance_cycle(
         if abs(float(account.positions_sz.get(c, 0.0) or 0.0)) > 1e-12
     }
     violations = check_kill_switch(
-        account, target_weights, bbo, limits, high_water_mark_usd=hwm, now_ms=now_ms, retained_coins=foreign
+        account,
+        target_weights,
+        bbo,
+        limits,
+        high_water_mark_usd=hwm,
+        now_ms=now_ms,
+        retained_coins=foreign,
+        oracle_equity_usd=oracle_equity_usd,
     )
     # Persist the account view the kill-switch evaluated, so the audit trail (and /metrics) show
     # equity, drawdown and orphan exposure even on cycles where nothing trips.
     orphan_notional_usd = sum(abs(float(account.position_notional_usd.get(c, 0.0) or 0.0)) for c in orphan_positions)
+    eff_dd_eq = (
+        min(account.equity_usd, float(oracle_equity_usd))
+        if oracle_equity_usd is not None and math.isfinite(oracle_equity_usd)
+        else account.equity_usd
+    )
     account_fields: dict[str, Any] = {
         "equity_usd": round(account.equity_usd, 6),
         "free_margin_usd": round(account.free_margin_usd, 6),
-        "drawdown_pct": round(drawdown_pct(account.equity_usd, hwm), 4),
+        "drawdown_pct": round(drawdown_pct(eff_dd_eq, hwm), 4),
         "orphan_notional_usd": round(orphan_notional_usd, 4),
     }
 
@@ -1884,18 +1950,45 @@ def execute_rebalance_cycle(
             now_ms=0,
             exclude_coins=foreign,
         )
-        asymmetry_dropped_coins = blocked_isolated_coins | blocked_leverage_coins | oracle_blocked | (
-            {o.coin for o in unblocked_baseline if not o.reduce_only}
-            - {o.coin for o in planned if not o.reduce_only}
+        asymmetry_dropped_coins = (
+            blocked_isolated_coins
+            | blocked_leverage_coins
+            | cancel_failed
+            | oracle_blocked
+            | ({o.coin for o in unblocked_baseline if not o.reduce_only} - {o.coin for o in planned if not o.reduce_only})
         )
         if asymmetry_dropped_coins:
             def _order_mid_ntl(order: PlannedOrder) -> float:
                 mid_p = 0.5 * (bbo[order.coin][0] + bbo[order.coin][1]) if order.coin in bbo else order.limit_px
                 return order.sz * mid_p
 
+            def _signed_order_ntl(order: PlannedOrder) -> float:
+                return _order_mid_ntl(order) if order.side == "buy" else -_order_mid_ntl(order)
+
+            perp_eq_cycle = max(0.0, effective_perp_equity_usd(account))
+            managed_scope = (
+                (set(account.positions_sz) | {o.coin for o in unblocked_baseline} | {o.coin for o in surviving})
+                - foreign
+            )
+            cur_net_usd = 0.0
+            for c_pos in managed_scope:
+                c_sz = float(account.positions_sz.get(c_pos, 0.0) or 0.0)
+                if abs(c_sz) <= 1e-12:
+                    continue
+                if c_pos in bbo:
+                    cur_net_usd += c_sz * 0.5 * (bbo[c_pos][0] + bbo[c_pos][1])
+                elif c_pos in account.position_notional_usd and abs(float(account.position_notional_usd[c_pos] or 0.0)) > 0:
+                    cur_net_usd += math.copysign(abs(float(account.position_notional_usd[c_pos])), c_sz)
+                elif reference_px and c_pos in reference_px and float(reference_px[c_pos] or 0.0) > 0:
+                    cur_net_usd += c_sz * float(reference_px[c_pos])
+
+            intended_net_usd = cur_net_usd + sum(_signed_order_ntl(o) for o in unblocked_baseline)
+            raw_post_net_usd = cur_net_usd + sum(_signed_order_ntl(o) for o in surviving)
+            net_tol = max(abs(intended_net_usd) + float(limits.min_order_usd), 0.10 * perp_eq_cycle)
+
             intended_buy_ntl = sum(_order_mid_ntl(o) for o in unblocked_baseline if not o.reduce_only and o.side == "buy")
             intended_sell_ntl = sum(_order_mid_ntl(o) for o in unblocked_baseline if not o.reduce_only and o.side == "sell")
-            if intended_buy_ntl > 0.0 and intended_sell_ntl > 0.0:
+            if abs(raw_post_net_usd) > net_tol and intended_buy_ntl > 0.0 and intended_sell_ntl > 0.0:
                 surv_buy_ntl = sum(_order_mid_ntl(o) for o in surviving if not o.reduce_only and o.side == "buy")
                 surv_sell_ntl = sum(_order_mid_ntl(o) for o in surviving if not o.reduce_only and o.side == "sell")
                 r_buy = surv_buy_ntl / intended_buy_ntl
@@ -1950,6 +2043,69 @@ def execute_rebalance_cycle(
                             emitted_scaled_coins.add(o.coin)
                             rebalanced_surviving.extend(resliced_by_coin.get(o.coin, []))
                     surviving = rebalanced_surviving
+
+            # Portfolio-rotation delta guard: when a replacement leg is blocked (e.g. rotating
+            # Long SOL -> Long BTC while Short ETH stays open, and BTC is blocked), executing the
+            # reduce_only SOL close would strand Short ETH 100% unhedged. Trim/defer non-mandatory
+            # opposing orders in normal rebalancing so |post_net_usd| stays within tolerance.
+            post_net_usd = cur_net_usd + sum(_signed_order_ntl(o) for o in surviving)
+            if abs(post_net_usd) > net_tol:
+                excess_net = post_net_usd - intended_net_usd
+                trim_side = "buy" if excess_net > 0 else ("sell" if excess_net < 0 else None)
+                if trim_side is not None and (post_net_usd * excess_net > 0):
+                    def _is_trimmable(order: PlannedOrder) -> bool:
+                        if order.side != trim_side or order.coin not in meta:
+                            return False
+                        if meta[order.coin].only_isolated and not limits.allow_only_isolated:
+                            return False
+                        return True
+
+                    trim_ntl = sum(_order_mid_ntl(o) for o in surviving if _is_trimmable(o))
+                    if trim_ntl > 0.0:
+                        need_cut = min(trim_ntl, abs(excess_net))
+                        keep_scale = max(0.0, 1.0 - need_cut / trim_ntl)
+                        if keep_scale < 1.0 - 1e-6:
+                            grp_totals: dict[tuple[str, bool], tuple[float, float]] = {}
+                            grp_order: list[tuple[str, bool]] = []
+                            for o in surviving:
+                                if not _is_trimmable(o):
+                                    continue
+                                gk = (o.coin, bool(o.reduce_only))
+                                if gk not in grp_totals:
+                                    grp_order.append(gk)
+                                    grp_totals[gk] = (o.sz, o.limit_px)
+                                else:
+                                    p_sz, lpx = grp_totals[gk]
+                                    grp_totals[gk] = (p_sz + o.sz, lpx)
+                            resliced_grp: dict[tuple[str, bool], list[PlannedOrder]] = {}
+                            if keep_scale > 1e-9:
+                                for c_name, is_ro in grp_order:
+                                    tot_sz, lpx = grp_totals[(c_name, is_ro)]
+                                    mid_px = 0.5 * (bbo[c_name][0] + bbo[c_name][1]) if c_name in bbo else lpx
+                                    resliced_grp[(c_name, is_ro)] = _emit_sliced_alo_leg(
+                                        c_name,
+                                        trim_side,
+                                        tot_sz * keep_scale,
+                                        lpx,
+                                        meta[c_name].sz_decimals,
+                                        reduce_only=is_ro,
+                                        is_full_close=False,
+                                        max_child_usd=limits.max_child_usd,
+                                        min_order_usd=limits.min_order_usd,
+                                        start_child_index=0,
+                                        ref_px=mid_px,
+                                    )
+                            emitted_grp: set[tuple[str, bool]] = set()
+                            trimmed_surviving: list[PlannedOrder] = []
+                            for o in surviving:
+                                if not _is_trimmable(o):
+                                    trimmed_surviving.append(o)
+                                    continue
+                                gk = (o.coin, bool(o.reduce_only))
+                                if gk not in emitted_grp:
+                                    emitted_grp.add(gk)
+                                    trimmed_surviving.extend(resliced_grp.get(gk, []))
+                            surviving = trimmed_surviving
 
         executable = surviving + orphan_unwinds
         placed = _submit_alo_orders(adapter, executable)

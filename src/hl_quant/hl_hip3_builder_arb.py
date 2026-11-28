@@ -350,7 +350,7 @@ def scan_hip3_cross_builder_arb(
         _, sl25, ok25 = cds.compute_executable_cross_dex_entry_bps(sb, sa, lb, la, short_hl=True, clip_usd=25_000.0)
         be_h: float | None = None
         be_h_taker: float | None = None
-        if sl5 is not None and eb5 is not None:
+        if ok5 and sl5 is not None and eb5 is not None:
             rt_m = opp.est_rt_maker_fee_bps if opp.est_rt_maker_fee_bps > 0 else round_trip_fee_bps
             mark_credit = cds.credited_entry_basis_bps(eb5, opp.mark_basis_bps)
             credit = (

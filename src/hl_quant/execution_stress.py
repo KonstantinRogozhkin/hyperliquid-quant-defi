@@ -115,9 +115,9 @@ def run_execution_monte_carlo(
         aprs = paths_r.mean(axis=1) * af.HOURS_PER_YEAR
         stds = paths_r.std(axis=1, ddof=1) if n >= 2 else np.zeros(n_paths, dtype=float)
         sharpes = np.where(stds > 0, paths_r.mean(axis=1) / stds * math.sqrt(af.HOURS_PER_YEAR), 0.0)
-        eq = np.cumsum(paths_r, axis=1)
-        peak = np.maximum.accumulate(np.hstack([np.zeros((n_paths, 1)), eq]), axis=1)[:, 1:]
-        max_dds = (eq - peak).min(axis=1)
+        wealth = np.cumprod(np.maximum(1.0 + paths_r, 1e-6), axis=1)
+        peak = np.maximum.accumulate(np.hstack([np.ones((n_paths, 1)), wealth]), axis=1)[:, 1:]
+        max_dds = (wealth / peak - 1.0).min(axis=1)
 
         results.append(
             StressSummary(
