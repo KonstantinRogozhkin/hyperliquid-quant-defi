@@ -199,8 +199,16 @@ async def record_hl_microstructure(
     trades_df = pd.DataFrame(trade_rows)
     if not trades_df.empty and "tid" in trades_df.columns:
         trades_df = trades_df.drop_duplicates(subset=["coin", "tid", "trade_time_ms"]).reset_index(drop=True)
-    l2_df.to_parquet(output_dir / "l2_ticks.parquet", index=False)
-    trades_df.to_parquet(output_dir / "trades.parquet", index=False)
+    l2_path = output_dir / "l2_ticks.parquet"
+    l2_tmp = l2_path.with_suffix(".parquet.tmp")
+    l2_df.to_parquet(l2_tmp, index=False)
+    l2_tmp.replace(l2_path)
+
+    trades_path = output_dir / "trades.parquet"
+    trades_tmp = trades_path.with_suffix(".parquet.tmp")
+    trades_df.to_parquet(trades_tmp, index=False)
+    trades_tmp.replace(trades_path)
+
     meta = {
         "coins": coins,
         "duration_sec": round(time.monotonic() - started, 2),
@@ -208,7 +216,10 @@ async def record_hl_microstructure(
         "trade_rows": len(trades_df),
         "output_dir": str(output_dir),
     }
-    (output_dir / "recording_meta.json").write_text(json.dumps(meta, indent=2))
+    meta_path = output_dir / "recording_meta.json"
+    meta_tmp = meta_path.with_suffix(".json.tmp")
+    meta_tmp.write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    meta_tmp.replace(meta_path)
     return meta
 
 

@@ -1,6 +1,6 @@
 # `hyperliquid-quant-defi` (`hl_quant`) — Техническая Wiki
 
-Добро пожаловать в полную инженерную документацию автономного full-stack стека **`hyperliquid-quant-defi`** (`src/hl_quant/` 37 модулей + **FastAPI API** + **7-вкладочное React/Vite/TS SPA** + **16-job Docker worker** + **GHCR & Dokploy CI/CD**, **291+ unit-тестов pytest** и **28+ Vitest** за PR-only Ruleset `tests` + `frontend`, нулевые внешние зависимости от монорепозиториев).
+Добро пожаловать в полную инженерную документацию автономного full-stack стека **`hyperliquid-quant-defi`** (`src/hl_quant/` 37 модулей + **FastAPI API** + **7-вкладочное React/Vite/TS SPA** + **16-job Docker worker** + **GHCR & Dokploy CI/CD**, **340+ unit-тестов pytest** и **33+ Vitest** за PR-only Ruleset `tests` + `frontend`, нулевые внешние зависимости от монорепозиториев).
 
 ---
 
@@ -73,6 +73,6 @@ flowchart LR
 ```bash
 uv sync --all-extras
 make lint       # ruff check src scripts tests
-make test       # 291+ unit tests (~5s)
+make test       # 340+ unit tests (~5s)
 make docker-up  # local Nginx + React SPA + FastAPI on http://localhost:8080
 ```
