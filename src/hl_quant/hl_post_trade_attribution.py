@@ -550,6 +550,22 @@ def compute_net_deposited_capital_usd(
     ignored because ``total_eq`` already consolidates Perp + Spot equity.
     Returns ``None`` when no external USDC ledger flows exist so offline callers fall back cleanly.
     """
+    net_flow = net_external_usdc_flow_usd(ledger_updates, account_address)
+    if net_flow is None or net_flow <= 0.0:
+        return None
+    return net_flow
+
+
+def net_external_usdc_flow_usd(
+    ledger_updates: list[dict[str, Any]] | None,
+    account_address: str,
+) -> float | None:
+    """Signed cumulative external USDC flow (deposits/incoming minus withdrawals/outgoing + fees).
+
+    ``None`` when the ledger holds no external USDC flow at all. Unlike
+    :func:`compute_net_deposited_capital_usd` this may be zero or negative, which the drawdown
+    high-water mark needs to offset withdrawals.
+    """
     if not ledger_updates:
         return None
     me = account_address.strip().lower()
@@ -589,7 +605,7 @@ def compute_net_deposited_capital_usd(
             elif me and src == me and dst != me:
                 net_flow -= amt + fee
                 found = True
-    if not found or net_flow <= 0.0:
+    if not found:
         return None
     return round(net_flow, 4)
 

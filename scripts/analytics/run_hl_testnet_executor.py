@@ -24,6 +24,7 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from hl_quant import hl_post_trade_attribution as pta  # noqa: E402
 from hl_quant import hl_testnet_executor as ex  # noqa: E402
 from hl_quant import hl_testnet_risk as risk  # noqa: E402
 from hl_quant import paper_tracker as pt  # noqa: E402
@@ -222,6 +223,22 @@ def main(
     # Cap HWM ratcheting at oracle-adjusted equity so thin-book mark spikes cannot inflate HWM,
     # and never mutate persisted HWM or production audit log during dry-run executions.
     stored_hwm = ex.load_high_water_mark(hwm_state) if account_addr else 0.0
+    # Net-of-flows HWM: shift the stored peak by external deposits/withdrawals since it was saved,
+    # so withdrawing capital is not read as a drawdown (and a deposit is not read as profit).
+    cur_net_flow: float | None = None
+    if account_addr:
+        try:
+            with httpx.Client(timeout=15.0) as ledger_client:
+                ledger = pta.fetch_all_user_ledger_updates(ledger_client, account_addr)
+            cur_net_flow = pta.net_external_usdc_flow_usd(ledger, account_addr)
+            if cur_net_flow is None:
+                cur_net_flow = 0.0  # ledger readable but no external flows yet
+        except Exception:  # noqa: BLE001 - ledger outage: keep the stored HWM unchanged
+            cur_net_flow = None
+        prev_net_flow = ex.load_hwm_net_flow(hwm_state)
+        if prev_net_flow is None and cur_net_flow is not None and stored_hwm > 0:
+            prev_net_flow = cur_net_flow  # first run with flow tracking: baseline, no adjustment
+        stored_hwm = ex.flow_adjusted_high_water_mark(stored_hwm, prev_net_flow, cur_net_flow)
     oracle_eq = risk.oracle_adjusted_equity_usd(account, asset_ctxs) if asset_ctxs else account.equity_usd
     ratchet_eq = oracle_eq if (math.isfinite(oracle_eq) and oracle_eq > 0.0) else 0.0
     hwm = max(stored_hwm, ratchet_eq)
@@ -244,7 +261,11 @@ def main(
         orphan_target_weights=intended_targets,
     )
     if execute_testnet and account_addr and math.isfinite(account.equity_usd) and account.equity_usd > 0.0 and hwm > 0.0:
-        ex.save_high_water_mark(hwm_state, hwm)
+        ex.save_high_water_mark(
+            hwm_state,
+            hwm,
+            net_external_flow_usd=cur_net_flow if cur_net_flow is not None else ex.load_hwm_net_flow(hwm_state),
+        )
     tg_resp = None
     if telegram:
         token, chat_id, thread_id = pt.load_telegram_credentials(
