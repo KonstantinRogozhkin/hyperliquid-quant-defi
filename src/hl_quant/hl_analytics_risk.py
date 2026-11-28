@@ -777,6 +777,107 @@ _SLEEVE_TIER_LABEL = {
     "hip3_paper": "US Equities / HIP-3 Builders",
 }
 
+VENUE_HLP = "HyperCore HLP Vault"
+_CANONICAL_VENUE = {
+    "HyperCore HLP / USDC": VENUE_HLP,
+    "HyperCore HLP Vault": VENUE_HLP,
+    "HLP Vault Reserve": VENUE_HLP,
+    "Free USDC Reserve": TIER_CASH,
+    "Free USDC Buffer": TIER_CASH,
+    "Idle USDC Buffer": TIER_CASH,
+    "Cash (HIP-3 sleeve)": TIER_CASH,
+    "Cash / HLP (Spot+Perp sleeve)": TIER_CASH,
+    "Cash (CTA sleeve)": TIER_CASH,
+    "Cash (Cross-DEX sleeve)": TIER_CASH,
+    "Cash (Metamodel sleeve)": TIER_CASH,
+}
+_SLEEVE_VENUE_LABEL = {
+    "hlp_savings_reserve": VENUE_HLP,
+    "crisis_cta": "HyperCore Perp (CTA)",
+    "cross_dex_paper": "HL x Lighter/Extended",
+    "metamodel_paper": "HL x CEX",
+    "hip3_paper": "HIP-3 Builders",
+    "spot_perp_paper": "HyperCore",
+}
+
+
+def canonical_venue(label: str) -> str:
+    return _CANONICAL_VENUE.get(str(label), str(label))
+
+
+def _autopilot_look_through_venues(
+    ap: dict[str, Any],
+    sp: dict[str, Any] | None,
+    h3: dict[str, Any] | None,
+    cd: dict[str, Any] | None = None,
+    mm: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Venue USD breakdown of the Autopilot NAV with deployed-vs-idle sleeve look-through."""
+    out: dict[str, float] = {}
+
+    def _add(label: str, usd: float) -> None:
+        if usd > 0:
+            key = canonical_venue(label)
+            out[key] = round(out.get(key, 0.0) + usd, 2)
+
+    for sleeve, alloc_raw in (ap.get("sleeve_allocations_usd") or {}).items():
+        alloc = _f(alloc_raw)
+        if alloc <= 0:
+            continue
+        if sleeve == "spot_perp_paper" and sp:
+            sp_eq = _f(sp.get("equity_usd"))
+            venues = (sp.get("risk_telemetry") or {}).get("venue_breakdown_usd") or {}
+            if sp_eq > 0 and venues:
+                scale = alloc / sp_eq
+                used = 0.0
+                for v, amt in venues.items():
+                    part = max(0.0, _f(amt)) * scale
+                    used += part
+                    _add(str(v), part)
+                _add(TIER_CASH, alloc - used)
+                continue
+        if sleeve == "hip3_paper" and h3:
+            h3_eq = _f(h3.get("equity_usd"))
+            locked = sum(_f(p.get("margin_locked_usd")) for p in (h3.get("positions") or {}).values() if isinstance(p, dict))
+            if h3_eq > 0:
+                frac = min(1.0, max(0.0, locked / h3_eq))
+                _add(_SLEEVE_VENUE_LABEL["hip3_paper"], alloc * frac)
+                _add(TIER_CASH, alloc * (1.0 - frac))
+                continue
+        if sleeve == "cross_dex_paper" and cd:
+            cd_eq = _f(cd.get("equity_usd"))
+            locked_cd = sum(
+                _f(p.get("margin_locked_usd"))
+                if p.get("margin_locked_usd") is not None
+                else (2.0 * _f(p.get("leg_notional_usd"))) / max(_f(p.get("per_leg_leverage"), 2.0), 1.0)
+                for p in (cd.get("positions") or {}).values()
+                if isinstance(p, dict)
+            )
+            if cd_eq > 0:
+                frac = min(1.0, max(0.0, locked_cd / cd_eq))
+                _add(_SLEEVE_VENUE_LABEL["cross_dex_paper"], alloc * frac)
+                _add(TIER_CASH, alloc * (1.0 - frac))
+                continue
+        if sleeve == "metamodel_paper" and mm:
+            mm_gross = sum(
+                metamodel_position_gross(p)
+                for p in (mm.get("positions") or {}).values()
+                if isinstance(p, dict)
+            )
+            frac = min(1.0, max(0.0, mm_gross / 2.0))
+            _add(_SLEEVE_VENUE_LABEL["metamodel_paper"], alloc * frac)
+            _add(TIER_CASH, alloc * (1.0 - frac))
+            continue
+        if sleeve == "crisis_cta":
+            weights = ((ap.get("cta_state") or {}).get("weights") or {}) if isinstance(ap.get("cta_state"), dict) else {}
+            gross_w = sum(abs(_f(w)) for w in weights.values() if abs(_f(w)) > 0)
+            frac = min(1.0, max(0.0, gross_w))
+            _add(_SLEEVE_VENUE_LABEL["crisis_cta"], alloc * frac)
+            _add(TIER_CASH, alloc * (1.0 - frac))
+            continue
+        _add(_SLEEVE_VENUE_LABEL.get(str(sleeve), str(sleeve)), alloc)
+    return out
+
 
 def _autopilot_look_through_tiers(
     ap: dict[str, Any],
@@ -979,7 +1080,8 @@ def build_consolidated_risk_exposure(
             tier_usd[key] = round(tier_usd.get(key, 0.0) + _f(amt), 2)
         if not ap:
             for v, amt in (rt.get("venue_breakdown_usd") or {}).items():
-                venue_usd[str(v)] = round(venue_usd.get(str(v), 0.0) + _f(amt), 2)
+                vkey = canonical_venue(str(v))
+                venue_usd[vkey] = round(venue_usd.get(vkey, 0.0) + _f(amt), 2)
 
     if cd:
         cd_nav_guards = int(cd.get("nav_guard_triggers", 0) or 0)
@@ -1013,7 +1115,6 @@ def build_consolidated_risk_exposure(
             }
         )
         if not ap:
-            venue_usd["HL x Lighter/Extended"] = round(venue_usd.get("HL x Lighter/Extended", 0.0) + cd_eq, 2)
             locked_cd = sum(
                 _f(p.get("margin_locked_usd"))
                 if p.get("margin_locked_usd") is not None
@@ -1023,10 +1124,12 @@ def build_consolidated_risk_exposure(
             )
             cd_deployed = min(cd_eq, max(0.0, locked_cd))
             if cd_deployed > 0:
+                venue_usd["HL x Lighter/Extended"] = round(venue_usd.get("HL x Lighter/Extended", 0.0) + cd_deployed, 2)
                 lbl = _SLEEVE_TIER_LABEL["cross_dex_paper"]
                 tier_usd[lbl] = round(tier_usd.get(lbl, 0.0) + cd_deployed, 2)
             cd_cash = max(0.0, cd_eq - cd_deployed)
             if cd_cash > 0:
+                venue_usd[TIER_CASH] = round(venue_usd.get(TIER_CASH, 0.0) + cd_cash, 2)
                 tier_usd[TIER_CASH] = round(tier_usd.get(TIER_CASH, 0.0) + cd_cash, 2)
 
     if h3:
@@ -1058,11 +1161,15 @@ def build_consolidated_risk_exposure(
                 "nav_guard_triggers": h3_nav_guards,
             }
         )
-        eq_deployed = sum(_f(p.get("margin_locked_usd")) for p in h3_pos.values() if isinstance(p, dict))
-        if eq_deployed > 0:
-            tier_usd["US Equities / HIP-3 Builders"] = round(tier_usd.get("US Equities / HIP-3 Builders", 0.0) + eq_deployed, 2)
+        eq_deployed = min(h3_eq, max(0.0, sum(_f(p.get("margin_locked_usd")) for p in h3_pos.values() if isinstance(p, dict))))
         if not ap:
-            venue_usd["HIP-3 Builders"] = round(venue_usd.get("HIP-3 Builders", 0.0) + h3_eq, 2)
+            if eq_deployed > 0:
+                tier_usd["US Equities / HIP-3 Builders"] = round(tier_usd.get("US Equities / HIP-3 Builders", 0.0) + eq_deployed, 2)
+                venue_usd["HIP-3 Builders"] = round(venue_usd.get("HIP-3 Builders", 0.0) + eq_deployed, 2)
+            h3_cash = max(0.0, h3_eq - eq_deployed)
+            if h3_cash > 0:
+                tier_usd[TIER_CASH] = round(tier_usd.get(TIER_CASH, 0.0) + h3_cash, 2)
+                venue_usd[TIER_CASH] = round(venue_usd.get(TIER_CASH, 0.0) + h3_cash, 2)
 
     if mm:
         mm_nav_guards = int(mm.get("nav_guard_triggers", 0) or 0)
@@ -1087,20 +1194,22 @@ def build_consolidated_risk_exposure(
             }
         )
         if not ap:
-            venue_usd["HL x CEX"] = round(venue_usd.get("HL x CEX", 0.0) + mm_eq, 2)
             mm_deployed = mm_eq * min(1.0, max(0.0, mm_lev / 2.0))
             if mm_deployed > 0:
+                venue_usd["HL x CEX"] = round(venue_usd.get("HL x CEX", 0.0) + mm_deployed, 2)
                 lbl = _SLEEVE_TIER_LABEL["metamodel_paper"]
                 tier_usd[lbl] = round(tier_usd.get(lbl, 0.0) + mm_deployed, 2)
             mm_cash = max(0.0, mm_eq - mm_deployed)
             if mm_cash > 0:
+                venue_usd[TIER_CASH] = round(venue_usd.get(TIER_CASH, 0.0) + mm_cash, 2)
                 tier_usd[TIER_CASH] = round(tier_usd.get(TIER_CASH, 0.0) + mm_cash, 2)
 
     # Asset-tier concentration must describe the SAME portfolio as venue concentration. When the
     # Autopilot master vault exists, both are derived from its sleeve allocations (look-through into
-    # each sleeve's own tier mix, scaled to the USD the Autopilot actually allocates to it).
+    # each sleeve's own deployed vs idle cash mix, scaled to the USD the Autopilot allocates to it).
     if ap and ap.get("sleeve_allocations_usd"):
         tier_usd = _autopilot_look_through_tiers(ap, sp, h3, cd, mm)
+        venue_usd = _autopilot_look_through_venues(ap, sp, h3, cd, mm)
 
     def _to_pct_rows(raw_map: dict[str, float]) -> list[dict[str, Any]]:
         tot = sum(v for v in raw_map.values() if v > 0)
@@ -1128,19 +1237,14 @@ def _with_inception_anchor(
     """Prepend the inception share 1.0 that max-DD / returns are measured from.
 
     The first stored tick already includes entry costs, so without the anchor the drawn curve
-    starts below 1.0 while ``max_dd_gross_pct`` is measured from 1.0. The anchor is stamped one
-    second (intraday ISO series) or one day (daily series) before the first observation.
+    starts below 1.0 while ``max_dd_gross_pct`` is measured from 1.0. Uses the same 4h (intraday)
+    or 1d (daily) pre-first-tick timestamp as :func:`simulate_net_series_from_inception`.
     """
     if not dates or not gross or abs(float(gross[0]) - 1.0) < 1e-12:
         return dates, gross, net
     first = str(dates[0])
-    try:
-        if "T" in first:
-            dt = datetime.fromisoformat(first.replace("Z", "+00:00")) - pd.Timedelta(seconds=1)
-            anchor_date = dt.strftime("%Y-%m-%dT%H:%M:%SZ")
-        else:
-            anchor_date = (datetime.fromisoformat(first) - pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-    except ValueError:
+    anchor_date = _inception_anchor_date_str(first)
+    if anchor_date == first:
         return dates, gross, net
     net_out = [1.0, *net] if net else net
     return [anchor_date, *dates], [1.0, *gross], net_out

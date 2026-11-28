@@ -1271,26 +1271,56 @@ def execute_rebalance_cycle(
         leverage_updates: list[dict[str, Any]] = []
         blocked_isolated_coins: set[str] = set()
         blocked_leverage_coins: set[str] = set()
+        planned_non_reduce_coins = {
+            o.coin for o in planned if not o.reduce_only and o.coin in meta
+        }
+        held_mismatched_coins: set[str] = set()
+        for coin, cur_sz in account.positions_sz.items():
+            if abs(float(cur_sz or 0.0)) <= 1e-12 or coin in foreign or coin not in meta:
+                continue
+            spec = meta[coin]
+            if spec.only_isolated and not limits.allow_only_isolated:
+                continue
+            cur_mode, cur_lev = account.position_leverage.get(coin, ("", 0))
+            if not cur_mode:
+                continue
+            is_cross = not spec.only_isolated
+            expected_mode = "cross" if is_cross else "isolated"
+            target_lev = max(
+                1,
+                min(spec.max_leverage, limits.default_cross_leverage if is_cross else limits.default_isolated_leverage),
+            )
+            if cur_mode != expected_mode or cur_lev != target_lev:
+                held_mismatched_coins.add(coin)
+
+        # Preserve planned order sequence first, then normalize any held managed positions with stale leverage.
+        lev_candidates: list[str] = []
         seen_lev_coins: set[str] = set()
         for o in planned:
-            if o.reduce_only or o.coin in seen_lev_coins or o.coin not in meta:
-                continue
-            seen_lev_coins.add(o.coin)
-            spec = meta[o.coin]
+            if not o.reduce_only and o.coin in meta and o.coin not in seen_lev_coins:
+                seen_lev_coins.add(o.coin)
+                lev_candidates.append(o.coin)
+        for coin in sorted(held_mismatched_coins):
+            if coin not in seen_lev_coins:
+                seen_lev_coins.add(coin)
+                lev_candidates.append(coin)
+
+        for coin in lev_candidates:
+            spec = meta[coin]
             is_cross = not spec.only_isolated
             target_lev = max(1, min(spec.max_leverage, limits.default_cross_leverage if is_cross else limits.default_isolated_leverage))
-            cur_mode, cur_lev = account.position_leverage.get(o.coin, ("", 0))
+            cur_mode, cur_lev = account.position_leverage.get(coin, ("", 0))
             expected_mode = "cross" if is_cross else "isolated"
             if cur_mode == expected_mode and cur_lev == target_lev:
                 continue
             try:
-                upd = adapter.set_leverage(o.coin, target_lev, is_cross=is_cross)
+                upd = adapter.set_leverage(coin, target_lev, is_cross=is_cross)
             except Exception as exc:
-                upd = {"coin": o.coin, "leverage": target_lev, "is_cross": is_cross, "error": str(exc)}
+                upd = {"coin": coin, "leverage": target_lev, "is_cross": is_cross, "error": str(exc)}
             leverage_updates.append(upd)
-            if not leverage_update_ok(upd):
+            if not leverage_update_ok(upd) and coin in planned_non_reduce_coins:
                 # Never open exposure at an unknown (exchange default / max) leverage.
-                (blocked_isolated_coins if spec.only_isolated else blocked_leverage_coins).add(o.coin)
+                (blocked_isolated_coins if spec.only_isolated else blocked_leverage_coins).add(coin)
 
         blocked = blocked_isolated_coins | blocked_leverage_coins
         executable = [o for o in planned if o.reduce_only or o.coin not in blocked] + orphan_unwinds

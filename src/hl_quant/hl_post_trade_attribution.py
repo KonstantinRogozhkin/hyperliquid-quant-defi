@@ -18,7 +18,7 @@ from typing import Any
 import httpx
 import pandas as pd
 
-from hl_quant.hl_testnet_executor import extract_hl_order_statuses
+from hl_quant.hl_testnet_executor import extract_hl_order_statuses, load_logged_order_oids
 
 TESTNET_INFO_URL = "https://api.hyperliquid-testnet.xyz/info"
 
@@ -91,8 +91,14 @@ class PostTradeAttribution:
     account_return_pct: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
+        obs_utc = (
+            datetime.fromtimestamp(self.observed_at_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            if self.observed_at_ms > 0
+            else None
+        )
         return {
             **{k: v for k, v in asdict(self).items() if k != "per_coin"},
+            "observed_at_utc": obs_utc,
             "per_coin": [c.to_dict() for c in self.per_coin],
         }
 
@@ -473,6 +479,27 @@ def fetch_post_trade_snapshot(
     }
 
 
+def earliest_audit_timestamp_ms(audit_log_path: Path | None) -> int | None:
+    """Return the earliest positive ``ts_ms`` of a live record in ``hl_testnet_audit.jsonl``."""
+    if audit_log_path is None or not audit_log_path.is_file():
+        return None
+    earliest: int | None = None
+    for line in audit_log_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict) or rec.get("mode") == "dry_run":
+            continue
+        rec_ts = int(_f(rec.get("ts_ms")))
+        if rec_ts > 0 and (earliest is None or rec_ts < earliest):
+            earliest = rec_ts
+    return earliest
+
+
 def extract_audit_oids(audit_log_path: Path | None, *, min_ts_ms: int | None = None) -> set[int]:
     """Extract all resting/filled order IDs submitted by our executor from ``hl_testnet_audit.jsonl``.
 
@@ -611,6 +638,7 @@ def compute_post_trade_attribution(
     snapshot: dict[str, Any],
     *,
     audit_log_path: Path | None = None,
+    mm_audit_log_path: Path | None = None,
     paper_dir: Path | None = None,
     liq_warn_threshold_pct: float = 15.0,
     adl_warn_threshold: float = 2.0,
@@ -891,15 +919,45 @@ def compute_post_trade_attribution(
         elif api_reqs_per_usd > 0.5:
             api_quota_health = "WATCH (>0.5 req/eff.$)"
 
-    # Account hygiene: fills that do not belong to audited executor orders mean the address is shared
-    # with MM / manual trading, so maker share, markout and PnL attribution are contaminated.
-    foreign_fill_vol = max(0.0, tot_vol - audit_vol) if all_audit_oids else 0.0
+    # Account hygiene: fills within the active audit coverage window that do not belong to audited
+    # executor orders mean the address is concurrently shared with MM / manual trading. Historical
+    # exchange fills from before the local audit log began (`time < earliest_audit_ts - 60_000`) are
+    # pre-log account history, not active contamination.
+    earliest_audit_ts = earliest_audit_timestamp_ms(audit_log_path)
+    mm_oids = (load_logged_order_oids(mm_audit_log_path) - all_audit_oids) if mm_audit_log_path is not None else set()
+    window_tot_vol = 0.0
+    window_exec_vol = 0.0
+    window_mm_vol = 0.0
+    for fl in fills:
+        px = _f(fl.get("px"))
+        sz = abs(_f(fl.get("sz")))
+        ntl = px * sz
+        if ntl <= 0:
+            continue
+        f_time = int(_f(fl.get("time")))
+        if earliest_audit_ts is not None and f_time > 0 and f_time < earliest_audit_ts - 60_000:
+            continue
+        window_tot_vol += ntl
+        f_oid = int(fl["oid"]) if ("oid" in fl and fl["oid"] is not None) else -1
+        if f_oid in all_audit_oids:
+            window_exec_vol += ntl
+        elif f_oid in mm_oids:
+            window_mm_vol += ntl
+
+    foreign_fill_vol = max(0.0, window_tot_vol - window_exec_vol) if all_audit_oids else 0.0
     mixed_warning = ""
-    if all_audit_oids and tot_vol > 0 and foreign_fill_vol / tot_vol > 0.05:
-        mixed_warning = (
-            f"{foreign_fill_vol / tot_vol * 100.0:.0f}% fill volume is not from audited executor orders "
-            "(MM/manual fills share this address) — attribution is contaminated"
-        )
+    if all_audit_oids and window_tot_vol > 0 and foreign_fill_vol / window_tot_vol > 0.05:
+        unknown_vol = max(0.0, foreign_fill_vol - window_mm_vol)
+        if window_mm_vol > 0 and unknown_vol / window_tot_vol <= 0.05:
+            mixed_warning = (
+                f"{window_mm_vol / window_tot_vol * 100.0:.0f}% concurrent fill volume is from MM orders sharing this address "
+                "— attribution includes MM fills"
+            )
+        else:
+            mixed_warning = (
+                f"{foreign_fill_vol / window_tot_vol * 100.0:.0f}% fill volume is not from audited executor orders "
+                "(MM/manual fills share this address) — attribution is contaminated"
+            )
     # Unified Account (`unifiedAccount` / `portfolioMargin`) is natively supported above (`total_eq = spot_usdc`);
     # only warn if an undocumented non-standard abstraction mode appears.
     if abstraction and abstraction not in {"disabled", "default", "standard", "unifiedAccount", "portfolioMargin"}:

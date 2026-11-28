@@ -689,9 +689,24 @@ def render_prometheus_metrics(
         )
         ap_rt = ap_st.get("risk_telemetry")
         if isinstance(ap_rt, dict):
+            ap_sleeves_raw = ap_st.get("sleeves")
+            if (
+                "pre_rebalance_max_drift_pct" not in ap_rt
+                and isinstance(ap_sleeves_raw, list)
+                and ap_sleeves_raw
+            ):
+                eff_drift: Any = round(
+                    max(
+                        (abs(_num(s.get("drift_pct")) or 0.0) for s in ap_sleeves_raw if isinstance(s, dict)),
+                        default=0.0,
+                    ),
+                    3,
+                )
+            else:
+                eff_drift = ap_rt.get("max_weight_drift_pct")
             b.emit("hl_autopilot_gross_leverage", ap_rt.get("gross_leverage"), help_text="Neutral Autopilot weighted gross leverage")
             b.emit("hl_autopilot_leverage_30d_max", ap_rt.get("leverage_30d_max"), help_text="Neutral Autopilot 30D max weighted leverage")
-            b.emit("hl_autopilot_max_drift_pct", ap_rt.get("max_weight_drift_pct"), help_text="Neutral Autopilot max sleeve drift vs target %")
+            b.emit("hl_autopilot_max_drift_pct", eff_drift, help_text="Neutral Autopilot max sleeve drift vs target %")
             b.emit("hl_autopilot_directional_exposure_pct", ap_rt.get("net_directional_exposure_pct"), help_text="Neutral Autopilot net directional exposure %")
             b.emit("hl_autopilot_directional_sleeve_pct", ap_rt.get("directional_sleeve_pct"), help_text="Neutral Autopilot Crisis-CTA sleeve weight %")
             b.emit("hl_autopilot_reserve_sleeve_pct", ap_rt.get("reserve_sleeve_pct"), help_text="Neutral Autopilot HLP/USDC reserve weight %")

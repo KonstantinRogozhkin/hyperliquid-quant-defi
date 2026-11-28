@@ -131,6 +131,27 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
         data_root / "hl_spot_perp_arb" / "snapshot.json"
     )
     autopilot = _read_json(data_root / "hl_autopilot" / "state.json")
+    if isinstance(autopilot, dict):
+        ap_rt = autopilot.get("risk_telemetry")
+        ap_sleeves = autopilot.get("sleeves")
+        if (
+            isinstance(ap_rt, dict)
+            and "pre_rebalance_max_drift_pct" not in ap_rt
+            and isinstance(ap_sleeves, list)
+            and ap_sleeves
+        ):
+            post_drift = round(
+                max((abs(_nf(s.get("drift_pct"))) for s in ap_sleeves if isinstance(s, dict)), default=0.0),
+                3,
+            )
+            autopilot = {
+                **autopilot,
+                "risk_telemetry": {
+                    **ap_rt,
+                    "pre_rebalance_max_drift_pct": _nf(ap_rt.get("max_weight_drift_pct")),
+                    "max_weight_drift_pct": post_drift,
+                },
+            }
     autopilot_ticks = _read_parquet_records(data_root / "hl_autopilot" / "ticks.parquet", limit=720)
     boros_snap = _read_json(data_root / "hl_boros" / "snapshot.json")
     yield_snap = _read_json(data_root / "hl_hyperevm_yield_stack" / "snapshot.json")

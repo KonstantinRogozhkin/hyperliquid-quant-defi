@@ -915,33 +915,46 @@ function Desk() {
                     <thead>
                       <tr>
                         <Th k="colCoin" />
+                        <Th k="colVenue" />
                         <Th k="colDirection" />
                         <Th k="colLegSize" num />
                         <Th k="colHoursHeld" num />
                         <Th k="colEntryApr" num />
                         <Th k="colLiveAprDual" num />
                         <Th k="colEntryBasis" num />
+                        <Th k="colFunding" num />
+                        <Th k="colBasisMtm" num />
+                        <Th k="colNetPnl" num />
                       </tr>
                     </thead>
                     <tbody>
-                      {Object.values(data?.cross_dex_paper?.positions ?? {}).map((pos) => (
-                        <tr key={pos.coin}>
-                          <td>
-                            <strong>{pos.coin}</strong>
-                          </td>
-                          <td className="mono">{pos.direction}</td>
-                          <td className="num">{fmtUsd(pos.leg_notional_usd, 0)}</td>
-                          <td className="num">{fx(pos.hours_held, 1, t("h", "ч"))}</td>
-                          <td className="num">{fmtPct(pos.entry_spread_apr_pct, 1)}</td>
-                          <td className={`num ${pos.live_spread_apr_pct >= 10 ? "pos" : pos.live_spread_apr_pct < 0 ? "neg" : "warn"}`}>
-                            {fmtPct(pos.live_spread_apr_pct, 1)}
-                          </td>
-                          <td className="num">{fmtBps(pos.entry_exec_basis_bps, 2)}</td>
-                        </tr>
-                      ))}
+                      {Object.values(data?.cross_dex_paper?.positions ?? {}).map((pos) => {
+                        const venueLabel =
+                          pos.other_dex ??
+                          (pos.direction.toLowerCase().includes("extended") ? "extended" : "lighter");
+                        return (
+                          <tr key={pos.coin}>
+                            <td>
+                              <strong>{pos.coin}</strong>
+                            </td>
+                            <td className="mono">{venueLabel}</td>
+                            <td className="mono">{pos.direction}</td>
+                            <td className="num">{fmtUsd(pos.leg_notional_usd, 0)}</td>
+                            <td className="num">{fx(pos.hours_held, 1, t("h", "ч"))}</td>
+                            <td className="num">{fmtPct(pos.entry_spread_apr_pct, 1)}</td>
+                            <td className={`num ${pos.live_spread_apr_pct >= 10 ? "pos" : pos.live_spread_apr_pct < 0 ? "neg" : "warn"}`}>
+                              {fmtPct(pos.live_spread_apr_pct, 1)}
+                            </td>
+                            <td className="num">{fmtBps(pos.entry_exec_basis_bps, 2)}</td>
+                            <td className={`num ${signCls(pos.cum_funding_usd)}`}>{fmtUsd(pos.cum_funding_usd)}</td>
+                            <td className={`num ${signCls(pos.cum_basis_mtm_usd)}`}>{fmtUsd(pos.cum_basis_mtm_usd)}</td>
+                            <td className={`num ${signCls(pos.net_pnl_usd)}`}>{fmtUsd(pos.net_pnl_usd)}</td>
+                          </tr>
+                        );
+                      })}
                       {Object.keys(data?.cross_dex_paper?.positions ?? {}).length === 0 && (
                         <tr>
-                          <td colSpan={7} className="muted">
+                          <td colSpan={11} className="muted">
                             {t("No open dual-leg paper positions.", "Нет открытых двуногих paper-позиций.")}
                           </td>
                         </tr>

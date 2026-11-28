@@ -137,10 +137,20 @@ export function AnalyticsRiskTab({
       const rawShares = feeMode === "gross" ? c.gross_shares : c.net_shares;
       let startIdx = 0;
 
-      if (cutoffMs !== null && c.dates.length === rawShares.length && c.dates.length > 0) {
+      // When Rebase is enabled alongside visible desk strategies, clamp long-history benchmarks to
+      // the later of the selected window cutoff and earliest desk strategy inception so a 30D/90D
+      // benchmark tail never crushes young multi-day strategy curves flat.
+      const seriesCutoffMs =
+        c.is_benchmark && rebaseWindow && earliestStrategyMs !== null
+          ? cutoffMs !== null
+            ? Math.max(cutoffMs, earliestStrategyMs)
+            : earliestStrategyMs
+          : cutoffMs;
+
+      if (seriesCutoffMs !== null && c.dates.length === rawShares.length && c.dates.length > 0) {
         const found = c.dates.findIndex((d) => {
           const ms = parseMs(d);
-          return ms !== null && ms >= cutoffMs;
+          return ms !== null && ms >= seriesCutoffMs;
         });
         if (found === -1) {
           // Stale series with zero observations inside the requested window: omit instead of plotting old tail.
@@ -151,29 +161,13 @@ export function AnalyticsRiskTab({
         const canStepBack =
           found > 0 &&
           foundMs !== null &&
-          foundMs > cutoffMs &&
+          foundMs > seriesCutoffMs &&
           prevMs !== null &&
-          cutoffMs - prevMs <= MAX_STEP_BACK_MS;
+          seriesCutoffMs - prevMs <= MAX_STEP_BACK_MS;
         startIdx = canStepBack ? found - 1 : found;
       } else if (periodDays > 0) {
         if (rawShares.length === 0) return;
         startIdx = Math.max(0, rawShares.length - periodDays);
-      } else if (rebaseWindow && c.is_benchmark && earliestStrategyMs !== null && c.dates.length === rawShares.length) {
-        // In "All" mode with Rebase enabled, align long-history benchmarks to the earliest desk strategy inception.
-        const found = c.dates.findIndex((d) => {
-          const ms = parseMs(d);
-          return ms !== null && ms >= earliestStrategyMs;
-        });
-        if (found > 0) {
-          const foundMs = parseMs(c.dates[found]);
-          const prevMs = parseMs(c.dates[found - 1]);
-          const canStepBack =
-            foundMs !== null &&
-            foundMs > earliestStrategyMs &&
-            prevMs !== null &&
-            earliestStrategyMs - prevMs <= MAX_STEP_BACK_MS;
-          startIdx = canStepBack ? found - 1 : found;
-        }
       }
 
       const subShares = rawShares.slice(startIdx);

@@ -11,7 +11,8 @@ EOF
   exit 0
 fi
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+SCRIPT_PATH="${0:A}"
+ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 RUN_DATE="$(date +%F)"
 RUN_TIME="$(date +%H%M)"
 TEMP_DIR="${ROOT_DIR}/.neira/temp"
@@ -37,25 +38,25 @@ printf "%s\n" "${EXISTING_CRONTAB}" > "${BACKUP_PATH}"
 
   cat <<EOF
 # BEGIN hyperliquid-quant-defi snapshot schedule
-50 * * * * zsh ${ROOT_DIR}/scripts/ops/run_hyperliquid_snapshot_tick.sh
+50 * * * * zsh "${ROOT_DIR}/scripts/ops/run_hyperliquid_snapshot_tick.sh"
 # END hyperliquid-quant-defi snapshot schedule
 # BEGIN hyperliquid-quant-defi metamodel paper schedule
-5 */4 * * * zsh ${ROOT_DIR}/scripts/ops/run_hl_metamodel_paper_tick.sh
+5 */4 * * * zsh "${ROOT_DIR}/scripts/ops/run_hl_metamodel_paper_tick.sh"
 # END hyperliquid-quant-defi metamodel paper schedule
 # BEGIN hyperliquid-quant-defi testnet executor schedule
-10 */4 * * * zsh ${ROOT_DIR}/scripts/ops/run_hl_testnet_executor_tick.sh
+10 */4 * * * zsh "${ROOT_DIR}/scripts/ops/run_hl_testnet_executor_tick.sh"
 # END hyperliquid-quant-defi testnet executor schedule
 # BEGIN hyperliquid-quant-defi cross-dex paper schedule
-15 */4 * * * zsh ${ROOT_DIR}/scripts/ops/run_hl_cross_dex_paper_tick.sh
+15 */4 * * * zsh "${ROOT_DIR}/scripts/ops/run_hl_cross_dex_paper_tick.sh"
 # END hyperliquid-quant-defi cross-dex paper schedule
 # BEGIN hyperliquid-quant-defi frontier persistence schedule
-20 */4 * * * zsh ${ROOT_DIR}/scripts/ops/run_hl_frontier_persistence_tick.sh
+20 */4 * * * zsh "${ROOT_DIR}/scripts/ops/run_hl_frontier_persistence_tick.sh"
 # END hyperliquid-quant-defi frontier persistence schedule
 # BEGIN hyperliquid-quant-defi onchain event alpha schedule
-*/15 * * * * zsh ${ROOT_DIR}/scripts/ops/run_hl_onchain_event_tick.sh
+*/15 * * * * zsh "${ROOT_DIR}/scripts/ops/run_hl_onchain_event_tick.sh"
 # END hyperliquid-quant-defi onchain event alpha schedule
 # BEGIN hyperliquid-quant-defi testnet attribution schedule
-0 6 * * * zsh ${ROOT_DIR}/scripts/ops/run_hl_testnet_attribution_daily.sh
+0 6 * * * zsh "${ROOT_DIR}/scripts/ops/run_hl_testnet_attribution_daily.sh"
 # END hyperliquid-quant-defi testnet attribution schedule
 EOF
 } > "${SHORT_CRON}"
