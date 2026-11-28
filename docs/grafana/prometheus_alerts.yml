@@ -97,14 +97,14 @@ groups:
           description: "Crisis-CTA directional sleeve exceeded 6% (hard cap 5%) or sleeve weight drift exceeded 6% (deadband 3%)."
 
       - alert: HLStrategyDrawdownOrApiQuotaCritical
-        expr: hl_strategy_max_dd_pct{category!="Benchmark"} > 5.0 or hl_testnet_api_reqs_per_usd_vol > 0.85
+        expr: hl_strategy_current_dd_pct{category!="Benchmark"} > 5.0 or hl_testnet_api_reqs_per_usd_vol > 0.85
         for: 5m
         labels:
           severity: critical
           service: hyperliquid-quant-defi
         annotations:
-          summary: "CRITICAL: Strategy Max Drawdown > 5% or HyperCore API Quota > 0.85 req/$"
-          description: "Desk strategy drawdown breached 5% safety limit or API request rate is approaching HyperCore's 1 req/$1 volume ceiling."
+          summary: "CRITICAL: Strategy current drawdown > 5% or HyperCore API Quota > 0.85 req/$"
+          description: "A desk strategy is currently more than 5% below its share-price peak (hl_strategy_current_dd_pct; historical max DD is hl_strategy_max_dd_pct and does not alert) or API request rate is approaching HyperCore's 1 req/$1 volume ceiling."
 
       - alert: HLTestnetDrawdownNearKillSwitch
         expr: hl_testnet_drawdown_pct > 3.5
@@ -121,8 +121,8 @@ groups:
     rules:
       - alert: HLArtifactStale
         expr: >-
-          hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|testnet_.*"} > 360
-          or hl_artifact_exists{artifact!~"mm_calibration|settlement_study|testnet_.*"} == 0
+          hl_artifact_age_minutes{artifact!~"mm_calibration|settlement_study|onchain_events|testnet_.*"} > 360
+          or hl_artifact_exists{artifact!~"mm_calibration|settlement_study|onchain_events|testnet_.*"} == 0
         for: 15m
         labels:
           severity: warning
@@ -214,3 +214,27 @@ groups:
         annotations:
           summary: "Testnet attribution stale (> 5h, cadence 4h) or artifact missing"
           description: "hl_testnet_* attribution gauges (equity, PnL, per-coin) are frozen at the last successful 4h run while enabled. Check the testnet_attribution worker job."
+
+      - alert: HLTestnetExecutorStale
+        expr: >-
+          (hl_artifact_age_minutes{artifact="testnet_audit"} > 300 and ignoring(artifact, worker_job) hl_worker_job_enabled{worker_job="testnet_executor"} == 1)
+          or (hl_artifact_exists{artifact="testnet_audit"} == 0 and ignoring(artifact, worker_job) hl_worker_job_enabled{worker_job="testnet_executor"} == 1)
+        for: 15m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Testnet executor audit log stale (> 5h, cadence 4h) or missing"
+          description: "hl_testnet_audit.jsonl has not been appended for > 300 min while the testnet_executor job is enabled; the executor has silently stopped rebalancing. Check the testnet_executor worker job."
+
+      - alert: HLOnchainEventsStale
+        expr: >-
+          hl_artifact_age_minutes{artifact="onchain_events"} > 45
+          or hl_artifact_exists{artifact="onchain_events"} == 0
+        for: 10m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "On-chain event watcher stale (> 45 min, cadence 15m) or snapshot missing"
+          description: "hl_onchain_events/latest_snapshot.json has not refreshed for > 45 minutes; H2/H5/H6 on-chain alerts are blind. Check the onchain_events job."

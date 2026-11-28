@@ -279,6 +279,18 @@ def _compute_drawdown_stats(
     return round(max_dd, 2), rec_out, round(max(0.0, underwater), 1)
 
 
+def _current_drawdown_pct(shares: list[float], *, inception_share: float | None = None) -> float:
+    """Current (open) drawdown of the last observation below the running peak, in percent (0.0 at a HWM)."""
+    if not shares:
+        return 0.0
+    peak = max(shares)
+    if inception_share is not None:
+        peak = max(peak, inception_share)
+    if peak <= 0:
+        return 0.0
+    return round(max(0.0, (peak - shares[-1]) / peak * 100.0), 2)
+
+
 def _compute_streaks(log_rets: np.ndarray) -> tuple[float | None, int, int]:
     """Return ``(positive_days_pct, longest_win_streak, longest_loss_streak)``."""
     if len(log_rets) == 0:
@@ -448,6 +460,8 @@ def compute_series_performance(
         "sortino_net": sortino_n,
         "max_dd_gross_pct": max_dd_g,
         "max_dd_net_pct": max_dd_n,
+        "current_dd_gross_pct": _current_drawdown_pct(gross_shares, inception_share=inception_share),
+        "current_dd_net_pct": _current_drawdown_pct(net_s, inception_share=inception_share),
         "dd_recovery_days": dd_rec_days,
         "current_underwater_days": underwater_days,
         "dd_recovery_net_days": dd_rec_net_days,

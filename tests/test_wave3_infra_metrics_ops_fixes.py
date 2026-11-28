@@ -176,7 +176,7 @@ def test_m2_grafana_16_jobs_and_prometheus_grafana_alert_parity():
     prom_by_name = {r["alert"]: r for g in prom["groups"] for r in g["rules"]}
     graf_by_uid = {r["uid"]: r for g in graf["groups"] for r in g["rules"]}
 
-    assert len(prom_by_name) == len(graf_by_uid) == 20
+    assert len(prom_by_name) == len(graf_by_uid) == 22
     assert prom_by_name["HLBoundedNavGuardTriggered"]["expr"] == "hl_desk_nav_guard_active > 0"
     assert graf_by_uid["hl-crit-nav-guard"]["data"][0]["model"]["expr"] == "hl_desk_nav_guard_active"
     assert "hl_artifact_exists" in prom_by_name["HLArtifactStale"]["expr"]
