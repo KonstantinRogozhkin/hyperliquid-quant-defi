@@ -100,7 +100,14 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
 
     (tmp_path / "hl_testnet_attribution").mkdir(parents=True)
     (tmp_path / "hl_testnet_attribution" / "attribution.json").write_text(
-        json.dumps({"equity_usd": 995.5, "total_fills": 14, "maker_volume_share_pct": 92.3}),
+        json.dumps(
+            {
+                "account_address": "0x6b9C2Ee61bEaCF9Ca805A7b5620F21C241573afD",
+                "equity_usd": 995.5,
+                "total_fills": 14,
+                "maker_volume_share_pct": 92.3,
+            }
+        ),
         encoding="utf-8",
     )
 
@@ -190,6 +197,8 @@ def test_api_endpoints_handle_empty_and_populated_data_root(tmp_path: Path):
     r_attr = client.get("/api/v1/attribution")
     assert r_attr.status_code == 200
     assert r_attr.json()["attribution"]["total_fills"] == 14
+    assert r_attr.json()["attribution"]["account_address"] == "0x6b9C...3afD"
+    assert client.get("/api/v1/overview").json()["attribution"]["account_address"] == "0x6b9C...3afD"
     assert r_attr.json()["testnet_audit_recent"][0]["placed_count"] == 7
     assert r_attr.json()["testnet_audit_recent"][0]["skipped_unquoted_coins"] == ["JUP", "PONS"]
     assert r_attr.json()["testnet_audit_recent"][0]["drawdown_pct"] == pytest.approx(0.9009)

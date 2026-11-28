@@ -54,8 +54,17 @@ ARTIFACT_FILES: dict[str, str] = {
 }
 
 
+def _mask_evm_address(addr: str) -> str:
+    """Mask 42-character EVM hex addresses (``0x1234...abcd``) in public HTTP payloads."""
+    s = addr.strip()
+    if len(s) == 42 and s.lower().startswith("0x") and all(ch in "0123456789abcdefABCDEF" for ch in s[2:]):
+        return f"{s[:6]}...{s[-4:]}"
+    return addr
+
+
 def sanitize_json(value: Any) -> Any:
     """Recursively convert NaN/Inf, NaT, NumPy scalars, Timestamps, and Paths into strict JSON values."""
+    expose_addr = os.environ.get("HL_EXPOSE_ACCOUNT_ADDRESS", "").strip().lower() in {"1", "true", "yes", "on"}
     if value is None or value is pd.NaT or isinstance(value, (bool, str, int)):
         return None if value is pd.NaT else value
     if isinstance(value, float):
@@ -72,7 +81,14 @@ def sanitize_json(value: Any) -> Any:
             pass
         return value.isoformat()
     if isinstance(value, dict):
-        return {str(k): sanitize_json(v) for k, v in value.items()}
+        out: dict[str, Any] = {}
+        for k, v in value.items():
+            ks = str(k)
+            if ks == "account_address" and isinstance(v, str) and not expose_addr:
+                out[ks] = _mask_evm_address(v)
+            else:
+                out[ks] = sanitize_json(v)
+        return out
     if isinstance(value, (list, tuple)):
         return [sanitize_json(v) for v in value]
     # Handle pandas/numpy scalars (np.float64, np.int64, np.bool_, pd.Timestamp, pd.NA)
@@ -381,7 +397,8 @@ def create_app(
                     stats.append((rel, st.st_mtime_ns, st.st_size))
                 except OSError:
                     stats.append((rel, -1, -1))
-        return (dir_exists, int(time.monotonic() // 2), extra_id, tuple(stats))
+        expose_flag = os.environ.get("HL_EXPOSE_ACCOUNT_ADDRESS", "").strip().lower() in {"1", "true", "yes", "on"}
+        return (dir_exists, int(time.monotonic() // 2), extra_id, expose_flag, tuple(stats))
 
     def _build_overview_uncached() -> dict[str, Any]:
         payload = collect_dashboard_payload(resolved_data_root)
