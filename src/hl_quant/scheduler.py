@@ -17,6 +17,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 import html
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -285,6 +286,8 @@ def build_job_specs() -> list[JobSpec]:
             str(root / "scripts/analytics/run_hl_testnet_attribution.py"),
             "--audit-log",
             str(data_dir / "paper/hl_testnet_audit.jsonl"),
+            "--mm-audit-log",
+            str(data_dir / "paper/hl_mm_testnet/mm_audit.jsonl"),
             "--paper-dir",
             str(data_dir / "paper/hl_metamodel"),
             "--output-dir",
@@ -980,9 +983,34 @@ class WorkerScheduler:
         }
         return sentinels.get(job_name)
 
+    def _bootstrap_needs_refresh(self, job_name: str, sentinel: Path) -> bool:
+        """Return True when an existing read-only artifact is degraded or missing current schema fields."""
+        try:
+            if job_name == "settlement_study":
+                meta_path = sentinel.parent / "meta.json"
+                if not meta_path.is_file():
+                    return True
+                meta = json.loads(meta_path.read_text(encoding="utf-8"))
+                if not isinstance(meta, dict):
+                    return True
+                if bool(meta.get("degraded")):
+                    return True
+                req = int(meta.get("coins_requested") or 0)
+                col = int(meta.get("coins_collected") or 0)
+                if req > 0 and col < int(math.ceil(0.8 * req)):
+                    return True
+            elif job_name == "testnet_attribution":
+                doc = json.loads(sentinel.read_text(encoding="utf-8"))
+                if not isinstance(doc, dict) or "observed_at_utc" not in doc:
+                    return True
+        except Exception:
+            return True
+        return False
+
     def run_bootstrap_readonly(self) -> None:
-        """Seed missing read-only snapshots on startup so every dashboard tab has live data immediately."""
+        """Seed missing or degraded read-only snapshots on startup so every dashboard tab is healthy."""
         missing_jobs: list[JobSpec] = []
+        refresh_jobs: list[JobSpec] = []
         for job in self.jobs:
             if not (job.bootstrap_eligible and job.readonly):
                 continue
@@ -992,11 +1020,14 @@ class WorkerScheduler:
             sentinel = self._bootstrap_sentinel_for(job.name)
             if sentinel is None or not sentinel.is_file():
                 missing_jobs.append(job)
-        if not missing_jobs:
+            elif self._bootstrap_needs_refresh(job.name, sentinel):
+                refresh_jobs.append(job)
+        all_jobs = [*missing_jobs, *refresh_jobs]
+        if not all_jobs:
             return
-        names = ", ".join(j.name for j in missing_jobs)
-        print(f"[hl-worker] seeding missing read-only snapshots: {names}", flush=True)
-        for job in missing_jobs:
+        names = ", ".join(j.name for j in all_jobs)
+        print(f"[hl-worker] seeding missing/degraded read-only snapshots: {names}", flush=True)
+        for job in all_jobs:
             if self._stop_event.is_set():
                 break
             self.run_job(job)

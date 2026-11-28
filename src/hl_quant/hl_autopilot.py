@@ -400,13 +400,17 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
     sp_rets = _read_sleeve_tick_returns(data_root / "hl_spot_perp_paper" / "ticks.parquet")
     if sp_st:
         rt = sp_st.get("risk_telemetry") or {}
+        sp_eq = max(_f(sp_st.get("equity_usd"), 100_000.0), 1.0)
+        sp_free = max(0.0, _f(sp_st.get("free_cash_usd"), sp_eq if not (sp_st.get("positions") or {}) else 0.0))
         out["spot_perp_paper"] = {
             "active": True,
-            "equity_usd": _f(sp_st.get("equity_usd"), 100_000.0),
+            "equity_usd": sp_eq,
             "starting_capital_usd": _f(sp_st.get("starting_capital_usd"), 100_000.0),
             "leverage": _f(rt.get("gross_leverage"), 1.25),
             "net_exposure_frac": _f(rt.get("net_delta_pct")) / 100.0,
             "positions_count": len(sp_st.get("positions") or {}),
+            "deployed_frac": round(min(1.0, max(0.0, 1.0 - sp_free / sp_eq)), 6),
+            "venue_breakdown_usd": dict(rt.get("venue_breakdown_usd") or {}),
             "returns": sp_rets,
             "venue": "HyperCore",
         }
@@ -418,12 +422,20 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
         cd_pos = cd_st.get("positions") or {}
         cd_eq = max(_f(cd_st.get("equity_usd"), 100_000.0), 1.0)
         cd_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in cd_pos.values() if isinstance(p, dict))
+        cd_locked = sum(
+            _f(p.get("margin_locked_usd"))
+            if p.get("margin_locked_usd") is not None
+            else (2.0 * _f(p.get("leg_notional_usd"))) / max(_f(p.get("per_leg_leverage"), 2.0), 1.0)
+            for p in cd_pos.values()
+            if isinstance(p, dict)
+        )
         out["cross_dex_paper"] = {
             "active": True,
             "equity_usd": cd_eq,
             "starting_capital_usd": _f(cd_st.get("starting_capital_usd"), 100_000.0),
             "leverage": round(cd_gross / cd_eq, 3),
             "positions_count": len(cd_pos),
+            "deployed_frac": round(min(1.0, max(0.0, cd_locked / cd_eq)), 6),
             "returns": cd_rets,
             "venue": "HL x Lighter/Extended",
         }
@@ -435,12 +447,14 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
         h3_pos = h3_st.get("positions") or {}
         h3_eq = max(_f(h3_st.get("equity_usd"), 50_000.0), 1.0)
         h3_gross = sum(2.0 * _f(p.get("leg_notional_usd")) for p in h3_pos.values() if isinstance(p, dict))
+        h3_locked = sum(_f(p.get("margin_locked_usd")) for p in h3_pos.values() if isinstance(p, dict))
         out["hip3_paper"] = {
             "active": True,
             "equity_usd": h3_eq,
             "starting_capital_usd": _f(h3_st.get("starting_capital_usd"), 50_000.0),
             "leverage": round(h3_gross / h3_eq, 3),
             "positions_count": len(h3_pos),
+            "deployed_frac": round(min(1.0, max(0.0, h3_locked / h3_eq)), 6),
             "returns": h3_rets,
             "venue": "HIP-3 Builders",
         }
@@ -460,6 +474,7 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
                 sum(_f(p.get("hl_weight")) + _f(p.get("cex_weight")) for p in mm_pos.values() if isinstance(p, dict)), 6
             ),
             "positions_count": len(mm_pos),
+            "deployed_frac": round(min(1.0, max(0.0, mm_lev / 2.0)), 6),
             "returns": mm_rets,
             "venue": "HL x CEX",
         }
@@ -476,8 +491,9 @@ def collect_desk_sleeve_metrics(data_root: Path, *, default_hlp_apr_pct: float =
         "active": True,
         "apr_pct": round(hlp_apr, 2),
         "leverage": 1.0,
+        "deployed_frac": 1.0,
         "returns": [],
-        "venue": "HyperCore HLP / USDC",
+        "venue": "HyperCore HLP Vault",
     }
     return out
 
@@ -936,24 +952,47 @@ def run_autopilot_tick(
     net_share = round(net_equity / start_cap, 6) if start_cap > 0 else 1.0
     net_ret_pct = round((net_share - 1.0) * 100.0, 4)
 
-    # 5. Consolidated Risk Telemetry (weighted leverage, 30D avg/max, venue breakdown)
+    # 5. Consolidated Risk Telemetry (weighted leverage, 30D avg/max, look-through venue breakdown)
     weighted_lev = 0.0
     venue_breakdown: dict[str, float] = {}
+
+    def _add_venue(label: str, amount_usd: float) -> None:
+        if amount_usd <= 0:
+            return
+        canon = "Cash / USDC" if label in ("Free USDC Reserve", "Free USDC Buffer") else label
+        venue_breakdown[canon] = round(venue_breakdown.get(canon, 0.0) + amount_usd, 2)
+
     for k, usd in alloc_usd.items():
         if usd <= 0:
             continue
         w = usd / max(gross_equity, 1.0)
         if k == "crisis_cta":
             lev_k = float(cta_snap["gross_leverage"])
-            venue_k = "HyperCore Perp (CTA)"
+            dep_frac = min(1.0, max(0.0, lev_k))
+            _add_venue("HyperCore Perp (CTA)", usd * dep_frac)
+            _add_venue("Cash / USDC", usd * (1.0 - dep_frac))
         elif k in sleeves:
-            lev_k = float(sleeves[k].get("leverage", 1.0))
-            venue_k = str(sleeves[k].get("venue", "HyperCore"))
+            s_info = sleeves[k]
+            lev_k = float(s_info.get("leverage", 1.0))
+            venue_k = str(s_info.get("venue", "HyperCore"))
+            sub_venues = s_info.get("venue_breakdown_usd")
+            s_eq = _f(s_info.get("equity_usd"))
+            if k == "spot_perp_paper" and isinstance(sub_venues, dict) and sub_venues and s_eq > 0:
+                scale = usd / s_eq
+                used = 0.0
+                for sv_lbl, sv_amt in sub_venues.items():
+                    part = max(0.0, _f(sv_amt)) * scale
+                    used += part
+                    _add_venue(str(sv_lbl), part)
+                _add_venue("Cash / USDC", usd - used)
+            else:
+                dep_frac = min(1.0, max(0.0, _f(s_info.get("deployed_frac"), 1.0)))
+                _add_venue(venue_k, usd * dep_frac)
+                _add_venue("Cash / USDC", usd * (1.0 - dep_frac))
         else:
             lev_k = 1.0
-            venue_k = "HyperCore"
+            _add_venue("HyperCore", usd)
         weighted_lev += w * lev_k
-        venue_breakdown[venue_k] = round(venue_breakdown.get(venue_k, 0.0) + usd, 2)
 
     weighted_lev = round(weighted_lev, 3)
     lev_30d_avg, lev_30d_max = spa._compute_30d_leverage_stats(ticks_path, weighted_lev, ts_ms)

@@ -204,6 +204,8 @@ export interface CrossDexOpp {
 
 export interface CrossDexPosition {
   coin: string;
+  other_dex?: string;
+  entry_type?: string;
   direction: string;
   leg_notional_usd: number;
   hours_held: number;
@@ -211,6 +213,10 @@ export interface CrossDexPosition {
   live_spread_apr_pct: number;
   entry_l2_slip_bps: number;
   entry_exec_basis_bps: number;
+  cum_funding_usd?: number;
+  cum_basis_mtm_usd?: number;
+  cum_cost_usd?: number;
+  net_pnl_usd?: number;
 }
 
 export interface Hip3PaperPosition {

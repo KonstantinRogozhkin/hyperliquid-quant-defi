@@ -51,6 +51,7 @@ def _atomic_write_text(path: Path, content: str) -> None:
 def main(
     account_address: str | None = typer.Option(None, help="Default: $HL_TESTNET_ACCOUNT_ADDRESS"),
     audit_log: Path = typer.Option(ROOT / "data/paper/hl_testnet_audit.jsonl"),
+    mm_audit_log: Path = typer.Option(ROOT / "data/paper/hl_mm_testnet/mm_audit.jsonl"),
     paper_dir: Path = typer.Option(ROOT / "data/paper/hl_metamodel"),
     output_dir: Path | None = typer.Option(ROOT / "data/paper/hl_testnet_attribution"),
     telegram: bool = typer.Option(False, help="Send Rich HTML attribution table to Telegram"),
@@ -63,7 +64,12 @@ def main(
     with httpx.Client(timeout=15.0) as client:
         snap = pta.fetch_post_trade_snapshot(client, addr)
 
-    attr = pta.compute_post_trade_attribution(snap, audit_log_path=audit_log, paper_dir=paper_dir)
+    attr = pta.compute_post_trade_attribution(
+        snap,
+        audit_log_path=audit_log,
+        mm_audit_log_path=mm_audit_log,
+        paper_dir=paper_dir,
+    )
     md = pta.format_attribution_markdown(attr)
 
     if output_dir is not None:

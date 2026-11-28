@@ -1389,4 +1389,45 @@ describe("i18n & tooltips", () => {
     await user.hover(within(posSection).getByText("Вес HL"));
     expect(screen.getByRole("tooltip")).toHaveTextContent(/Доля капитала в позиции на Hyperliquid/);
   });
+
+  it("renders venue and per-position PnL columns in 5-DEX open dual-leg paper positions", async () => {
+    const overview = makeOverview({
+      cross_dex_paper: {
+        starting_capital_usd: 50000,
+        equity_usd: 49980.25,
+        cum_funding_usd: 34.5,
+        cum_basis_mtm_usd: -12.25,
+        cum_costs_usd: 42.0,
+        closed_pairs_count: 2,
+        payback_achieved_count: 2,
+        positions: {
+          ETH: {
+            coin: "ETH",
+            other_dex: "extended",
+            direction: "Short HL / Long extended",
+            leg_notional_usd: 5000,
+            hours_held: 18.2,
+            entry_spread_apr_pct: 29.4,
+            live_spread_apr_pct: 24.1,
+            entry_l2_slip_bps: 1.5,
+            entry_exec_basis_bps: 2.75,
+            cum_funding_usd: 19.8,
+            cum_basis_mtm_usd: -4.2,
+            net_pnl_usd: 11.4,
+          },
+        },
+      },
+    });
+    mockFetch(overview);
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    await user.click(screen.getByRole("tab", { name: "5-DEX & Paper" }));
+    const dualSec = screen.getByText("Open Dual-Leg Paper Positions").closest("section")!;
+    expect(within(dualSec).getByText("extended")).toBeInTheDocument();
+    expect(within(dualSec).getByText("$19.80")).toBeInTheDocument();
+    expect(within(dualSec).getByText("-$4.20")).toBeInTheDocument();
+    expect(within(dualSec).getByText("$11.40")).toBeInTheDocument();
+  });
 });

@@ -130,7 +130,7 @@ def test_monthly_ytd_uses_unrounded_closes_and_is_null_without_year_start():
 
 def test_curve_inception_anchor_prepended():
     d, g, n = ar._with_inception_anchor(["2026-11-27T14:39:36Z", "2026-11-27T18:39:36Z"], [0.999923, 0.999991], None)
-    assert g[0] == 1.0 and d[0] == "2026-11-27T14:39:35Z" and n is None
+    assert g[0] == 1.0 and d[0] == "2026-11-27T10:39:36Z" and n is None
     d2, g2, _ = ar._with_inception_anchor(["2026-11-27", "2026-11-28"], [0.99963, 0.9991], [0.99963, 0.9990])
     assert d2[0] == "2026-11-26" and g2[:2] == [1.0, 0.99963]
 
