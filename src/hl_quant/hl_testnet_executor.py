@@ -1040,6 +1040,30 @@ def save_high_water_mark(path: Path, value: float) -> None:
 _CANCEL_GONE_MARKERS = ("already canceled", "already cancelled", "filled", "never placed")
 
 
+def cancelled_orders_count(records: list[dict[str, Any]]) -> int:
+    """Count individual open orders whose cancellation verifiably succeeded (or were already gone)."""
+    total = 0
+    for rec in records:
+        if not isinstance(rec, dict) or rec.get("error"):
+            continue
+        reqs = rec.get("requests") if isinstance(rec.get("requests"), list) else None
+        if rec.get("mode") == "dry_run":
+            total += len(reqs) if reqs is not None else 1
+            continue
+        statuses, err_msg = extract_hl_order_statuses(rec.get("response"))
+        if err_msg is not None:
+            continue
+        n_expected = len(reqs) if reqs is not None else 1
+        for idx in range(n_expected):
+            st = statuses[idx] if idx < len(statuses) else None
+            if st == "success":
+                total += 1
+            elif isinstance(st, dict) and st.get("error"):
+                if any(m in str(st.get("error")).lower() for m in _CANCEL_GONE_MARKERS):
+                    total += 1
+    return total
+
+
 def cancel_failed_coins(records: list[dict[str, Any]], requested: list[dict[str, Any]]) -> set[str]:
     """Coins whose cancel request did not verifiably succeed.
 
@@ -1329,12 +1353,13 @@ def execute_rebalance_cycle(
             "status": "kill_switch_triggered",
             "violations": violations,
             "derisk_mode": derisk_mode,
-            "cancelled_count": len(cancelled),
+            "cancelled_count": cancelled_orders_count(cancelled),
             "placed_count": ok_count,
             "rejected_count": rejected_count,
             "total_notional_usd": _accepted_notional_usd(derisk_orders, placed),
             "orphan_unwind_count": len(orphan_unwinds),
             "cancel_failed_coins": sorted(cancel_failed),
+            "oracle_band_blocked_coins": sorted(oracle_blocked),
             "high_water_mark_usd": hwm,
             "skipped_unquoted_coins": skipped_unquoted,
             "orphan_positions": orphan_positions,
@@ -1417,7 +1442,7 @@ def execute_rebalance_cycle(
             "mode": cycle_mode,
             "status": cycle_status,
             "violations": [],
-            "cancelled_count": len(cancelled),
+            "cancelled_count": cancelled_orders_count(cancelled),
             "placed_count": ok_count,
             "rejected_count": rejected_count,
             "total_notional_usd": _accepted_notional_usd(executable, placed),

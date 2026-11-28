@@ -220,7 +220,12 @@ function Desk() {
       }
     } catch (err) {
       if (timedOut && seq === reqSeqRef.current) {
-        setError(`Request timed out after ${FETCH_TIMEOUT_MS / 1000} s`);
+        setError(
+          t(
+            `Request timed out after ${FETCH_TIMEOUT_MS / 1000} s`,
+            `Превышено время ожидания запроса (${FETCH_TIMEOUT_MS / 1000} с)`,
+          ),
+        );
         return;
       }
       if (signal.aborted || (err instanceof DOMException && err.name === "AbortError") || seq !== reqSeqRef.current) {
@@ -875,6 +880,9 @@ function Desk() {
                             <td>
                               <div>
                                 <strong>{m.name || m.symbol}</strong>{" "}
+                                {m.collateral_symbol && (
+                                  <span className="badge mono">{m.collateral_symbol}</span>
+                                )}{" "}
                                 {m.is_spread_market && (
                                   <span className="badge badge-cyan">{t("SPREAD", "СПРЕД")}</span>
                                 )}
@@ -1650,6 +1658,12 @@ function Desk() {
                               rec.blocked_leverage_coins?.length
                                 ? `${t("leverage blocked", "блок плеча")}: ${rec.blocked_leverage_coins.join(", ")}`
                                 : "",
+                              rec.cancel_failed_coins?.length
+                                ? `${t("cancel failed", "сбой отмены")}: ${rec.cancel_failed_coins.join(", ")}`
+                                : "",
+                              rec.oracle_band_blocked_coins?.length
+                                ? `${t("oracle band blocked", "блок расх. оракула")}: ${rec.oracle_band_blocked_coins.join(", ")}`
+                                : "",
                               rec.skipped_unquoted_coins?.length
                                 ? `${t("skipped (no BBO)", "пропущено (нет BBO)")}: ${rec.skipped_unquoted_coins.join(", ")}`
                                 : "",
@@ -1791,7 +1805,10 @@ function Desk() {
                             </span>
                             {!j.enabled && <div className="section-sub">{j.status_reason}</div>}
                             {j.last_error && (
-                              <div className="section-sub neg mono" style={{ whiteSpace: "normal", maxWidth: 320 }}>
+                              <div
+                                className={`section-sub ${j.state === "interrupted" ? "warn" : "neg"} mono`}
+                                style={{ whiteSpace: "normal", maxWidth: 320 }}
+                              >
                                 {j.last_error}
                               </div>
                             )}

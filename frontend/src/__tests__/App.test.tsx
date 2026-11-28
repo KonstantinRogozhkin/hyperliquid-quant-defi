@@ -1552,4 +1552,73 @@ describe("Audit 2026-11-28 regressions", () => {
       vi.useRealTimers();
     }
   });
+
+  it("renders Boros collateral badge, Testnet cancel/oracle block tags, and amber interrupted job warning", async () => {
+    const base = makeOverview();
+    mockFetch(
+      makeOverview({
+        boros: {
+          active_markets_count: 1,
+          hl_and_spread_count: 1,
+          markets: [
+            {
+              market_id: 229,
+              name: "Hyperliquid BTC 25 Dec 2026",
+              symbol: "HYPERLIQUID-BTC-25DEC2026",
+              underlying: "BTC",
+              is_spread_market: false,
+              days_to_maturity: 28,
+              best_bid_apr_pct: 8.94,
+              best_ask_apr_pct: 9.3,
+              floating_apr_pct: 6.5,
+              fixed_minus_float_bid_pct: 2.44,
+              recommended_action: "Short Perp + Short Boros (Lock +8.94%)",
+              collateral_symbol: "WBTC",
+            },
+          ],
+        },
+        testnet_audit_recent: [
+          {
+            ts_ms: 1795800000000,
+            observed_at_utc: "2026-11-28 00:10 UTC",
+            status: "ok",
+            violations: [],
+            cancelled_count: 2,
+            placed_count: 1,
+            total_notional_usd: 150,
+            high_water_mark_usd: 1000,
+            blocked_isolated_coins: [],
+            cancel_failed_coins: ["SOL"],
+            oracle_band_blocked_coins: ["INIT"],
+          },
+        ],
+        worker_status: {
+          ...base.worker_status!,
+          jobs: [
+            {
+              ...base.worker_status!.jobs[0],
+              name: "settlement_study",
+              state: "interrupted",
+              last_error: "interrupted_by_worker_shutdown",
+            },
+          ],
+        },
+      }),
+    );
+    const user = userEvent.setup();
+    render(<App />);
+    await screen.findByText("Hyperliquid Quant DeFi · Live Desk");
+
+    await user.click(screen.getByRole("tab", { name: /HIP-3/i }));
+    expect(screen.getByText("WBTC")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: /Testnet/i }));
+    expect(screen.getByText(/cancel failed: SOL/)).toBeInTheDocument();
+    expect(screen.getByText(/oracle band blocked: INIT/)).toBeInTheDocument();
+
+    await user.click(screen.getByRole("tab", { name: "Scheduler & Ops" }));
+    const errEl = screen.getByText("interrupted_by_worker_shutdown");
+    expect(errEl).toHaveClass("warn");
+    expect(errEl).not.toHaveClass("neg");
+  });
 });

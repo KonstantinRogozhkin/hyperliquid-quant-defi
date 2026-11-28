@@ -437,10 +437,35 @@ def run_paper_tick(
         prev_pos = {c: p for c, p in prev_pos.items() if c not in missing_held_set}
     (state_dir / "held_missing.json").unlink(missing_ok=True)
 
+    all_raw_targets = compute_latest_target_positions(market, active_sleeves)
+
     def _live_feed_ok(coin_name: str) -> bool:
-        if coin_name not in market.coins or coin_name not in quotes:
+        if (
+            coin_name not in market.coins
+            or coin_name not in quotes
+            or coin_name not in market.hl_close.columns
+            or market.hl_close[coin_name].loc[:tick_hour_ms].dropna().empty
+        ):
             return False
-        if cex_mid_prices is None:
+        cand = all_raw_targets.get(coin_name)
+        req_legs = _cex_legs(cand) if isinstance(cand, dict) else {}
+        if req_legs:
+            for venue in req_legs:
+                cex_close_df, cex_fund_df = _cex_frames(market, venue)
+                if cex_mid_prices is not None:
+                    v_map = cex_mid_prices.get(venue.lower()) or cex_mid_prices.get(venue) or {}
+                    px = v_map.get(coin_name)
+                    if px is None or not (math.isfinite(float(px)) and float(px) > 0):
+                        return False
+                if (
+                    coin_name not in cex_fund_df.columns
+                    or cex_fund_df[coin_name].isna().all()
+                    or coin_name not in cex_close_df.columns
+                    or cex_close_df[coin_name].loc[:tick_hour_ms].dropna().empty
+                ):
+                    return False
+            return True
+        if cand is not None or cex_mid_prices is None:
             return True
         for v_map in cex_mid_prices.values():
             px = (v_map or {}).get(coin_name)
@@ -535,9 +560,7 @@ def run_paper_tick(
         new_equity = equity
     else:
         # 2. Compute new target weights (with optional micro-turnover deadband) and L2-priced costs
-        raw_targets = {
-            c: t for c, t in compute_latest_target_positions(market, active_sleeves).items() if c not in stale_excluded
-        }
+        raw_targets = {c: t for c, t in all_raw_targets.items() if c not in stale_excluded}
         targets: dict[str, dict[str, Any]] = {}
         for coin, t in raw_targets.items():
             if rebalance_deadband_weight > 0.0 and coin in prev_pos:

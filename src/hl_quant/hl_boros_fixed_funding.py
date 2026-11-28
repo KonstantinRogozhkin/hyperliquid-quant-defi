@@ -25,6 +25,21 @@ import httpx
 from hl_quant import cross_dex_scanner as cds
 
 BOROS_MARKETS_URL = "https://api-boros.pendle.finance/apis/v1/markets"
+BOROS_ASSETS_URL = "https://api-boros.pendle.finance/apis/v1/assets"
+
+_DEFAULT_COLLATERAL_SYMBOLS: dict[int, str] = {
+    1: "WBTC",
+    2: "WETH",
+    3: "USDT0",
+    4: "BNB",
+    5: "HYPE",
+}
+_COLLATERAL_UNDERLYINGS: dict[int, str] = {
+    1: "BTC",
+    2: "ETH",
+    4: "BNB",
+    5: "HYPE",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +67,7 @@ class BorosActiveMarket:
     lighter_live_apr_pct: float | None = None
     locked_hl_minus_lt_apr_pct: float | None = None
     is_actionable: bool = True
+    collateral_symbol: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -99,10 +115,73 @@ def _opt_pct(v: object) -> float | None:
     return x * 100.0 if math.isfinite(x) else None
 
 
+def fetch_boros_collateral_assets(
+    client: httpx.Client,
+    *,
+    assets_url: str = BOROS_ASSETS_URL,
+) -> dict[int, tuple[str, float]]:
+    """Fetch collateral token symbols and USD prices (``tokenId -> (symbol, usd_price)``).
+
+    Boros denominates ``notionalOI`` and ``volume24h`` in each market's collateral token
+    (e.g. ``tokenId=1`` WBTC in BTC, ``tokenId=2`` WETH in ETH, ``tokenId=3`` USDT0 in USD,
+    ``tokenId=5`` HYPE in HYPE), so USD thresholds require converting coin-margined markets.
+    """
+    try:
+        resp = client.get(assets_url)
+        resp.raise_for_status()
+        body = resp.json()
+    except Exception:
+        return {}
+    out: dict[int, tuple[str, float]] = {}
+    for item in (body.get("results") if isinstance(body, dict) else None) or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            tid = int(item.get("tokenId", -1))
+        except (TypeError, ValueError):
+            continue
+        if tid <= 0:
+            continue
+        px = _f(item.get("usdPrice"))
+        if px <= 0:
+            continue
+        raw_sym = str(item.get("symbol") or item.get("id") or _DEFAULT_COLLATERAL_SYMBOLS.get(tid, ""))
+        sym = "USDT0" if tid == 3 or "USD" in raw_sym.upper() else raw_sym.upper()
+        out[tid] = (sym, px)
+    return out
+
+
+def _resolve_collateral_usd(
+    raw: dict[str, Any],
+    data: dict[str, Any],
+    underlying: str,
+    collateral_assets: dict[int, tuple[str, float]] | None,
+) -> tuple[str, float]:
+    raw_tid = raw.get("tokenId")
+    if raw_tid is None:
+        return "", 1.0
+    try:
+        tid = int(raw_tid)
+    except (TypeError, ValueError):
+        return "", 1.0
+    if collateral_assets and tid in collateral_assets:
+        sym, px = collateral_assets[tid]
+        if px > 0 and math.isfinite(px):
+            return sym, px
+    sym = _DEFAULT_COLLATERAL_SYMBOLS.get(tid, "")
+    if tid == 3:
+        return sym or "USDT0", 1.0
+    mark_px = _f(data.get("assetMarkPrice"))
+    if tid in _COLLATERAL_UNDERLYINGS and _COLLATERAL_UNDERLYINGS[tid] == underlying.upper() and mark_px > 0:
+        return sym, mark_px
+    return sym, 1.0
+
+
 def parse_boros_market(
     raw: dict[str, Any],
     *,
     lighter_quotes: dict[str, cds.DexMarketQuote] | None = None,
+    collateral_assets: dict[int, tuple[str, float]] | None = None,
     min_volume_24h_usd: float = MIN_ACTIONABLE_VOLUME_24H_USD,
     min_oi_usd: float = MIN_ACTIONABLE_OI_USD,
     perp_round_trip_cost_bps: float = DEFAULT_PERP_ROUND_TRIP_COST_BPS,
@@ -161,9 +240,11 @@ def parse_boros_market(
             action = "Monitor"
 
     # Never recommend trading a market nobody trades: quoted APRs on a zero-volume / dust-OI book
-    # are stale indications, not executable prices.
-    oi_usd = _f(d.get("notionalOI"))
-    vol_usd = _f(d.get("volume24h"))
+    # are stale indications, not executable prices. Coin-margined markets report OI/volume in
+    # collateral units (WBTC, WETH, BNB, HYPE), so convert to USD before applying USD floors.
+    collateral_sym, collateral_usd_px = _resolve_collateral_usd(raw, d, under, collateral_assets)
+    oi_usd = _f(d.get("notionalOI")) * collateral_usd_px
+    vol_usd = _f(d.get("volume24h")) * collateral_usd_px
     has_liq_fields = "volume24h" in d or "notionalOI" in d  # absent fields are unknown, not zero
     illiquid = has_liq_fields and (vol_usd < min_volume_24h_usd or oi_usd < min_oi_usd)
     is_actionable = (not illiquid) and (bid_pct is not None or ask_pct is not None)
@@ -202,6 +283,7 @@ def parse_boros_market(
         lighter_live_apr_pct=lt_apr,
         locked_hl_minus_lt_apr_pct=locked_vs_lt,
         is_actionable=is_actionable,
+        collateral_symbol=collateral_sym,
     )
 
 
@@ -209,13 +291,20 @@ def fetch_boros_active_markets(
     client: httpx.Client,
     *,
     markets_url: str = BOROS_MARKETS_URL,
+    assets_url: str = BOROS_ASSETS_URL,
     lighter_quotes: dict[str, cds.DexMarketQuote] | None = None,
+    collateral_assets: dict[int, tuple[str, float]] | None = None,
     max_pages: int = 15,
     min_volume_24h_usd: float = MIN_ACTIONABLE_VOLUME_24H_USD,
     min_oi_usd: float = MIN_ACTIONABLE_OI_USD,
     perp_round_trip_cost_bps: float = DEFAULT_PERP_ROUND_TRIP_COST_BPS,
 ) -> tuple[int, list[BorosActiveMarket]]:
     """Paginate through Boros Open API via ``resumeToken`` and return all active markets."""
+    collaterals = (
+        collateral_assets
+        if collateral_assets is not None
+        else fetch_boros_collateral_assets(client, assets_url=assets_url)
+    )
     token: str | None = None
     total_seen = 0
     active: list[BorosActiveMarket] = []
@@ -232,6 +321,7 @@ def fetch_boros_active_markets(
             parsed = parse_boros_market(
                 item,
                 lighter_quotes=lighter_quotes,
+                collateral_assets=collaterals,
                 min_volume_24h_usd=min_volume_24h_usd,
                 min_oi_usd=min_oi_usd,
                 perp_round_trip_cost_bps=perp_round_trip_cost_bps,
@@ -249,6 +339,7 @@ def run_boros_fixed_funding_scan(
     *,
     include_lighter_comparison: bool = True,
     markets_url: str = BOROS_MARKETS_URL,
+    assets_url: str = BOROS_ASSETS_URL,
     min_volume_24h_usd: float = MIN_ACTIONABLE_VOLUME_24H_USD,
     min_oi_usd: float = MIN_ACTIONABLE_OI_USD,
     perp_round_trip_cost_bps: float = DEFAULT_PERP_ROUND_TRIP_COST_BPS,
@@ -267,6 +358,7 @@ def run_boros_fixed_funding_scan(
         total_seen, all_active = fetch_boros_active_markets(
             c,
             markets_url=markets_url,
+            assets_url=assets_url,
             lighter_quotes=lt_q,
             min_volume_24h_usd=min_volume_24h_usd,
             min_oi_usd=min_oi_usd,
@@ -277,7 +369,7 @@ def run_boros_fixed_funding_scan(
             c.close()
 
     hl_and_spread = [m for m in all_active if m.is_hyperliquid or m.is_spread_market]
-    hl_and_spread.sort(key=lambda m: (-int(m.days_to_maturity >= 5.0), -m.notional_oi))
+    hl_and_spread.sort(key=lambda m: (-int(m.is_actionable), -int(m.days_to_maturity >= 5.0), -m.notional_oi))
     return BorosScannerSnapshot(
         observed_at_ms=now_ms,
         total_markets_scanned=total_seen,
