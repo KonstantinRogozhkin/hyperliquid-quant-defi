@@ -449,6 +449,26 @@ def compute_funding_settlement_overlay_bps(
     return 0.0
 
 
+def fetch_open_orders_checked(http: httpx.Client, account_address: str) -> list[dict[str, Any]] | None:
+    """``openOrders`` for ``account_address``, or ``None`` when the response is not a valid list.
+
+    Callers must skip order-tracking reconciliation on ``None``: treating an error payload (dict /
+    null / HTTP error) as "no live orders" would drop every tracked quote and re-place duplicates.
+    """
+    try:
+        resp = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address})
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        return None
+    if not isinstance(payload, list):
+        return None
+    return [o for o in payload if isinstance(o, dict)]
+
+
+MAX_BOOK_STALENESS_FOR_DMS_SEC = 10.0
+
+
 def reduce_only_is_valid(side: str, sz: float, account_position_sz: float) -> bool:
     """True when a ``side`` order of ``sz`` only reduces the signed *account* position."""
     if sz <= 0:
@@ -1119,6 +1139,7 @@ def run_live_mm_session(
             _refresh_rest_dms(started_ms)
         dms_refresh_sec = max(3.0, (dead_man_timeout_ms / 1000.0) * 0.4)
         last_dms_mono = time.monotonic()
+        last_book_ok_mono = time.monotonic()
 
         ticks_observed = 0
         quotes_placed = 0
@@ -1134,10 +1155,18 @@ def run_live_mm_session(
         while True:
             loop_start = time.monotonic()
             now_ms = int(time.time() * 1000)
-            if enable_dead_man_switch and (loop_start - last_dms_mono) >= dms_refresh_sec:
+            # Stale market data must not keep quotes alive: only extend the exchange-side Dead Man's
+            # Switch while books keep arriving, so a frozen feed lets it fire and pull the quotes.
+            if (
+                enable_dead_man_switch
+                and (loop_start - last_dms_mono) >= dms_refresh_sec
+                and (loop_start - last_book_ok_mono) <= MAX_BOOK_STALENESS_FOR_DMS_SEC
+            ):
                 _refresh_rest_dms(now_ms)
                 last_dms_mono = loop_start
             book = fetch_testnet_l2_snapshot(http, coin)
+            if book is not None:
+                last_book_ok_mono = time.monotonic()
             if book is None:
                 if time.monotonic() >= deadline:
                     break
@@ -1150,12 +1179,13 @@ def run_live_mm_session(
 
             # 1. Reconcile fills (live userFills vs paper touch simulation)
             if execute_live and account_address:
-                oo = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address}).json() or []
-                live_oids = {int(o["oid"]) for o in oo if isinstance(o, dict) and o.get("oid") is not None}
-                for side_k in list(active_orders.keys()):
-                    oid = active_orders[side_k].get("oid")
-                    if oid is not None and oid not in live_oids:
-                        active_orders.pop(side_k, None)
+                oo = fetch_open_orders_checked(http, account_address)
+                if oo is not None:  # invalid response -> keep tracking as-is this tick
+                    live_oids = {int(o["oid"]) for o in oo if o.get("oid") is not None}
+                    for side_k in list(active_orders.keys()):
+                        oid = active_orders[side_k].get("oid")
+                        if oid is not None and oid not in live_oids:
+                            active_orders.pop(side_k, None)
 
                 uf = http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json() or []
                 for fl in uf:
@@ -2094,9 +2124,14 @@ async def run_multi_coin_mm_ws_session(
         if enable_lead_lag and ws_messages is None:
             lead_task = asyncio.create_task(_binance_lead_reader(coin_list, lead_ests, lead_stop))
 
+        last_book_mono = time.monotonic()
+
         async def _handle_message(msg: dict[str, Any], recv_ms: int) -> bool:
+            nonlocal last_book_mono
             channel = msg.get("channel")
             data = msg.get("data")
+            if channel in ("bbo", "l2Book"):
+                last_book_mono = time.monotonic()
 
             if channel == "cexLead" and isinstance(data, dict):
                 c_name = str(data.get("coin", ""))
@@ -2365,7 +2400,12 @@ async def run_multi_coin_mm_ws_session(
                             if now_mono - last_ping >= 25.0:
                                 await ws.send(json.dumps({"method": "ping"}))
                                 last_ping = now_mono
-                            if enable_dead_man_switch and (now_mono - last_dms) >= dms_refresh_sec:
+                            if (
+                                enable_dead_man_switch
+                                and (now_mono - last_dms) >= dms_refresh_sec
+                                and (now_mono - last_book_mono) <= MAX_BOOK_STALENESS_FOR_DMS_SEC
+                            ):
+                                # Extend the DMS only while books keep arriving (see REST loop).
                                 await _refresh_dead_man(int(time.time() * 1000))
                                 last_dms = now_mono
                             try:
@@ -2392,7 +2432,10 @@ async def run_multi_coin_mm_ws_session(
                         break
                     if execute_live and account_address:
                         try:
-                            oo_rc = http.post(TESTNET_INFO_URL, json={"type": "openOrders", "user": account_address}).json() or []
+                            oo_rc_checked = fetch_open_orders_checked(http, account_address)
+                            if oo_rc_checked is None:
+                                raise ValueError("openOrders unavailable; keep order tracking")
+                            oo_rc = oo_rc_checked
                             live_by_coin: dict[str, set[int]] = {c: set() for c in coin_list}
                             for o in oo_rc:
                                 if isinstance(o, dict) and o.get("oid") is not None:

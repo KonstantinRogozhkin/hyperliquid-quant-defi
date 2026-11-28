@@ -95,7 +95,10 @@ def fetch_l2_quotes(client: hl.HyperliquidInfoClient, coins: list[str]) -> dict[
     """Fetch live Hyperliquid L2 top-5 quotes for each coin (read-only)."""
     quotes: dict[str, L2Quote] = {}
     for coin in sorted(set(coins)):
-        book = client.info({"type": "l2Book", "coin": coin})
+        try:
+            book = client.info({"type": "l2Book", "coin": coin})
+        except Exception:  # noqa: BLE001 - one bad book must not abort the whole tick
+            continue
         levels = book.get("levels") if isinstance(book, dict) else None
         if not (isinstance(levels, list) and len(levels) == 2 and levels[0] and levels[1]):
             continue
@@ -317,6 +320,7 @@ def run_paper_tick(
     cex_mid_prices: dict[str, dict[str, float]] | None = None,
     rebalance_deadband_weight: float = 0.0,
     max_tick_nav_jump_pct: float = 8.0,
+    max_held_missing_ticks: int = 3,
 ) -> dict[str, Any]:
     """Execute one idempotent paper-trading tick and persist updated ledger."""
     state_dir.mkdir(parents=True, exist_ok=True)
@@ -396,13 +400,35 @@ def run_paper_tick(
                     missing_held_set.add(coin)
                     break
 
+    forced_stale_exits: list[str] = []
     if missing_held_set:
-        return {
-            "status": "held_coins_missing",
-            "tick_hour_ms": tick_hour_ms,
-            "equity_usd": state["equity_usd"],
-            "missing_coins": sorted(missing_held_set),
-        }
+        # Count distinct tick hours the ledger has been blocked. A dead feed for one held coin (e.g.
+        # Bybit delisting) must not freeze the whole metamodel forever: after
+        # ``max_held_missing_ticks`` blocked hours the stale coins are written off at their last
+        # mark (no MTM for the unobservable interval) and the tick proceeds for everything else.
+        # The counter lives in a sidecar file so a blocked tick never mutates state.json.
+        blocked_path = state_dir / "held_missing.json"
+        try:
+            blocked = json.loads(blocked_path.read_text()) if blocked_path.is_file() else {}
+        except (OSError, ValueError):
+            blocked = {}
+        hours_seen = [int(h) for h in (blocked.get("tick_hours") or []) if isinstance(h, (int, float))]
+        if tick_hour_ms not in hours_seen:
+            hours_seen.append(int(tick_hour_ms))
+        if max_held_missing_ticks <= 0 or len(hours_seen) < max_held_missing_ticks:
+            tmp_blocked = blocked_path.with_suffix(".tmp.json")
+            tmp_blocked.write_text(json.dumps({"coins": sorted(missing_held_set), "tick_hours": hours_seen[-50:]}))
+            tmp_blocked.replace(blocked_path)
+            return {
+                "status": "held_coins_missing",
+                "tick_hour_ms": tick_hour_ms,
+                "equity_usd": state["equity_usd"],
+                "missing_coins": sorted(missing_held_set),
+                "blocked_ticks": len(hours_seen),
+            }
+        forced_stale_exits = sorted(missing_held_set)
+        prev_pos = {c: p for c, p in prev_pos.items() if c not in missing_held_set}
+    (state_dir / "held_missing.json").unlink(missing_ok=True)
 
     # 1. Mark-to-market PnL and funding accrual over (prev_hour_ms, tick_hour_ms]
     price_pnl_usd = 0.0
@@ -646,6 +672,7 @@ def run_paper_tick(
         "nav_guard_triggered": nav_guard_triggered,
         "nav_guard_reason": nav_guard_reason,
         "nav_guard_pending_tick_hour_ms": nav_guard_pending,
+        "last_forced_stale_exits": forced_stale_exits,
         "positions": new_positions,
         "sleeves": [{"name": s.spec.name, "weight": s.weight} for s in active_sleeves],
     }
@@ -653,7 +680,7 @@ def run_paper_tick(
     tmp_state.write_text(json.dumps(state_out, indent=2))
     tmp_state.replace(state_path)
 
-    return {"status": "ok", **tick_row, "trades_count": len(trade_rows), "quotes_count": len(quotes)}
+    return {"status": "ok", "forced_stale_exits": forced_stale_exits, **tick_row, "trades_count": len(trade_rows), "quotes_count": len(quotes)}
 
 
 def load_telegram_credentials(env_paths: tuple[Path, ...] = ()) -> tuple[str, str, str | None]:

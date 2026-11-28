@@ -35,6 +35,14 @@ from hl_quant import paper_tracker as pt
 ROOT_DIR = Path(__file__).resolve().parents[2]
 
 
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name, "").strip()
+    try:
+        return float(raw) if raw else default
+    except ValueError:
+        return default
+
+
 def _env_flag(name: str, default: bool = False) -> bool:
     raw = os.environ.get(name)
     if raw is None:
@@ -582,6 +590,7 @@ class WorkerScheduler:
         alert_sender: Callable[[str], Any] | None = None,
         dependency_wait_s: dict[str, tuple[str, float]] | None = None,
         dependency_poll_s: float = 0.25,
+        startup_catchup_minutes: int | None = None,
     ) -> None:
         self.root_dir = Path(root_dir)
         self.data_dir = Path(
@@ -599,6 +608,17 @@ class WorkerScheduler:
             dict(dependency_wait_s) if dependency_wait_s is not None else dict(self.DEFAULT_JOB_DEPENDENCIES)
         )
         self._dependency_poll_s = max(0.01, float(dependency_poll_s))
+        # On (re)start, run each job's latest slot from the last N minutes that it has not started
+        # yet, so a deploy at e.g. :37 does not silently skip a 4-hourly paper/autopilot tick.
+        self.startup_catchup_minutes = max(
+            0,
+            int(
+                startup_catchup_minutes
+                if startup_catchup_minutes is not None
+                else _env_float("HL_WORKER_STARTUP_CATCHUP_MIN", 20.0)
+            ),
+        )
+        self._last_started_dt: dict[str, datetime] = {}
         self._last_failure_alert_mono: dict[str, float] = {}
         self._alerted_failed_jobs: set[str] = set()
         self._thread_local = threading.local()
@@ -645,7 +665,7 @@ class WorkerScheduler:
             prev_rc = prev.get("last_exit_code")
             if not enabled:
                 restored_state = "disabled"
-            elif prev_state in {"ok", "failed"}:
+            elif prev_state in {"ok", "failed", "interrupted"}:
                 restored_state = prev_state
             elif prev_rc == 0:
                 restored_state = "ok"
@@ -658,6 +678,12 @@ class WorkerScheduler:
                 # Hydrate in-memory slot guard (`YYYY-MM-DD HH:MM`) so a container restart inside a scheduled
                 # UTC minute never executes `testnet_executor` or paper ledgers a second time.
                 self._last_slot_run[job.name] = last_started[:16]
+                try:
+                    self._last_started_dt[job.name] = datetime.strptime(
+                        last_started[:19], "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=timezone.utc)
+                except ValueError:
+                    pass
             self._state[job.name] = {
                 "name": job.name,
                 "description": job.description,
@@ -843,6 +869,11 @@ class WorkerScheduler:
         if not lock.acquire(blocking=False):
             print(f"[hl-worker] skipping overlapping run of {job.name}", flush=True)
             return 0
+        proc_lock_fd = self._acquire_process_lock(job.name)
+        if proc_lock_fd is None:
+            lock.release()
+            print(f"[hl-worker] skipping {job.name}: another process holds its run lock", flush=True)
+            return 0
         try:
             self._wait_for_dependency(job.name)
             start_dt = datetime.now(tz=timezone.utc)
@@ -852,6 +883,7 @@ class WorkerScheduler:
                 prev_failed = entry.get("state") == "failed"
                 entry["state"] = "running"
                 entry["last_started_at_utc"] = start_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                self._last_started_dt[job.name] = start_dt
             self.publish_status(start_dt)
 
             cmd = job.build_command(self.root_dir, self.data_dir, self.telegram_enabled)
@@ -883,17 +915,25 @@ class WorkerScheduler:
             end_dt = datetime.now(tz=timezone.utc)
             end_utc_str = end_dt.strftime("%Y-%m-%d %H:%M:%S UTC")
 
+            # A child killed by our own shutdown (SIGTERM on deploy) did not fail: record it as
+            # ``interrupted`` so HLWorkerJobFailed does not fire on every deploy.
+            interrupted = exit_code != 0 and self._stop_event.is_set()
             with self._status_lock:
                 entry = self._state[job.name]
                 was_failed = prev_failed or (job.name in self._alerted_failed_jobs)
-                entry["state"] = "ok" if exit_code == 0 else "failed"
+                entry["state"] = "ok" if exit_code == 0 else ("interrupted" if interrupted else "failed")
                 entry["last_finished_at_utc"] = end_utc_str
                 entry["last_exit_code"] = exit_code
                 entry["last_duration_s"] = duration
-                entry["last_error"] = None if exit_code == 0 else (last_err or f"exit_code={exit_code}")
+                if exit_code == 0:
+                    entry["last_error"] = None
+                elif interrupted:
+                    entry["last_error"] = "interrupted_by_worker_shutdown"
+                else:
+                    entry["last_error"] = last_err or f"exit_code={exit_code}"
                 if exit_code == 0:
                     entry["runs_ok"] = int(entry["runs_ok"]) + 1
-                else:
+                elif not interrupted:
                     entry["runs_failed"] = int(entry["runs_failed"]) + 1
                 final_err = entry["last_error"]
             print(f"[hl-worker] finished {job.name} rc={exit_code} in {duration:.1f}s", flush=True)
@@ -909,7 +949,43 @@ class WorkerScheduler:
             )
             return exit_code
         finally:
+            self._release_process_lock(proc_lock_fd)
             lock.release()
+
+    def _acquire_process_lock(self, job_name: str) -> int | None:
+        """Kernel ``flock`` per job shared by every process using this data dir.
+
+        The in-process ``threading.Lock`` does not stop a ``--run-once`` (e.g. via ``docker exec``)
+        from running the same job — including ``testnet_executor`` — concurrently with the worker.
+        Returns the locked fd, or ``None`` when another process holds it. Falls back to no
+        cross-process lock (returns -1) if the lock file cannot be created.
+        """
+        try:
+            import fcntl
+
+            lock_dir = self.paper_dir / "locks"
+            lock_dir.mkdir(parents=True, exist_ok=True)
+            fd = os.open(lock_dir / f"{job_name}.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        except (ImportError, OSError):
+            return -1
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(fd)
+            return None
+        except OSError:
+            os.close(fd)
+            return -1
+        return fd
+
+    @staticmethod
+    def _release_process_lock(fd: int | None) -> None:
+        if fd is None or fd < 0:
+            return
+        try:
+            os.close(fd)  # releases the flock
+        except OSError:
+            pass
 
     def _dispatch_alert_html(self, rich_html: str) -> None:
         if self._alert_sender is not None:
@@ -1041,8 +1117,11 @@ class WorkerScheduler:
     def collect_due_jobs(self, now_utc: datetime, *, max_catchup_minutes: int = 60) -> list[tuple[JobSpec, str]]:
         """Return all ``(job, slot_key)`` pairs due between the last check and ``now_utc`` inclusive."""
         cur_min = now_utc.replace(second=0, microsecond=0)
-        if self._last_checked_minute is None:
-            minutes_to_scan = [cur_min]
+        startup_scan = self._last_checked_minute is None
+        if startup_scan:
+            # First poll after (re)start: also look back ``startup_catchup_minutes`` for slots
+            # missed while the worker was down. Jobs already started at/after a slot are skipped.
+            minutes_to_scan = [cur_min - timedelta(minutes=k) for k in range(self.startup_catchup_minutes, -1, -1)]
         else:
             start_min = max(self._last_checked_minute + timedelta(minutes=1), cur_min - timedelta(minutes=max_catchup_minutes))
             minutes_to_scan = []
@@ -1052,18 +1131,30 @@ class WorkerScheduler:
                 cursor += timedelta(minutes=1)
         self._last_checked_minute = cur_min
 
-        due: list[tuple[JobSpec, str]] = []
+        due: list[tuple[datetime, JobSpec, str]] = []
         seen_jobs_this_poll: set[str] = set()
-        for slot_dt in minutes_to_scan:
+        # Newest slot first, so a job that missed several slots runs once, for the latest one.
+        for slot_dt in reversed(minutes_to_scan):
             slot_key = slot_dt.strftime("%Y-%m-%d %H:%M")
             for job in self.jobs:
                 if job.name in seen_jobs_this_poll:
                     continue
-                if job.should_run_at(slot_dt) and self._last_slot_run.get(job.name) != slot_key:
-                    self._last_slot_run[job.name] = slot_key
+                if not job.should_run_at(slot_dt) or self._last_slot_run.get(job.name) == slot_key:
+                    continue
+                started = self._last_started_dt.get(job.name)
+                if startup_scan and slot_dt < cur_min and started is None:
+                    # Restart catch-up only for jobs with run history; a fresh worker relies on
+                    # bootstrap seeding instead of replaying the last minutes.
+                    continue
+                if started is not None and started >= slot_dt:
+                    # Already started at/after this slot (e.g. delayed by a dependency wait).
                     seen_jobs_this_poll.add(job.name)
-                    due.append((job, slot_key))
-        return due
+                    continue
+                self._last_slot_run[job.name] = slot_key
+                seen_jobs_this_poll.add(job.name)
+                due.append((slot_dt, job, slot_key))
+        due.sort(key=lambda item: item[0])
+        return [(job, slot_key) for _, job, slot_key in due]
 
     def tick_minute(self, now_utc: datetime) -> list[str]:
         """Synchronously execute any jobs due at or since the last checked minute (deterministic for tests)."""

@@ -58,6 +58,9 @@ class RiskLimits:
     # Close positions on coins without a two-sided Testnet book with reduce-only ALO orders priced
     # off the oracle (or the surviving book side) instead of leaving them unmanaged forever.
     unwind_unquoted_orphans: bool = True
+    # Do not OPEN exposure where the thin Testnet book mid deviates from the oracle by more than
+    # this (reduce-only orders are still allowed): joining a dislocated book buys the dislocation.
+    max_entry_oracle_dev_pct: float = 10.0
 
 
 # Kill-switch reasons caused by untrustworthy inputs: no BBO-based rebalancing on them (fail-closed).
@@ -1034,6 +1037,70 @@ def save_high_water_mark(path: Path, value: float) -> None:
     tmp.replace(path)
 
 
+_CANCEL_GONE_MARKERS = ("already canceled", "already cancelled", "filled", "never placed")
+
+
+def cancel_failed_coins(records: list[dict[str, Any]], requested: list[dict[str, Any]]) -> set[str]:
+    """Coins whose cancel request did not verifiably succeed.
+
+    Parses Hyperliquid ``cancel`` / ``bulkCancel`` responses (``response.data.statuses`` aligned
+    with the request order). An error saying the order is already gone (filled / cancelled) counts
+    as success; any other error, a missing status, or a transport error counts as failure so the
+    caller does not stack new exposure on top of an order that may still rest.
+    """
+    failed: set[str] = set()
+    covered: set[str] = set()
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        if rec.get("mode") == "dry_run":
+            covered.add(str(rec.get("coin") or ""))
+            continue
+        reqs = rec.get("requests") if isinstance(rec.get("requests"), list) else [{"coin": rec.get("coin"), "oid": rec.get("oid")}]
+        coins = [str((r or {}).get("coin") or "") for r in reqs]
+        covered.update(coins)
+        if rec.get("error"):
+            failed.update(coins)
+            continue
+        statuses, err_msg = extract_hl_order_statuses(rec.get("response"))
+        if err_msg is not None:
+            failed.update(coins)
+            continue
+        for idx, coin in enumerate(coins):
+            st = statuses[idx] if idx < len(statuses) else None
+            if st == "success":
+                continue
+            if isinstance(st, dict) and st.get("error"):
+                if any(m in str(st.get("error")).lower() for m in _CANCEL_GONE_MARKERS):
+                    continue
+            failed.add(coin)
+    # Requested coins without any record (e.g. adapter returned nothing) are unverified too.
+    failed.update(str(o.get("coin") or "") for o in requested if str(o.get("coin") or "") not in covered)
+    failed.discard("")
+    return failed
+
+
+def oracle_band_blocked_coins(
+    bbo: dict[str, tuple[float, float, int]], reference_px: dict[str, float] | None, limits: RiskLimits
+) -> set[str]:
+    """Coins whose book mid deviates from the oracle reference by more than ``max_entry_oracle_dev_pct``."""
+    out: set[str] = set()
+    if not reference_px or limits.max_entry_oracle_dev_pct <= 0:
+        return out
+    for coin, (bid, ask, _) in bbo.items():
+        ref = reference_px.get(coin)
+        mid = 0.5 * (bid + ask)
+        if ref is None or not (math.isfinite(float(ref)) and float(ref) > 0) or mid <= 0:
+            continue
+        if abs(mid / float(ref) - 1.0) * 100.0 > limits.max_entry_oracle_dev_pct:
+            out.add(coin)
+    return out
+
+
+def _accepted_notional_usd(orders: list[PlannedOrder], records: list[dict[str, Any]]) -> float:
+    return round(sum(o.notional_usd for o, r in zip(orders, records, strict=False) if _order_record_succeeded(r)), 2)
+
+
 def _order_record_succeeded(rec: Any) -> bool:
     """Return True when an adapter order record was accepted (resting or filled, not rejected/errored)."""
     if not isinstance(rec, dict):
@@ -1164,7 +1231,17 @@ def execute_rebalance_cycle(
             for o in account.open_orders
             if str(o.get("coin") or "") in managed_coins and safe_int(o.get("oid")) not in foreign_oids
         ]
-    cancelled = adapter.cancel_all_open_orders(orders_to_cancel) if orders_to_cancel else []
+    cancelled: list[dict[str, Any]] = []
+    if orders_to_cancel:
+        try:
+            cancelled = adapter.cancel_all_open_orders(orders_to_cancel) or []
+        except Exception as exc:
+            cancelled = [{"mode": cycle_mode, "error": f"{type(exc).__name__}: {exc}", "requests": orders_to_cancel}]
+    # Never stack new exposure on a coin whose old orders may still rest, and never open exposure
+    # into a book that is dislocated from the oracle; reduce-only orders remain allowed for both.
+    cancel_failed = cancel_failed_coins(cancelled, orders_to_cancel) if orders_to_cancel else set()
+    oracle_blocked = oracle_band_blocked_coins(bbo, reference_px, limits)
+    entry_blocked = cancel_failed | oracle_blocked
 
     orphan_unwinds: list[PlannedOrder] = []
     if limits.unwind_unquoted_orphans and not hard_data:
@@ -1243,6 +1320,7 @@ def execute_rebalance_cycle(
                 )
                 if o.reduce_only
             ] + orphan_unwinds
+        derisk_orders = [o for o in derisk_orders if o.reduce_only or o.coin not in entry_blocked]
         placed = _submit_alo_orders(adapter, derisk_orders)
         ok_count = sum(1 for r in placed if _order_record_succeeded(r))
         rejected_count = len(placed) - ok_count
@@ -1254,8 +1332,9 @@ def execute_rebalance_cycle(
             "cancelled_count": len(cancelled),
             "placed_count": ok_count,
             "rejected_count": rejected_count,
-            "total_notional_usd": round(sum(o.notional_usd for o in derisk_orders), 2),
+            "total_notional_usd": _accepted_notional_usd(derisk_orders, placed),
             "orphan_unwind_count": len(orphan_unwinds),
+            "cancel_failed_coins": sorted(cancel_failed),
             "high_water_mark_usd": hwm,
             "skipped_unquoted_coins": skipped_unquoted,
             "orphan_positions": orphan_positions,
@@ -1328,7 +1407,7 @@ def execute_rebalance_cycle(
                 # Never open exposure at an unknown (exchange default / max) leverage.
                 (blocked_isolated_coins if spec.only_isolated else blocked_leverage_coins).add(coin)
 
-        blocked = blocked_isolated_coins | blocked_leverage_coins
+        blocked = blocked_isolated_coins | blocked_leverage_coins | entry_blocked
         executable = [o for o in planned if o.reduce_only or o.coin not in blocked] + orphan_unwinds
         placed = _submit_alo_orders(adapter, executable)
         ok_count = sum(1 for r in placed if _order_record_succeeded(r))
@@ -1341,8 +1420,10 @@ def execute_rebalance_cycle(
             "cancelled_count": len(cancelled),
             "placed_count": ok_count,
             "rejected_count": rejected_count,
-            "total_notional_usd": round(sum(o.notional_usd for o in executable), 2),
+            "total_notional_usd": _accepted_notional_usd(executable, placed),
             "orphan_unwind_count": len(orphan_unwinds),
+            "cancel_failed_coins": sorted(cancel_failed),
+            "oracle_band_blocked_coins": sorted(oracle_blocked),
             "high_water_mark_usd": hwm,
             "leverage_updates": leverage_updates,
             "blocked_isolated_coins": sorted(blocked_isolated_coins),

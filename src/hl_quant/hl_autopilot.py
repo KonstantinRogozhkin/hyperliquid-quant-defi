@@ -126,6 +126,11 @@ class AutopilotConfig:
     # (paid, HWM reset) only once per period: "quarter" or "month".
     perf_fee_crystallization: str = "quarter"
     max_tick_nav_jump_pct: float = 4.0  # Bounded NAV sanity guard
+    # A second invocation within this window (scheduler retry, manual re-run) is a no-op instead of
+    # booking another tick with dt ~ 0 on top of an already persisted state.
+    min_tick_spacing_min: float = 10.0
+    # Longest interval time-based accruals (mgmt fee, HLP yield, CTA carry) cover after an outage.
+    max_accrual_hours: float = 168.0
     default_hlp_apr_pct: float = 12.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -676,6 +681,9 @@ def run_autopilot_tick(
     rebal_path = out_dir / "rebalances.parquet"
 
     state = _load_or_init_autopilot_state(state_path, cfg)
+    last_ms = int(state.get("last_tick_ms", 0) or 0)
+    if last_ms > 0 and cfg.min_tick_spacing_min > 0 and 0 <= ts_ms - last_ms < cfg.min_tick_spacing_min * 60_000:
+        return {"state": state, "status": "duplicate_tick_skipped"}
     sleeves = collect_desk_sleeve_metrics(data_root, default_hlp_apr_pct=cfg.default_hlp_apr_pct)
 
     own_client = client is None and daily_closes is None
@@ -719,10 +727,10 @@ def run_autopilot_tick(
             http_client.close()
 
     prev_ms = int(state.get("last_tick_ms", 0))
-    dt_hours = max(0.0, min(48.0, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
+    dt_hours = max(0.0, min(cfg.max_accrual_hours, (ts_ms - prev_ms) / 3_600_000.0)) if prev_ms > 0 else 0.0
     # Time-based accruals (HLP reserve yield, CTA perp carry) skipped by a NAV-guard clamp are
     # carried forward and applied on the next accepted tick instead of being lost.
-    accrual_hours = min(48.0, dt_hours + max(0.0, _f(state.get("nav_guard_deferred_hours"))))
+    accrual_hours = min(cfg.max_accrual_hours, dt_hours + max(0.0, _f(state.get("nav_guard_deferred_hours"))))
     prev_gross = float(state.get("gross_equity_usd", cfg.starting_capital_usd))
     prev_net = float(state.get("net_equity_usd", cfg.starting_capital_usd))
     start_cap = float(state.get("starting_capital_usd", cfg.starting_capital_usd))
@@ -1070,7 +1078,8 @@ def run_autopilot_tick(
         }
     )
 
-    _write_json_atomic(state_path, state)
+    # Append the tick row BEFORE persisting state: if anything fails in between, the retry re-runs
+    # the same interval from the old state instead of leaving state ahead of ticks.parquet.
     _append_parquet(
         ticks_path,
         [
@@ -1094,6 +1103,7 @@ def run_autopilot_tick(
             }
         ],
     )
+    _write_json_atomic(state_path, state)
     return {"state": state}
 
 

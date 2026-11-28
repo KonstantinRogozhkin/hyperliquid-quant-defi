@@ -32,6 +32,10 @@ def main(
     out_dir = state_dir or (data_root / "hl_autopilot")
     with httpx.Client(timeout=25.0) as client:
         res = ap.run_autopilot_tick(client, data_root=data_root, state_dir=out_dir, cfg=cfg)
+    if res.get("status") == "duplicate_tick_skipped":
+        # A retry / manual re-run inside the spacing window: nothing new to report or alert.
+        typer.echo(json.dumps({"status": "duplicate_tick_skipped", "last_tick_ms": res["state"].get("last_tick_ms")}))
+        return
 
     md = ap.format_autopilot_markdown(res)
     tmp_md = out_dir / "report.tmp.md"

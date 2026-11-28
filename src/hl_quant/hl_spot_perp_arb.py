@@ -27,6 +27,7 @@ import pandas as pd
 from hl_quant import cross_dex_scanner as cds
 from hl_quant import hl_boros_fixed_funding as boros
 from hl_quant import hl_hyperevm_defi as evm
+from hl_quant import persistence_clock as pc
 from hl_quant.persistence_clock import advance_streak, streak_count, update_streak_map
 
 HL_INFO_URL = "https://api.hyperliquid.xyz/info"
@@ -731,16 +732,19 @@ def run_spot_perp_paper_tick(
         hlp_usd = round(hlp_usd + tick_hlp_usd, 4)
 
         # 2. Mark-to-market open positions (delta-neutral spot + short perp) & accrue settled hourly funding
-        expected_settlements = (ts_ms // 3_600_000) - (prev_ms // 3_600_000) if prev_ms > 0 else 0
+        # Per-position accrual clock: a position skipped on an earlier tick (missing quote) keeps its
+        # own ``last_accrual_ms``, so its settled-funding window starts where it last accrued.
+        pos_start_ms = {base: pc.position_accrual_start_ms(pos, prev_ms) for base, pos in positions.items()}
         settled_rates: dict[str, float] = {}
-        if prev_ms > 0 and expected_settlements > 0 and positions and markets is None and http_client is not None:
-            settled_rates = fetch_settled_funding_sum(
-                http_client,
-                list(positions.keys()),
-                prev_ms + 1,
-                ts_ms,
-                info_url=info_url,
-            )
+        if prev_ms > 0 and positions and markets is None and http_client is not None:
+            by_start: dict[int, list[str]] = {}
+            for base, start in pos_start_ms.items():
+                if start > 0 and (ts_ms // 3_600_000) - (start // 3_600_000) > 0:
+                    by_start.setdefault(start, []).append(base)
+            for start, bases in by_start.items():
+                settled_rates.update(
+                    fetch_settled_funding_sum(http_client, bases, start + 1, ts_ms, info_url=info_url)
+                )
 
         for base, pos in list(positions.items()):
             opp = by_base.get(base)
@@ -758,13 +762,17 @@ def run_spot_perp_paper_tick(
             basis_pnl = spot_pnl + perp_pnl
             perp_notional = qty * cur_perp
             spot_notional = qty * cur_spot
-            if prev_ms > 0 and markets is None and expected_settlements == 0:
+            p_start = pos_start_ms.get(base, prev_ms)
+            pos_dt_hours = max(0.0, min(24.0, (ts_ms - p_start) / 3_600_000.0)) if p_start > 0 else dt_hours
+            pos_settlements = (ts_ms // 3_600_000) - (p_start // 3_600_000) if p_start > 0 else 0
+            pos["last_accrual_ms"] = ts_ms
+            if prev_ms > 0 and markets is None and pos_settlements == 0:
                 # Sub-hour re-run with zero `:00` settlements crossed accrues zero settled funding.
                 fund_pnl = 0.0
             elif base in settled_rates:
                 fund_pnl = perp_notional * settled_rates[base]
             else:
-                fund_pnl = perp_notional * opp.funding_rate_h * dt_hours
+                fund_pnl = perp_notional * opp.funding_rate_h * pos_dt_hours
 
             # Update perp margin with unrealized perp PnL + funding accrued on perp account
             perp_margin = float(pos["perp_margin_usd"]) + perp_pnl + fund_pnl
@@ -781,7 +789,7 @@ def run_spot_perp_paper_tick(
             pos["perp_liq_distance_pct"] = round(
                 max(0.0, (perp_margin / max(perp_notional, 1.0) - mmr) * 100.0), 2
             )
-            pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + dt_hours, 2)
+            pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + pos_dt_hours, 2)
             pos["live_funding_apr_pct"] = opp.funding_apr_pct
             pos["live_mark_basis_bps"] = opp.mark_basis_bps
             pos["cum_funding_usd"] = round(float(pos.get("cum_funding_usd", 0.0)) + fund_pnl, 4)
