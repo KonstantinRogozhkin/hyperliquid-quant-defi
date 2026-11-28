@@ -85,7 +85,7 @@ Under **GitHub → Settings → Secrets and variables → Actions**:
 1. Every change enters `main` via a **Pull Request** gated by `ci.yml` (`tests` + `frontend`).
 2. Merging to `main` triggers `.github/workflows/release.yml`:
    - `gate`: verifies the target commit is still the tip of `main`.
-   - `verify`: re-runs Python `ruff` + `pytest` (340+ tests) and frontend `Vitest` (33+ checks) on the exact release SHA.
+   - `verify`: re-runs Python `ruff` + `pytest` (430+ tests) and frontend `Vitest` (40+ checks) on the exact release SHA.
    - `build-and-push`: builds `hl-backend`, `hl-worker`, `hl-frontend` with `BUILD_SHA=$GITHUB_SHA`, runs pre-push container smoke tests (`/healthz`, `/build-info.json`, `/api/v1/overview`, worker 16-job scheduler & SDK check), and pushes immutable `ghcr.io/<owner>/hl-*:sha-<GITHUB_SHA>` tags.
    - `deploy-dokploy`: calls `scripts/ops/deploy_dokploy.py` to pin `DEPLOY_SHA=<GITHUB_SHA>` in Dokploy, trigger `compose.deploy`, wait for `status == done`, and assert frontend, backend, and `worker_status.build_sha` all serve the exact `GITHUB_SHA`.
 3. **Instant Rollback:** set `DEPLOY_SHA=<previous-40-char-sha>` in Dokploy Environment and click **Deploy** (no rebuild needed; every historical SHA image remains immutable in GHCR).

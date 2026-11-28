@@ -87,6 +87,9 @@ export interface TestnetAuditRecord {
   orphan_unwind_count?: number;
   blocked_isolated_coins: string[];
   blocked_leverage_coins?: string[];
+  cancel_failed_coins?: string[];
+  oracle_band_blocked_coins?: string[];
+  rejected_count?: number;
   foreign_coins?: string[];
   skipped_unquoted_coins?: string[];
   orphan_positions?: Record<string, number> | null;
@@ -166,11 +169,13 @@ export interface BorosMarket {
   underlying: string;
   is_spread_market: boolean;
   days_to_maturity: number;
-  best_bid_apr_pct: number;
-  best_ask_apr_pct: number;
+  best_bid_apr_pct: number | null;
+  best_ask_apr_pct: number | null;
   floating_apr_pct: number;
-  fixed_minus_float_bid_pct: number;
+  fixed_minus_float_bid_pct: number | null;
   recommended_action: string;
+  is_actionable?: boolean;
+  collateral_symbol?: string;
 }
 
 export interface YieldStrategyRow {

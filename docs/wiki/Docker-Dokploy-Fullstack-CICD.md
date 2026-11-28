@@ -16,11 +16,11 @@
 
 ## 2. CI/CD и защита `main`
 
-- **GitHub Ruleset `Protect main (PR + CI)`:** прямой push, force-push и удаление `main` заблокированы; обязательны Pull Request и зелёные чеки **`tests`** (Python `ruff` + `pytest`, 340+ тестов) и **`frontend`** (`Vitest` 33+ проверок + TypeScript `tsc --noEmit` + `vite build`), все GitHub Actions на нативном Node 24.
+- **GitHub Ruleset `Protect main (PR + CI)`:** прямой push, force-push и удаление `main` заблокированы; обязательны Pull Request и зелёные чеки **`tests`** (Python `ruff` + `pytest`, 430+ тестов) и **`frontend`** (`Vitest` 40+ проверок + TypeScript `tsc --noEmit` + `vite build`), все GitHub Actions на нативном Node 24.
 - **Быстрый path-skip внутри джоб (`ci.yml`):** при docs/backend-only PR `frontend` завершается за ~4s (не подвешивая required checks); при frontend-only PR аналогично быстро завершается `tests`.
 - **Авторелиз при мерже в `main` (`release.yml`):**
   1. `gate`: проверяет, что `HEAD == main` (не деплоит устаревший SHA при серии мержей).
-  2. `verify`: прогоняет `ruff check`, `pytest` (340+ тестов) и `npm test` (Vitest) на точном релизном `SHA` перед сборкой образов.
+  2. `verify`: прогоняет `ruff check`, `pytest` (430+ тестов) и `npm test` (Vitest) на точном релизном `SHA` перед сборкой образов.
   3. `build-and-push`: собирает `hl-backend`, `hl-worker`, `hl-frontend` с `BUILD_SHA=$GITHUB_SHA`, прогоняет **pre-push container smoke tests** (`/healthz`, `/build-info.json`, `/api/v1/overview`, worker SDK & 16 jobs incl. `spot_perp_paper` и `autopilot_allocator`, standalone Nginx `/nginx-health`) и пушит immutable `:sha-<GITHUB_SHA>` + `:latest` в публичный GHCR (`ghcr.io`).
   4. `deploy-dokploy` (при `vars.DOKPLOY_DEPLOY_ENABLED == 'true'`): вызывает `scripts/ops/deploy_dokploy.py`, обновляет `DEPLOY_SHA` через Dokploy API (`compose.update`), запускает `compose.deploy`, дожидается `status == done` и проверяет совпадение `sha` на живых `/build-info.json`, `/api/v1/build-info.json` и `worker_status.build_sha`.
 
