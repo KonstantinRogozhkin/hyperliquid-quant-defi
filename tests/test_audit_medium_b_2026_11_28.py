@@ -116,3 +116,119 @@ def test_run_scripts_use_repo_local_lock_dir_not_tmpdir() -> None:
         text = p.read_text(encoding="utf-8")
         assert "TMPDIR" not in text, p.name
         assert "/.neira/state/locks/" in text, p.name
+
+
+# --------------------------------------------------------------------------- 9-11. API healthz / audit / metrics
+
+
+def test_healthz_reports_degraded_when_data_root_missing(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+
+    from hl_quant.api.app import create_app
+
+    client = TestClient(create_app(data_root=tmp_path / "missing", build_sha="abc"))
+    r = client.get("/healthz")
+    assert r.status_code == 200
+    assert r.json()["status"] == "degraded"
+    assert r.json()["data_root_exists"] is False
+    assert TestClient(create_app(data_root=tmp_path, build_sha="abc")).get("/healthz").json()["status"] == "ok"
+
+
+def test_audit_record_orphan_positions_none_when_field_absent() -> None:
+    from hl_quant.api.app import _audit_record
+
+    assert _audit_record({"ts_ms": 1, "status": "ok"})["orphan_positions"] is None
+    assert _audit_record({"ts_ms": 1, "status": "ok", "orphan_positions": {}})["orphan_positions"] == {}
+    assert _audit_record({"ts_ms": 1, "orphan_positions": {"SKY": -975.0}})["orphan_positions"] == {"SKY": -975.0}
+
+
+def test_metrics_survive_analytics_failure_and_export_error_gauge(tmp_path: Path, monkeypatch) -> None:
+    from fastapi.testclient import TestClient
+
+    from hl_quant.api import app as api_app
+
+    (tmp_path / "hl_worker_status.json").write_text(
+        '{"service": "hl-worker", "heartbeat_utc": "2026-11-27 14:00:00 UTC", "jobs": []}', encoding="utf-8"
+    )
+    client = TestClient(api_app.create_app(data_root=tmp_path, build_sha="abc"))
+    ok = client.get("/metrics")
+    assert ok.status_code == 200
+    assert "hl_metrics_render_errors 0" in ok.text
+
+    def _boom(_root: Path) -> dict:
+        raise RuntimeError("analytics exploded")
+
+    monkeypatch.setattr(api_app, "build_desk_analytics_payload", _boom)
+    r = client.get("/metrics")
+    assert r.status_code == 200
+    assert "hl_metrics_render_errors 1" in r.text
+    assert "hl_worker_up" in r.text
+    assert "hl_artifact_exists" in r.text
+
+
+# --------------------------------------------------------------------------- 12. cutover requires testnet jobs
+
+
+def _load_cutover():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location("cutover_b", ROOT / "scripts/ops/cutover_local_crons_to_dokploy.py")
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    import sys
+
+    sys.modules["cutover_b"] = mod  # dataclasses resolve their module via sys.modules
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_cutover_requires_testnet_executor_and_risk_probe_when_testnet_enabled() -> None:
+    cutover = _load_cutover()
+    now = datetime(2026, 11, 27, 12, 0, 0, tzinfo=timezone.utc)
+    hb = (now - timedelta(seconds=10)).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    def fetcher_for(testnet_jobs: list[dict], testnet_enabled: bool = True):
+        jobs = [{"name": n, "enabled": True, "state": "ok"} for n in cutover.DEFAULT_REQUIRED_JOBS] + testnet_jobs
+
+        def _fetch(url: str) -> dict:
+            if url.endswith("/api/v1/healthz"):
+                return {"status": "ok"}
+            if url.endswith("build-info.json"):
+                return {"sha": "a" * 40}
+            return {
+                "worker_status": {
+                    "build_sha": "a" * 40,
+                    "heartbeat_utc": hb,
+                    "testnet_execution_enabled": testnet_enabled,
+                    "jobs": jobs,
+                }
+            }
+
+        return _fetch
+
+    ex_ok = {"name": "testnet_executor", "enabled": True, "state": "ok"}
+    rp_ok = {"name": "testnet_risk_probe", "enabled": True, "state": "ok"}
+    res = cutover.verify_dokploy_stack("https://hl.example.com", fetcher=fetcher_for([ex_ok, rp_ok]), now_utc=now)
+    assert res.testnet_execution_enabled is True
+
+    with pytest.raises(RuntimeError, match="testnet_risk_probe' is missing"):
+        cutover.verify_dokploy_stack("https://hl.example.com", fetcher=fetcher_for([ex_ok]), now_utc=now)
+    with pytest.raises(RuntimeError, match="testnet_executor' is missing"):
+        cutover.verify_dokploy_stack("https://hl.example.com", fetcher=fetcher_for([rp_ok]), now_utc=now)
+    with pytest.raises(RuntimeError, match="testnet_risk_probe disabled"):
+        cutover.verify_dokploy_stack(
+            "https://hl.example.com",
+            fetcher=fetcher_for([ex_ok, {"name": "testnet_risk_probe", "enabled": False, "state": "disabled"}]),
+            now_utc=now,
+        )
+    with pytest.raises(RuntimeError, match="testnet_risk_probe' is in failed state"):
+        cutover.verify_dokploy_stack(
+            "https://hl.example.com",
+            fetcher=fetcher_for([ex_ok, {"name": "testnet_risk_probe", "enabled": True, "state": "failed"}]),
+            now_utc=now,
+        )
+    # Read-only worker: testnet jobs are not required.
+    res_ro = cutover.verify_dokploy_stack(
+        "https://hl.example.com", fetcher=fetcher_for([], testnet_enabled=False), now_utc=now
+    )
+    assert res_ro.testnet_execution_enabled is False

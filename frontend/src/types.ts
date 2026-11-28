@@ -89,7 +89,7 @@ export interface TestnetAuditRecord {
   blocked_leverage_coins?: string[];
   foreign_coins?: string[];
   skipped_unquoted_coins?: string[];
-  orphan_positions?: Record<string, number>;
+  orphan_positions?: Record<string, number> | null;
 }
 
 export interface TestnetRiskSnapshot {

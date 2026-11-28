@@ -264,6 +264,9 @@ def test_m3_cutover_required_jobs_testnet_executor_verification_and_stray_python
                 "last_exit_code": 1 if te_state == "failed" else 0,
             }
         )
+        jobs.append(
+            {"name": "testnet_risk_probe", "enabled": True, "status_reason": "active", "state": "ok", "last_exit_code": 0}
+        )
 
         def _fetch(url: str) -> dict[str, Any]:
             if url.endswith("/api/v1/healthz"):
@@ -284,9 +287,11 @@ def test_m3_cutover_required_jobs_testnet_executor_verification_and_stray_python
 
         return _fetch
 
-    # Worker claims testnet_execution_enabled=true, but testnet_executor job is disabled -> downgraded to False
-    res = cutover.verify_dokploy_stack("https://hl.example.com", fetcher=_build_fetcher(te_enabled=False, te_state="disabled"), now_utc=now)
-    assert res.testnet_execution_enabled is False
+    # Worker claims testnet_execution_enabled=true, but testnet_executor job is disabled -> refuse (2026-11-28 audit)
+    with pytest.raises(RuntimeError, match="testnet_executor disabled"):
+        cutover.verify_dokploy_stack(
+            "https://hl.example.com", fetcher=_build_fetcher(te_enabled=False, te_state="disabled"), now_utc=now
+        )
     with pytest.raises(RuntimeError, match="testnet_executor disabled"):
         cutover.verify_dokploy_stack(
             "https://hl.example.com",
