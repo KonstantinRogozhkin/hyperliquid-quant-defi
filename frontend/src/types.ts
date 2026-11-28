@@ -273,6 +273,18 @@ export interface PaperTick {
   turnover: number;
 }
 
+export interface SettlementMeta {
+  observed_at_ms?: number;
+  bar_interval?: string;
+  span_days?: number;
+  total_settlement_events?: number;
+  coins_requested?: number;
+  coins_collected?: number;
+  coins_failed?: string[];
+  collection_ratio?: number;
+  degraded?: boolean;
+}
+
 export interface SettlementStat {
   strategy: string;
   bucket: string;
@@ -283,6 +295,15 @@ export interface SettlementStat {
   win_rate_pct: number;
   net_maker_bps: number;
   net_taker_bps: number;
+  t_stat_clustered?: number | null;
+  n_clusters?: number | null;
+  clusters?: number | null;
+  ex_top1_gross_bps?: number | null;
+  ex_top1_t_stat?: number | null;
+  top1_coin?: string | null;
+  net_t_stat?: number | null;
+  net_t_stat_clustered?: number | null;
+  fdr_pass?: boolean | null;
 }
 
 export interface CalibrationPoint {
@@ -329,11 +350,8 @@ export interface OverviewPayload {
     throughput_ticks_per_sec: number;
   } | null;
   settlement_stats?: SettlementStat[];
-  settlement_meta?: {
-    span_days?: number;
-    total_settlement_events?: number;
-    coins_collected?: number;
-  } | null;
+  settlement_meta?: SettlementMeta | null;
+  settlement_last_attempt?: SettlementMeta | null;
   frontier_history?: {
     observed_at_utc: string;
     ny_session: string;

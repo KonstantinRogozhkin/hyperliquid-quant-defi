@@ -33,9 +33,9 @@ app = typer.Typer(add_completion=False, help=__doc__)
 
 
 def cex_symbol(coin: str) -> str:
-    """HL ``kPEPE``-style thousand-unit coins trade as ``1000PEPEUSDT`` on CEXs."""
-    if coin.startswith("k") and coin[1:].isupper():
-        return f"1000{coin[1:]}USDT"
+    """HL ``kPEPE`` / ``kFloki`` thousand-unit coins trade as ``1000PEPEUSDT`` / ``1000FLOKIUSDT`` on CEXs."""
+    if len(coin) > 1 and coin.startswith("k") and coin[1].isupper():
+        return f"1000{coin[1:].upper()}USDT"
     return f"{coin}USDT"
 
 
@@ -107,8 +107,9 @@ def main(
         raise typer.BadParameter(f"venue must be one of {cex.VENUES}")
     raw = raw_root or (ROOT / os.getenv("BACKTESTER_RAW_ROOT", "data/raw")).resolve()
     now = hl.current_time_ms()
-    end_ms = now - now % fa.HOUR_MS - 1
-    start_ms = end_ms + 1 - days * 24 * fa.HOUR_MS
+    floor_hour_ms = now - now % fa.HOUR_MS
+    end_ms = floor_hour_ms
+    start_ms = floor_hour_ms - days * 24 * fa.HOUR_MS
     coin_list = [c.strip() for c in coins.split(",") if c.strip()]
     costs = fa.Costs(hl_fee_bps=hl_fee_bps, cex_fee_bps=cex_fee_bps, slippage_bps_per_leg=slippage_bps, leverage=leverage)
 

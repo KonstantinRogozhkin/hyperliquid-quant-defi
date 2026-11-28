@@ -22,7 +22,7 @@
 | `50 * * * *` | `run_hyperliquid_snapshot_tick.sh` | Часовые снимки `predictedFundings` и состояния рынков | `data/raw/hyperliquid/snapshot/` |
 | `5 */4 * * *` | `run_hl_metamodel_paper_tick.sh` | Observation-only shadow paper-трекер на измеренных `5.0 б.п.` | `data/paper/hl_metamodel/` |
 | `10 */4 * * *` | `run_hl_testnet_executor_tick.sh` | Живой Testnet `ALO` ребалансер (`cross:3x`, `onlyIsolated` guard) | `data/paper/hl_testnet_audit.jsonl` |
-| `15 */4 * * *` | `run_hl_cross_dex_paper_tick.sh` | Cross-DEX Paper v2 (`HL × Lighter × Extended`, Persistence + H1 Combo) | `data/paper/hl_cross_dex_paper/` |
+| `17 */4 * * *` | `run_hl_cross_dex_paper_tick.sh` | Cross-DEX Paper v2 (`HL × Lighter × Extended`, Persistence + H1 Combo) | `data/paper/hl_cross_dex_paper/` |
 | `20 */4 * * *` | `run_hl_frontier_persistence_tick.sh` | Frontier Persistence Tracker (`HIP-3` + `Pendle Boros` + `HyperEVM Yield Stack`) | `data/paper/hl_frontier_history/` |
 | `*/15 * * * *` | `run_hl_onchain_event_tick.sh` | On-Chain Event Alpha (`H2/H4/H5/H6` + deposit-clean HLP PnL + 4ч cooldown + 6ч кэш китов) | `data/paper/hl_onchain_events/` |
 | `0 6 * * *` (`09:00 UTC`) | `run_hl_testnet_attribution_daily.sh` | Пост-трейд атрибуция (`ALO Fill`, `ADL Rank`, `API Quota`) + авторефреш HTML-дашборда | `data/paper/hl_testnet_attribution/` |

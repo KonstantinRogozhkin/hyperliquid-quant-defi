@@ -88,10 +88,11 @@ def build_panel(
     # Close of the bar opening at h_k is the price at h_{k+1}; the return over
     # (h_k, h_{k+1}] is close_k / close_{k-1} - 1.
     for name, bars in (("hl", hl_bars), ("cex", cex_bars)):
-        close = bars.set_index("open_time_ms")["close"].astype(float)
+        close = bars.set_index("open_time_ms")["close"].astype(float).replace(0.0, np.nan)
         close = close[~close.index.duplicated(keep="last")].reindex(grid)
+        close_ff = close.ffill(limit=2)
         panel[f"{name}_close"] = close
-        panel[f"{name}_ret"] = close / close.shift(1) - 1.0
+        panel[f"{name}_ret"] = (close_ff / close_ff.shift(1) - 1.0).fillna(0.0)
         if "volume" in bars.columns:
             vol = bars.set_index("open_time_ms")["volume"].astype(float)
             vol = vol[~vol.index.duplicated(keep="last")].reindex(grid)
@@ -175,12 +176,30 @@ def simulate(panel: pd.DataFrame, params: Params, costs: Costs = Costs()) -> pd.
 
 
 def metrics(sim: pd.DataFrame) -> dict[str, float]:
-    ret = sim["ret"].to_numpy()
+    if sim.empty or "ret" not in sim.columns:
+        return {
+            "hours": 0.0,
+            "total_return": 0.0,
+            "apr": 0.0,
+            "vol_annual": 0.0,
+            "vol": 0.0,
+            "sharpe": 0.0,
+            "max_drawdown": 0.0,
+            "max_dd": 0.0,
+            "time_in_market": 0.0,
+            "active_frac": 0.0,
+            "position_changes": 0.0,
+            "turnover": 0.0,
+            "funding_pnl": 0.0,
+            "basis_pnl": 0.0,
+            "cost_pnl": 0.0,
+        }
+    ret = sim["ret"].to_numpy(dtype=float)
     n = len(ret)
-    if n == 0:
-        return {"hours": 0}
     equity = np.cumsum(ret)
-    drawdown = equity - np.maximum.accumulate(np.concatenate([[0.0], equity]))[1:]
+    wealth = np.cumprod(np.maximum(1.0 + ret, 1e-6))
+    peak = np.maximum.accumulate(np.concatenate([[1.0], wealth]))[1:]
+    drawdown = wealth / peak - 1.0
     std = ret.std(ddof=1) if n > 1 else 0.0
     changes = np.abs(np.diff(np.concatenate([[0.0], sim["position"].to_numpy()])))
     return {
@@ -233,6 +252,37 @@ def portfolio(sims: dict[str, pd.DataFrame]) -> pd.DataFrame:
     return out
 
 
+def _simulate_on_union(panel: pd.DataFrame, union_idx: pd.Index, params: Params, costs: Costs) -> pd.DataFrame:
+    """Simulate ``panel`` on its active lifespan (charging full exit cost at ``T_delist``) and zero-pad onto ``union_idx``."""
+    sub = panel
+    if "hl_close" in sub.columns and "cex_close" in sub.columns:
+        valid = sub["hl_close"].replace(0.0, np.nan).notna() & sub["cex_close"].replace(0.0, np.nan).notna()
+        if valid.any():
+            last_valid = int(sub.index[valid][-1])
+            sub = sub[sub.index <= last_valid]
+        else:
+            sub = sub.iloc[0:0]
+    if sub.empty:
+        return pd.DataFrame(
+            {
+                "expected_apr": np.nan,
+                "position": 0.0,
+                "funding_pnl": 0.0,
+                "basis_pnl": 0.0,
+                "cost_pnl": 0.0,
+                "ret": 0.0,
+            },
+            index=union_idx,
+        )
+    sim_active = simulate(sub, params, costs)
+    if sim_active.index.equals(union_idx):
+        return sim_active
+    aligned = sim_active.reindex(union_idx)
+    for col in ("position", "funding_pnl", "basis_pnl", "cost_pnl", "ret"):
+        aligned[col] = aligned[col].fillna(0.0)
+    return aligned
+
+
 def evaluate(
     panels: dict[str, pd.DataFrame],
     *,
@@ -245,20 +295,23 @@ def evaluate(
 
     Signals are computed on the full history (they only look back), so the test
     part starts with a warm lookback window and no information from the future.
+    Uses the union of panel timestamps so an early-delisted coin pays exit costs at
+    ``T_delist`` and flattens to 0.0 afterward without truncating active coins' OOS window.
     """
     if not 0.1 <= train_fraction <= 0.9:
         raise ValueError("train_fraction must be within [0.1, 0.9]")
     grid = tuple(grid)
-    common = None
+    all_ts: set[int] = set()
     for panel in panels.values():
-        common = panel.index if common is None else common.intersection(panel.index)
-    if common is None or len(common) < 2 * max(p.lookback_h for p in grid):
+        all_ts.update(int(x) for x in panel.index)
+    union_idx = pd.Index(sorted(all_ts), dtype="int64", name="hour_ms") if all_ts else None
+    if union_idx is None or len(union_idx) < 2 * max(p.lookback_h for p in grid):
         raise ValueError("not enough common history for the grid lookbacks")
-    split = int(split_hour_ms) if split_hour_ms is not None else int(common[int(len(common) * train_fraction)])
+    split = int(split_hour_ms) if split_hour_ms is not None else int(union_idx[int(len(union_idx) * train_fraction)])
 
     train_rows, test_rows, sims_by_params = [], [], {}
     for params in grid:
-        sims = {coin: simulate(panel.loc[common], params, costs) for coin, panel in panels.items()}
+        sims = {coin: _simulate_on_union(panel, union_idx, params, costs) for coin, panel in panels.items()}
         pooled = portfolio(sims)
         sims_by_params[params] = (sims, pooled)
         train_rows.append({"params": params.label(), **metrics(pooled[pooled.index < split])})

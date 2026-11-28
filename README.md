@@ -13,7 +13,7 @@
 
 ## Verified Live Results
 
-Standalone full-stack quant suite: Python package **`hl_quant`** (`src/hl_quant/`, zero external monorepo dependencies, **340+ passing unit tests**, zero warnings), **FastAPI read-only desk API** (with `/metrics` OpenMetrics exposition & `/api/v1/analytics`), **7-tab React + Vite + TypeScript Live Desk SPA** (33+ Vitest checks, EN/RU i18n), **16-job Docker `worker` scheduler** (with cooldown-gated Telegram failure/recovery alerts), and automated **GHCR + Dokploy CI/CD** behind a protected PR-only `main` branch (`tests` + `frontend` required checks). Every number below comes from live Hyperliquid Mainnet feeds, Hyperliquid Testnet executions, HyperEVM Chain 999 RPC (`eth_call`), Pendle Boros Open API, and reproducible OOS studies.
+Standalone full-stack quant suite: Python package **`hl_quant`** (`src/hl_quant/`, zero external monorepo dependencies, **470+ passing unit tests**, zero warnings), **FastAPI read-only desk API** (with `/metrics` OpenMetrics exposition & `/api/v1/analytics`), **7-tab React + Vite + TypeScript Live Desk SPA** (45+ Vitest checks, EN/RU i18n), **16-job Docker `worker` scheduler** (with cooldown-gated Telegram failure/recovery alerts), and automated **GHCR + Dokploy CI/CD** behind a protected PR-only `main` branch (`tests` + `frontend` required checks). Every number below comes from live Hyperliquid Mainnet feeds, Hyperliquid Testnet executions, HyperEVM Chain 999 RPC (`eth_call`), Pendle Boros Open API, and reproducible OOS studies.
 
 | Module | Scope | Verified Result | Report / Proof |
 |---|---|---|---|
@@ -82,7 +82,7 @@ Requires **Python >= 3.11.5** (and **Node >= 22** or **Docker** for the live web
 # 1. Install Python environment, dev tools & optional Testnet SDK
 uv sync --all-extras
 
-# 2. Run lint and the full 340+ unit test suite
+# 2. Run lint and the full 470+ unit test suite
 make lint
 make test
 
@@ -109,7 +109,7 @@ All live execution code is hard-pinned to **`https://api.hyperliquid-testnet.xyz
 | Hourly `:50` | `scripts/ops/run_hyperliquid_snapshot_tick.sh` | Live `predictedFundings` & market snapshots |
 | Every 4h `:05` | `scripts/ops/run_hl_metamodel_paper_tick.sh` | Observation-only shadow paper tracker at measured `5.0 bps` HL cost |
 | Every 4h `:10` | `scripts/ops/run_hl_testnet_executor_tick.sh` | Live Testnet `ALO` rebalancer (`cross:3x`, `onlyIsolated` guard, kill-switch) |
-| Every 4h `:15` | `scripts/ops/run_hl_cross_dex_paper_tick.sh` | Cross-DEX Paper v2 (**HL × Lighter × Extended**, Persistence + Slip `<=5 bps` + H1 Combo) |
+| Every 4h `:17` | `scripts/ops/run_hl_cross_dex_paper_tick.sh` | Cross-DEX Paper v2 (**HL × Lighter × Extended**, Persistence + Slip `<=5 bps` + H1 Combo) |
 | Every 4h `:20` | `scripts/ops/run_hl_frontier_persistence_tick.sh` | Frontier Persistence Tracker (**HIP-3** Growth/Oracle + **Pendle Boros** + **HyperEVM Yield Stack**) |
 | Every 15m (`*/15`) | `scripts/ops/run_hl_onchain_event_tick.sh` | On-Chain Event Alpha (**H2** Leveraged Whales + **H4** EVM + **H5** Deposit-Clean HLP + **H6** 3-Regime Stress + **4h Cooldown**) |
 | Daily `09:00 UTC` | `scripts/ops/run_hl_testnet_attribution_daily.sh` | Post-trade PnL, Maker %, `ALO` Fill Rate, `ADL Rank`, API quota + quiet HTML dashboard refresh |
@@ -124,8 +124,8 @@ zsh scripts/ops/install_all_hl_crons.sh
 ## Repository Layout
 
 - `src/hl_quant/` — 37 reusable modules (research, MM, execution, 5-DEX, HIP-3 + Split-Margin Paper, Spot+Perp + Autopilot, Neutral-style analytics, Boros, HyperEVM, attribution, Prometheus `metrics.py`, FastAPI `api/`, and 16-job container `scheduler.py`).
-- `frontend/` — React + Vite + TypeScript 7-tab live quant desk SPA (EN/RU i18n, 33+ Vitest checks).
+- `frontend/` — React + Vite + TypeScript 7-tab live quant desk SPA (EN/RU i18n, 45+ Vitest checks).
 - `docker/` & `docker-compose*.yml` — multi-stage `backend`/`worker` (Python + `uv`) and `frontend` (Node + Nginx) containers for Dokploy & local preview.
 - `scripts/analytics/` & `scripts/ops/` — thin CLI entrypoints, lock-aware cron wrappers, Dokploy cron cutover tool, and SHA release script (`deploy_dokploy.py`).
-- `tests/` — 45+ test modules (**340+ unit tests**), enforced on GitHub Actions (`tests` + `frontend` required PR checks).
+- `tests/` — 50+ test modules (**470+ unit tests**), enforced on GitHub Actions (`tests` + `frontend` required PR checks).
 - `docs/` — deployment runbook (`DEPLOYMENT_DOKPLOY.md`), 10-page Wiki mirror (`docs/wiki/`), and dated research reports (`docs/reports/`).

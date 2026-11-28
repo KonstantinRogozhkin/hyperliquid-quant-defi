@@ -177,11 +177,11 @@ def wait_for_latest_deployment(
 
 
 def _worker_heartbeat_is_fresh(raw_ts: object, *, max_age_s: float = 300.0) -> bool:
-    if not raw_ts:
-        return True
+    if not isinstance(raw_ts, str) or not raw_ts.strip():
+        return False
     from datetime import datetime, timezone
 
-    s = str(raw_ts).strip()
+    s = raw_ts.strip()
     for fmt in ("%Y-%m-%d %H:%M:%S UTC", "%Y-%m-%d %H:%M UTC"):
         try:
             dt = datetime.strptime(s, fmt).replace(tzinfo=timezone.utc)

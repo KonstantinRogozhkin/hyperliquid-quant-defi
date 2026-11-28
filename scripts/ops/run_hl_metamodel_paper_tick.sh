@@ -18,6 +18,7 @@ ROOT_DIR="$(cd "$(dirname "${SCRIPT_PATH}")/../.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 STATE_DIR="${HL_PAPER_STATE_DIR:-${ROOT_DIR}/data/paper/hl_metamodel}"
+ATTRIBUTION_JSON="${HL_ATTRIBUTION_JSON:-${ROOT_DIR}/data/paper/hl_testnet_attribution/attribution.json}"
 LOCK_FILE="${HL_LOCK_FILE:-${ROOT_DIR}/.neira/state/locks/hl_metamodel_paper_tick.flock}"
 
 if [[ "${HL_OPS_LOCK_HELD:-0}" != "1" ]]; then
@@ -34,6 +35,7 @@ HL_PAPER_TELEGRAM="${HL_PAPER_TELEGRAM:-1}"
 CMD=(
   "${PYTHON_BIN}" "${ROOT_DIR}/scripts/analytics/run_hl_metamodel_paper_tick.py"
   --state-dir "${STATE_DIR}"
+  --attribution-json "${ATTRIBUTION_JSON}"
   --max-coins "${HL_PAPER_MAX_COINS:-35}"
 )
 if [[ "${HL_PAPER_TELEGRAM}" == "1" || "${HL_PAPER_TELEGRAM:l}" == "true" ]]; then

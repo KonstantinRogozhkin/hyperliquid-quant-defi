@@ -13,12 +13,13 @@ import html
 import json
 import math
 from pathlib import Path
-import threading
 from typing import Any
 
 import pandas as pd
 
+from hl_quant import hl_funding_settlement_study as fss
 from hl_quant import hl_tear_sheet as ts
+from hl_quant.hl_analytics_risk import _read_parquet_cached
 from hl_quant.hl_liquidation_and_funding_alpha import cascade_bias_label
 
 
@@ -32,37 +33,18 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
-_PARQUET_CACHE: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
-_PARQUET_CACHE_LOCK = threading.Lock()
-
-
-def _slice_records(records: list[dict[str, Any]], limit: int | None, *, head: bool) -> list[dict[str, Any]]:
-    if limit is None:
-        sliced = records
-    elif limit <= 0:
-        sliced = []
-    else:
-        sliced = records[:limit] if head else records[-limit:]
-    return [dict(r) for r in sliced]
-
-
 def _read_parquet_records(path: Path, limit: int | None = None, *, head: bool = False) -> list[dict[str, Any]]:
-    if not path.is_file():
+    df = _read_parquet_cached(path)
+    if df is None or df.empty:
         return []
+    if limit is not None:
+        if limit <= 0:
+            return []
+        sub = df.head(limit) if head else df.tail(limit)
+    else:
+        sub = df
     try:
-        st = path.stat()
-        cache_key = str(path.resolve())
-        with _PARQUET_CACHE_LOCK:
-            cached = _PARQUET_CACHE.get(cache_key)
-            if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
-                return _slice_records(cached[2], limit, head=head)
-        df = pd.read_parquet(path)
-        records = df.to_dict(orient="records")
-        with _PARQUET_CACHE_LOCK:
-            if len(_PARQUET_CACHE) > 64:
-                _PARQUET_CACHE.clear()
-            _PARQUET_CACHE[cache_key] = (st.st_mtime_ns, st.st_size, records)
-        return _slice_records(records, limit, head=head)
+        return [dict(r) for r in sub.to_dict(orient="records")]
     except Exception:
         return []
 
@@ -98,37 +80,45 @@ def collect_dashboard_payload(data_root: Path) -> dict[str, Any]:
     """Collect all live JSON/Parquet outputs under ``data_root`` for dashboard rendering."""
     base = ts.collect_tear_sheet_data(data_root)
     cross_paper_state = _read_json(data_root / "hl_cross_dex_paper" / "state.json")
-    paper_ticks = _read_parquet_records(data_root / "hl_metamodel" / "ticks.parquet", limit=720)
+    paper_ticks_path = data_root / "hl_metamodel" / "ticks.parquet"
+    paper_ticks_df = _read_parquet_cached(paper_ticks_path)
+    paper_ticks = _read_parquet_records(paper_ticks_path, limit=720)
     paper_info = base.get("paper")
     if isinstance(paper_info, dict):
         mm_state = _read_json(data_root / "hl_metamodel" / "state.json") or {}
-        all_paper_ticks = _read_parquet_records(data_root / "hl_metamodel" / "ticks.parquet")
         paper_info = dict(paper_info)
         if "nav_guard_triggers" in mm_state:
             paper_info["nav_guard_triggers"] = int(mm_state.get("nav_guard_triggers", 0) or 0)
-        last_tick = all_paper_ticks[-1] if all_paper_ticks else {}
+        last_tick = (
+            paper_ticks_df.iloc[-1].to_dict()
+            if (paper_ticks_df is not None and not paper_ticks_df.empty)
+            else {}
+        )
         if isinstance(last_tick, dict):
-            if last_tick.get("gross_hl") is not None:
+            if last_tick.get("gross_hl") is not None and pd.notna(last_tick.get("gross_hl")):
                 paper_info["gross_hl"] = _nf(last_tick.get("gross_hl"))
-            if last_tick.get("gross_cex") is not None:
+            if last_tick.get("gross_cex") is not None and pd.notna(last_tick.get("gross_cex")):
                 paper_info["gross_cex"] = _nf(last_tick.get("gross_cex"))
             paper_info["nav_guard_triggered"] = bool(
-                last_tick.get("nav_guard_triggered") or mm_state.get("nav_guard_pending_tick_hour_ms") is not None
+                (pd.notna(last_tick.get("nav_guard_triggered")) and bool(last_tick.get("nav_guard_triggered")))
+                or mm_state.get("nav_guard_pending_tick_hour_ms") is not None
             )
         if mm_state.get("cum_funding_usd") is not None:
             paper_info["cum_funding_usd"] = round(_nf(mm_state.get("cum_funding_usd")), 4)
-        elif all_paper_ticks and paper_info.get("cum_funding_usd") is None:
-            paper_info["cum_funding_usd"] = round(
-                sum(_nf(t.get("fund_pnl_usd")) for t in all_paper_ticks if isinstance(t, dict)),
-                4,
-            )
+        elif paper_ticks_df is not None and not paper_ticks_df.empty and paper_info.get("cum_funding_usd") is None:
+            if "fund_pnl_usd" in paper_ticks_df.columns:
+                paper_info["cum_funding_usd"] = round(
+                    _nf(pd.to_numeric(paper_ticks_df["fund_pnl_usd"], errors="coerce").sum()),
+                    4,
+                )
         if mm_state.get("cum_costs_usd") is not None:
             paper_info["cum_costs_usd"] = round(abs(_nf(mm_state.get("cum_costs_usd"))), 4)
-        elif all_paper_ticks and paper_info.get("cum_costs_usd") is None:
-            paper_info["cum_costs_usd"] = round(
-                abs(sum(_nf(t.get("cost_pnl_usd")) for t in all_paper_ticks if isinstance(t, dict))),
-                4,
-            )
+        elif paper_ticks_df is not None and not paper_ticks_df.empty and paper_info.get("cum_costs_usd") is None:
+            if "cost_pnl_usd" in paper_ticks_df.columns:
+                paper_info["cum_costs_usd"] = round(
+                    abs(_nf(pd.to_numeric(paper_ticks_df["cost_pnl_usd"], errors="coerce").sum())),
+                    4,
+                )
         base = {**base, "paper": paper_info}
     mm_quotes = _read_parquet_records(data_root / "hl_mm_testnet" / "quotes.parquet", limit=200)
     # Prefer the live daily hl_funding_settlement_study when present (or pick newer mtime if both exist)
@@ -523,22 +513,90 @@ def render_portfolio_dashboard_html(d: dict[str, Any]) -> str:
         dev_m = dev_m[~dev_m.index.duplicated(keep="last")]
         hld_m = sdf[sdf["split"] == "holdout"].set_index(["bucket", "strategy"])
         hld_m = hld_m[~hld_m.index.duplicated(keep="last")]
-        for key in dev_m.index:
-            if key not in hld_m.index:
-                continue
+        common_keys = [k for k in dev_m.index if k in hld_m.index]
+
+        def _finite_opt(val: Any) -> float | None:
+            if val is None or pd.isna(val):
+                return None
+            try:
+                fv = float(val)
+            except (TypeError, ValueError):
+                return None
+            return fv if math.isfinite(fv) else None
+
+        def _row_net_t_stat(hv_row: Any) -> float:
+            explicit = _finite_opt(hv_row.get("net_t_stat") if hasattr(hv_row, "get") else None)
+            if explicit is not None:
+                return explicit
+            net_val = _nf(hv_row.get("net_maker_bps") if hasattr(hv_row, "get") else None, 0.0)
+            ev_n = _nf(hv_row.get("events") if hasattr(hv_row, "get") else None, 0.0)
+            sh_ev = _finite_opt(hv_row.get("sharpe_event") if hasattr(hv_row, "get") else None)
+            if sh_ev is not None and ev_n >= 2.0:
+                return sh_ev * math.sqrt(ev_n)
+            sd_val = _finite_opt(hv_row.get("std_bps") if hasattr(hv_row, "get") else None)
+            if sd_val is not None and sd_val > 1e-9 and ev_n >= 2.0:
+                return net_val / (sd_val / math.sqrt(ev_n))
+            gross_val = _nf(hv_row.get("mean_gross_bps") if hasattr(hv_row, "get") else None, 0.0)
+            gross_t = _finite_opt(hv_row.get("t_stat") if hasattr(hv_row, "get") else None)
+            if gross_t is not None and abs(gross_val) > 1e-9 and abs(gross_t) > 1e-9:
+                se = abs(gross_val / gross_t)
+                return net_val / se if se > 1e-12 else 0.0
+            return -math.inf if net_val <= 0.0 else (gross_t if gross_t is not None else -math.inf)
+
+        def _row_holdout_p(hv_row: Any) -> float:
+            t_net = _row_net_t_stat(hv_row)
+            t_cl_raw = (
+                _finite_opt(hv_row.get("t_stat_clustered_net") if hasattr(hv_row, "get") else None)
+                if (hasattr(hv_row, "get") and hv_row.get("t_stat_clustered_net") is not None)
+                else _finite_opt(hv_row.get("t_stat_clustered") if hasattr(hv_row, "get") else None)
+            )
+            t_cl_val = t_cl_raw if t_cl_raw is not None else -math.inf
+            ev_n = _nf(hv_row.get("events") if hasattr(hv_row, "get") else None, 0.0)
+            cl_n = _nf(hv_row.get("clusters") if hasattr(hv_row, "get") else None, 0.0)
+            df_ev = (ev_n - 1.0) if ev_n >= 2.0 else None
+            df_cl = (cl_n - 1.0) if cl_n >= 2.0 else df_ev
+            return max(fss.one_sided_p_value(t_net, df_ev), fss.one_sided_p_value(t_cl_val, df_cl))
+
+        computed_bh = dict(
+            zip(
+                common_keys,
+                fss.benjamini_hochberg(
+                    [_row_holdout_p(hld_m.loc[k]) for k in common_keys],
+                    fss.SETTLEMENT_FDR_Q,
+                ),
+                strict=False,
+            )
+        )
+
+        for key in common_keys:
             b_n, st_n = key
             dv, hv = dev_m.loc[key], hld_m.loc[key]
             net_m = float(hv["net_maker_bps"])
             t_v = float(hv["t_stat"])
-            t_clust_raw = hv.get("t_stat_clustered") if hasattr(hv, "get") else None
-            t_clust = float(t_clust_raw) if (t_clust_raw is not None and pd.notna(t_clust_raw)) else t_v
+            t_net_v = _row_net_t_stat(hv)
+            t_clust_opt = _finite_opt(hv.get("t_stat_clustered") if hasattr(hv, "get") else None)
+            # Never fall back to naive t_stat when clustered t-stat is NaN/None: treat as -inf.
+            t_clust = t_clust_opt if t_clust_opt is not None else -math.inf
+            fdr_raw = hv.get("fdr_pass") if hasattr(hv, "get") else None
+            if fdr_raw is not None and not pd.isna(fdr_raw):
+                fdr_ok = bool(fdr_raw)
+            else:
+                fdr_ok = bool(computed_bh.get(key, False))
             ex_top1_raw = hv.get("ex_top1_gross_bps") if hasattr(hv, "get") else None
             if ex_top1_raw is not None and pd.notna(ex_top1_raw):
                 cost_bps = float(hv["mean_gross_bps"]) - net_m
                 ex_top1_net_ok = (float(ex_top1_raw) - cost_bps) > 0.0
             else:
                 ex_top1_net_ok = True
-            if float(dv["net_maker_bps"]) > 0 and net_m > 0 and t_v >= 2.0 and t_clust >= 2.0 and ex_top1_net_ok:
+            if (
+                float(dv["net_maker_bps"]) > 0
+                and net_m > 0
+                and t_v >= 2.0
+                and t_net_v >= 2.0
+                and t_clust >= 2.0
+                and ex_top1_net_ok
+                and fdr_ok
+            ):
                 v_pill = '<span class="pill green">GO</span>'
             elif float(dv["mean_gross_bps"]) > 1.0 and float(hv["mean_gross_bps"]) > 1.0 and t_v >= 2.0:
                 v_pill = '<span class="pill amber">MM Overlay</span>'

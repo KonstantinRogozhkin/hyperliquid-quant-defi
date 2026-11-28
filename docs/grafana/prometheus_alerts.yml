@@ -27,17 +27,19 @@ groups:
           description: "UTC worker job {{ $labels.worker_job }} is in failed state. Check Dokploy hl-worker logs and /api/v1/scheduler/status."
 
       - alert: HLTestnetKillSwitchTriggered
-        expr: hl_testnet_last_cycle_ok == 0
+        expr: hl_testnet_last_cycle_ok == 0 and on() hl_worker_testnet_execution_enabled == 1
         for: 1m
         labels:
           severity: critical
           service: hyperliquid-quant-defi
         annotations:
           summary: "Testnet ALO Executor tripped kill-switch or failed last cycle"
-          description: "hl_testnet_last_cycle_ok == 0. Inspect /api/v1/attribution and recent Testnet audit violations immediately."
+          description: "hl_testnet_last_cycle_ok == 0 while Testnet execution is enabled. Inspect /api/v1/attribution and recent Testnet audit violations immediately."
 
       - alert: HLTestnetLiquidationRisk
-        expr: hl_testnet_liq_warnings > 0 or hl_testnet_min_liq_distance_pct < 20
+        expr: >-
+          (hl_testnet_liq_warnings > 0 or hl_testnet_min_liq_distance_pct < 20)
+          and on() hl_worker_job_enabled{worker_job="testnet_attribution"} == 1
         for: 1m
         labels:
           severity: critical
@@ -47,7 +49,7 @@ groups:
           description: "Liquidation warnings={{ $value }} or min liquidation distance dropped below 20% on live Testnet positions."
 
       - alert: HLTestnetADLRisk
-        expr: hl_testnet_adl_warnings > 0
+        expr: hl_testnet_adl_warnings > 0 and on() hl_worker_job_enabled{worker_job="testnet_attribution"} == 1
         for: 2m
         labels:
           severity: critical
@@ -97,7 +99,9 @@ groups:
           description: "Crisis-CTA directional sleeve exceeded 6% (hard cap 5%) or sleeve weight drift exceeded 6% (deadband 3%)."
 
       - alert: HLStrategyDrawdownOrApiQuotaCritical
-        expr: hl_strategy_current_dd_pct{category!="Benchmark"} > 5.0 or hl_testnet_api_reqs_per_usd_vol > 0.85
+        expr: >-
+          hl_strategy_current_dd_pct{category!="Benchmark"} > 5.0
+          or (hl_testnet_api_reqs_per_usd_vol > 0.85 and on() hl_worker_job_enabled{worker_job="testnet_attribution"} == 1)
         for: 5m
         labels:
           severity: critical
@@ -107,7 +111,7 @@ groups:
           description: "A desk strategy is currently more than 5% below its share-price peak (hl_strategy_current_dd_pct; historical max DD is hl_strategy_max_dd_pct and does not alert) or API request rate is approaching HyperCore's 1 req/$1 volume ceiling."
 
       - alert: HLTestnetDrawdownNearKillSwitch
-        expr: hl_testnet_drawdown_pct > 3.5
+        expr: hl_testnet_drawdown_pct > 3.5 and on() hl_worker_job_enabled{worker_job="testnet_risk_probe"} == 1
         for: 5m
         labels:
           severity: critical
@@ -131,6 +135,18 @@ groups:
           summary: "Telemetry artifact stale (> 6h) or missing: {{ $labels.artifact }}"
           description: "Artifact {{ $labels.artifact }} is missing or has not refreshed for > 360 minutes."
 
+      - alert: HLDailyArtifactStale
+        expr: >-
+          hl_artifact_age_minutes{artifact=~"mm_calibration|settlement_study"} > 1620
+          or hl_artifact_exists{artifact=~"mm_calibration|settlement_study"} == 0
+        for: 15m
+        labels:
+          severity: warning
+          service: hyperliquid-quant-defi
+        annotations:
+          summary: "Daily telemetry artifact stale (> 27h) or missing: {{ $labels.artifact }}"
+          description: "Daily artifact {{ $labels.artifact }} is missing or has not refreshed for > 1620 minutes (27h, cadence 24h)."
+
       - alert: HLSettlementStudyDegraded
         expr: hl_settlement_study_degraded == 1
         for: 15m
@@ -142,7 +158,7 @@ groups:
           description: "Latest :00 funding settlement study collected <80% of requested coins (likely HTTP 429); retained previous stats.parquet."
 
       - alert: HLTestnetALOFillRateLow
-        expr: hl_testnet_alo_fill_rate_pct < 65
+        expr: hl_testnet_alo_fill_rate_pct < 65 and on() hl_worker_job_enabled{worker_job="testnet_attribution"} == 1
         for: 30m
         labels:
           severity: warning
@@ -152,7 +168,7 @@ groups:
           description: "Real ALO fill rate dropped to {{ $value }}% (target >= 85%). Check BBO spread conditions."
 
       - alert: HLTestnetDrawdownWarning
-        expr: hl_testnet_drawdown_pct > 2.0
+        expr: hl_testnet_drawdown_pct > 2.0 and on() hl_worker_job_enabled{worker_job="testnet_risk_probe"} == 1
         for: 15m
         labels:
           severity: warning
@@ -162,7 +178,7 @@ groups:
           description: "Live Testnet drawdown from the executor HWM exceeded 2% for 15m; kill-switch fires at 5% on the next 4h executor cycle."
 
       - alert: HLTestnetOrphanPositions
-        expr: hl_testnet_unmanaged_orphan_positions > 0
+        expr: hl_testnet_unmanaged_orphan_positions > 0 and on() hl_worker_job_enabled{worker_job="testnet_risk_probe"} == 1
         for: 30m
         labels:
           severity: warning
@@ -172,7 +188,7 @@ groups:
           description: "Non-dust orphan Testnet position(s) outside active target weights have no resting unwind order. See hl_testnet_live_position_orphan and hl_testnet_live_orphan_notional_usd."
 
       - alert: HLTestnetMarkOracleDislocation
-        expr: hl_testnet_mark_oracle_pnl_gap_pct > 1.0
+        expr: hl_testnet_mark_oracle_pnl_gap_pct > 1.0 and on() hl_worker_job_enabled{worker_job="testnet_risk_probe"} == 1
         for: 30m
         labels:
           severity: warning
@@ -182,7 +198,7 @@ groups:
           description: "Thin Testnet books moved mark prices away from oracle; mark-based PnL and drawdown overstate (or understate) economic exposure."
 
       - alert: HLTestnetCoinMarkOracleDislocation
-        expr: abs(hl_testnet_mark_oracle_max_dev_pct) > 15
+        expr: abs(hl_testnet_mark_oracle_max_dev_pct) > 15 and on() hl_worker_job_enabled{worker_job="testnet_risk_probe"} == 1
         for: 30m
         labels:
           severity: warning

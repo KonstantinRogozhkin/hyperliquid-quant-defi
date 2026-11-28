@@ -178,6 +178,8 @@ def build_metamodel(
     max_total: int = 8,
     target_vol_annual: float = 0.12,
     max_leverage: float = 3.0,
+    vol_target_cost_bps: float = 0.0,
+    vol_target_stressed_cost_bps: float = 5.0,
 ) -> MetamodelResult:
     """Select orthogonal alphas & fit weights strictly on Dev; audit once on untouched Holdout."""
     dev_mask = oof_returns.index < holdout_start_ms
@@ -221,10 +223,20 @@ def build_metamodel(
         holdout_stressed_metrics[method] = series_metrics(full_s.loc[hold_mask])
         holdout_cols[method] = full_r.loc[hold_mask]
 
-        # Also evaluate causal vol-targeted version (capped at max_leverage)
+        # Also evaluate causal vol-targeted version (capped at max_leverage), charging stressed cost_bps on stress slice
         vt_name = f"{method}_vt{int(target_vol_annual * 100)}"
-        full_vt = apply_vol_target(full_r, target_vol_annual=target_vol_annual, max_leverage=max_leverage)
-        full_vt_s = apply_vol_target(full_s, target_vol_annual=target_vol_annual, max_leverage=max_leverage)
+        full_vt = apply_vol_target(
+            full_r,
+            target_vol_annual=target_vol_annual,
+            max_leverage=max_leverage,
+            cost_bps=vol_target_cost_bps,
+        )
+        full_vt_s = apply_vol_target(
+            full_s,
+            target_vol_annual=target_vol_annual,
+            max_leverage=max_leverage,
+            cost_bps=vol_target_stressed_cost_bps,
+        )
         dev_metrics[vt_name] = series_metrics(full_vt.loc[dev_mask])
         holdout_metrics[vt_name] = series_metrics(full_vt.loc[hold_mask])
         holdout_stressed_metrics[vt_name] = series_metrics(full_vt_s.loc[hold_mask])

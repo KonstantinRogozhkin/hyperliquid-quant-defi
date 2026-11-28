@@ -176,7 +176,7 @@ def test_m2_grafana_16_jobs_and_prometheus_grafana_alert_parity():
     prom_by_name = {r["alert"]: r for g in prom["groups"] for r in g["rules"]}
     graf_by_uid = {r["uid"]: r for g in graf["groups"] for r in g["rules"]}
 
-    assert len(prom_by_name) == len(graf_by_uid) == 22
+    assert len(prom_by_name) == len(graf_by_uid) == 23
     assert prom_by_name["HLBoundedNavGuardTriggered"]["expr"] == "hl_desk_nav_guard_active > 0"
     assert graf_by_uid["hl-crit-nav-guard"]["data"][0]["model"]["expr"] == "hl_desk_nav_guard_active"
     assert "hl_artifact_exists" in prom_by_name["HLArtifactStale"]["expr"]
@@ -201,7 +201,7 @@ def test_h11_scheduler_publish_status_mm_audit_max_workers_and_dependency_wait(t
     monkeypatch.delenv("HL_TESTNET_ACCOUNT_ADDRESS", raising=False)
 
     sched = WorkerScheduler(data_dir=tmp_path, telegram_enabled=False, dependency_poll_s=0.02)
-    assert sched.max_workers == 6
+    assert sched.max_workers == 8
     status = sched.publish_status()
     assert status["testnet_execution_enabled"] is False
 
@@ -654,12 +654,12 @@ def test_h19_m18_l4_analytics_net_streaks_risk_exposure_and_single_parquet_read(
     assert len(read_counts) == 3
     assert all(cnt == 1 for cnt in read_counts.values()), read_counts
 
-    # H-19: net streaks computed alongside gross streaks
+    # H-19: net streaks computed alongside gross streaks (10 observed calendar days => 9 real day-over-day returns)
     cd_lb = next(r for r in payload["leaderboard"] if r["id"] == "cross_dex")
     assert cd_lb["positive_days_pct"] == 100.0
-    assert cd_lb["longest_win_streak"] == 10
+    assert cd_lb["longest_win_streak"] == 9
     assert cd_lb["positive_days_net_pct"] == 0.0
-    assert cd_lb["longest_loss_streak_net"] == 10
+    assert cd_lb["longest_loss_streak_net"] == 9
     assert cd_lb["longest_win_streak_net"] == 0
 
     # L-4: real net_exposure_pct, nav_guard_triggers, and standalone tier_usd when Autopilot is absent

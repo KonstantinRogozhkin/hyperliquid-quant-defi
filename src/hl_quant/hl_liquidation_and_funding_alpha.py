@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 import html
 import json
 import math
+import os
 from pathlib import Path
 import time
 from typing import Any
@@ -517,7 +518,9 @@ async def run_liquidation_and_funding_alpha_scan(
             wallets = select_active_whale_wallets(lb_rows, top_n=top_whales)
             if whale_cache_path is not None and wallets:
                 whale_cache_path.parent.mkdir(parents=True, exist_ok=True)
-                tmp_c = whale_cache_path.with_suffix(".tmp.json")
+                tmp_c = whale_cache_path.with_name(
+                    f".{whale_cache_path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+                )
                 tmp_c.write_text(
                     json.dumps({"cached_at_ms": now_ms, "wallets": wallets}, indent=2),
                     encoding="utf-8",

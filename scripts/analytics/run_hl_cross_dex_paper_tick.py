@@ -72,6 +72,10 @@ def main(
     with httpx.Client(timeout=20.0) as client:
         res = cdp.run_cross_dex_paper_tick(client, state_dir=state_dir, cfg=cfg)
 
+    if res.get("status") == "duplicate_hour_skipped":
+        typer.echo(json.dumps({"status": "duplicate_hour_skipped", "ts_ms": res["tick"]["ts_ms"]}))
+        return
+
     md = cdp.format_cross_dex_paper_markdown(res)
     _write_text_atomic(state_dir / "report.md", md)
     if report_path is not None:

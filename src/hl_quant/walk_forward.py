@@ -87,9 +87,46 @@ def simulate_portfolio_weights(
     per_coin: dict[str, pd.DataFrame] = {}
 
     for coin in weights_by_coin.columns:
-        panel = panels[coin].reindex(hours)
+        src_panel = panels[coin]
         w = weights_by_coin[coin].to_numpy(dtype=float, copy=True)
         w = np.where(np.isfinite(w), w, 0.0)
+
+        if "hl_close" in src_panel.columns and "cex_close" in src_panel.columns and n > 0 and not src_panel.empty:
+            hl_raw = src_panel["hl_close"].astype(float).replace(0.0, np.nan)
+            cex_raw = src_panel["cex_close"].astype(float).replace(0.0, np.nan)
+            both_valid = hl_raw.notna() & cex_raw.notna()
+            if both_valid.any():
+                last_valid_ms = int(src_panel.index[both_valid][-1])
+                p_start = min(int(src_panel.index.min()), int(hours.min()))
+                p_end = max(int(src_panel.index.max()), int(hours.max()))
+                if (p_end - p_start) // fa.HOUR_MS <= 200_000:
+                    full_grid = pd.Index(np.arange(p_start, p_end + 1, fa.HOUR_MS, dtype="int64"), name="hour_ms")
+                    hl_ff = hl_raw.reindex(full_grid).ffill(limit=2)
+                    cex_ff = cex_raw.reindex(full_grid).ffill(limit=2)
+                    hl_ff = hl_ff.where(full_grid <= last_valid_ms)
+                    cex_ff = cex_ff.where(full_grid <= last_valid_ms)
+                    hl_ret_full = (hl_ff / hl_ff.shift(1) - 1.0).fillna(0.0)
+                    cex_ret_full = (cex_ff / cex_ff.shift(1) - 1.0).fillna(0.0)
+                    next_hl = hl_ret_full.reindex(hours).fillna(0.0).to_numpy(dtype=float)
+                    next_cex = cex_ret_full.reindex(hours).fillna(0.0).to_numpy(dtype=float)
+                else:
+                    panel_tmp = src_panel.reindex(hours)
+                    next_hl = panel_tmp["hl_ret"].fillna(0.0).to_numpy(dtype=float)
+                    next_cex = panel_tmp["cex_ret"].fillna(0.0).to_numpy(dtype=float)
+                # Force exit at delisting (first hour after last_valid_ms, or wherever >2h gap leaves prices NaN)
+                hours_arr = hours.to_numpy(dtype="int64")
+                delisted_mask = hours_arr > last_valid_ms
+                w = np.where(delisted_mask, 0.0, w)
+            else:
+                w[:] = 0.0
+                next_hl = np.zeros(n, dtype=float)
+                next_cex = np.zeros(n, dtype=float)
+            panel = src_panel.reindex(hours)
+        else:
+            panel = src_panel.reindex(hours)
+            next_hl = panel["hl_ret"].fillna(0.0).to_numpy(dtype=float)
+            next_cex = panel["cex_ret"].fillna(0.0).to_numpy(dtype=float)
+
         if n > 0:
             w[-1] = 0.0  # flatten final unpriced hour
         prev = np.concatenate([[0.0], w[:-1]]) if n > 0 else w.copy()
@@ -97,9 +134,6 @@ def simulate_portfolio_weights(
 
         hl_f = panel["hl_fund_next"].fillna(0.0).to_numpy(dtype=float)
         cex_f = panel["cex_fund_next"].fillna(0.0).to_numpy(dtype=float)
-        # panel["*_ret"][k] is already the close-to-close return over (h_k, h_{k+1}].
-        next_hl = panel["hl_ret"].fillna(0.0).to_numpy(dtype=float)
-        next_cex = panel["cex_ret"].fillna(0.0).to_numpy(dtype=float)
 
         fund = w * (hl_f - cex_f) * scale
         basis = w * (next_cex - next_hl) * scale
@@ -174,8 +208,21 @@ def compute_fold_weights(
         panel = panels[coin]
         # Compute rolling signal on full history up to fold_hours[-1] (strictly backward-looking)
         upto = panel[panel.index <= int(fold_hours[-1])]
-        exp_full = _expected_apr_series(upto, params.lookback_h)
+        if "hl_close" in upto.columns and "cex_close" in upto.columns:
+            valid_px = upto["hl_close"].replace(0.0, np.nan).notna() & upto["cex_close"].replace(0.0, np.nan).notna()
+            if valid_px.any():
+                upto = upto[upto.index <= int(upto.index[valid_px][-1])]
+            else:
+                upto = upto.iloc[0:0]
+        exp_full = _expected_apr_series(upto, params.lookback_h) if not upto.empty else pd.Series(dtype=float)
         exp_fold = exp_full.reindex(fold_hours).to_numpy(dtype=float)
+        if "hl_close" in panel.columns and "cex_close" in panel.columns:
+            vp_all = panel["hl_close"].replace(0.0, np.nan).notna() & panel["cex_close"].replace(0.0, np.nan).notna()
+            if vp_all.any():
+                last_v = int(panel.index[vp_all][-1])
+                exp_fold = np.where(fold_hours.to_numpy(dtype="int64") > last_v, np.nan, exp_fold)
+            else:
+                exp_fold[:] = np.nan
         exp_map[coin] = exp_fold
 
         prev = int((prev_signals or {}).get(coin, 0))

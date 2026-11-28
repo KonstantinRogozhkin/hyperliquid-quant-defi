@@ -35,9 +35,9 @@ The v2 dashboard (`uid: hl-quant-defi-overview`, 8 rows) includes:
 7. **On-Chain Alpha (H2/H4/H5/H6) & Avellaneda-Stoikov MM** — whale liquidation walls, empirical $\kappa$ & $R^2$, `p50/p99` tick-to-quote latency.
 8. **16 UTC Worker Jobs Table & Artifact Freshness**.
 
-## 3. Critical & Warning Alert Rules (22 Rules — Exact Parity)
+## 3. Critical & Warning Alert Rules (23 Rules — Exact Parity)
 
-Two equivalent alert rule formats are provided (11 critical + 11 warning = 22 rules each):
+Two equivalent alert rule formats are provided (11 critical + 12 warning = 23 rules each):
 - **Prometheus native rules:** `docs/grafana/prometheus_alerts.yml` (include in `/etc/prometheus/alerts.yml` on `Prometheus 85`).
 - **Grafana Unified Alerting provisioning:** `docs/grafana/grafana_alert_rules.yml` (or configured directly in Grafana Alerting UI under folder **Hyperliquid Quant DeFi**).
 
@@ -50,8 +50,8 @@ Critical alerts covered (11):
 - `HLAutopilotRiskLimitBreach` (CTA sleeve `> 6%` or drift `> 6%`)
 - `HLStrategyDrawdownOrApiQuotaCritical` (current drawdown `hl_strategy_current_dd_pct > 5%` or API `> 0.85 req/$`)
 
-Warning alerts covered (11):
-- `HLArtifactStale`, `HLSettlementStudyDegraded`, `HLTestnetALOFillRateLow`
+Warning alerts covered (12):
+- `HLArtifactStale`, `HLDailyArtifactStale` (`mm_calibration` / `settlement_study` > 1620 min or missing), `HLSettlementStudyDegraded`, `HLTestnetALOFillRateLow`
 - `HLTestnetDrawdownWarning`, `HLTestnetOrphanPositions`, `HLTestnetMarkOracleDislocation`, `HLTestnetCoinMarkOracleDislocation`
 - `HLTestnetRiskProbeStale`, `HLTestnetAttributionStale`, `HLTestnetExecutorStale` (audit log > 300 min), `HLOnchainEventsStale` (> 45 min)
 

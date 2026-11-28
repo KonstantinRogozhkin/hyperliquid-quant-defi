@@ -21,6 +21,7 @@ services:
       - ./data:/app/data:ro
     ports:
       - "127.0.0.1:8000:8000"
+    stop_grace_period: 15s
     restart: unless-stopped
 
   frontend:
@@ -55,8 +56,10 @@ services:
       HL_DATA_ROOT: /app/data/paper
       HL_BUILD_SHA: ${DEPLOY_SHA:-local}
       HL_WORKER_BOOTSTRAP_READONLY: ${HL_WORKER_BOOTSTRAP_READONLY:-true}
+      HL_WORKER_STARTUP_CATCHUP_MIN: ${HL_WORKER_STARTUP_CATCHUP_MIN:-20}
       HL_TELEGRAM_ENABLED: ${HL_TELEGRAM_ENABLED:-false}
       HL_ENABLE_TESTNET_EXECUTION: ${HL_ENABLE_TESTNET_EXECUTION:-false}
     volumes:
       - ./data:/app/data:rw
+    stop_grace_period: 30s
     restart: unless-stopped

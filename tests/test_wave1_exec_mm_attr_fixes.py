@@ -135,8 +135,12 @@ def test_c2_and_h34_orphan_close_px_oracle_bounds_partial_min_usd_and_slicing():
     assert len(sliced) == 3
     assert [o.child_index for o in sliced] == [0, 1, 2]
     assert all(o.notional_usd <= 1_000.0 for o in sliced)
-    resid = ex.orphan_residual_notional_usd(
+    resid_conservative = ex.orphan_residual_notional_usd(
         acct_big, _meta("BIG"), {}, {"BIG": (None, None, NOW)}, {"BIG": 100.0}, limits=limits
+    )
+    assert resid_conservative["BIG"] == pytest.approx(2_500.0, abs=1.0)
+    resid = ex.orphan_residual_notional_usd(
+        acct_big, _meta("BIG"), {}, {"BIG": (None, None, NOW)}, {"BIG": 100.0}, limits=limits, assume_unwinds_fill=True
     )
     assert resid["BIG"] == pytest.approx(0.0, abs=1.0)
 

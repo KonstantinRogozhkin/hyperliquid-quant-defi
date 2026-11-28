@@ -174,7 +174,8 @@ def _resolve_collateral_usd(
     mark_px = _f(data.get("assetMarkPrice"))
     if tid in _COLLATERAL_UNDERLYINGS and _COLLATERAL_UNDERLYINGS[tid] == underlying.upper() and mark_px > 0:
         return sym, mark_px
-    return sym, 1.0
+    # Unpriced non-USD coin-margined collateral fails closed (0.0 -> non-actionable) rather than assuming $1.00!
+    return sym, 0.0
 
 
 def parse_boros_market(
@@ -218,23 +219,27 @@ def parse_boros_market(
     fixed_minus_float = (bid_pct - float_pct) if bid_pct is not None else None
     float_minus_fixed = (float_pct - ask_pct) if ask_pct is not None else None
 
+    hedge_cost_apr_pct = (perp_round_trip_cost_bps / 100.0) * (365.0 / days) if days > 0 else math.inf
     if bid_pct is None and ask_pct is None:
         action = "No executable quotes (Monitor)"
     elif is_spread:
-        if fixed_minus_float is not None and fixed_minus_float >= 2.0:
+        if days >= 7.0 and fixed_minus_float is not None and (fixed_minus_float - hedge_cost_apr_pct) >= 2.0:
             action = "Short Boros Spread (Lock Fixed > Float)"
-        elif float_minus_fixed is not None and float_minus_fixed >= 2.0:
+        elif days >= 7.0 and float_minus_fixed is not None and (float_minus_fixed - hedge_cost_apr_pct) >= 2.0:
             action = "Long Boros Spread (Pay Cheap Fixed)"
         else:
             action = "Watch Spread"
     else:
-        hedge_cost_apr_pct = (perp_round_trip_cost_bps / 100.0) * (365.0 / days) if days > 0 else math.inf
         lock_beats_float = fixed_minus_float is not None and (fixed_minus_float - hedge_cost_apr_pct) > 0.0
+        rev_net_locked_ok = ask_pct is not None and (-ask_pct - hedge_cost_apr_pct) >= 6.0
+        # Locking negative fixed carry for weeks/months insures against floating mean-reversion; only skip if
+        # current floating carry is dramatically (>10% APR) deeper than the fixed ask.
+        rev_not_deeply_inferior = float_minus_fixed is None or (float_pct >= (ask_pct or 0.0) - 10.0)
         if bid_pct is not None and bid_pct >= 6.0 and days >= 7.0 and lock_beats_float:
             action = f"Short Perp + Short Boros (Lock {bid_pct:+.2f}%)"
-        elif ask_pct is not None and ask_pct <= -10.0 and days >= 7.0:
+        elif ask_pct is not None and ask_pct <= -10.0 and days >= 7.0 and rev_net_locked_ok and rev_not_deeply_inferior:
             action = f"Long Perp + Long Boros (Lock {-ask_pct:+.2f}%)"
-        elif float_minus_fixed is not None and float_minus_fixed >= 3.0:
+        elif days >= 7.0 and float_minus_fixed is not None and (float_minus_fixed - hedge_cost_apr_pct) >= 3.0:
             action = "Long Boros YU (Float > Ask)"
         else:
             action = "Monitor"
@@ -369,7 +374,7 @@ def run_boros_fixed_funding_scan(
             c.close()
 
     hl_and_spread = [m for m in all_active if m.is_hyperliquid or m.is_spread_market]
-    hl_and_spread.sort(key=lambda m: (-int(m.is_actionable), -int(m.days_to_maturity >= 5.0), -m.notional_oi))
+    hl_and_spread.sort(key=lambda m: (-int(m.is_actionable), -int(m.days_to_maturity >= 7.0), -m.notional_oi))
     return BorosScannerSnapshot(
         observed_at_ms=now_ms,
         total_markets_scanned=total_seen,

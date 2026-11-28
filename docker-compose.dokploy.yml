@@ -20,6 +20,7 @@ services:
       timeout: 5s
       retries: 4
       start_period: 10s
+    stop_grace_period: 15s
     restart: unless-stopped
 
   frontend:
@@ -44,6 +45,7 @@ services:
       HL_DATA_ROOT: /app/data/paper
       HL_BUILD_SHA: ${DEPLOY_SHA}
       HL_WORKER_BOOTSTRAP_READONLY: ${HL_WORKER_BOOTSTRAP_READONLY:-true}
+      HL_WORKER_STARTUP_CATCHUP_MIN: ${HL_WORKER_STARTUP_CATCHUP_MIN:-20}
       HL_TELEGRAM_ENABLED: ${HL_TELEGRAM_ENABLED:-true}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID:-}
@@ -68,6 +70,7 @@ services:
       HL_SETTLEMENT_MAX_COINS: ${HL_SETTLEMENT_MAX_COINS:-35}
     volumes:
       - hl-data:/app/data:rw
+    stop_grace_period: 30s
     restart: unless-stopped
 
 volumes:

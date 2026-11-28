@@ -296,16 +296,23 @@ class EWMAVolatilityEstimator:
     def update(self, ts_ms: int, mid_px: float) -> float:
         if not math.isfinite(mid_px) or mid_px <= 0:
             return self.sigma_tau_bps
+        t_cur = int(ts_ms)
+        if self._last_ms is not None and t_cur <= self._last_ms:
+            return self.sigma_tau_bps
         if self._last_ms is not None and self._last_mid is not None and self._last_mid > 0:
-            dt_sec = max(0.2, (ts_ms - self._last_ms) / 1000.0)
+            dt_sec = (t_cur - self._last_ms) / 1000.0
+            if mid_px == self._last_mid and dt_sec < 1.0:
+                # High-frequency depth/size ticks with unchanged mid must not decay variance
+                # or chop the elapsed time before the next true mid-price change.
+                return self.sigma_tau_bps
             ret_bps = math.log(mid_px / self._last_mid) * 1e4
             # Winsorize extreme single-tick outliers at 200 bps / sqrt(s)
-            inst_var = min((ret_bps**2) / dt_sec, 40_000.0)
+            inst_var = min((ret_bps**2) / max(dt_sec, 0.05), 40_000.0)
             alpha = 1.0 - math.exp(-math.log(2.0) * dt_sec / self.half_life_sec)
-            alpha = min(max(alpha, 0.02), 0.50)
+            alpha = min(max(alpha, 0.0), 0.50)
             self._var_per_sec = (1.0 - alpha) * self._var_per_sec + alpha * inst_var
             self._obs_count += 1
-        self._last_ms = int(ts_ms)
+        self._last_ms = t_cur
         self._last_mid = float(mid_px)
         return self.sigma_tau_bps
 
@@ -469,6 +476,19 @@ def fetch_open_orders_checked(http: httpx.Client, account_address: str) -> list[
 MAX_BOOK_STALENESS_FOR_DMS_SEC = 10.0
 
 
+def _hl_price_tick(px: float, sz_decimals: int) -> float:
+    """Minimum Hyperliquid perp price tick at ``px`` for ``sz_decimals``."""
+    if not math.isfinite(px) or px <= 0:
+        return 1e-6
+    if px >= 100_000:
+        return 1.0
+    max_dec = max(0, 6 - int(sz_decimals))
+    magnitude = math.floor(math.log10(px))
+    sig_dec = max(0, 4 - magnitude)
+    decimals = min(max_dec, sig_dec)
+    return float(10.0 ** (-decimals))
+
+
 def reduce_only_is_valid(side: str, sz: float, account_position_sz: float) -> bool:
     """True when a ``side`` order of ``sz`` only reduces the signed *account* position."""
     if sz <= 0:
@@ -570,13 +590,25 @@ def compute_as_quotes(
 
     bid_px: float | None = round_hl_price(raw_bid, spec.sz_decimals, side="buy")
     ask_px: float | None = round_hl_price(raw_ask, spec.sz_decimals, side="sell")
-    # Guarantee strict non-crossing bid < ask after precision rounding
-    if bid_px >= ask_px:
-        bid_px = round_hl_price(book.best_bid, spec.sz_decimals, side="buy")
-        ask_px = round_hl_price(book.best_ask, spec.sz_decimals, side="sell")
-        if bid_px >= ask_px:
-            # Degenerate 0-tick locked book -> step bid down conservatively
-            bid_px = round_hl_price(book.best_bid * (1.0 - fee_floor * 1e-4), spec.sz_decimals, side="buy")
+    # Guarantee strict post-only non-crossing (bid < best_ask, ask > best_bid, bid < ask) even on 0-tick locked books
+    if bid_px >= ask_px or (params.clamp_to_bbo and (bid_px >= book.best_ask or ask_px <= book.best_bid)):
+        if book.best_bid < book.best_ask:
+            bid_px = min(bid_px, round_hl_price(book.best_bid, spec.sz_decimals, side="buy"))
+            ask_px = max(ask_px, round_hl_price(book.best_ask, spec.sz_decimals, side="sell"))
+        if bid_px >= ask_px or bid_px >= book.best_ask:
+            b_tick = _hl_price_tick(book.best_bid, spec.sz_decimals)
+            bid_px = round_hl_price(
+                min(book.best_ask - b_tick, book.best_bid * (1.0 - fee_floor * 1e-4)),
+                spec.sz_decimals,
+                side="buy",
+            )
+        if ask_px <= bid_px or ask_px <= book.best_bid:
+            a_tick = _hl_price_tick(book.best_ask, spec.sz_decimals)
+            ask_px = round_hl_price(
+                max(book.best_bid + a_tick, book.best_ask * (1.0 + fee_floor * 1e-4)),
+                spec.sz_decimals,
+                side="sell",
+            )
 
     # 3. Inventory-aware asymmetric quote sizing & hard inventory caps
     bid_reduce_only = False
@@ -646,17 +678,20 @@ def compute_as_quotes(
 def should_requote_side(
     desired_px: float | None,
     desired_sz: float,
-    resting: tuple[float, float] | None,
+    resting: tuple[float, float] | tuple[float, float, bool] | None,
     *,
     mid_px: float,
     threshold_bps: float,
+    desired_reduce_only: bool | None = None,
 ) -> bool:
     """Return True if a resting quote must be cancelled/replaced (respecting queue-preserving deadband)."""
     if desired_px is None or desired_sz <= 0:
         return resting is not None
     if resting is None:
         return True
-    rest_px, rest_sz = resting
+    rest_px, rest_sz = float(resting[0]), float(resting[1])
+    if desired_reduce_only is not None and len(resting) >= 3 and bool(resting[2]) != bool(desired_reduce_only):
+        return True
     if mid_px <= 0:
         return True
     px_diff_bps = abs(desired_px - rest_px) / mid_px * 1e4
@@ -728,12 +763,31 @@ class _InventoryLedger:
         return self.realized_pnl_usd + self.unrealized_pnl_usd(mid_px) - self.fees_usd
 
 
+def _append_monotonic_mid(mids_series: list[tuple[int, float]], ts_ms: int, mid_px: float) -> None:
+    """Keep ``mids_series`` strictly non-decreasing in timestamp for ``np.searchsorted`` markout lookups."""
+    if not (math.isfinite(mid_px) and mid_px > 0):
+        return
+    t = int(ts_ms)
+    if mids_series:
+        last_t = mids_series[-1][0]
+        if t < last_t:
+            return
+        if t == last_t:
+            mids_series[-1] = (t, float(mid_px))
+            return
+    mids_series.append((t, float(mid_px)))
+
+
 def _compute_vw_markout(fills: list[dict[str, Any]], mids_series: list[tuple[int, float]], horizon_ms: int) -> float | None:
     """Compute volume-weighted signed post-fill markout (bps) at ``fill_ms + horizon_ms``."""
     if not fills or not mids_series:
         return None
     ts_arr = np.array([t for t, _ in mids_series], dtype=np.int64)
     mid_arr = np.array([m for _, m in mids_series], dtype=np.float64)
+    if len(ts_arr) > 1 and np.any(ts_arr[1:] < ts_arr[:-1]):
+        order = np.argsort(ts_arr, kind="mergesort")
+        ts_arr = ts_arr[order]
+        mid_arr = mid_arr[order]
     num = 0.0
     den = 0.0
     for fl in fills:
@@ -776,8 +830,8 @@ def simulate_avellaneda_stoikov_on_l2(
     )
     ledger = _InventoryLedger(maker_fee_bps=params.maker_fee_bps)
 
-    resting_bid: tuple[float, float] | None = None
-    resting_ask: tuple[float, float] | None = None
+    resting_bid: tuple[float, float, bool] | None = None
+    resting_ask: tuple[float, float, bool] | None = None
     quotes_placed = 0
     quotes_cancelled = 0
     requotes_skipped = 0
@@ -805,7 +859,7 @@ def simulate_avellaneda_stoikov_on_l2(
         ba = float(row.best_ask)
         mid = 0.5 * (bb + ba)
         last_mid = mid
-        mids_series.append((ts_ms, mid))
+        _append_monotonic_mid(mids_series, ts_ms, mid)
         bsz1 = float(getattr(row, "bid_sz1", 1.0))
         asz1 = float(getattr(row, "ask_sz1", 1.0))
         imb5 = float(getattr(row, "imbalance5", 0.0))
@@ -815,7 +869,7 @@ def simulate_avellaneda_stoikov_on_l2(
         # 1. Check fills on resting quotes against current book touch + intervening trades
         tick_trades = trades_by_idx.get(idx, [])
         if resting_bid is not None:
-            b_px, b_sz = resting_bid
+            b_px, b_sz, _ = resting_bid
             trade_hit = any(side == "sell" and t_px <= b_px for side, t_px, _ in tick_trades)
             if ba <= b_px or trade_hit:
                 ledger.on_fill("buy", b_px, b_sz)
@@ -823,7 +877,7 @@ def simulate_avellaneda_stoikov_on_l2(
                 resting_bid = None
 
         if resting_ask is not None:
-            a_px, a_sz = resting_ask
+            a_px, a_sz, _ = resting_ask
             trade_hit = any(side == "buy" and t_px >= a_px for side, t_px, _ in tick_trades)
             if bb >= a_px or trade_hit:
                 ledger.on_fill("sell", a_px, a_sz)
@@ -893,23 +947,37 @@ def simulate_avellaneda_stoikov_on_l2(
         half_spreads.append(dec.half_spread_bps)
         sigmas.append(dec.sigma_tau_bps)
 
-        # 4. Queue-preserving requote deadband per side
-        if should_requote_side(dec.bid_px, dec.bid_sz, resting_bid, mid_px=mid, threshold_bps=params.requote_threshold_bps):
+        # 4. Queue-preserving requote deadband per side (including reduce_only transitions)
+        if should_requote_side(
+            dec.bid_px,
+            dec.bid_sz,
+            resting_bid,
+            mid_px=mid,
+            threshold_bps=params.requote_threshold_bps,
+            desired_reduce_only=dec.bid_reduce_only,
+        ):
             if resting_bid is not None:
                 quotes_cancelled += 1
             if dec.bid_px is not None and dec.bid_sz > 0:
-                resting_bid = (dec.bid_px, dec.bid_sz)
+                resting_bid = (dec.bid_px, dec.bid_sz, dec.bid_reduce_only)
                 quotes_placed += 1
             else:
                 resting_bid = None
         else:
             requotes_skipped += 1
 
-        if should_requote_side(dec.ask_px, dec.ask_sz, resting_ask, mid_px=mid, threshold_bps=params.requote_threshold_bps):
+        if should_requote_side(
+            dec.ask_px,
+            dec.ask_sz,
+            resting_ask,
+            mid_px=mid,
+            threshold_bps=params.requote_threshold_bps,
+            desired_reduce_only=dec.ask_reduce_only,
+        ):
             if resting_ask is not None:
                 quotes_cancelled += 1
             if dec.ask_px is not None and dec.ask_sz > 0:
-                resting_ask = (dec.ask_px, dec.ask_sz)
+                resting_ask = (dec.ask_px, dec.ask_sz, dec.ask_reduce_only)
                 quotes_placed += 1
             else:
                 resting_ask = None
@@ -1164,10 +1232,28 @@ def run_live_mm_session(
             ):
                 _refresh_rest_dms(now_ms)
                 last_dms_mono = loop_start
-            book = fetch_testnet_l2_snapshot(http, coin)
+            try:
+                book = fetch_testnet_l2_snapshot(http, coin)
+            except Exception:
+                book = None
             if book is not None:
                 last_book_ok_mono = time.monotonic()
             if book is None:
+                if active_orders:
+                    to_cancel_none = [
+                        {"coin": coin, "oid": o["oid"]} for o in active_orders.values() if o.get("oid") is not None
+                    ]
+                    if to_cancel_none:
+                        try:
+                            c_resps = adapter.cancel_all_open_orders(to_cancel_none)
+                        except Exception as exc:
+                            c_resps = [{"status": "err", "response": str(exc)}]
+                        if _cancel_response_ok(c_resps):
+                            quotes_cancelled += len(to_cancel_none)
+                            active_orders.clear()
+                    else:
+                        active_orders.clear()
+                    halt_events.append("empty_or_invalid_book")
                 if time.monotonic() >= deadline:
                     break
                 time.sleep(min(poll_interval_sec, max(0.0, deadline - time.monotonic())))
@@ -1175,7 +1261,7 @@ def run_live_mm_session(
 
             ticks_observed += 1
             last_mid = book.mid_px
-            mids_series.append((now_ms, book.mid_px))
+            _append_monotonic_mid(mids_series, now_ms, book.mid_px)
 
             # 1. Reconcile fills (live userFills vs paper touch simulation)
             if execute_live and account_address:
@@ -1266,9 +1352,15 @@ def run_live_mm_session(
                 halt_events.append(eff_halt)
                 to_cancel = [{"coin": coin, "oid": o["oid"]} for o in active_orders.values() if o.get("oid") is not None]
                 if to_cancel:
-                    adapter.cancel_all_open_orders(to_cancel)
-                    quotes_cancelled += len(to_cancel)
-                active_orders.clear()
+                    try:
+                        c_resps = adapter.cancel_all_open_orders(to_cancel)
+                    except Exception as exc:
+                        c_resps = [{"status": "err", "response": str(exc)}]
+                    if _cancel_response_ok(c_resps):
+                        quotes_cancelled += len(to_cancel)
+                        active_orders.clear()
+                else:
+                    active_orders.clear()
             else:
                 half_spreads.append(dec.half_spread_bps)
                 sigmas.append(dec.sigma_tau_bps)
@@ -1278,14 +1370,28 @@ def run_live_mm_session(
                 }
                 for side_k, (d_px, d_sz, d_red) in desired.items():
                     cur_ord = active_orders.get(side_k)
-                    cur_tuple = (cur_ord["px"], cur_ord["sz"]) if cur_ord else None
-                    if not should_requote_side(d_px, d_sz, cur_tuple, mid_px=book.mid_px, threshold_bps=params.requote_threshold_bps):
+                    cur_tuple = (
+                        (cur_ord["px"], cur_ord["sz"], bool(cur_ord.get("reduce_only", False))) if cur_ord else None
+                    )
+                    if not should_requote_side(
+                        d_px,
+                        d_sz,
+                        cur_tuple,
+                        mid_px=book.mid_px,
+                        threshold_bps=params.requote_threshold_bps,
+                        desired_reduce_only=d_red,
+                    ):
                         requotes_skipped += 1
                         continue
-                    # Cancel existing side order if present
+                    # Cancel existing side order if present before replacing
                     if cur_ord is not None:
                         if cur_ord.get("oid") is not None:
-                            adapter.cancel_all_open_orders([{"coin": coin, "oid": cur_ord["oid"]}])
+                            try:
+                                c_resps = adapter.cancel_all_open_orders([{"coin": coin, "oid": cur_ord["oid"]}])
+                            except Exception as exc:
+                                c_resps = [{"status": "err", "response": str(exc)}]
+                            if not _cancel_response_ok(c_resps):
+                                continue
                         quotes_cancelled += 1
                         active_orders.pop(side_k, None)
                     # Place new passive ALO quote
@@ -1305,7 +1411,7 @@ def run_live_mm_session(
                         if oid is not None:
                             all_mm_oids.add(oid)
                         if status in {"resting", "simulated_alo"}:
-                            active_orders[side_k] = {"oid": oid, "px": d_px, "sz": d_sz}
+                            active_orders[side_k] = {"oid": oid, "px": d_px, "sz": d_sz, "reduce_only": bool(d_red)}
                         if audit_log_path is not None:
                             is_dry = isinstance(adapter, DryRunAdapter) or (
                                 isinstance(resp, dict) and resp.get("mode") == "dry_run"
@@ -1439,6 +1545,30 @@ def run_live_mm_session(
                                 "crossed": True,
                             }
                         )
+                    if audit_log_path is not None:
+                        is_dry_flat = (
+                            (not execute_live)
+                            or isinstance(adapter, DryRunAdapter)
+                            or (isinstance(flat_resp, dict) and flat_resp.get("mode") == "dry_run")
+                        )
+                        audit_log_path.parent.mkdir(parents=True, exist_ok=True)
+                        with audit_log_path.open("a", encoding="utf-8") as fh:
+                            fh.write(
+                                json.dumps(
+                                    {
+                                        "ts_ms": int(time.time() * 1000),
+                                        "mode": "dry_run" if is_dry_flat else "rest_flatten_ioc",
+                                        "action": "rest_flatten_ioc",
+                                        "coin": coin,
+                                        "oid": _extract_order_oid(flat_resp)[0],
+                                        "status": "flatten",
+                                        "filled_sz": filled_sz,
+                                        "order": flat_ord.to_dict(),
+                                    },
+                                    default=str,
+                                )
+                                + "\n"
+                            )
                 except Exception:
                     pass
 
@@ -1705,38 +1835,58 @@ def sweep_as_parameters_on_l2(
 BINANCE_FUTURES_STREAM_URL = "wss://fstream.binance.com/stream"
 
 
+def binance_futures_symbol(coin: str) -> str:
+    """Map Hyperliquid perp symbol to Binance USD-M Futures symbol (e.g. ``kPEPE`` -> ``1000PEPEUSDT``)."""
+    if len(coin) > 1 and coin.startswith("k") and coin[1].isupper():
+        return f"1000{coin[1:].upper()}USDT"
+    return f"{coin.upper()}USDT"
+
+
 async def _binance_lead_reader(
     coins: list[str],
     estimators: dict[str, LeadLagEstimator],
     stop_event: asyncio.Event,
 ) -> None:
-    """Background Binance Futures ``bookTicker`` WS reader feeding sub-100ms external mids."""
+    """Background Binance Futures ``bookTicker`` WS reader with auto-reconnect and ``k*`` mapping."""
     import websockets
 
-    streams = "/".join(f"{c.lower()}usdt@bookTicker" for c in coins)
-    url = f"{BINANCE_FUTURES_STREAM_URL}?streams={streams}"
-    sym_to_coin = {f"{c.upper()}USDT": c for c in coins}
-    try:
-        async with websockets.connect(url, open_timeout=6, ping_interval=20) as ws:
-            while not stop_event.is_set():
-                try:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
-                except asyncio.TimeoutError:
-                    continue
-                msg = json.loads(raw)
-                data = msg.get("data") if isinstance(msg, dict) and "data" in msg else msg
-                if not isinstance(data, dict):
-                    continue
-                coin = sym_to_coin.get(str(data.get("s", "")).upper())
-                if coin is None:
-                    continue
-                bid = float(data.get("b", 0.0) or 0.0)
-                ask = float(data.get("a", 0.0) or 0.0)
-                if bid > 0 and ask >= bid:
-                    estimators[coin].update_cex(int(time.time() * 1000), 0.5 * (bid + ask))
-    except Exception:
-        # External lead feed is strictly an enhancement; degrade gracefully to HL-only quotes.
+    sym_to_coin = {binance_futures_symbol(c): c for c in coins if c}
+    if not sym_to_coin:
         return
+    streams = "/".join(f"{sym.lower()}@bookTicker" for sym in sym_to_coin)
+    url = f"{BINANCE_FUTURES_STREAM_URL}?streams={streams}"
+    failures = 0
+    while not stop_event.is_set():
+        try:
+            async with websockets.connect(url, open_timeout=6, ping_interval=20) as ws:
+                while not stop_event.is_set():
+                    try:
+                        raw = await asyncio.wait_for(ws.recv(), timeout=1.0)
+                    except asyncio.TimeoutError:
+                        continue
+                    failures = 0
+                    msg = json.loads(raw)
+                    data = msg.get("data") if isinstance(msg, dict) and "data" in msg else msg
+                    if not isinstance(data, dict):
+                        continue
+                    coin = sym_to_coin.get(str(data.get("s", "")).upper())
+                    if coin is None:
+                        continue
+                    bid = float(data.get("b", 0.0) or 0.0)
+                    ask = float(data.get("a", 0.0) or 0.0)
+                    if bid > 0 and ask >= bid:
+                        estimators[coin].update_cex(int(time.time() * 1000), 0.5 * (bid + ask))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            if stop_event.is_set():
+                return
+            failures += 1
+            backoff_s = min(5.0, 0.5 * (2 ** min(failures - 1, 4)))
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=backoff_s)
+            except asyncio.TimeoutError:
+                continue
 
 
 def _cancel_response_ok(cancel_resps: Any) -> bool:
@@ -1800,21 +1950,34 @@ async def _sync_coin_quotes_atomic(
         "sell": (dec.ask_px, dec.ask_sz, dec.ask_reduce_only),
     }
     to_cancel: list[dict[str, Any]] = []
+    cancel_sides: list[str] = []
     to_modify: list[tuple[str, int, PlannedOrder]] = []
     to_place: list[tuple[str, PlannedOrder]] = []
+    deferred_after_cancel: list[tuple[str, PlannedOrder]] = []
     skipped = 0
 
     for side_k, (d_px, d_sz, d_red) in desired.items():
         cur_ord = active_orders.get(side_k)
-        cur_tuple = (cur_ord["px"], cur_ord["sz"]) if cur_ord else None
-        if not should_requote_side(d_px, d_sz, cur_tuple, mid_px=mid_px, threshold_bps=params.requote_threshold_bps):
+        cur_tuple = (
+            (cur_ord["px"], cur_ord["sz"], bool(cur_ord.get("reduce_only", False))) if cur_ord else None
+        )
+        if not should_requote_side(
+            d_px,
+            d_sz,
+            cur_tuple,
+            mid_px=mid_px,
+            threshold_bps=params.requote_threshold_bps,
+            desired_reduce_only=d_red,
+        ):
             skipped += 1
             continue
         if d_px is None or d_sz <= 0:
             if cur_ord is not None:
                 if cur_ord.get("oid") is not None:
                     to_cancel.append({"coin": coin, "oid": cur_ord["oid"]})
-                active_orders.pop(side_k, None)
+                    cancel_sides.append(side_k)
+                else:
+                    active_orders.pop(side_k, None)
             continue
         order = PlannedOrder(
             coin=coin,
@@ -1834,22 +1997,32 @@ async def _sync_coin_quotes_atomic(
         if can_use_modify:
             to_modify.append((side_k, int(cur_ord["oid"]), order))
         else:
-            if cur_ord is not None:
-                if cur_ord.get("oid") is not None:
-                    to_cancel.append({"coin": coin, "oid": cur_ord["oid"]})
-                active_orders.pop(side_k, None)
-            to_place.append((side_k, order))
+            if cur_ord is not None and cur_ord.get("oid") is not None:
+                to_cancel.append({"coin": coin, "oid": cur_ord["oid"]})
+                cancel_sides.append(side_k)
+                deferred_after_cancel.append((side_k, order))
+            else:
+                if cur_ord is not None:
+                    active_orders.pop(side_k, None)
+                to_place.append((side_k, order))
 
     cancelled = 0
     if to_cancel:
-        if prefer_explicit_cancel:
-            try:
-                await asyncio.to_thread(adapter.cancel_all_open_orders, to_cancel, fast=True)
-            except TypeError:
-                await asyncio.to_thread(adapter.cancel_all_open_orders, to_cancel)
-        else:
-            await asyncio.to_thread(adapter.cancel_all_open_orders, to_cancel)
-        cancelled += len(to_cancel)
+        try:
+            if prefer_explicit_cancel:
+                try:
+                    cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, to_cancel, fast=True)
+                except TypeError:
+                    cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, to_cancel)
+            else:
+                cancel_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, to_cancel)
+        except Exception as exc:
+            cancel_resps = [{"status": "err", "response": str(exc)}]
+        if _cancel_response_ok(cancel_resps):
+            for side_k in cancel_sides:
+                active_orders.pop(side_k, None)
+            cancelled += len(to_cancel)
+            to_place.extend(deferred_after_cancel)
 
     modified = 0
     if to_modify:
@@ -1859,7 +2032,12 @@ async def _sync_coin_quotes_atomic(
             if status in {"resting", "simulated_alo"} and new_oid is not None:
                 modified += 1
                 all_mm_oids.add(new_oid)
-                active_orders[side_k] = {"oid": new_oid, "px": order.limit_px, "sz": order.sz}
+                active_orders[side_k] = {
+                    "oid": new_oid,
+                    "px": order.limit_px,
+                    "sz": order.sz,
+                    "reduce_only": bool(order.reduce_only),
+                }
             else:
                 # Modify rejected/failed: prev_oid may still be resting on the book OR may have just
                 # filled. Explicitly cancel prev_oid first; only re-place if cancel confirmed removal.
@@ -1909,7 +2087,12 @@ async def _sync_coin_quotes_atomic(
             if oid is not None:
                 all_mm_oids.add(oid)
             if status in {"resting", "simulated_alo"}:
-                active_orders[side_k] = {"oid": oid, "px": order.limit_px, "sz": order.sz}
+                active_orders[side_k] = {
+                    "oid": oid,
+                    "px": order.limit_px,
+                    "sz": order.sz,
+                    "reduce_only": bool(order.reduce_only),
+                }
             if audit_log_path is not None:
                 is_dry = isinstance(adapter, DryRunAdapter) or (
                     isinstance(resp, dict) and resp.get("mode") == "dry_run"
@@ -2124,14 +2307,46 @@ async def run_multi_coin_mm_ws_session(
         if enable_lead_lag and ws_messages is None:
             lead_task = asyncio.create_task(_binance_lead_reader(coin_list, lead_ests, lead_stop))
 
-        last_book_mono = time.monotonic()
+        init_mono = time.monotonic()
+        last_valid_book_mono: dict[str, float] = {c: init_mono for c in coin_list}
+
+        def _ingest_live_fill(fl: dict[str, Any], *, default_ts_ms: int, check_session_window: bool = False) -> None:
+            c_name = str(fl.get("coin") or "")
+            if c_name not in all_mm_oids:
+                return
+            try:
+                f_oid = int(fl.get("oid", -1))
+            except (TypeError, ValueError):
+                return
+            f_time = int(fl.get("time", default_ts_ms) or default_ts_ms)
+            if f_oid not in all_mm_oids[c_name]:
+                return
+            if check_session_window and f_time < started_ms - 5_000:
+                return
+            f_sz = abs(float(fl.get("sz", 0.0)))
+            f_px = float(fl.get("px", 0.0))
+            f_side = "buy" if str(fl.get("side")) == "B" else "sell"
+            key = _fill_dedup_key(fl, c_name, f_oid, f_side, f_sz, f_time)
+            if key in seen_fill_keys:
+                return
+            seen_fill_keys.add(key)
+            ledgers[c_name].on_fill(f_side, f_px, f_sz, fee_usd=float(fl.get("fee", 0.0)))
+            stats[c_name]["fills"].append(
+                {
+                    "coin": c_name,
+                    "ts_ms": f_time,
+                    "oid": f_oid,
+                    "side": f_side,
+                    "px": f_px,
+                    "sz": f_sz,
+                    "notional_usd": f_px * f_sz,
+                    "crossed": bool(fl.get("crossed", False)),
+                }
+            )
 
         async def _handle_message(msg: dict[str, Any], recv_ms: int) -> bool:
-            nonlocal last_book_mono
             channel = msg.get("channel")
             data = msg.get("data")
-            if channel in ("bbo", "l2Book"):
-                last_book_mono = time.monotonic()
 
             if channel == "cexLead" and isinstance(data, dict):
                 c_name = str(data.get("coin", ""))
@@ -2140,27 +2355,10 @@ async def run_multi_coin_mm_ws_session(
                 return True
 
             if channel == "userFills" and isinstance(data, dict) and execute_live:
-                if data.get("isSnapshot"):
-                    return True
+                # Process both streaming and reconnect isSnapshot=True fills strictly filtered by all_mm_oids + seen_fill_keys.
                 for fl in data.get("fills") or []:
-                    c_name = str(fl.get("coin") or "")
-                    if c_name not in all_mm_oids:
-                        continue
-                    f_oid = int(fl.get("oid", -1))
-                    f_time = int(fl.get("time", recv_ms))
-                    if f_oid not in all_mm_oids[c_name]:
-                        continue
-                    f_sz = abs(float(fl.get("sz", 0.0)))
-                    f_px = float(fl.get("px", 0.0))
-                    f_side = "buy" if str(fl.get("side")) == "B" else "sell"
-                    key = _fill_dedup_key(fl, c_name, f_oid, f_side, f_sz, f_time)
-                    if key in seen_fill_keys:
-                        continue
-                    seen_fill_keys.add(key)
-                    ledgers[c_name].on_fill(f_side, f_px, f_sz, fee_usd=float(fl.get("fee", 0.0)))
-                    stats[c_name]["fills"].append(
-                        {"coin": c_name, "ts_ms": f_time, "oid": f_oid, "side": f_side, "px": f_px, "sz": f_sz, "notional_usd": f_px * f_sz, "crossed": bool(fl.get("crossed", False))}
-                    )
+                    if isinstance(fl, dict):
+                        _ingest_live_fill(fl, default_ts_ms=recv_ms, check_session_window=False)
                 return True
 
             if channel == "orderUpdates" and isinstance(data, list) and execute_live:
@@ -2227,10 +2425,11 @@ async def run_multi_coin_mm_ws_session(
                     return True
                 latest_imb5[c_name] = book.imbalance5
 
+            last_valid_book_mono[c_name] = time.monotonic()
             st = stats[c_name]
             st["ticks"] += 1
             last_mids[c_name] = book.mid_px
-            st["mids_series"].append((book.observed_ms if execute_live else recv_ms, book.mid_px))
+            _append_monotonic_mid(st["mids_series"], book.observed_ms if execute_live else recv_ms, book.mid_px)
 
             # Dry-run touch fills
             if not execute_live:
@@ -2308,9 +2507,15 @@ async def run_multi_coin_mm_ws_session(
                 st["halt_events"].append(eff_halt)
                 to_c = [{"coin": c_name, "oid": o["oid"]} for o in active_orders[c_name].values() if o.get("oid") is not None]
                 if to_c:
-                    await asyncio.to_thread(adapter.cancel_all_open_orders, to_c)
-                    st["cancelled"] += len(to_c)
-                active_orders[c_name].clear()
+                    try:
+                        c_resps = await asyncio.to_thread(adapter.cancel_all_open_orders, to_c)
+                    except Exception as exc:
+                        c_resps = [{"status": "err", "response": str(exc)}]
+                    if _cancel_response_ok(c_resps):
+                        st["cancelled"] += len(to_c)
+                        active_orders[c_name].clear()
+                else:
+                    active_orders[c_name].clear()
                 last_action_mono[c_name] = now_mono
             elif can_act:
                 st["half_spreads"].append(dec.half_spread_bps)
@@ -2400,12 +2605,17 @@ async def run_multi_coin_mm_ws_session(
                             if now_mono - last_ping >= 25.0:
                                 await ws.send(json.dumps({"method": "ping"}))
                                 last_ping = now_mono
+                            active_dms_coins = [c for c in coin_list if active_orders[c]] or coin_list
+                            books_fresh_for_dms = all(
+                                (now_mono - last_valid_book_mono[c]) <= MAX_BOOK_STALENESS_FOR_DMS_SEC
+                                for c in active_dms_coins
+                            )
                             if (
                                 enable_dead_man_switch
                                 and (now_mono - last_dms) >= dms_refresh_sec
-                                and (now_mono - last_book_mono) <= MAX_BOOK_STALENESS_FOR_DMS_SEC
+                                and books_fresh_for_dms
                             ):
-                                # Extend the DMS only while books keep arriving (see REST loop).
+                                # Extend the DMS only while every active coin has fresh valid two-sided books.
                                 await _refresh_dead_man(int(time.time() * 1000))
                                 last_dms = now_mono
                             try:
@@ -2432,7 +2642,7 @@ async def run_multi_coin_mm_ws_session(
                         break
                     if execute_live and account_address:
                         try:
-                            oo_rc_checked = fetch_open_orders_checked(http, account_address)
+                            oo_rc_checked = await asyncio.to_thread(fetch_open_orders_checked, http, account_address)
                             if oo_rc_checked is None:
                                 raise ValueError("openOrders unavailable; keep order tracking")
                             oo_rc = oo_rc_checked
@@ -2442,11 +2652,24 @@ async def run_multi_coin_mm_ws_session(
                                     cn = str(o.get("coin") or "")
                                     if cn in live_by_coin:
                                         live_by_coin[cn].add(int(o["oid"]))
+                            any_vanished = False
                             for cn in coin_list:
                                 for sk in list(active_orders[cn].keys()):
                                     oid_v = active_orders[cn][sk].get("oid")
                                     if oid_v is not None and int(oid_v) not in live_by_coin[cn]:
                                         active_orders[cn].pop(sk, None)
+                                        any_vanished = True
+                            if any_vanished and any(all_mm_oids.values()):
+                                uf_rc = (
+                                    await asyncio.to_thread(
+                                        lambda: http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json()
+                                    )
+                                    or []
+                                )
+                                now_rc_ms = int(time.time() * 1000)
+                                for fl in uf_rc:
+                                    if isinstance(fl, dict):
+                                        _ingest_live_fill(fl, default_ts_ms=now_rc_ms, check_session_window=True)
                         except Exception:
                             pass
                     backoff_s = min(0.5 * reconnects, max(0.0, deadline - time.monotonic()))
@@ -2456,25 +2679,10 @@ async def run_multi_coin_mm_ws_session(
             # Final REST fill reconciliation for any fill arriving right at socket close
             if execute_live and account_address and any(all_mm_oids.values()):
                 uf = http.post(TESTNET_INFO_URL, json={"type": "userFills", "user": account_address}).json() or []
+                now_fin_ms = int(time.time() * 1000)
                 for fl in uf:
-                    c_name = str(fl.get("coin") or "")
-                    if c_name not in all_mm_oids:
-                        continue
-                    f_oid = int(fl.get("oid", -1))
-                    f_time = int(fl.get("time", 0))
-                    if f_oid not in all_mm_oids[c_name] or f_time < started_ms - 5_000:
-                        continue
-                    f_sz = abs(float(fl.get("sz", 0.0)))
-                    f_px = float(fl.get("px", 0.0))
-                    f_side = "buy" if str(fl.get("side")) == "B" else "sell"
-                    key = _fill_dedup_key(fl, c_name, f_oid, f_side, f_sz, f_time)
-                    if key in seen_fill_keys:
-                        continue
-                    seen_fill_keys.add(key)
-                    ledgers[c_name].on_fill(f_side, f_px, f_sz, fee_usd=float(fl.get("fee", 0.0)))
-                    stats[c_name]["fills"].append(
-                        {"coin": c_name, "ts_ms": f_time, "oid": f_oid, "side": f_side, "px": f_px, "sz": f_sz, "notional_usd": f_px * f_sz, "crossed": bool(fl.get("crossed", False))}
-                    )
+                    if isinstance(fl, dict):
+                        _ingest_live_fill(fl, default_ts_ms=now_fin_ms, check_session_window=True)
     finally:
         lead_stop.set()
         if lead_task is not None:
@@ -2595,14 +2803,31 @@ async def run_multi_coin_mm_ws_session(
                                 }
                             )
                         if audit_log_path is not None:
-                            # Log the exit IOC so attribution can tell MM flatten fills from foreign ones.
+                            # Log the exit IOC so attribution can tell MM flatten fills from foreign ones,
+                            # while tagging dry-run simulates as mode="dry_run" so OIDs stay out of live sets.
+                            is_dry_flat = (
+                                (not execute_live)
+                                or isinstance(adapter, DryRunAdapter)
+                                or (isinstance(flat_resp, dict) and flat_resp.get("mode") == "dry_run")
+                            )
                             audit_log_path.parent.mkdir(parents=True, exist_ok=True)
                             with audit_log_path.open("a", encoding="utf-8") as fh:
-                                fh.write(json.dumps({
-                                    "ts_ms": int(time.time() * 1000), "mode": "ws_flatten_ioc", "coin": c_name,
-                                    "oid": _extract_order_oid(flat_resp)[0], "status": "flatten",
-                                    "filled_sz": filled_sz, "order": flat_ord.to_dict(),
-                                }, default=str) + "\n")
+                                fh.write(
+                                    json.dumps(
+                                        {
+                                            "ts_ms": int(time.time() * 1000),
+                                            "mode": "dry_run" if is_dry_flat else "ws_flatten_ioc",
+                                            "action": "ws_flatten_ioc",
+                                            "coin": c_name,
+                                            "oid": _extract_order_oid(flat_resp)[0],
+                                            "status": "flatten",
+                                            "filled_sz": filled_sz,
+                                            "order": flat_ord.to_dict(),
+                                        },
+                                        default=str,
+                                    )
+                                    + "\n"
+                                )
                     except Exception:
                         pass
 

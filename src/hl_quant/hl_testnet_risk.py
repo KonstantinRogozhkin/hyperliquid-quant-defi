@@ -69,7 +69,12 @@ def fetch_testnet_asset_ctxs(client: httpx.Client) -> dict[str, AssetCtx]:
     return parse_asset_ctxs(resp.json())
 
 
-def fetch_book_sides(client: httpx.Client, coins: list[str]) -> dict[str, str]:
+def fetch_book_sides(
+    client: httpx.Client,
+    coins: list[str],
+    *,
+    open_orders: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
     """Return ``{coin: "two_sided" | "bid_only" | "ask_only" | "empty" | "unknown"}`` from Testnet ``l2Book``."""
     out: dict[str, str] = {}
     for coin in sorted(set(coins)):
@@ -82,7 +87,8 @@ def fetch_book_sides(client: httpx.Client, coins: list[str]) -> dict[str, str]:
         if not (isinstance(levels, list) and len(levels) == 2):
             out[coin] = "unknown"
             continue
-        has_bid, has_ask = bool(levels[0]), bool(levels[1])
+        eff_levels = ex.strip_own_orders_from_l2_levels(levels, open_orders, coin) if open_orders else levels
+        has_bid, has_ask = bool(eff_levels[0]), bool(eff_levels[1])
         out[coin] = (
             "two_sided" if has_bid and has_ask else "bid_only" if has_bid else "ask_only" if has_ask else "empty"
         )
@@ -118,6 +124,7 @@ def build_risk_snapshot(
     book_sides: dict[str, str],
     max_drawdown_pct: float = ex.RiskLimits().max_drawdown_pct,
     target_weights: dict[str, float] | None = None,
+    foreign_coins: set[str] | None = None,
     min_orphan_alert_usd: float = 10.0,
     now_ms: int | None = None,
 ) -> dict[str, Any]:
@@ -126,11 +133,14 @@ def build_risk_snapshot(
     A position is an orphan when its Testnet book is not two-sided: the ALO planner cannot price,
     rebalance or close it, matching ``execute_rebalance_cycle``'s ``coin not in bbo`` rule.
     ``unmanaged_orphan_positions`` counts non-dust orphans that are not retained same-side target
-    holdings and do not already have a resting reduce-only unwind order working on the book.
+    holdings, not MM-owned ``foreign_coins``, and do not already have a resting reduce-only unwind
+    order working on the book.
     """
     equity = float(account.equity_usd)
-    hwm = max(float(high_water_mark_usd or 0.0), equity if math.isfinite(equity) else 0.0)
-    dd = ex.drawdown_pct(equity, hwm)
+    oracle_eq = oracle_adjusted_equity_usd(account, asset_ctxs)
+    hwm = max(float(high_water_mark_usd or 0.0), oracle_eq if math.isfinite(oracle_eq) else 0.0)
+    dd = ex.drawdown_pct(oracle_eq, hwm)
+    foreign = set(foreign_coins or ())
 
     resting_unwind_coins: set[str] = set()
     for oo in account.open_orders:
@@ -143,8 +153,9 @@ def build_risk_snapshot(
         if abs(szi_oo) <= 1e-12:
             continue
         oo_side = str(oo.get("side") or "").upper()
-        closes_dir = (szi_oo > 0 and oo_side in {"A", "SELL"}) or (szi_oo < 0 and oo_side in {"B", "BUY"})
-        if closes_dir and bool(oo.get("reduceOnly", True)):
+        closes_dir = (szi_oo > 0 and oo_side in {"A", "S", "SELL"}) or (szi_oo < 0 and oo_side in {"B", "BUY"})
+        is_reduce_only = bool(oo["reduceOnly"]) if ("reduceOnly" in oo and oo["reduceOnly"] is not None) else True
+        if closes_dir and is_reduce_only:
             resting_unwind_coins.add(c_oo)
 
     per_coin: list[dict[str, Any]] = []
@@ -191,6 +202,7 @@ def build_risk_snapshot(
                 abs(notional) >= float(min_orphan_alert_usd)
                 and not retained_target
                 and not has_unwind_order
+                and coin not in foreign
             )
             if is_unmanaged:
                 unmanaged_orphans += 1
@@ -222,6 +234,7 @@ def build_risk_snapshot(
     return {
         "observed_at_ms": int(now_ms if now_ms is not None else time.time() * 1000),
         "equity_usd": round(equity, 6),
+        "oracle_adjusted_equity_usd": round(oracle_eq, 6) if math.isfinite(oracle_eq) else round(equity, 6),
         "free_margin_usd": round(float(account.free_margin_usd), 6),
         "high_water_mark_usd": round(hwm, 6),
         "drawdown_pct": round(dd, 4),

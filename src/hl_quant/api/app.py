@@ -8,19 +8,22 @@ plus immutable ``/build-info.json`` and ``/healthz`` probes for Dokploy CI/CD ve
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import hmac
 import json
 import logging
 import math
 import os
 from pathlib import Path
+import threading
+import time
 from typing import Any
 
-from fastapi import FastAPI, Response
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 import pandas as pd
 
-from hl_quant.hl_analytics_risk import build_desk_analytics_payload
+from hl_quant.hl_analytics_risk import _read_parquet_cached, build_desk_analytics_payload
 from hl_quant.hl_portfolio_dashboard import collect_dashboard_payload, normalize_autopilot_state
 from hl_quant.metrics import PROMETHEUS_CONTENT_TYPE, render_prometheus_metrics
 
@@ -103,11 +106,26 @@ def _read_json(path: Path) -> dict[str, Any] | None:
         return None
 
 
+_EXTRA_CACHE_PATHS: tuple[str, ...] = (
+    "hl_autopilot/ticks.parquet",
+    "hl_spot_perp_paper/ticks.parquet",
+    "hl_cross_dex_paper/ticks.parquet",
+    "hl_hip3_paper/ticks.parquet",
+    "hl_metamodel/ticks.parquet",
+    "hl_mm_testnet/summary.json",
+    "hl_mm_testnet/quotes.parquet",
+    "hl_funding_settlement_study/meta.json",
+    "hl_funding_settlement_study/last_attempt.json",
+    "hl_funding_settlement_study_52d/stats.parquet",
+    "hl_spot_perp_arb/snapshot.json",
+)
+
+
 def _read_parquet_tail(path: Path, limit: int = 100) -> list[dict[str, Any]]:
-    if not path.is_file():
+    df = _read_parquet_cached(path)
+    if df is None or df.empty:
         return []
     try:
-        df = pd.read_parquet(path)
         if limit > 0 and len(df) > limit:
             df = df.tail(limit)
         return df.to_dict(orient="records")
@@ -146,16 +164,62 @@ def _read_metamodel_positions(data_root: Path) -> list[dict[str, Any]]:
     return rows
 
 
-def _read_testnet_audit_tail(data_root: Path, limit: int = 15) -> list[dict[str, Any]]:
-    path = data_root / "hl_testnet_audit.jsonl"
-    if not path.is_file():
+def _tail_jsonl_lines(path: Path, max_lines: int, *, block_size: int = 65_536) -> list[str]:
+    """Read up to ``max_lines`` trailing non-empty lines in O(1) memory via reverse 64KB block seeks."""
+    if max_lines <= 0 or not path.is_file():
         return []
-    records: list[dict[str, Any]] = []
     try:
-        lines = [ln.strip() for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+        with path.open("rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            pos = fh.tell()
+            if pos <= 0:
+                return []
+            chunks: list[bytes] = []
+            nonempty_seen = 0
+            carry = b""
+            while pos > 0 and nonempty_seen < max_lines:
+                read_sz = min(block_size, pos)
+                pos -= read_sz
+                fh.seek(pos, os.SEEK_SET)
+                buf = fh.read(read_sz)
+                if not buf:
+                    break
+                combined = buf + carry
+                parts = combined.split(b"\n")
+                if pos > 0:
+                    carry = parts[0]
+                    complete = parts[1:]
+                else:
+                    carry = b""
+                    complete = parts
+                chunks.append(buf)
+                nonempty_seen += sum(1 for ln in complete if ln.strip())
     except OSError:
         return []
-    for line in reversed(lines[-limit:]):
+    raw = b"".join(reversed(chunks))
+    raw_lines = raw.splitlines()
+    if pos > 0 and raw_lines:
+        raw_lines = raw_lines[1:]
+    out: list[str] = []
+    for b_line in reversed(raw_lines):
+        s = b_line.decode("utf-8", errors="replace").strip()
+        if s:
+            out.append(s)
+            if len(out) >= max_lines:
+                break
+    out.reverse()
+    return out
+
+
+def _read_testnet_audit_tail(data_root: Path, limit: int = 15) -> list[dict[str, Any]]:
+    if limit <= 0:
+        return []
+    path = data_root / "hl_testnet_audit.jsonl"
+    lines = _tail_jsonl_lines(path, max_lines=limit + 5)
+    if not lines:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in reversed(lines):
         try:
             rec = json.loads(line)
         except ValueError:
@@ -166,6 +230,8 @@ def _read_testnet_audit_tail(data_root: Path, limit: int = 15) -> list[dict[str,
             records.append(_audit_record(rec))
         except (TypeError, ValueError, OverflowError):
             continue  # skip malformed audit lines instead of 500-ing /overview and /metrics
+        if len(records) >= limit:
+            break
     return records
 
 
@@ -254,11 +320,13 @@ def create_app(
     resolved_sha = (build_sha if build_sha is not None else os.environ.get("HL_BUILD_SHA", "dev")).strip() or "dev"
     resolved_built_at = (built_at if built_at is not None else os.environ.get("HL_BUILT_AT", "")).strip()
 
+    enable_api_docs = os.environ.get("HL_ENABLE_API_DOCS", "").strip().lower() in {"1", "true", "yes", "on"}
     app = FastAPI(
         title="Hyperliquid Quant DeFi API",
         version="0.1.0",
-        docs_url="/api/docs",
-        openapi_url="/api/openapi.json",
+        docs_url="/api/docs" if enable_api_docs else None,
+        redoc_url=None,
+        openapi_url="/api/openapi.json" if enable_api_docs else None,
     )
 
     cors_raw = os.environ.get("HL_CORS_ORIGINS", "").strip()
@@ -298,7 +366,24 @@ def create_app(
         _no_store(response)
         return dict(build_payload)
 
-    def _build_overview_payload() -> dict[str, Any]:
+    cache_lock = threading.Lock()
+    overview_cache: dict[str, Any] = {"fp": None, "raw": None, "sanitized": None}
+    analytics_cache: dict[str, Any] = {"fp": None, "raw": None, "sanitized": None}
+
+    def _artifact_fingerprint(extra_id: int) -> tuple[Any, ...]:
+        dir_exists = resolved_data_root.is_dir()
+        stats: list[tuple[str, int, int]] = []
+        if dir_exists:
+            for rel in (*ARTIFACT_FILES.values(), *_EXTRA_CACHE_PATHS):
+                target = resolved_data_root / rel
+                try:
+                    st = target.stat()
+                    stats.append((rel, st.st_mtime_ns, st.st_size))
+                except OSError:
+                    stats.append((rel, -1, -1))
+        return (dir_exists, int(time.monotonic() // 2), extra_id, tuple(stats))
+
+    def _build_overview_uncached() -> dict[str, Any]:
         payload = collect_dashboard_payload(resolved_data_root)
         payload["build_info"] = dict(build_payload)
         payload["worker_status"] = _read_json(resolved_data_root / "hl_worker_status.json")
@@ -308,15 +393,59 @@ def create_app(
         payload["testnet_risk"] = _read_json(resolved_data_root / "hl_testnet_risk" / "latest.json")
         return payload
 
+    def _build_overview_payload(*, sanitized: bool = False) -> dict[str, Any]:
+        fp = _artifact_fingerprint(id(collect_dashboard_payload))
+        with cache_lock:
+            if overview_cache["fp"] == fp and overview_cache["raw"] is not None:
+                if sanitized:
+                    if overview_cache["sanitized"] is None:
+                        overview_cache["sanitized"] = sanitize_json(overview_cache["raw"])
+                    return overview_cache["sanitized"]
+                return overview_cache["raw"]
+        built = _build_overview_uncached()
+        clean = sanitize_json(built) if sanitized else None
+        with cache_lock:
+            overview_cache["fp"] = fp
+            overview_cache["raw"] = built
+            overview_cache["sanitized"] = clean
+        return clean if sanitized and clean is not None else built
+
+    def _build_analytics_cached(*, sanitized: bool = False) -> dict[str, Any]:
+        fp = _artifact_fingerprint(id(build_desk_analytics_payload))
+        with cache_lock:
+            if analytics_cache["fp"] == fp and analytics_cache["raw"] is not None:
+                if sanitized:
+                    if analytics_cache["sanitized"] is None:
+                        analytics_cache["sanitized"] = sanitize_json(analytics_cache["raw"])
+                    return analytics_cache["sanitized"]
+                return analytics_cache["raw"]
+        built = build_desk_analytics_payload(resolved_data_root)
+        clean = sanitize_json(built) if sanitized else None
+        with cache_lock:
+            analytics_cache["fp"] = fp
+            analytics_cache["raw"] = built
+            analytics_cache["sanitized"] = clean
+        return clean if sanitized and clean is not None else built
+
     @app.get("/metrics")
     @app.get("/api/v1/metrics")
-    def prometheus_metrics() -> PlainTextResponse:
-        overview_payload = _build_overview_payload()
+    def prometheus_metrics(request: Request) -> PlainTextResponse:
+        expected_token = os.environ.get("HL_METRICS_BEARER_TOKEN", "").strip()
+        if expected_token:
+            auth_raw = request.headers.get("authorization", "").strip()
+            scheme, _, supplied = auth_raw.partition(" ")
+            if scheme.lower() != "bearer" or not hmac.compare_digest(supplied.strip(), expected_token):
+                return PlainTextResponse(
+                    content="Unauthorized\n",
+                    status_code=401,
+                    headers={"WWW-Authenticate": "Bearer", "Cache-Control": "no-store"},
+                )
+        overview_payload = _build_overview_payload(sanitized=False)
         render_errors = 0
         # Analytics-derived gauges are best-effort: a failure there must not turn the whole scrape into a 500
         # (that would also fire HLWorkerDown via absent(hl_worker_up)).
         try:
-            analytics_payload: dict[str, Any] | None = build_desk_analytics_payload(resolved_data_root)
+            analytics_payload: dict[str, Any] | None = _build_analytics_cached(sanitized=False)
         except Exception:
             logger.exception("metrics: build_desk_analytics_payload failed; emitting overview-only metrics")
             analytics_payload = None
@@ -345,7 +474,7 @@ def create_app(
     @app.get("/api/v1/overview")
     def overview(response: Response) -> dict[str, Any]:
         _no_store(response)
-        return sanitize_json(_build_overview_payload())
+        return _build_overview_payload(sanitized=True)
 
     @app.get("/api/v1/metamodel/positions")
     def metamodel_positions(response: Response) -> dict[str, Any]:
@@ -401,7 +530,7 @@ def create_app(
     @app.get("/api/v1/analytics")
     def analytics_risk(response: Response) -> dict[str, Any]:
         _no_store(response)
-        return sanitize_json(build_desk_analytics_payload(resolved_data_root))
+        return _build_analytics_cached(sanitized=True)
 
     @app.get("/api/v1/events/latest")
     def events_latest(response: Response) -> dict[str, Any]:

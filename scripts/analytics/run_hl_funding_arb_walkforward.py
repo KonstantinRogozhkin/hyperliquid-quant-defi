@@ -119,8 +119,9 @@ def main(
 
     raw = raw_root or (ROOT / os.getenv("BACKTESTER_RAW_ROOT", "data/raw")).resolve()
     now = hl.current_time_ms()
-    end_ms = now - now % fa.HOUR_MS - 1
-    start_ms = end_ms + 1 - days * 24 * fa.HOUR_MS
+    floor_hour_ms = now - now % fa.HOUR_MS
+    end_ms = floor_hour_ms
+    start_ms = floor_hour_ms - days * 24 * fa.HOUR_MS
     costs = fa.Costs(hl_fee_bps=hl_fee_bps, cex_fee_bps=cex_fee_bps, slippage_bps_per_leg=slippage_bps, leverage=leverage)
 
     panels: dict[str, pd.DataFrame] = {}

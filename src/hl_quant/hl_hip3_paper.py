@@ -53,6 +53,7 @@ class Hip3PaperConfig:
     exit_oracle_div_bps: float = 35.0  # emergency exit if oracles diverge > 35 bps while held
     max_l2_slip_bps: float = 6.0  # reject thin builder books with > 6 bps L2 VWAP slip
     min_exec_basis_bps: float = -5.0  # refuse entries starting deep underwater on L2 basis
+    max_book_mark_divergence_bps: float = 10.0  # reject stale/async L2 book vs mark basis divergence
     max_payback_hours: float = 24.0  # reject slow-payback pairs (> 1 day)
     use_taker_fees: bool = True  # conservative atomic two-leg crossing assumption
     allow_only_isolated: bool = True  # track both Cross and half-sized Isolated pairs in paper
@@ -75,6 +76,8 @@ def _load_or_init_state(state_path: Path, cfg: Hip3PaperConfig) -> dict[str, Any
         st.setdefault("nav_guard_triggered", False)
         st.setdefault("nav_guard_reason", "")
         st.setdefault("nav_guard_pending_ms", None)
+        st.setdefault("nav_guard_pending_ret_pct", None)
+        st.setdefault("last_clamped_ms", 0)
         return st
     return {
         "starting_capital_usd": cfg.starting_capital_usd,
@@ -87,6 +90,7 @@ def _load_or_init_state(state_path: Path, cfg: Hip3PaperConfig) -> dict[str, Any
         "cum_basis_mtm_usd": 0.0,
         "cum_costs_usd": 0.0,
         "last_tick_ms": 0,
+        "last_clamped_ms": 0,
         "ny_session": "",
         "positions": {},  # base_symbol -> position dict
         "clean_streaks": {},  # "BASE:short_sym->long_sym" -> consecutive clean ticks
@@ -96,6 +100,7 @@ def _load_or_init_state(state_path: Path, cfg: Hip3PaperConfig) -> dict[str, Any
         "nav_guard_triggered": False,
         "nav_guard_reason": "",
         "nav_guard_pending_ms": None,
+        "nav_guard_pending_ret_pct": None,
     }
 
 
@@ -149,6 +154,14 @@ def _leg_fee_bps(mkt: hip3.Hip3BuilderMarket, *, use_taker: bool) -> float:
     return float(mkt.est_taker_fee_bps if use_taker else mkt.est_maker_fee_bps)
 
 
+def _pair_gross_notional_usd(pos: dict[str, Any]) -> float:
+    s_n = pos.get("short_notional_usd")
+    l_n = pos.get("long_notional_usd")
+    if s_n is not None and l_n is not None:
+        return max(0.0, float(s_n)) + max(0.0, float(l_n))
+    return 2.0 * max(0.0, float(pos.get("leg_notional_usd", 0.0)))
+
+
 def settled_funding_by_position(
     client: Any,
     positions: dict[str, dict[str, Any]],
@@ -157,8 +170,9 @@ def settled_funding_by_position(
     ts_ms: int,
     *,
     cap_hours: float | None = None,
-) -> dict[str, float]:
-    """Realized ``fundingHistory`` rate sums per symbol, each over its position's own accrual window.
+    info_url: str = hip3.HL_INFO_URL,
+) -> dict[Any, float]:
+    """Realized ``fundingHistory`` rate sums per ``(start, symbol)`` and ``symbol``.
 
     ``symbols_of(pos)`` yields the HL symbols to fetch for a position. Symbols missing from the
     result (no history / unsupported) fall back to the snapshot rate in the caller.
@@ -176,10 +190,13 @@ def settled_funding_by_position(
             start = max(start, ts_ms - int(cap_hours * 3_600_000))
         if start > 0 and (ts_ms // 3_600_000) - (start // 3_600_000) > 0:
             by_start.setdefault(start, set()).update(str(s) for s in symbols_of(pos) if s)
-    out: dict[str, float] = {}
+    out: dict[Any, float] = {}
     for start, syms in by_start.items():
         try:
-            out.update(fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms))
+            fetched = fetch_settled_funding_sum(client, sorted(syms), start + 1, ts_ms, info_url=info_url)
+            for sym, val in fetched.items():
+                out[sym] = val
+                out[(start, sym)] = val
         except Exception:  # noqa: BLE001 - fall back to snapshot-rate accrual
             continue
     return out
@@ -204,8 +221,17 @@ def run_hip3_paper_tick(
     state = _load_or_init_state(state_path, cfg)
 
     prev_ms = int(state.get("last_tick_ms", 0))
-    if prev_ms > 0 and (ts_ms // 3_600_000) <= (prev_ms // 3_600_000):
+    last_clamped_ms = int(state.get("last_clamped_ms", 0) or 0)
+    same_prev_hour = prev_ms > 0 and (ts_ms // 3_600_000) <= (prev_ms // 3_600_000)
+    same_clamped_hour = (
+        bool(state.get("nav_guard_pending_ms"))
+        and last_clamped_ms > 0
+        and (ts_ms // 3_600_000) <= (last_clamped_ms // 3_600_000)
+    )
+    if same_prev_hour or same_clamped_hour:
         pos_snap = state.get("positions") or {}
+        gross_snap = round(sum(_pair_gross_notional_usd(p) for p in pos_snap.values()), 2)
+        eq_snap = max(float(state["equity_usd"]), 1.0)
         return {
             "status": "duplicate_hour_skipped",
             "tick": {
@@ -215,7 +241,8 @@ def run_hip3_paper_tick(
                 "equity_usd": state["equity_usd"],
                 "liquidation_equity_usd": state.get("liquidation_equity_usd", state["equity_usd"]),
                 "active_pairs": len(pos_snap),
-                "gross_notional_usd": round(sum(float(p["leg_notional_usd"]) * 2.0 for p in pos_snap.values()), 2),
+                "gross_notional_usd": gross_snap,
+                "gross_leverage": round(gross_snap / eq_snap, 3),
                 "margin_locked_usd": state.get("margin_locked_usd", 0.0),
                 "margin_utilization_pct": state.get("margin_utilization_pct", 0.0),
                 "net_delta_usd": state.get("net_delta_usd", 0.0),
@@ -245,7 +272,7 @@ def run_hip3_paper_tick(
 
         def _default_book(sym: str) -> tuple[list[tuple[float, float]], list[tuple[float, float]]]:
             assert http_client is not None
-            return cds.fetch_dex_l2_book(http_client, "hyperliquid", sym)
+            return cds.fetch_dex_l2_book(http_client, "hyperliquid", sym, info_url=info_url)
 
         get_book = book_fetcher or _default_book
         by_symbol: dict[str, hip3.Hip3BuilderMarket] = {m.full_symbol: m for m in live_markets}
@@ -270,6 +297,7 @@ def run_hip3_paper_tick(
                 prev_ms,
                 ts_ms,
                 cap_hours=dt_cap_h,
+                info_url=info_url,
             )
             if markets is None
             else {}
@@ -292,13 +320,14 @@ def run_hip3_paper_tick(
             l_notional = long_qty * l_mkt.mark_px
             # Per-position clock: a tick skipped for a missing quote keeps its funding interval.
             pos_prev_ms = pc.position_accrual_start_ms(pos, prev_ms)
+            eff_start = max(pos_prev_ms, ts_ms - int(dt_cap_h * 3_600_000)) if dt_cap_h > 0 else pos_prev_ms
             pos_settled_hours = pc.settled_hours_between(pos_prev_ms, ts_ms, cap_hours=dt_cap_h) if prev_ms > 0 else 0.0
             pos_dt_hours = max(0.0, min(dt_cap_h, (ts_ms - pos_prev_ms) / 3_600_000.0)) if pos_prev_ms > 0 else dt_hours
             pos["last_accrual_ms"] = ts_ms
             # Short receives positive funding (+s_mkt.funding_rate_h); long pays positive funding (-l_mkt.funding_rate_h).
             s_sym, l_sym = str(pos["short_symbol"]), str(pos["long_symbol"])
-            s_rate_sum = settled.get(s_sym, s_mkt.funding_rate_h * pos_settled_hours)
-            l_rate_sum = settled.get(l_sym, l_mkt.funding_rate_h * pos_settled_hours)
+            s_rate_sum = float(settled.get((eff_start, s_sym), settled.get(s_sym, s_mkt.funding_rate_h * pos_settled_hours)))
+            l_rate_sum = float(settled.get((eff_start, l_sym), settled.get(l_sym, l_mkt.funding_rate_h * pos_settled_hours)))
             fund_pnl = s_notional * s_rate_sum - l_notional * l_rate_sum
 
             live_spread_apr = round(s_mkt.funding_apr_pct - l_mkt.funding_apr_pct, 2)
@@ -312,8 +341,15 @@ def run_hip3_paper_tick(
             init_leg_m = notional / lev_p
             short_upnl = -short_qty * (s_mkt.mark_px - entry_s)
             long_upnl = long_qty * (l_mkt.mark_px - entry_l)
-            dyn_margin = max(0.0, max(init_leg_m + short_upnl, s_notional / lev_p)) + max(
-                0.0, max(init_leg_m + long_upnl, l_notional / lev_p)
+            s_mmr = 0.5 / max(1.0, float(s_mkt.max_leverage or 10))
+            l_mmr = 0.5 / max(1.0, float(l_mkt.max_leverage or 10))
+            leg_liquidated = (
+                (init_leg_m + short_upnl) <= s_notional * s_mmr
+                or (init_leg_m + long_upnl) <= l_notional * l_mmr
+            )
+            # Do NOT count unrealized profit (> 0) on the winning leg as locked margin!
+            dyn_margin = max(0.0, max(init_leg_m + min(0.0, short_upnl), s_notional / lev_p)) + max(
+                0.0, max(init_leg_m + min(0.0, long_upnl), l_notional / lev_p)
             )
 
             pos["short_qty"] = round(short_qty, 8)
@@ -322,6 +358,7 @@ def run_hip3_paper_tick(
             pos["long_notional_usd"] = round(l_notional, 2)
             pos["net_delta_usd"] = round(l_notional - s_notional, 2)
             pos["margin_locked_usd"] = round(dyn_margin, 2)
+            pos["split_margin_leg_liquidated"] = bool(leg_liquidated)
             pos["last_short_px"] = s_mkt.mark_px
             pos["last_long_px"] = l_mkt.mark_px
             pos["hours_held"] = round(float(pos.get("hours_held", 0.0)) + pos_dt_hours, 2)
@@ -343,30 +380,47 @@ def run_hip3_paper_tick(
         # 1b. Bounded NAV Sanity Guard (clamp anomalous single-tick MTM jump until >= 1h confirmation)
         prev_equity = float(state.get("equity_usd", cfg.starting_capital_usd))
         raw_tick_pnl = tick_funding_usd + tick_basis_mtm_usd
+        raw_ret_pct = (raw_tick_pnl / prev_equity * 100.0) if prev_equity > 0 else 0.0
         pending_raw = state.get("nav_guard_pending_ms")
         nav_guard_pending: int | None = int(pending_raw) if pending_raw else None
+        pending_ret_raw = state.get("nav_guard_pending_ret_pct")
+        nav_guard_pending_ret: float | None = float(pending_ret_raw) if pending_ret_raw is not None else None
         jump_exceeded = (
             prev_ms > 0
             and prev_equity > 0
             and cfg.max_tick_nav_jump_pct > 0.0
-            and abs(raw_tick_pnl) / prev_equity * 100.0 > cfg.max_tick_nav_jump_pct
+            and abs(raw_ret_pct) > cfg.max_tick_nav_jump_pct
         )
         nav_guard_triggered = False
         nav_guard_reason = ""
         if jump_exceeded and nav_guard_pending is not None and ts_ms - nav_guard_pending >= NAV_GUARD_CONFIRM_MS:
-            nav_guard_reason = (
-                f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% persisted since the clamped tick; "
-                "accepted as genuine"
+            confirmed = nav_guard_pending_ret is None or (
+                (raw_ret_pct * nav_guard_pending_ret) > 0.0
+                and abs(raw_ret_pct - nav_guard_pending_ret)
+                <= max(cfg.max_tick_nav_jump_pct, 0.5 * abs(nav_guard_pending_ret))
             )
-            nav_guard_pending = None
-            jump_exceeded = False
+            if confirmed:
+                nav_guard_reason = (
+                    f"Tick NAV jump {raw_ret_pct:+.2f}% persisted since the clamped tick; "
+                    "accepted as genuine"
+                )
+                nav_guard_pending = None
+                nav_guard_pending_ret = None
+                jump_exceeded = False
+            else:
+                nav_guard_pending = ts_ms
+                nav_guard_pending_ret = round(raw_ret_pct, 6)
         elif not jump_exceeded:
             nav_guard_pending = None
+            nav_guard_pending_ret = None
         if jump_exceeded:
-            nav_guard_pending = nav_guard_pending if nav_guard_pending is not None else ts_ms
+            if nav_guard_pending is None:
+                nav_guard_pending = ts_ms
+            if nav_guard_pending_ret is None:
+                nav_guard_pending_ret = round(raw_ret_pct, 6)
             nav_guard_triggered = True
             nav_guard_reason = (
-                f"Tick NAV jump {raw_tick_pnl / prev_equity * 100.0:+.2f}% exceeded "
+                f"Tick NAV jump {raw_ret_pct:+.2f}% exceeded "
                 f"+/-{cfg.max_tick_nav_jump_pct:.1f}% guard; clamping MTM & freezing rebalance"
             )
             state["nav_guard_triggers"] = int(state.get("nav_guard_triggers", 0)) + 1
@@ -374,14 +428,17 @@ def run_hip3_paper_tick(
             tick_funding_usd = 0.0
             tick_basis_mtm_usd = 0.0
 
-        # 2. Evaluate exits: carry decay, oracle divergence spike, or delisted/missing legs
+        # 2. Evaluate exits: split-margin leg liquidation, carry decay, oracle divergence spike, or delisted/missing legs
         hip3_online = bool(by_symbol)
+        closed_this_tick: set[str] = set()
         for base in (list(positions.keys()) if not nav_guard_triggered else []):
             pos = positions[base]
             s_mkt = by_symbol.get(str(pos["short_symbol"]))
             l_mkt = by_symbol.get(str(pos["long_symbol"]))
             exit_reason = ""
-            if not (s_mkt and l_mkt):
+            if bool(pos.get("split_margin_leg_liquidated", False)):
+                exit_reason = "split_margin_leg_liquidation"
+            elif not (s_mkt and l_mkt):
                 if not hip3_online:
                     continue
                 # Wall-clock ticks, not invocations (see cross_dex_paper).
@@ -414,11 +471,10 @@ def run_hip3_paper_tick(
                     sb, sa = get_book(s_mkt.full_symbol)
                     lb, la = get_book(l_mkt.full_symbol)
                     # Closing reverses legs: buy back short_symbol (ask) & sell long_symbol (bid) -> short_hl=False
-                    _, sl, _ = cds.compute_executable_cross_dex_entry_bps(
+                    _, sl, full_ok = cds.compute_executable_cross_dex_entry_bps(
                         sb, sa, lb, la, short_hl=False, clip_usd=exit_notional
                     )
-                    if sl is not None:
-                        l2_slip = sl
+                    l2_slip = sl if (sl is not None and full_ok) else max(float(sl or 0.0), 2.0)
                     exit_fee_bps = _leg_fee_bps(s_mkt, use_taker=cfg.use_taker_fees) + _leg_fee_bps(
                         l_mkt, use_taker=cfg.use_taker_fees
                     )
@@ -453,6 +509,7 @@ def run_hip3_paper_tick(
                     }
                 )
                 positions.pop(base, None)
+                closed_this_tick.add(base)
 
         # 3. Scan cross-builder candidates and update local clean streaks
         opps = hip3.scan_hip3_cross_builder_arb(
@@ -490,6 +547,7 @@ def run_hip3_paper_tick(
             "skipped_streak": 0,
             "skipped_l2_slip": 0,
             "skipped_basis": 0,
+            "skipped_basis_source": 0,
             "skipped_payback": 0,
             "skipped_margin": 0,
         }
@@ -500,7 +558,7 @@ def run_hip3_paper_tick(
         for opp in (opps if not nav_guard_triggered else []):
             if len(positions) >= cfg.max_slots:
                 break
-            if opp.base_symbol in positions:
+            if opp.base_symbol in positions or opp.base_symbol in closed_this_tick:
                 continue
             if opp.oracle_risk_warning or opp.oracle_divergence_bps > cfg.max_oracle_div_bps:
                 gated_stats["skipped_oracle"] += 1
@@ -544,6 +602,10 @@ def run_hip3_paper_tick(
             if not full_ok or l2_slip is None or exec_basis is None or l2_slip > cfg.max_l2_slip_bps:
                 gated_stats["skipped_l2_slip"] += 1
                 continue
+            book_mid_basis = cds.compute_book_mid_basis_bps(sb, sa, lb, la, short_hl=True)
+            if book_mid_basis is None or abs(book_mid_basis - opp.mark_basis_bps) > cfg.max_book_mark_divergence_bps:
+                gated_stats["skipped_basis_source"] += 1
+                continue
             # Positions are marked on mark_px: an L2 basis better than the mark basis never realizes,
             # and the part of the mark basis explained by builder oracle divergence is structural
             # (it does not converge to zero), so it is never credited as an edge.
@@ -559,10 +621,11 @@ def run_hip3_paper_tick(
                 l_mkt, use_taker=cfg.use_taker_fees
             )
             rt_fee_bps = 2.0 * entry_fee_bps
-            # Conservative 50% credit on positive entry basis (same policy as cross_dex_paper)
-            basis_credit = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
-            # Exit crosses the book again: charge the L2 slip twice (as spot_perp does).
-            est_rt_cost_bps = max(0.0, rt_fee_bps + 2.0 * l2_slip - basis_credit)
+            # Conservative 50% credit on positive entry basis, capped at one-way entry fee.
+            eff_exec_basis = (0.5 * credited_basis) if credited_basis > 0 else credited_basis
+            basis_credit = min(max(float(eff_exec_basis), -50.0), entry_fee_bps)
+            # exec_basis ALREADY subtracts 1x entry L2 slip from mid basis; add 1x l2_slip for exit.
+            est_rt_cost_bps = max(1.0, rt_fee_bps + 1.0 * l2_slip - basis_credit)
             hourly_bps = opp.spread_apr_pct / (hip3.HOURS_PER_YEAR * 100.0) * 1e4
             be_hours = (est_rt_cost_bps / hourly_bps) if hourly_bps > 1e-9 else float("inf")
             if be_hours > cfg.max_payback_hours:
@@ -592,6 +655,7 @@ def run_hip3_paper_tick(
                 "margin_locked_usd": pair_margin,
                 "per_leg_leverage": cfg.per_leg_leverage,
                 "opened_ms": ts_ms,
+                "last_accrual_ms": ts_ms,
                 "hours_held": 0.0,
                 "entry_short_px": s_mkt.mark_px,
                 "entry_long_px": l_mkt.mark_px,
@@ -665,10 +729,15 @@ def run_hip3_paper_tick(
         margin_util = round((margin_locked / new_equity) * 100.0, 2) if new_equity > 0 else 0.0
         net_delta_total = round(sum(float(p.get("net_delta_usd", 0.0)) for p in positions.values()), 2)
 
+        gross_notional_usd = round(sum(_pair_gross_notional_usd(p) for p in positions.values()), 2)
+        gross_leverage = round(gross_notional_usd / max(new_equity, 1.0), 3)
+
         state["equity_usd"] = new_equity
         state["est_exit_costs_usd"] = est_exit_costs_usd
         state["liquidation_equity_usd"] = liquidation_equity_usd
         state["return_pct"] = round(((new_equity / start_cap) - 1.0) * 100.0, 4) if start_cap > 0 else 0.0
+        state["gross_notional_usd"] = gross_notional_usd
+        state["gross_leverage"] = gross_leverage
         state["margin_locked_usd"] = margin_locked
         state["margin_utilization_pct"] = margin_util
         state["net_delta_usd"] = net_delta_total
@@ -676,9 +745,11 @@ def run_hip3_paper_tick(
         state["cum_basis_mtm_usd"] = round(float(state["cum_basis_mtm_usd"]) + tick_basis_mtm_usd, 4)
         state["cum_costs_usd"] = round(float(state["cum_costs_usd"]) + tick_costs_usd, 4)
         state["last_tick_ms"] = prev_ms if nav_guard_triggered else ts_ms
+        state["last_clamped_ms"] = ts_ms if nav_guard_triggered else 0
         state["nav_guard_triggered"] = nav_guard_triggered
         state["nav_guard_reason"] = nav_guard_reason
         state["nav_guard_pending_ms"] = nav_guard_pending
+        state["nav_guard_pending_ret_pct"] = nav_guard_pending_ret
         state["observed_at_utc"] = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
         state["ny_session"] = ny_session
         state["positions"] = positions
@@ -692,7 +763,8 @@ def run_hip3_paper_tick(
             "equity_usd": new_equity,
             "liquidation_equity_usd": liquidation_equity_usd,
             "active_pairs": len(positions),
-            "gross_notional_usd": round(sum(float(p["leg_notional_usd"]) * 2.0 for p in positions.values()), 2),
+            "gross_notional_usd": gross_notional_usd,
+            "gross_leverage": gross_leverage,
             "margin_locked_usd": margin_locked,
             "margin_utilization_pct": margin_util,
             "net_delta_usd": net_delta_total,

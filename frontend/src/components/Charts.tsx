@@ -261,11 +261,13 @@ export function OlsScatterChart({
 export function EquityCurveChart({
   values,
   initialValue = null,
+  totalTicks = null,
   stroke = "#10b981",
   height = 130,
 }: {
   values: number[];
   initialValue?: number | null;
+  totalTicks?: number | null;
   stroke?: string;
   height?: number;
 }) {
@@ -291,15 +293,25 @@ export function EquityCurveChart({
   const polygon = `${padX},${height - padY} ${polyline} ${width - padX},${height - padY}`;
   const first = values[0];
   const last = values[values.length - 1];
-  const base = typeof initialValue === "number" && Number.isFinite(initialValue) && initialValue > 0 ? initialValue : first;
+  const validTotalTicks =
+    typeof totalTicks === "number" && Number.isFinite(totalTicks) && totalTicks > 0 ? Math.trunc(totalTicks) : null;
+  const isTrailingSlice = validTotalTicks !== null && validTotalTicks > values.length;
+  const base =
+    !isTrailingSlice && typeof initialValue === "number" && Number.isFinite(initialValue) && initialValue > 0
+      ? initialValue
+      : first;
   const pct = base > 0 ? ((last - base) / base) * 100 : 0;
+  const markerCoords = coords.length <= 48 ? coords : [coords[0], coords[coords.length - 1]];
+  const tickSummary = isTrailingSlice
+    ? `${values.length} / ${validTotalTicks} ${p(validTotalTicks, "tick", "ticks", "тик", "тика", "тиков")}`
+    : `${values.length} ${p(values.length, "tick", "ticks", "тик", "тика", "тиков")}`;
 
   return (
     <div>
       <svg viewBox={`0 0 ${width} ${height}`} className="chart-svg" role="img" aria-label="Equity curve">
         <polygon points={polygon} fill={stroke} fillOpacity="0.14" />
         <polyline points={polyline} fill="none" stroke={stroke} strokeWidth="2.4" strokeLinecap="round" />
-        {coords.map(([x, y], i) => (
+        {markerCoords.map(([x, y], i) => (
           <circle key={i} cx={x} cy={y} r="3" fill={stroke} />
         ))}
       </svg>
@@ -310,7 +322,7 @@ export function EquityCurveChart({
         </span>
         <span className={`mono ${pct > 0 ? "pos" : pct < 0 ? "neg" : ""}`}>
           {pct >= 0 ? "+" : ""}
-          {pct.toFixed(3)}% ({values.length} {p(values.length, "tick", "ticks", "тик", "тика", "тиков")})
+          {pct.toFixed(3)}% ({tickSummary})
         </span>
       </div>
     </div>

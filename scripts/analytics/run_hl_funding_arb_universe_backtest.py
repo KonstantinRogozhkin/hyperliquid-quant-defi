@@ -69,6 +69,7 @@ def _report(
     top_k: int,
     rank_by: str,
     skipped: dict[str, str],
+    include_delisted: bool = True,
 ) -> str:
     split = datetime.fromtimestamp(u_eval.split_hour_ms / 1000, tz=timezone.utc).isoformat()
     se = u_eval.selected_eval
@@ -125,9 +126,15 @@ def _report(
         for coin, reason in sorted(skipped.items()):
             lines.append(f"- `{coin}`: {reason}")
 
+    surv_note = (
+        "делистинги HL/CEX включены (`--include-delisted`, комиссия выхода начисляется на часе делистинга), "
+        "однако полностью удалённые из публичных API тикеры могут отсутствовать; "
+        if include_delisted
+        else "survivorship bias (`--no-include-delisted`: отобраны только ныне активные листинги HL/CEX); "
+    )
     lines += [
         "",
-        "Ограничения: survivorship bias (отбираются только ныне активные листинги HL/CEX); "
+        f"Ограничения: {surv_note}"
         "закрытия 1h вместо исполнения по стакану; маржа, ликвидации и перевод залога не моделируются.",
     ]
     return "\n".join(lines) + "\n"
@@ -163,8 +170,9 @@ def main(
 
     raw = raw_root or (ROOT / os.getenv("BACKTESTER_RAW_ROOT", "data/raw")).resolve()
     now = hl.current_time_ms()
-    end_ms = now - now % fa.HOUR_MS - 1
-    start_ms = end_ms + 1 - days * 24 * fa.HOUR_MS
+    floor_hour_ms = now - now % fa.HOUR_MS
+    end_ms = floor_hour_ms
+    start_ms = floor_hour_ms - days * 24 * fa.HOUR_MS
     costs = fa.Costs(hl_fee_bps=hl_fee_bps, cex_fee_bps=cex_fee_bps, slippage_bps_per_leg=slippage_bps, leverage=leverage)
 
     panels: dict[str, pd.DataFrame] = {}
@@ -250,6 +258,7 @@ def main(
             top_k=top_k,
             rank_by=rank_by,
             skipped=skipped,
+            include_delisted=include_delisted,
         )
     )
     summary = {

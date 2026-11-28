@@ -103,6 +103,7 @@ def _timeseries(
     w: int,
     h: int = 7,
     *,
+    description: str | None = None,
     unit: str | None = None,
     decimals: int | None = None,
     thresholds: list[dict[str, Any]] | None = None,
@@ -123,7 +124,7 @@ def _timeseries(
         defaults["decimals"] = decimals
     if thresholds:
         defaults["thresholds"] = {"mode": "absolute", "steps": thresholds}
-    return {
+    panel: dict[str, Any] = {
         "id": pid,
         "type": "timeseries",
         "title": title,
@@ -136,6 +137,9 @@ def _timeseries(
         },
         "fieldConfig": {"defaults": defaults, "overrides": []},
     }
+    if description:
+        panel["description"] = description
+    return panel
 
 
 def _bargauge(
@@ -298,8 +302,8 @@ def build_dashboard() -> dict[str, Any]:
         {
             "id": next_id(),
             "type": "table",
-            "title": "All Strategies — Live Results, Carry APR, Leverage & Risk Leaderboard",
-            "description": "Unified live ledger across Neutral Autopilot, HyperCore Spot+Perp (+10% HLP), Cross-DEX v2, HIP-3 Split-Margin, Metamodel (Obs), Live Testnet ALO, and HLP Benchmark.",
+            "title": "All Strategies — Live Results, Capital-Weighted Live Carry APR %, Leverage & Risk Leaderboard",
+            "description": "Unified live ledger across Neutral Autopilot, HyperCore Spot+Perp (+10% HLP), Cross-DEX v2, HIP-3 Split-Margin, Metamodel (Obs), Live Testnet ALO, and HLP Benchmark. Capital-Weighted Live Carry APR % scales active pair spread APR by deployed leg notional / strategy equity (see hl_hip3_paper_avg_pair_apr_pct & hl_cross_dex_paper_avg_pair_apr_pct for unweighted open-pair averages).",
             "datasource": DS,
             "gridPos": {"h": 9, "w": 24, "x": 0, "y": 6},
             "targets": [
@@ -333,7 +337,7 @@ def build_dashboard() -> dict[str, Any]:
                             "Value #E": "Net PnL ($)",
                             "Value #F": "Funding/Yield ($)",
                             "Value #G": "Costs ($)",
-                            "Value #H": "Live APR %",
+                            "Value #H": "Capital-Weighted Live Carry APR %",
                             "Value #I": "Positions",
                             "Value #J": "Leverage",
                             "Value #K": "Max DD %",
@@ -342,7 +346,7 @@ def build_dashboard() -> dict[str, Any]:
                     },
                 },
             ],
-            "options": {"showHeader": True, "sortBy": [{"displayName": "Live APR %", "desc": True}]},
+            "options": {"showHeader": True, "sortBy": [{"displayName": "Capital-Weighted Live Carry APR %", "desc": True}]},
             "fieldConfig": {
                 "defaults": {"custom": {"align": "auto", "cellOptions": {"type": "auto"}}},
                 "overrides": [
@@ -396,7 +400,7 @@ def build_dashboard() -> dict[str, Any]:
                     _override("Funding/Yield ($)", [{"id": "unit", "value": "currencyUSD"}, {"id": "decimals", "value": 2}]),
                     _override("Costs ($)", [{"id": "unit", "value": "currencyUSD"}, {"id": "decimals", "value": 2}]),
                     _override(
-                        "Live APR %",
+                        "Capital-Weighted Live Carry APR %",
                         [
                             {"id": "unit", "value": "percent"},
                             {"id": "decimals", "value": 2},
@@ -648,16 +652,20 @@ def build_dashboard() -> dict[str, Any]:
     panels.append(
         _timeseries(
             next_id(),
-            "Active Carry Pair Live APR (%) — Spot+Perp, HIP-3 & Cross-DEX",
+            "Capital-Weighted Live Carry APR % vs Open-Pair Spread APR — Spot+Perp, HIP-3 & Cross-DEX",
             [
-                _target("A", "hl_spot_perp_position_live_apr_pct", legend="Spot+Perp {{symbol}}"),
-                _target("B", "hl_hip3_paper_pair_live_apr_pct", legend="HIP-3 {{symbol}} ({{short_dex}}/{{long_dex}})"),
-                _target("C", "hl_cross_dex_paper_pair_live_apr_pct", legend="Cross-DEX {{coin}} ({{other_dex}})"),
+                _target("A", 'hl_strategy_live_apr_pct{strategy=~"spot_perp_hlp|hip3_split_margin|cross_dex_v2"}', legend="Capital-Weighted {{strategy}}"),
+                _target("B", "hl_hip3_paper_avg_pair_apr_pct", legend="HIP-3 Avg Open Pair APR"),
+                _target("C", "hl_cross_dex_paper_avg_pair_apr_pct", legend="Cross-DEX Avg Open Pair APR"),
+                _target("D", "hl_spot_perp_position_live_apr_pct", legend="Spot+Perp {{symbol}}"),
+                _target("E", "hl_hip3_paper_pair_live_apr_pct", legend="HIP-3 {{symbol}} ({{short_dex}}/{{long_dex}})"),
+                _target("F", "hl_cross_dex_paper_pair_live_apr_pct", legend="Cross-DEX {{coin}} ({{other_dex}})"),
             ],
             0,
             40,
             12,
             h=7,
+            description="Compares Capital-Weighted Live Carry APR % (deployed leg notional * spread APR / strategy equity, accounting for idle cash buffers) against unweighted open-pair average APR (hl_hip3_paper_avg_pair_apr_pct, hl_cross_dex_paper_avg_pair_apr_pct) and per-pair spread APRs.",
             unit="percent",
         )
     )
@@ -666,10 +674,14 @@ def build_dashboard() -> dict[str, Any]:
             next_id(),
             "Carry PnL Attribution — Cumulative Funding vs Basis MTM vs Costs (USD)",
             [
-                _target("A", "hl_spot_perp_funding_usd + hl_spot_perp_hlp_yield_usd", legend="Spot+Perp Funding+HLP"),
+                _target("A", "(hl_spot_perp_funding_usd or vector(0)) + (hl_spot_perp_hlp_yield_usd or vector(0))", legend="Spot+Perp Funding+HLP"),
                 _target("B", "hl_hip3_paper_funding_usd", legend="HIP-3 Funding"),
                 _target("C", "hl_cross_dex_paper_funding_usd", legend="Cross-DEX Funding"),
-                _target("D", "-(hl_spot_perp_costs_usd + hl_hip3_paper_costs_usd + hl_cross_dex_paper_costs_usd)", legend="Total Carry Costs"),
+                _target(
+                    "D",
+                    "-((hl_spot_perp_costs_usd or vector(0)) + (hl_hip3_paper_costs_usd or vector(0)) + (hl_cross_dex_paper_costs_usd or vector(0)))",
+                    legend="Total Carry Costs",
+                ),
             ],
             12,
             40,
@@ -1063,7 +1075,7 @@ def build_dashboard() -> dict[str, Any]:
             "targets": [
                 _target(
                     "A",
-                    "max by (worker_job) (hl_worker_job_enabled * (1 + hl_worker_job_ok + 2 * hl_worker_job_failed))",
+                    "max by (worker_job) (hl_worker_job_enabled * (1 + hl_worker_job_ok + 2 * hl_worker_job_interrupted + 3 * hl_worker_job_failed))",
                     instant=True,
                     table=True,
                 ),
@@ -1104,7 +1116,8 @@ def build_dashboard() -> dict[str, Any]:
                                             "0": {"text": "DISABLED", "color": "semi-dark-blue"},
                                             "1": {"text": "IDLE / RUN", "color": "blue"},
                                             "2": {"text": "OK", "color": "green"},
-                                            "3": {"text": "FAIL", "color": "red"},
+                                            "3": {"text": "INTERRUPTED", "color": "yellow"},
+                                            "4": {"text": "FAIL", "color": "red"},
                                         },
                                     }
                                 ],
@@ -1118,7 +1131,8 @@ def build_dashboard() -> dict[str, Any]:
                                         {"color": "semi-dark-blue", "value": None},
                                         {"color": "blue", "value": 1},
                                         {"color": "green", "value": 2},
-                                        {"color": "red", "value": 3},
+                                        {"color": "yellow", "value": 3},
+                                        {"color": "red", "value": 4},
                                     ],
                                 },
                             },

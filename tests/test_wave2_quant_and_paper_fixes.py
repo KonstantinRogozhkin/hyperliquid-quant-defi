@@ -503,7 +503,7 @@ def test_m9_m10_m11_m12_cross_dex_hip3_frontier_boros_and_yield_stack(tmp_path: 
     )
     assert r_dup["status"] == "duplicate_hour_skipped"
 
-    # +20% synchronized rally (100 -> 120): net PnL ~0, but split-margin locked grows to $6,500!
+    # +20% synchronized rally (100 -> 120): net PnL ~0, split-margin locked grows to $6,000 ($3k + $3k; winning uPnL is not locked margin)
     mkts_rally = [
         hip3.Hip3BuilderMarket("io", "io", "io:NVDA", "NVDA", 120.0, 120.0, 0.0, 0.00005, 43.8, 5e6, 2e6, False, 10, True, 1.0, 0.9, 0.3),
         hip3.Hip3BuilderMarket("xyz", "xyz", "xyz:NVDA", "NVDA", 120.0, 120.0, 0.0, 0.0, 0.0, 5e6, 2e6, False, 10, True, 1.0, 0.9, 0.3),
@@ -511,7 +511,7 @@ def test_m9_m10_m11_m12_cross_dex_hip3_frontier_boros_and_yield_stack(tmp_path: 
     r2 = hp.run_hip3_paper_tick(
         state_dir=h3_dir, cfg=cfg_h3, now_ms=t0 + 4 * H, markets=mkts_rally, book_fetcher=lambda _s: ([(119.99, 500.0)], [(120.01, 500.0)])
     )
-    assert r2["state"]["margin_locked_usd"] == pytest.approx(6_500.0)
+    assert r2["state"]["margin_locked_usd"] == pytest.approx(6_000.0)
 
     # Corrupt single-leg spike triggers HIP-3 NAV Sanity Guard
     mkts_corrupt = [

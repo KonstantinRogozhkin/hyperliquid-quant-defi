@@ -45,7 +45,8 @@ printf "%s\n" "${EXISTING_CRONTAB}" > "${BACKUP_PATH}"
     '
   fi
   echo "${BEGIN_MARKER}"
-  echo "${HL_ONCHAIN_CRON_SCHEDULE} zsh \"${TICK_PATH}\""
+  echo "# CRON_TZ=UTC"
+  echo "${HL_ONCHAIN_CRON_SCHEDULE} TZ=UTC zsh \"${TICK_PATH}\""
   echo "${END_MARKER}"
 } > "${CRON_PATH}"
 

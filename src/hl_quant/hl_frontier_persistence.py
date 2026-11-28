@@ -148,11 +148,28 @@ def run_frontier_persistence_tick(
     hip3_snap: hip3_mod.Hip3ScannerSnapshot | None = None,
     boros_snap: boros_mod.BorosScannerSnapshot | None = None,
     yield_snap: ys_mod.HyperEvmYieldSnapshot | None = None,
+    min_tick_spacing_min: float = 55.0,
 ) -> dict[str, Any]:
     """Run one read-only HIP-3 + Pendle Boros + HyperEVM Yield Stack persistence logging tick."""
     ts_ms = int(now_ms if now_ms is not None else time.time() * 1000)
     hist_dir = data_root / "hl_frontier_history"
     hist_dir.mkdir(parents=True, exist_ok=True)
+    latest_summary_path = hist_dir / "latest_summary.json"
+    prior_ticks: list[int] = []
+    if latest_summary_path.is_file():
+        try:
+            prev_sum = json.loads(latest_summary_path.read_text(encoding="utf-8"))
+            if isinstance(prev_sum, dict):
+                raw_ticks = prev_sum.get("tick_timestamps_ms") or []
+                prior_ticks = [int(t) for t in raw_ticks if t is not None]
+                prev_last = prev_sum.get("last_tick_ms") or prev_sum.get("ts_ms")
+                if prev_last is not None:
+                    prev_last_i = int(prev_last)
+                    prior_ticks.append(prev_last_i)
+                    if min_tick_spacing_min > 0 and 0 <= ts_ms - prev_last_i < min_tick_spacing_min * 60_000:
+                        return {**prev_sum, "status": "duplicate_tick_skipped"}
+        except Exception:
+            prior_ticks = []
 
     with httpx.Client(timeout=25.0) as client:
         if hip3_snap is None:
@@ -217,20 +234,6 @@ def run_frontier_persistence_tick(
         }
         for s in yield_snap.strategies
     ]
-
-    latest_summary_path = hist_dir / "latest_summary.json"
-    prior_ticks: list[int] = []
-    if latest_summary_path.is_file():
-        try:
-            prev_sum = json.loads(latest_summary_path.read_text(encoding="utf-8"))
-            if isinstance(prev_sum, dict):
-                raw_ticks = prev_sum.get("tick_timestamps_ms") or []
-                prior_ticks = [int(t) for t in raw_ticks if t is not None]
-                prev_last = prev_sum.get("last_tick_ms") or prev_sum.get("ts_ms")
-                if prev_last is not None:
-                    prior_ticks.append(int(prev_last))
-        except Exception:
-            prior_ticks = []
 
     hip3_df = _append_parquet(hist_dir / "hip3_history.parquet", hip3_rows)
     boros_df = _append_parquet(hist_dir / "boros_history.parquet", boros_rows)

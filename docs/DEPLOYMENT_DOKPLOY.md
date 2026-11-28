@@ -4,7 +4,7 @@ This repository ships as a three-container Docker Compose stack behind Dokploy T
 
 - **`frontend`** (`nginx:1.27-alpine` + React/Vite/TS 7-tab SPA): serves the live quant desk UI, `/build-info.json`, and proxies `/api/*` → `http://backend:8000` (single public domain, zero CORS setup).
 - **`backend`** (`python:3.11-slim` + `FastAPI`/`uvicorn`): read-only telemetry & analytics API (`/api/v1/overview`, `/api/v1/analytics`, `/api/v1/spot-perp`, `/api/v1/autopilot`, `/metrics`, `/api/v1/metrics`, `/healthz`, `/build-info.json`) mounted on `/app/data:ro`, never receives wallet private keys or Telegram tokens.
-- **`worker`** (`python:3.11-slim` + `hl_quant.scheduler` + `--extra testnet`): runs all **16 UTC jobs** (10 core research/paper/testnet schedules including `spot_perp_paper`, `autopilot_allocator`, 4h `testnet_attribution`, and 15m `testnet_risk_probe`, plus 6 read-only dashboard/paper scanners: `hip3_paper`, `cross_dex_scan`, `hyperevm_defi_scan`, `liq_funding_alpha`, `mm_calibration`, and `settlement_study`), preserves job health across restarts, sends cooldown-gated Telegram alerts on job failure/recovery, writes atomically to shared volume `hl-data:/app/data:rw`, and seeds any missing read-only tab in the background on startup.
+- **`worker`** (`python:3.11-slim` + `hl_quant.scheduler` + `--extra testnet`, `stop_grace_period: 30s`): runs all **16 UTC jobs** (10 core research/paper/testnet schedules including `spot_perp_paper`, `autopilot_allocator`, 4h `testnet_attribution`, and 15m `testnet_risk_probe`, plus 6 read-only dashboard/paper scanners: `hip3_paper`, `cross_dex_scan`, `hyperevm_defi_scan`, `liq_funding_alpha`, `mm_calibration`, and `settlement_study`), drains active child process groups cleanly on `SIGTERM` within the `30s` stop grace window (recording interrupted jobs as `interrupted` rather than `failed`), supports safe ad-hoc `python -m hl_quant.scheduler --run-once <job>` runs with per-job kernel `flock` and lock-merged status updates into `hl_worker_status.json` (preserving the live daemon's `heartbeat_utc` and sibling job states), sends cooldown-gated Telegram alerts on job failure/recovery, writes atomically to shared volume `hl-data:/app/data:rw`, and seeds any missing read-only tab in the background on startup.
 
 ---
 
@@ -85,7 +85,7 @@ Under **GitHub → Settings → Secrets and variables → Actions**:
 1. Every change enters `main` via a **Pull Request** gated by `ci.yml` (`tests` + `frontend`).
 2. Merging to `main` triggers `.github/workflows/release.yml`:
    - `gate`: verifies the target commit is still the tip of `main`.
-   - `verify`: re-runs Python `ruff` + `pytest` (430+ tests) and frontend `Vitest` (40+ checks) on the exact release SHA.
+   - `verify`: re-runs Python `ruff` + `pytest` (470+ tests) and frontend `Vitest` (45+ checks) on the exact release SHA.
    - `build-and-push`: builds `hl-backend`, `hl-worker`, `hl-frontend` with `BUILD_SHA=$GITHUB_SHA`, runs pre-push container smoke tests (`/healthz`, `/build-info.json`, `/api/v1/overview`, worker 16-job scheduler & SDK check), and pushes immutable `ghcr.io/<owner>/hl-*:sha-<GITHUB_SHA>` tags.
    - `deploy-dokploy`: calls `scripts/ops/deploy_dokploy.py` to pin `DEPLOY_SHA=<GITHUB_SHA>` in Dokploy, trigger `compose.deploy`, wait for `status == done`, and assert frontend, backend, and `worker_status.build_sha` all serve the exact `GITHUB_SHA`.
 3. **Instant Rollback:** set `DEPLOY_SHA=<previous-40-char-sha>` in Dokploy Environment and click **Deploy** (no rebuild needed; every historical SHA image remains immutable in GHCR).

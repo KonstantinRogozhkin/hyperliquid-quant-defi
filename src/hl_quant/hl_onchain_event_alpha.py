@@ -268,8 +268,9 @@ def extract_h5_hlp_inventory_skew(
                 "ret_4h_bps": np.nan,
             }
         )
-    rows.sort(key=lambda r: -float(r["hlp_abs_usd"]))
-    return rows[: cfg.h5_top_n]
+    rows.sort(key=lambda r: (-int(r["alert"]), -float(r["hlp_abs_usd"])))
+    keep_n = max(int(cfg.h5_top_n), sum(1 for r in rows if r["alert"]))
+    return rows[:keep_n]
 
 
 def extract_h6_book_mark_oracle_dislocations(
@@ -339,7 +340,8 @@ def extract_h6_book_mark_oracle_dislocations(
             }
         )
     rows.sort(key=lambda r: (-int(r["alert"]), -float(r["max_disloc_bps"])))
-    return rows[: cfg.h6_top_n]
+    keep_n = max(int(cfg.h6_top_n), sum(1 for r in rows if r["alert"]))
+    return rows[:keep_n]
 
 
 def summarize_hlp_mm_pnl_regime(
@@ -446,14 +448,17 @@ def grade_forward_outcomes(
     """Back-fill realized +15m / +1h / +4h mark-price returns onto prior logged events."""
     if not parquet_path.is_file():
         return 0
-    df = pd.read_parquet(parquet_path)
-    if df.empty or "coin" not in df.columns or "mark_px" not in df.columns:
+    try:
+        df = pd.read_parquet(parquet_path)
+    except Exception:
+        return 0
+    if df.empty or "ts_ms" not in df.columns or "coin" not in df.columns or "mark_px" not in df.columns:
         return 0
 
     horizons = (
-        ("ret_15m_bps", 14 * 60_000, 25 * 60_000),
-        ("ret_1h_bps", 55 * 60_000, 75 * 60_000),
-        ("ret_4h_bps", 230 * 60_000, 260 * 60_000),
+        ("ret_15m_bps", 14 * 60_000, 40 * 60_000),
+        ("ret_1h_bps", 55 * 60_000, 78 * 60_000),
+        ("ret_4h_bps", 230 * 60_000, 265 * 60_000),
     )
     ts_series = pd.to_numeric(df["ts_ms"], errors="coerce")
     updated = 0

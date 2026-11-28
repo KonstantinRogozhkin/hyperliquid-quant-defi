@@ -164,11 +164,11 @@ def test_metamodel_live_cex_marks_deadband_and_nav_guard(tmp_path: Path, monkeyp
         rebalance_deadband_weight=0.02,
     )
     assert r2["price_pnl_usd"] == pytest.approx(0.0, abs=1e-6)
-    # BTC micro-drift (-0.20 -> -0.208) suppressed; ETH full exit (0.15 -> 0.0) executed -> 1 trade, turnover=0.30!
+    # BTC micro-drift (-0.206 drifted -> -0.208 target) suppressed; ETH full exit (+0.15 * 1.03 = 0.1545 per leg -> 0.0) executed -> 1 trade, turnover=0.309!
     assert r2["trades_count"] == 1
-    assert r2["turnover"] == pytest.approx(0.30, abs=1e-6)
+    assert r2["turnover"] == pytest.approx(0.309, abs=1e-4)
     st2 = json.loads((tmp_path / "state.json").read_text())
-    assert st2["positions"]["BTC"]["hl_weight"] == pytest.approx(-0.20)
+    assert st2["positions"]["BTC"]["hl_weight"] == pytest.approx(-0.206, abs=1e-4)
     assert "ETH" not in st2["positions"]
 
     # Tick 3: Corrupt HL quote spikes +60% while CEX stays at 103 -> >8% NAV jump triggers Bounded NAV Sanity Guard!

@@ -57,14 +57,20 @@ class _FakeDokployClient:
 
 
 def test_deploy_sha_to_dokploy_happy_path_and_live_verification(monkeypatch):
+    from datetime import datetime, timezone
+
     sha = "b" * 40
     client = _FakeDokployClient()
+    fresh_hb = datetime.now(tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
     def fake_fetch_json(url: str, *, timeout_s: int = 10) -> dict[str, Any]:
         if url.endswith("/api/v1/healthz"):
             return {"status": "ok", "sha": sha}
         if url.endswith("/api/v1/scheduler/status"):
-            return {"build_info": {"sha": sha}, "worker_status": {"service": "hl-worker", "build_sha": sha}}
+            return {
+                "build_info": {"sha": sha},
+                "worker_status": {"service": "hl-worker", "build_sha": sha, "heartbeat_utc": fresh_hb},
+            }
         return {"sha": sha}
 
     monkeypatch.setattr(mod, "fetch_json", fake_fetch_json)

@@ -158,13 +158,16 @@ def margin_buffer_audit(
 
     rows = []
     for lev in leverages:
+        w24_pct = max(-99.99, w24 * lev * 100.0)
+        w72_pct = max(-99.99, w72 * lev * 100.0)
+        max_dd_pct = max(-99.99, max_single_leg_dd * lev * 100.0)
         rows.append(
             {
                 "leverage": lev,
-                "worst_24h_single_leg_pct": w24 * lev * 100.0,
-                "worst_72h_single_leg_pct": w72 * lev * 100.0,
-                "max_single_leg_dd_pct": max_single_leg_dd * lev * 100.0,
-                "recommended_free_margin_pct": max(15.0, abs(w72 * lev * 100.0) * 2.5),
+                "worst_24h_single_leg_pct": w24_pct,
+                "worst_72h_single_leg_pct": w72_pct,
+                "max_single_leg_dd_pct": max_dd_pct,
+                "recommended_free_margin_pct": min(99.0, max(15.0, abs(w72_pct) * 2.5)),
             }
         )
     return rows
@@ -202,11 +205,12 @@ def metamodel_stream(
             sim = af.simulate_cross_venue(market, w_df, venue_choice=venue_choice, one_way_cost_bps=cross_venue_cost_bps)
             cex_turn = sim.get("cex_turnover", sim["turnover"])
             capital_turn = 0.5 * (sim["turnover"] + cex_turn)
-            leg_exposure = 0.5 * cex_turn
+            leg_exposure = 0.25 * cex_turn
         elif spec.family == "basis_mean_reversion":
             sim = af.simulate_cross_venue(market, af.build_basis_mr_weights(market, spec.params), one_way_cost_bps=cross_venue_cost_bps)
-            capital_turn = 0.5 * (sim["turnover"] + sim["cex_turnover"])
-            leg_exposure = 0.5 * sim["cex_turnover"]
+            cex_turn = sim["cex_turnover"]
+            capital_turn = 0.5 * (sim["turnover"] + cex_turn)
+            leg_exposure = 0.25 * cex_turn
         elif spec.family in ("hl_xs_funding_contrarian", "hl_xs_price_reversal_mom", "hl_xs_velocity_div"):
             builder = {
                 "hl_xs_funding_contrarian": af.build_xs_funding_contrarian_weights,
@@ -221,5 +225,6 @@ def metamodel_stream(
         ret = ret + weight * sim["ret"]
         turnover = turnover + weight * capital_turn
         delay_exposure = delay_exposure + weight * leg_exposure
-    leg_vol = market.hl_ret_next.shift(1).rolling(leg_vol_window_h, min_periods=6).std().median(axis=1)
+    raw_hl_ret = market.hl_close.replace(0, np.nan).pct_change(fill_method=None)
+    leg_vol = raw_hl_ret.shift(1).rolling(leg_vol_window_h, min_periods=6).std().median(axis=1)
     return ret, turnover, pd.Series(leg_vol.to_numpy(dtype=float), index=market.hours), delay_exposure

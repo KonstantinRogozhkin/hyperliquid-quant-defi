@@ -131,7 +131,7 @@ def main(
         if foreign_coin_set:
             valid_targets = {c: w for c, w in valid_targets.items() if c not in foreign_coin_set}
         coins_to_quote = sorted(set(valid_targets.keys()) | set(account.positions_sz.keys()))
-        book_tops = ex.fetch_testnet_book_tops(client, coins_to_quote)
+        book_tops = ex.fetch_testnet_book_tops(client, coins_to_quote, open_orders=account.open_orders)
         bbo = ex.two_sided_bbo(book_tops)
         try:
             # Oracle prices let the executor close positions whose Testnet book is one-sided/empty
@@ -142,13 +142,14 @@ def main(
             asset_ctxs = {}
             reference_px = {}
         skipped_unquoted: list[str] = []
+        perp_eq = ex.effective_perp_equity_usd(account)
         mm_gross_w = (
             sum(
-                abs(float(account.position_notional_usd.get(c, 0.0) or 0.0)) / account.equity_usd
+                abs(float(account.position_notional_usd.get(c, 0.0) or 0.0)) / perp_eq
                 for c in foreign_coin_set
                 if abs(float(account.positions_sz.get(c, 0.0) or 0.0)) > 1e-12
             )
-            if account.equity_usd > 0
+            if perp_eq > 0
             else 0.0
         )
         base_max_gross = max(0.0, min(0.90, limits.max_gross_leverage) - mm_gross_w)
@@ -177,7 +178,7 @@ def main(
             if neutralize_net:
                 orphan_net_w = 0.0
                 orphan_gross_w = 0.0
-                # Offset only the orphan exposure that survives this cycle's planned unwinds.
+                # Passive ALO unwinds on unquoted books do not fill immediately; reserve full residual exposure.
                 residual_ntl = (
                     ex.orphan_residual_notional_usd(
                         account,
@@ -192,18 +193,18 @@ def main(
                     if limits.unwind_unquoted_orphans
                     else {}
                 )
-                if account.equity_usd > 0:
+                if perp_eq > 0:
                     for c, sz in account.positions_sz.items():
                         if abs(sz) <= 1e-12 or c in valid_targets:
                             continue
                         ntl = float(account.position_notional_usd.get(c, 0.0) or 0.0)
                         if c not in bbo:
                             kept = residual_ntl.get(c, ntl)
-                            orphan_net_w += kept / account.equity_usd
-                            orphan_gross_w += abs(kept) / account.equity_usd
+                            orphan_net_w += kept / perp_eq
+                            orphan_gross_w += abs(kept) / perp_eq
                         elif c in foreign_coin_set:
                             # MM inventory stays on the book: reserve its gross, leave its net to the MM.
-                            orphan_gross_w += abs(ntl) / account.equity_usd
+                            orphan_gross_w += abs(ntl) / perp_eq
                 rem_gross = max(0.0, min(0.90, limits.max_gross_leverage) - orphan_gross_w)
                 valid_targets = ex.neutralize_target_weights(
                     valid_targets,
@@ -222,10 +223,12 @@ def main(
         adapter = ex.DryRunAdapter()
     # Cap HWM ratcheting at oracle-adjusted equity so thin-book mark spikes cannot inflate HWM,
     # and never mutate persisted HWM or production audit log during dry-run executions.
+    oracle_eq = risk.oracle_adjusted_equity_usd(account, asset_ctxs) if asset_ctxs else account.equity_usd
     stored_hwm = ex.load_high_water_mark(hwm_state) if account_addr else 0.0
     # Net-of-flows HWM: shift the stored peak by external deposits/withdrawals since it was saved,
     # so withdrawing capital is not read as a drawdown (and a deposit is not read as profit).
     cur_net_flow: float | None = None
+    raw_prev_net_flow: float | None = None
     if account_addr:
         try:
             with httpx.Client(timeout=15.0) as ledger_client:
@@ -235,14 +238,28 @@ def main(
                 cur_net_flow = 0.0  # ledger readable but no external flows yet
         except Exception:  # noqa: BLE001 - ledger outage: keep the stored HWM unchanged
             cur_net_flow = None
-        prev_net_flow = ex.load_hwm_net_flow(hwm_state)
+        raw_prev_net_flow = ex.load_hwm_net_flow(hwm_state)
+        prev_net_flow = raw_prev_net_flow
         if prev_net_flow is None and cur_net_flow is not None and stored_hwm > 0:
             prev_net_flow = cur_net_flow  # first run with flow tracking: baseline, no adjustment
-        stored_hwm = ex.flow_adjusted_high_water_mark(stored_hwm, prev_net_flow, cur_net_flow)
-    oracle_eq = risk.oracle_adjusted_equity_usd(account, asset_ctxs) if asset_ctxs else account.equity_usd
+        stored_hwm = ex.flow_adjusted_high_water_mark(
+            stored_hwm, prev_net_flow, cur_net_flow, current_equity_usd=oracle_eq
+        )
+        reanchor_audit_path = audit_log if audit_log is not None else (hwm_state.parent / "hl_testnet_audit.jsonl")
+        gross_ntl = ex.account_gross_notional_usd(account, reference_px=reference_px, bbo=bbo)
+        stored_hwm, _ = ex.reanchor_hwm_after_flatten(
+            hwm_state,
+            reanchor_audit_path,
+            stored_hwm=stored_hwm,
+            oracle_equity_usd=oracle_eq,
+            gross_notional_usd=gross_ntl,
+            now_ms=account.observed_at_ms,
+            net_external_flow_usd=cur_net_flow,
+            persist=bool(execute_testnet and ex.hwm_persist_allowed(cur_net_flow, raw_prev_net_flow)),
+        )
     ratchet_eq = oracle_eq if (math.isfinite(oracle_eq) and oracle_eq > 0.0) else 0.0
     hwm = max(stored_hwm, ratchet_eq)
-    eff_audit_log = audit_log if audit_log is not None else ((ROOT / "data/paper/hl_testnet_audit.jsonl") if execute_testnet else None)
+    eff_audit_log = audit_log if audit_log is not None else ((hwm_state.parent / "hl_testnet_audit.jsonl") if execute_testnet else None)
     result = ex.execute_rebalance_cycle(
         account,
         valid_targets,

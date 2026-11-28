@@ -253,6 +253,42 @@ def write_frozen_contract(path: Path, contract: MicroExecutionContract) -> dict[
     return payload
 
 
+def plan_spot_buy_quantity_for_base_fee(
+    target_net_qty: Decimal,
+    *,
+    step: Decimal,
+    fee_rate: Decimal = Decimal("0"),
+    spot_price: Decimal | None = None,
+    max_spot_notional: Decimal | None = None,
+    max_delta_fraction: Decimal = Decimal("0.001"),
+) -> Decimal:
+    """Choose a lot-rounded Binance Spot buy quantity accounting for base-asset commission."""
+    q_base = round_to_step(target_net_qty, step)
+    if fee_rate <= 0 or fee_rate >= Decimal("0.05") or target_net_qty <= 0:
+        return q_base
+    raw_gross = target_net_qty / (Decimal("1") - fee_rate)
+    q_down = round_to_step(raw_gross, step, up=False)
+    q_up = round_to_step(raw_gross, step, up=True)
+    candidates: list[Decimal] = []
+    for cand in (q_down, q_up, q_base):
+        if cand > 0 and cand not in candidates:
+            if max_spot_notional is not None and spot_price is not None and spot_price > 0:
+                if cand * spot_price > max_spot_notional:
+                    continue
+            candidates.append(cand)
+    if not candidates:
+        return q_base
+
+    def _post_fee_delta(q: Decimal) -> Decimal:
+        net_q = q * (Decimal("1") - fee_rate)
+        denom = max(net_q, target_net_qty)
+        return abs(net_q - target_net_qty) / denom if denom > 0 else Decimal("1")
+
+    passing = [q for q in candidates if _post_fee_delta(q) <= max_delta_fraction]
+    pool = passing if passing else candidates
+    return min(pool, key=_post_fee_delta)
+
+
 def plan_entry_quantities(
     contract: MicroExecutionContract,
     *,
@@ -262,13 +298,14 @@ def plan_entry_quantities(
     binance_step: Decimal,
     bybit_step: Decimal,
     hyperliquid_step: Decimal,
+    binance_base_fee_rate: Decimal = Decimal("0"),
 ) -> dict[str, Decimal]:
     """Build one lot-aware entry plan shared by preflight and live execution.
 
     The v2 mode treats the configured notionals as risk ceilings.  Perp legs
     are rounded down first, then the spot quantity matches their combined base
-    quantity.  This preserves the delta gate without increasing a coarse venue
-    lot merely to hit a headline notional.
+    quantity (grossed up when a base-asset commission applies and a valid step
+    exists within the per-asset gross budget).
     """
 
     bybit_quantity = round_to_step(
@@ -279,10 +316,18 @@ def plan_entry_quantities(
         contract.hyperliquid_perp_short_usdc_notional / hyperliquid_price,
         hyperliquid_step,
     )
+    bybit_notional = bybit_quantity * bybit_price
+    hyperliquid_notional = hyperliquid_quantity * hyperliquid_price
+    short_notional = bybit_notional + hyperliquid_notional
+    max_spot_ntl = max(Decimal("0"), contract.per_asset_gross - short_notional)
     if contract.spot_quantity_mode == "match_rounded_perps":
-        binance_quantity = round_to_step(
+        binance_quantity = plan_spot_buy_quantity_for_base_fee(
             bybit_quantity + hyperliquid_quantity,
-            binance_step,
+            step=binance_step,
+            fee_rate=binance_base_fee_rate,
+            spot_price=binance_price,
+            max_spot_notional=max_spot_ntl,
+            max_delta_fraction=contract.max_delta_mismatch_fraction,
         )
     else:
         binance_quantity = round_to_step(
@@ -291,9 +336,13 @@ def plan_entry_quantities(
         )
 
     binance_notional = binance_quantity * binance_price
-    bybit_notional = bybit_quantity * bybit_price
-    hyperliquid_notional = hyperliquid_quantity * hyperliquid_price
-    short_notional = bybit_notional + hyperliquid_notional
+    eff_net_spot = (
+        binance_quantity * (Decimal("1") - binance_base_fee_rate)
+        if Decimal("0") < binance_base_fee_rate < Decimal("0.05")
+        else binance_quantity
+    )
+    short_qty = bybit_quantity + hyperliquid_quantity
+    delta_denom = max(eff_net_spot, short_qty)
     target_bybit_weight = (
         contract.bybit_perp_short_usdc_notional / contract.total_perp_notional
     )
@@ -302,9 +351,8 @@ def plan_entry_quantities(
         "bybit": bybit_quantity,
         "hyperliquid": hyperliquid_quantity,
         "delta_fraction": (
-            abs(binance_quantity - bybit_quantity - hyperliquid_quantity)
-            / binance_quantity
-            if binance_quantity
+            abs(eff_net_spot - short_qty) / delta_denom
+            if eff_net_spot > 0 and delta_denom > 0
             else Decimal("1")
         ),
         "spot_target_coverage_fraction": (
@@ -636,14 +684,17 @@ class HyperliquidClient:
             require_mainnet_execution_opt_in()
         # A cloid is not supplied: it could be linked to an order identity and must never leave memory.
         self._exchange.expires_after = int((time.time() + 10.0) * 1000)
-        response = self._exchange.order(
-            asset,
-            is_buy,
-            float(quantity),
-            float(price),
-            {"limit": {"tif": "Ioc"}},
-            reduce_only=reduce_only,
-        )
+        try:
+            response = self._exchange.order(
+                asset,
+                is_buy,
+                float(quantity),
+                float(price),
+                {"limit": {"tif": "Ioc"}},
+                reduce_only=reduce_only,
+            )
+        finally:
+            self._exchange.expires_after = None
         _validate_hyperliquid_ioc_response(response)
         return response
 
@@ -798,6 +849,20 @@ def _binance_free_balance(account: Mapping[str, Any], asset: str) -> Decimal:
     rows = list(account.get("balances") or [])
     row = next((item for item in rows if item.get("asset") == asset), None)
     return _decimal(row.get("free", "0"), field="binance_spot_free") if row else Decimal("0")
+
+
+def _binance_spot_taker_fee_rate(account: Mapping[str, Any]) -> Decimal:
+    """Extract Binance Spot taker fee rate as a fraction (e.g. ``10`` -> ``0.001``)."""
+    rates = account.get("commissionRates")
+    if isinstance(rates, Mapping) and rates.get("taker") not in (None, ""):
+        rate = _decimal(rates["taker"], field="binance_taker_rate")
+    elif account.get("takerCommission") not in (None, ""):
+        rate = _decimal(account["takerCommission"], field="binance_taker_commission") / Decimal("10000")
+    else:
+        return Decimal("0")
+    if rate < 0 or rate >= Decimal("0.05"):
+        return Decimal("0")
+    return rate
 
 
 def _hyperliquid_available_usdc(
@@ -997,6 +1062,7 @@ class MicroExecutionRunner:
             })
             binance_account = responses["binance_account"]
             binance_available_usdc = _binance_free_balance(binance_account, "USDC")
+            binance_taker_fee_rate = _binance_spot_taker_fee_rate(binance_account)
             bybit_permissions = responses["bybit_api"].get("result", {}).get("permissions") or []
             expected_agent = self.hyperliquid.api_wallet_address.lower()
             now_ms = int(time.time() * 1000)
@@ -1095,6 +1161,7 @@ class MicroExecutionRunner:
                     binance_step=binance_step,
                     bybit_step=bybit_step,
                     hyperliquid_step=hyper_step,
+                    binance_base_fee_rate=binance_taker_fee_rate,
                 )
                 valid_sizes = quantities["binance"] >= binance_min_qty and quantities["bybit"] >= bybit_min_qty
                 valid_notionals = quantities["binance"] * binance_price >= binance_min_notional and quantities["bybit"] * bybit_price >= bybit_min_notional and quantities["hyperliquid"] * hyper_price >= hyper_min_notional
@@ -1396,6 +1463,9 @@ class MicroExecutionRunner:
             pf = self.preflight(assets=(asset,))
             if pf.get("status") != "passed":
                 raise PreflightBlocked("preflight_blocked")
+        b_account = self.binance.account()
+        b_fee_rate = _binance_spot_taker_fee_rate(b_account)
+        b_avail_usdc = _binance_free_balance(b_account, "USDC")
         b_instrument = self.binance.instrument(symbol)
         b_step, b_min, b_min_notional = _binance_constraints(b_instrument)
         b_tick = _binance_price_tick(b_instrument)
@@ -1415,6 +1485,7 @@ class MicroExecutionRunner:
             binance_step=b_step,
             bybit_step=y_step,
             hyperliquid_step=h_step,
+            binance_base_fee_rate=b_fee_rate,
         )
         b_qty, y_qty, h_qty = plan["binance"], plan["bybit"], plan["hyperliquid"]
         if b_qty < b_min or y_qty < y_min or b_qty * b_price < b_min_notional or y_qty * y_price < y_min_notional or h_qty * h_price < h_min_notional:
@@ -1454,6 +1525,7 @@ class MicroExecutionRunner:
             ),
         }
         known_open: dict[str, Decimal] = {"binance": Decimal("0")}
+        exit_books: dict[str, Any] | None = None
         try:
             perp_orders, _ = _run_parallel({
                 "bybit": lambda: self.bybit.create_ioc(symbol=perp, side="Sell", quantity=y_qty, price=protected["bybit"], client_id=f"{tag}-yi", reduce_only=False),
@@ -1480,12 +1552,30 @@ class MicroExecutionRunner:
             if y_filled != y_qty or h_filled != h_qty:
                 unwound = self._safe_unwind(asset, filled=filled, books=books, client_tag=tag)
                 return {"asset": asset, "status": "failed_safe_unwind" if unwound else "failed_manual_intervention", "entry_span_ms": int(time.time() * 1000) - start_ms, "delta_mismatch_fraction": None, "entry": {"fills": {"bybit": _aggregate_fills(perp_fills["bybit"], venue="bybit", side="sell", symbol=perp)[1], "hyperliquid": _aggregate_fills(perp_fills["hyperliquid"], venue="hyperliquid", side="sell", symbol=asset)[1]}}, "safe_unwind_attempted": True}
+            short_filled_qty = y_filled + h_filled
+            max_spot_budget = min(
+                max(Decimal("0"), self.contract.per_asset_gross - y_filled * y_price - h_filled * h_price),
+                b_avail_usdc * (b_price / protected["binance"]) if protected["binance"] > 0 else b_avail_usdc,
+            )
             spot_qty = (
-                round_to_step(y_filled + h_filled, b_step)
+                plan_spot_buy_quantity_for_base_fee(
+                    short_filled_qty,
+                    step=b_step,
+                    fee_rate=b_fee_rate,
+                    spot_price=b_price,
+                    max_spot_notional=max_spot_budget,
+                    max_delta_fraction=self.contract.max_delta_mismatch_fraction,
+                )
                 if self.contract.spot_quantity_mode == "match_rounded_perps"
                 else b_qty
             )
-            prospective_delta = abs(spot_qty - y_filled - h_filled) / spot_qty if spot_qty > 0 else Decimal("1")
+            est_net_spot = spot_qty * (Decimal("1") - b_fee_rate) if b_fee_rate > 0 else spot_qty
+            prospective_denom = max(est_net_spot, short_filled_qty)
+            prospective_delta = (
+                abs(est_net_spot - short_filled_qty) / prospective_denom
+                if est_net_spot > 0 and prospective_denom > 0
+                else Decimal("1")
+            )
             if prospective_delta > self.contract.max_delta_mismatch_fraction:
                 unwound = self._safe_unwind(asset, filled=filled, books=books, client_tag=tag)
                 return {"asset": asset, "status": "failed_safe_unwind" if unwound else "failed_manual_intervention", "entry_span_ms": int(time.time() * 1000) - start_ms, "delta_mismatch_fraction": None, "safe_unwind_attempted": True}
@@ -1519,9 +1609,10 @@ class MicroExecutionRunner:
             )
             binance_position_qty = max(Decimal("0"), b_filled - binance_base_fee)
             known_open = {"binance": binance_position_qty, "bybit": y_filled, "hyperliquid": h_filled}
+            delta_denom = max(binance_position_qty, short_filled_qty)
             delta_mismatch = (
-                abs(binance_position_qty - y_filled - h_filled) / binance_position_qty
-                if binance_position_qty > 0
+                abs(binance_position_qty - short_filled_qty) / delta_denom
+                if binance_position_qty > 0 and delta_denom > 0
                 else Decimal("1")
             )
             entry_snapshot = self._account_snapshot(asset)
@@ -1587,8 +1678,8 @@ class MicroExecutionRunner:
                 return {"asset": asset, "status": "failed_safe_unwind" if unwound else "failed_manual_intervention", "entry_span_ms": exit_start - start_ms, "exit_span_ms": int(time.time() * 1000) - exit_start, "delta_mismatch_fraction": float(delta_mismatch), "entry_snapshot": entry_snapshot, "exit_snapshot": exit_snapshot, "safe_unwind_attempted": True}
             return {"asset": asset, "status": "completed", "entry_span_ms": exit_start - start_ms - self.contract.hold_seconds * 1000, "exit_span_ms": int(time.time() * 1000) - exit_start, "delta_mismatch_fraction": float(delta_mismatch), "entry_snapshot": entry_snapshot, "exit_snapshot": exit_snapshot, "entry": {"fills": {"binance": b_summary, "bybit": _aggregate_fills(all_fills["bybit"], venue="bybit", side="sell", symbol=perp)[1], "hyperliquid": _aggregate_fills(all_fills["hyperliquid"], venue="hyperliquid", side="sell", symbol=asset)[1]}}, "exit": {"fills": {"binance": _aggregate_fills(exit_fills["binance"], venue="binance", side="sell", symbol=symbol)[1], "bybit": _aggregate_fills(exit_fills["bybit"], venue="bybit", side="buy", symbol=perp)[1], "hyperliquid": _aggregate_fills(exit_fills["hyperliquid"], venue="hyperliquid", side="buy", symbol=asset)[1]}}, "implementation_shortfall_bps": {"binance_entry": _shortfall_bps(all_fills["binance"], venue="binance", symbol=symbol, side="buy", arrival_price=b_price), "bybit_entry": _shortfall_bps(all_fills["bybit"], venue="bybit", symbol=perp, side="sell", arrival_price=y_price), "hyperliquid_entry": _shortfall_bps(all_fills["hyperliquid"], venue="hyperliquid", symbol=asset, side="sell", arrival_price=h_price), }, "safe_unwind_attempted": False}
         except Exception as error:
-            # Unwind only legs that were submitted/filled in this run (falling back to live state for in-flight legs).
-            unwound = self._safe_unwind(asset, filled=known_open, books=books, client_tag=tag)
+            # Unwind only legs that were submitted/filled in this run, preferring fresh exit_books when available.
+            unwound = self._safe_unwind(asset, filled=known_open, books=exit_books or books, client_tag=tag)
             return {
                 "asset": asset,
                 "status": "failed_safe_unwind" if unwound else "failed_manual_intervention",

@@ -42,7 +42,7 @@ def main(
     min_oi_usd: float = typer.Option(2_000_000.0, help="Minimum open interest USD"),
     min_vol_usd: float = typer.Option(500_000.0, help="Minimum 24h volume USD"),
     output_dir: Path = typer.Option(ROOT / "data/paper/hl_funding_settlement_study"),
-    report_path: Path = typer.Option(ROOT / "docs/reports/2026-11-26/hl_hourly_funding_settlement_study.md"),
+    report_path: Path = typer.Option(ROOT / "data/reports/hl_hourly_funding_settlement_study.md"),
     telegram: bool = typer.Option(False, help="Send Rich HTML OOS verdict table to Telegram"),
 ) -> None:
     _load_dotenv(ROOT / ".env")
