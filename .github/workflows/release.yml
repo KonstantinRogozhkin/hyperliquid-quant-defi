@@ -80,6 +80,7 @@ jobs:
 
       - name: Run Python lint and unit tests
         run: |
+          command -v zsh >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends zsh)
           uv sync --locked --no-install-project --extra dev
           .venv/bin/ruff check src scripts tests
           .venv/bin/pytest -q --tb=short -p no:cacheprovider

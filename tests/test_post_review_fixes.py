@@ -7,6 +7,8 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import shutil
 import subprocess
 import sys
 
@@ -162,6 +164,8 @@ def test_deploy_dokploy_rejects_mismatched_worker_sha_or_stale_heartbeat(monkeyp
 
 def test_relative_path_ops_run_script_execs_cleanly_from_outside_repo(tmp_path: Path):
     """Invoking zsh ../.../scripts/ops/run_*.sh via a relative path from another cwd must resolve SCRIPT_PATH."""
+    if not shutil.which("zsh"):
+        pytest.skip("zsh not available in minimal environment")
     rel_script = os.path.relpath(ROOT / "scripts/ops/run_hl_frontier_persistence_tick.sh", start=tmp_path)
     # Create a tiny stub python that prints args when running the analytics script, while using real .venv python for ops_lock
     real_py = ROOT / ".venv/bin/python"
@@ -280,9 +284,14 @@ def test_scheduler_wait_budgets_mm_cli_guards_and_unmanaged_orphans(tmp_path: Pa
     summary_json = json.loads((out_mm / "summary.json").read_text(encoding="utf-8"))
     assert set(summary_json["summaries"]) == {"BTC", "ETH"}
 
-    res_rest_multi = CliRunner().invoke(mm_cli.app, ["--coins", "BTC,ETH", "--rest", "--duration-sec", "1"])
+    res_rest_multi = CliRunner().invoke(
+        mm_cli.app,
+        ["--coins", "BTC,ETH", "--rest", "--duration-sec", "1"],
+        env={"NO_COLOR": "1"},
+    )
     assert res_rest_multi.exit_code != 0
-    assert "--ws" in res_rest_multi.output
+    clean_out = re.sub(r"\x1b\[[0-9;]*m", "", res_rest_multi.output)
+    assert "--ws" in clean_out
 
     # 3. Unmanaged orphan gating: retained target orphan & unwind-order-covered orphan do NOT count as unmanaged
     acct = ex.AccountSnapshot(

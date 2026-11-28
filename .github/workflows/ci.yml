@@ -74,7 +74,9 @@ jobs:
 
       - name: Install dev dependencies
         if: steps.changes.outputs.run_py == 'true'
-        run: uv sync --locked --no-install-project --extra dev
+        run: |
+          command -v zsh >/dev/null 2>&1 || (sudo apt-get update -qq && sudo apt-get install -y -qq --no-install-recommends zsh)
+          uv sync --locked --no-install-project --extra dev
 
       - name: Run checks and unit tests
         if: steps.changes.outputs.run_py == 'true'

@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import threading
@@ -322,6 +323,9 @@ def test_h12_install_local_cron_scripts_preserve_lines_after_legacy_blocks(tmp_p
         lend = next(ln.split("=", 1)[1].strip('"') for ln in content.splitlines() if ln.startswith("LEGACY_END_MARKER="))
         assert lbegin.removeprefix("# BEGIN ") == lend.removeprefix("# END "), script.name
 
+    if not shutil.which("zsh"):
+        pytest.skip("zsh not available in minimal environment")
+
     # End-to-end check with fake `crontab` binary: lines AFTER a legacy block must NEVER be wiped!
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
@@ -373,8 +377,9 @@ def test_h12_run_tick_scripts_use_atomic_ops_lock():
         assert "hl_quant.ops_lock" in text, name
         assert 'mkdir "${LOCK_DIR}"' not in text, name
         assert 'rm -rf "${LOCK_DIR}"' not in text, name
-        proc = subprocess.run(["zsh", str(path), "--help"], capture_output=True, text=True, check=True)
-        assert "Usage:" in proc.stdout
+        if shutil.which("zsh"):
+            proc = subprocess.run(["zsh", str(path), "--help"], capture_output=True, text=True, check=True)
+            assert "Usage:" in proc.stdout
 
 
 # --------------------------------------------------------------------------- 4. Dokploy Deploy Hardening (H-13)
