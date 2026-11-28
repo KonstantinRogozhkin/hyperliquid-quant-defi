@@ -311,3 +311,102 @@ def test_intraday_inception_anchor_uses_four_hour_step_not_one_second() -> None:
     assert dates[0] == "2026-11-26T22:00:00Z"
     assert gross[0] == 1.0
     assert net is not None and net[0] == 1.0
+
+
+def test_filter_unquoted_skips_all_when_fewer_than_two_quoted_coins_without_outage() -> None:
+    now = 1_795_800_000_000
+    targets = {"BTC": 0.20, "JUP": -0.10, "WLFI": -0.10}
+    bbo = {"BTC": (60_000.0, 60_002.0, now)}
+    # All books were read (`observed_ms == now`), yet only 1 coin has a two-sided Testnet BBO:
+    # skip new BBO entries (`{}`) without returning raw targets that would trip a false kill-switch.
+    tops = {
+        "BTC": (60_000.0, 60_002.0, now),
+        "JUP": (0.25, None, now),
+        "WLFI": (None, None, now),
+    }
+    filtered, skipped = hlex.filter_unquoted_targets(targets, bbo, max_missing_fraction=0.35, book_tops=tops)
+    assert filtered == {}
+    assert skipped == ["BTC", "JUP", "WLFI"]
+
+    # If books failed to read (`observed_ms == 0`), still fail closed so check_kill_switch halts!
+    tops_outage = {"BTC": (60_000.0, 60_002.0, now), "JUP": (None, None, 0), "WLFI": (None, None, 0)}
+    out_f, out_s = hlex.filter_unquoted_targets(targets, bbo, max_missing_fraction=0.35, book_tops=tops_outage)
+    assert out_f == targets
+    assert out_s == []
+
+
+def test_metrics_clears_pre_pr30_missing_quote_orphan_unwind_when_live_probe_is_healthy() -> None:
+    t_audit = 1_795_824_616_226
+    overview = {
+        "attribution": {"equity_usd": 989.77, "liq_warnings": [], "adl_warnings": [], "observed_at_ms": t_audit + 3_000_000},
+        "testnet_audit_recent": [
+            {
+                "ts_ms": t_audit,
+                "mode": "testnet_live",
+                "status": "kill_switch_triggered",
+                "derisk_mode": "orphan_unwind_only",
+                "violations": ["missing_quote:JUP", "missing_quote:WLFI"],
+                "placed_count": 4,
+                "high_water_mark_usd": 1006.55,
+            }
+        ],
+        "testnet_risk": {
+            "observed_at_ms": t_audit + 4_900_000,
+            "equity_usd": 989.63,
+            "drawdown_pct": 1.68,
+            "kill_switch_drawdown_pct": 5.0,
+            "unknown_books": 0,
+            "unmanaged_orphan_positions": 0,
+            "orphan_positions": {"VVV": {"szi": 1.71, "unmanaged": False}},
+        },
+    }
+    txt = prom.render_prometheus_metrics(overview)
+    assert "hl_testnet_last_cycle_ok 1\n" in txt
+    assert 'hl_strategy_status_ok{strategy="testnet_alo_live",category="Live Testnet",mode="testnet"} 1\n' in txt
+
+    # Account-risk drawdown violation NEVER clears even with a fresher probe!
+    overview_dd = {
+        **overview,
+        "testnet_audit_recent": [
+            {
+                **overview["testnet_audit_recent"][0],
+                "derisk_mode": "flatten",
+                "violations": ["drawdown_limit:5.20%>=5.00%"],
+            }
+        ],
+    }
+    txt_dd = prom.render_prometheus_metrics(overview_dd)
+    assert "hl_testnet_last_cycle_ok 0\n" in txt_dd
+    assert 'hl_strategy_status_ok{strategy="testnet_alo_live",category="Live Testnet",mode="testnet"} 0\n' in txt_dd
+
+
+def test_autopilot_route_and_mm_calibration_bootstrap_refresh(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+    from hl_quant.api.app import create_app
+
+    paper_dir = tmp_path / "paper"
+    ap_dir = paper_dir / "hl_autopilot"
+    ap_dir.mkdir(parents=True)
+    (ap_dir / "state.json").write_text(
+        json.dumps(
+            {
+                "gross_equity_usd": 250_000.0,
+                "sleeves": [{"name": "spot_perp_paper", "drift_pct": 0.0}],
+                "risk_telemetry": {"max_weight_drift_pct": 6.4, "rebalanced_this_tick": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    client = TestClient(create_app(data_root=paper_dir))
+    r = client.get("/api/v1/autopilot")
+    assert r.status_code == 200
+    assert r.json()["state"]["risk_telemetry"]["max_weight_drift_pct"] == 0.0
+
+    # Scheduler bootstrap refreshes pre-PR29 mm_calibration lacking calibration_ok
+    cal_file = paper_dir / "hl_mm_calibration" / "calibration.json"
+    cal_file.parent.mkdir(parents=True, exist_ok=True)
+    cal_file.write_text(json.dumps({"BTC": {"kappa_per_bp": 0.53}}), encoding="utf-8")
+    ws = sched.WorkerScheduler(root_dir=sched.ROOT_DIR, data_dir=tmp_path, runner=lambda *_: 0)
+    assert ws._bootstrap_needs_refresh("mm_calibration", cal_file) is True
+    cal_file.write_text(json.dumps({"BTC": {"kappa_per_bp": 0.53, "calibration_ok": True}}), encoding="utf-8")
+    assert ws._bootstrap_needs_refresh("mm_calibration", cal_file) is False

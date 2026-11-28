@@ -1003,6 +1003,12 @@ class WorkerScheduler:
                 doc = json.loads(sentinel.read_text(encoding="utf-8"))
                 if not isinstance(doc, dict) or "observed_at_utc" not in doc:
                     return True
+            elif job_name == "mm_calibration":
+                doc = json.loads(sentinel.read_text(encoding="utf-8"))
+                if not isinstance(doc, dict) or not doc:
+                    return True
+                if any(not isinstance(v, dict) or "calibration_ok" not in v for v in doc.values()):
+                    return True
         except Exception:
             return True
         return False

@@ -446,10 +446,10 @@ def build_dashboard() -> dict[str, Any]:
     panels.append(
         _timeseries(
             next_id(),
-            "Cumulative Return % — Our Strategies vs Crypto & Gold Benchmarks (90D)",
+            "Cumulative Return % — Our Strategies vs Crypto & Gold Benchmarks (1Y)",
             [
                 _target("A", 'hl_strategy_return_pct{category!="Benchmark"}', legend="{{strategy}}"),
-                _target("B", "hl_benchmark_return_pct", legend="Benchmark {{asset}} (90D)"),
+                _target("B", "hl_benchmark_return_pct", legend="Benchmark {{asset}} (1Y)"),
             ],
             12,
             15,
