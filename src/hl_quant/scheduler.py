@@ -481,7 +481,9 @@ def build_job_specs() -> list[JobSpec]:
             cron_expr="34 5 * * *",
             minutes=(34,),
             hours=(5,),
-            timeout_s=480,
+            # ~35 coins x (5,000-bar candles + ~3 funding pages) ~ 8.5k info weight, paced at
+            # 900 weight/min to stay under Hyperliquid's per-IP limit -> ~10 min of collection.
+            timeout_s=1500,
             readonly=True,
             bootstrap_eligible=True,
             build_command=_settlement_study_cmd,

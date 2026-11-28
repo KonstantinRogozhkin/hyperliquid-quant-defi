@@ -226,14 +226,19 @@ def _level_px(side: Any) -> float | None:
 
 
 def fetch_testnet_book_tops(client: httpx.Client, coins: list[str]) -> dict[str, BookTop]:
-    """Return ``{coin: (best_bid | None, best_ask | None, observed_ms)}`` including one-sided books."""
+    """Return ``{coin: (best_bid | None, best_ask | None, observed_ms)}`` including one-sided books.
+
+    A well-formed but empty/one-sided book (routine on thin Testnet alts) keeps a positive
+    ``observed_ms``; a malformed response is marked ``observed_ms == 0`` so callers can tell a
+    genuine feed failure apart from an illiquid market.
+    """
     out: dict[str, BookTop] = {}
     for coin in sorted(set(coins)):
         resp = _post_testnet_info(client, {"type": "l2Book", "coin": coin})
         book = resp.json()
         levels = book.get("levels") if isinstance(book, dict) else None
         if not (isinstance(levels, list) and len(levels) == 2):
-            out[coin] = (None, None, int(time.time() * 1000))
+            out[coin] = (None, None, 0)
             continue
         # Exchange-side book time, so the stale-feed gate measures real quote age.
         book_ms = book.get("time")
@@ -357,13 +362,18 @@ def filter_unquoted_targets(
     bbo: dict[str, tuple[float, float, int]],
     *,
     max_missing_fraction: float = 0.35,
+    book_tops: dict[str, BookTop] | None = None,
 ) -> tuple[dict[str, float], list[str]]:
     """Drop thinly-quoted Testnet coins lacking a two-sided BBO unless missing share exceeds safety threshold.
 
     Fail-closed guarantee: if all targets are missing, if fewer than 2 quoted coins remain
-    when >= 2 non-zero targets were requested, or if the unquoted fraction exceeds
-    ``max_missing_fraction``, returns the original ``target_weights`` unchanged so
+    when >= 2 non-zero targets were requested, or if the share of coins whose book could NOT be
+    read exceeds ``max_missing_fraction``, returns the original ``target_weights`` unchanged so
     ``check_kill_switch`` halts the cycle on systemic feed outages.
+
+    When ``book_tops`` is given, a coin whose ``l2Book`` was read successfully but is empty or
+    one-sided (``observed_ms > 0``) is an illiquid market, not a feed outage: it is always skipped
+    and does not count toward the outage fraction.
     """
     nonzero = {c: float(w) for c, w in target_weights.items() if abs(float(w)) > 1e-9}
     if not nonzero:
@@ -372,7 +382,11 @@ def filter_unquoted_targets(
     if not missing:
         return dict(target_weights), []
     quoted_count = len(nonzero) - len(missing)
-    missing_frac = len(missing) / len(nonzero)
+    if book_tops is not None:
+        outage = [c for c in missing if c not in book_tops or int(book_tops[c][2] or 0) <= 0]
+    else:
+        outage = missing
+    missing_frac = len(outage) / len(nonzero)
     if quoted_count <= 0 or (len(nonzero) >= 2 and quoted_count < 2) or missing_frac > max_missing_fraction + 1e-9:
         return dict(target_weights), []
     missing_set = set(missing)
